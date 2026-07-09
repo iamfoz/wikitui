@@ -19,8 +19,12 @@ fn span_style(kind: &SpanStyle) -> Style {
     }
 }
 
-fn document_to_text(doc: &Document) -> Text<'static> {
+fn document_to_text(doc: &Document, focused_link: Option<usize>) -> Text<'static> {
     let mut lines: Vec<Line<'static>> = Vec::new();
+    // Must advance in the exact same order as `doc::collect_links` (which
+    // only visits Paragraph/ListItem/Blockquote spans) so a cycled-to link
+    // index highlights the same occurrence the app will actually follow.
+    let mut link_counter = 0usize;
 
     lines.push(Line::from(RSpan::styled(
         doc.title.clone(),
@@ -50,7 +54,11 @@ fn document_to_text(doc: &Document) -> Text<'static> {
                 lines.push(Line::from(RSpan::styled(text, style)));
             }
             Block::Paragraph(spans) => {
-                lines.push(Line::from(spans_to_rspans(spans)));
+                lines.push(Line::from(spans_to_rspans(
+                    spans,
+                    &mut link_counter,
+                    focused_link,
+                )));
                 lines.push(Line::from(""));
             }
             Block::ListItem {
@@ -66,12 +74,12 @@ fn document_to_text(doc: &Document) -> Text<'static> {
                     "•".to_string()
                 };
                 let mut rspans = vec![RSpan::raw(format!("{indent}{bullet} "))];
-                rspans.extend(spans_to_rspans(spans));
+                rspans.extend(spans_to_rspans(spans, &mut link_counter, focused_link));
                 lines.push(Line::from(rspans));
             }
             Block::Blockquote(spans) => {
                 let mut rspans = vec![RSpan::styled("▌ ", Style::default().fg(Color::DarkGray))];
-                rspans.extend(spans_to_rspans(spans));
+                rspans.extend(spans_to_rspans(spans, &mut link_counter, focused_link));
                 lines.push(Line::from(rspans));
                 lines.push(Line::from(""));
             }
@@ -153,10 +161,33 @@ fn strip_tags(html: &str) -> String {
     out
 }
 
-fn spans_to_rspans(spans: &[crate::doc::Span]) -> Vec<RSpan<'static>> {
+/// Converts spans to styled ratatui spans, giving the `focused` link index
+/// (as counted by `doc::collect_links`'s ordering) a distinct highlight so
+/// the reader can see which link Tab/Shift-Tab and Enter act on.
+fn spans_to_rspans(
+    spans: &[crate::doc::Span],
+    link_counter: &mut usize,
+    focused: Option<usize>,
+) -> Vec<RSpan<'static>> {
     spans
         .iter()
-        .map(|s| RSpan::styled(s.text.clone(), span_style(&s.style)))
+        .map(|s| {
+            if matches!(s.style, SpanStyle::Link(_)) {
+                let this_index = *link_counter;
+                *link_counter += 1;
+                let style = if Some(this_index) == focused {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    span_style(&s.style)
+                };
+                RSpan::styled(s.text.clone(), style)
+            } else {
+                RSpan::styled(s.text.clone(), span_style(&s.style))
+            }
+        })
         .collect()
 }
 
@@ -183,7 +214,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 fn draw_reading(frame: &mut Frame, app: &mut App, area: Rect) {
     match &app.doc {
         Some(doc) => {
-            let text = document_to_text(doc);
+            let text = document_to_text(doc, app.focused_link);
             let visible_height = area.height.max(1);
             let total_lines = text.lines.len() as u16;
             app.max_scroll = total_lines.saturating_sub(visible_height);
@@ -270,7 +301,18 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Results => "Enter: open   Esc: cancel   j/k: move".to_string(),
         Mode::Help => "Press any key to close help".to_string(),
         Mode::Reading if app.loading => "Loading…".to_string(),
-        Mode::Reading => app.status.clone(),
+        Mode::Reading => match app.focused_link.and_then(|i| app.links.get(i)) {
+            Some(link) if link.internal_title.is_some() => {
+                format!(
+                    "→ {} ({}/{})   Tab/S-Tab: cycle   Enter: open   H: back   L: forward",
+                    link.text,
+                    app.focused_link.unwrap() + 1,
+                    app.links.len()
+                )
+            }
+            Some(link) => format!("→ {} (external, not yet followable)", link.text),
+            None => app.status.clone(),
+        },
     };
     let style = if app.mode == Mode::Search {
         Style::default().fg(Color::Black).bg(Color::Yellow)
@@ -299,8 +341,10 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect) {
         Line::from("j/k, ↓/↑     scroll"),
         Line::from("Ctrl-d/u     half page down/up"),
         Line::from("gg / G       top / bottom"),
+        Line::from("Tab/S-Tab    cycle links"),
+        Line::from("Enter        follow link / open selected result"),
+        Line::from("H / L        back / forward"),
         Line::from("/            search"),
-        Line::from("Enter        open selected result"),
         Line::from("Esc          cancel / close"),
         Line::from("?            toggle this help"),
         Line::from("q            quit"),

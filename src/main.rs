@@ -80,17 +80,7 @@ async fn run(
         app.search_input = query;
         run_search(client, &mut app).await;
     } else if let Some(title) = cli.title {
-        app.loading = true;
-        match client.fetch_article_html(&title).await {
-            Ok((canonical, html)) => {
-                let document = doc::parse_article_html(&canonical, &html);
-                app.open_document(document);
-            }
-            Err(e) => {
-                app.status = format!("Error: {e}");
-            }
-        }
-        app.loading = false;
+        open_title(client, &mut app, &title).await;
     }
 
     loop {
@@ -111,6 +101,41 @@ async fn run(
     }
 
     Ok(())
+}
+
+/// Fetch and open `title` as a fresh navigation (pushes the current article
+/// onto the back stack — see `App::open_document`). Used for the initial
+/// CLI title, search results, and following a link.
+async fn open_title(client: &WikiClient, app: &mut App, title: &str) {
+    app.loading = true;
+    match client.fetch_article_html(title).await {
+        Ok((canonical, html)) => {
+            let document = doc::parse_article_html(&canonical, &html);
+            app.open_document(document);
+        }
+        Err(e) => {
+            app.status = format!("Error: {e}");
+            app.mode = Mode::Reading;
+        }
+    }
+    app.loading = false;
+}
+
+/// Fetch and install `title` without touching the back/forward stacks —
+/// used for `H`/`L` navigation, which already adjusted the stacks via
+/// `App::navigate_back_target`/`navigate_forward_target`.
+async fn open_title_from_history(client: &WikiClient, app: &mut App, title: &str) {
+    app.loading = true;
+    match client.fetch_article_html(title).await {
+        Ok((canonical, html)) => {
+            let document = doc::parse_article_html(&canonical, &html);
+            app.set_document(document);
+        }
+        Err(e) => {
+            app.status = format!("Error: {e}");
+        }
+    }
+    app.loading = false;
 }
 
 async fn handle_key(client: &WikiClient, app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
@@ -151,18 +176,7 @@ async fn handle_key(client: &WikiClient, app: &mut App, code: KeyCode, modifiers
             }
             KeyCode::Enter => {
                 if let Some(result) = app.results.get(app.selected_result).cloned() {
-                    app.loading = true;
-                    match client.fetch_article_html(&result.title).await {
-                        Ok((canonical, html)) => {
-                            let document = doc::parse_article_html(&canonical, &html);
-                            app.open_document(document);
-                        }
-                        Err(e) => {
-                            app.status = format!("Error: {e}");
-                            app.mode = Mode::Reading;
-                        }
-                    }
-                    app.loading = false;
+                    open_title(client, app, &result.title).await;
                 }
             }
             KeyCode::Char('?') => {
@@ -186,6 +200,30 @@ async fn handle_key(client: &WikiClient, app: &mut App, code: KeyCode, modifiers
             KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => app.scroll_by(10),
             KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => app.scroll_by(-10),
             KeyCode::Char(' ') => app.scroll_by(15),
+            KeyCode::Tab => app.cycle_link(true),
+            KeyCode::BackTab => app.cycle_link(false),
+            KeyCode::Enter => {
+                if let Some(link) = app.focused_link.and_then(|i| app.links.get(i)).cloned() {
+                    match link.internal_title {
+                        Some(title) => open_title(client, app, &title).await,
+                        None => app.status = format!("External link: {}", link.href),
+                    }
+                }
+            }
+            KeyCode::Char('H') => {
+                if let Some(title) = app.navigate_back_target() {
+                    open_title_from_history(client, app, &title).await;
+                } else {
+                    app.status = "No earlier page in history".to_string();
+                }
+            }
+            KeyCode::Char('L') => {
+                if let Some(title) = app.navigate_forward_target() {
+                    open_title_from_history(client, app, &title).await;
+                } else {
+                    app.status = "No later page in history".to_string();
+                }
+            }
             KeyCode::Char('g') => {
                 if app.pending_g {
                     app.scroll_to_top();

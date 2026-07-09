@@ -50,6 +50,61 @@ pub struct Document {
     pub blocks: Vec<Block>,
 }
 
+/// A link encountered while reading, in document order. `internal_title` is
+/// `Some` for links to another article on the same wiki (resolved from
+/// Parsoid's `./Title` / `/wiki/Title` conventions) and `None` for anything
+/// else (external URLs, interwiki links) — those aren't followable yet.
+#[derive(Debug, Clone)]
+pub struct LinkRef {
+    pub href: String,
+    pub text: String,
+    pub internal_title: Option<String>,
+}
+
+fn internal_title_from_href(href: &str) -> Option<String> {
+    let path = href
+        .strip_prefix("./")
+        .or_else(|| href.strip_prefix("/wiki/"))?;
+    if path.starts_with("http://") || path.starts_with("https://") || path.contains("://") {
+        return None;
+    }
+    let path = path.split('#').next().unwrap_or(path);
+    if path.is_empty() {
+        return None;
+    }
+    let decoded = urlencoding::decode(path).ok()?.into_owned();
+    Some(decoded.replace('_', " "))
+}
+
+/// Collects every link in the blocks that can render one interactively
+/// (paragraphs, list items, blockquotes), in the exact order the reading
+/// view renders them — `ui::draw_reading` relies on this ordering to map a
+/// cycled-to link index back to the span it highlights. Headings are
+/// deliberately excluded: they're rendered as flattened plain text with no
+/// per-span styling, so a link inside one couldn't be highlighted anyway.
+pub fn collect_links(doc: &Document) -> Vec<LinkRef> {
+    let mut links = Vec::new();
+    let mut visit = |spans: &[Span]| {
+        for s in spans {
+            if let SpanStyle::Link(href) = &s.style {
+                links.push(LinkRef {
+                    href: href.clone(),
+                    text: s.text.clone(),
+                    internal_title: internal_title_from_href(href),
+                });
+            }
+        }
+    };
+    for block in &doc.blocks {
+        match block {
+            Block::Paragraph(spans) | Block::Blockquote(spans) => visit(spans),
+            Block::ListItem { spans, .. } => visit(spans),
+            _ => {}
+        }
+    }
+    links
+}
+
 /// Tags whose content is handled by a dedicated `Block`, and which
 /// `inline_spans` must therefore never descend into (otherwise their text
 /// would be captured twice: once as a block, once as part of an ancestor's
@@ -725,5 +780,44 @@ mod tests {
         assert!(plain.contains("First item"));
         assert!(plain.contains("[infobox]"));
         assert!(plain.contains("[image: A test picture]"));
+    }
+
+    #[test]
+    fn resolves_internal_wiki_links() {
+        assert_eq!(
+            internal_title_from_href("./Alan_Turing"),
+            Some("Alan Turing".to_string())
+        );
+        assert_eq!(
+            internal_title_from_href("/wiki/Alan_Turing"),
+            Some("Alan Turing".to_string())
+        );
+        assert_eq!(
+            internal_title_from_href("./Bletchley_Park#History"),
+            Some("Bletchley Park".to_string())
+        );
+        assert_eq!(internal_title_from_href("https://example.com/"), None);
+        assert_eq!(internal_title_from_href("#cite_note-1"), None);
+        assert_eq!(internal_title_from_href(""), None);
+    }
+
+    #[test]
+    fn collect_links_finds_body_link_but_skips_heading_and_reference_anchor() {
+        let doc = parse_article_html("Test Article", FIXTURE);
+        let links = collect_links(&doc);
+
+        let body_link = links
+            .iter()
+            .find(|l| l.internal_title.as_deref() == Some("Other Article"))
+            .expect("the intro paragraph's internal link should be collected");
+        assert_eq!(body_link.text, "link");
+
+        // The reference marker's anchor (#cite_note-1) is a same-page
+        // fragment, not an internal article link, and must not resolve.
+        assert!(
+            links
+                .iter()
+                .all(|l| l.href != "#cite_note-1" || l.internal_title.is_none())
+        );
     }
 }
