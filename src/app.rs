@@ -1,11 +1,12 @@
 use crate::api::SearchResult;
-use crate::doc::{Document, LinkRef, collect_links};
+use crate::doc::{Document, LinkRef, SectionRef, collect_links, section_outline};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Reading,
     Search,
     Results,
+    Toc,
     Help,
 }
 
@@ -15,6 +16,8 @@ pub struct App {
     pub doc: Option<Document>,
     pub links: Vec<LinkRef>,
     pub focused_link: Option<usize>,
+    pub sections: Vec<SectionRef>,
+    pub selected_section: usize,
     pub back_stack: Vec<String>,
     pub forward_stack: Vec<String>,
     pub scroll: u16,
@@ -37,6 +40,8 @@ impl App {
             doc: None,
             links: Vec::new(),
             focused_link: None,
+            sections: Vec::new(),
+            selected_section: 0,
             back_stack: Vec::new(),
             forward_stack: Vec::new(),
             scroll: 0,
@@ -91,14 +96,27 @@ impl App {
     pub fn set_document(&mut self, doc: Document) {
         self.links = collect_links(&doc);
         self.focused_link = if self.links.is_empty() { None } else { Some(0) };
+        self.sections = section_outline(&doc);
+        self.selected_section = 0;
         self.status = format!(
-            "{} — {} blocks, {} links",
+            "{} — {} blocks, {} links, {} sections",
             doc.title,
             doc.blocks.len(),
-            self.links.len()
+            self.links.len(),
+            self.sections.len()
         );
         self.doc = Some(doc);
         self.scroll = 0;
+        self.mode = Mode::Reading;
+    }
+
+    /// Scroll to the given section's heading line, clamped to what's
+    /// actually scrollable (a section near the end of a short article may
+    /// not have `max_scroll` lines below it).
+    pub fn jump_to_section(&mut self, index: usize) {
+        if let Some(section) = self.sections.get(index) {
+            self.scroll = section.line.min(self.max_scroll);
+        }
         self.mode = Mode::Reading;
     }
 
@@ -228,5 +246,29 @@ mod tests {
         let mut app = App::new("en".to_string());
         app.cycle_link(true);
         assert_eq!(app.focused_link, None);
+    }
+
+    #[test]
+    fn jump_to_section_clamps_to_max_scroll() {
+        let mut app = App::new("en".to_string());
+        app.sections = vec![SectionRef {
+            level: 2,
+            title: "Late Section".to_string(),
+            line: 500,
+        }];
+        app.max_scroll = 30; // a short article: the recorded line is past the end
+        app.mode = Mode::Toc;
+
+        app.jump_to_section(0);
+        assert_eq!(app.scroll, 30);
+        assert_eq!(app.mode, Mode::Reading);
+    }
+
+    #[test]
+    fn jump_to_section_out_of_range_does_not_panic() {
+        let mut app = App::new("en".to_string());
+        app.mode = Mode::Toc;
+        app.jump_to_section(5); // no sections at all
+        assert_eq!(app.mode, Mode::Reading, "should still return to Reading");
     }
 }

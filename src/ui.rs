@@ -202,6 +202,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Mode::Reading | Mode::Help => draw_reading(frame, app, chunks[0]),
         Mode::Search => draw_reading(frame, app, chunks[0]),
         Mode::Results => draw_results(frame, app, chunks[0]),
+        Mode::Toc => draw_toc(frame, app, chunks[0]),
     }
 
     draw_status_bar(frame, app, chunks[1]);
@@ -295,10 +296,34 @@ fn draw_results(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(list, area);
 }
 
+fn draw_toc(frame: &mut Frame, app: &App, area: Rect) {
+    let items: Vec<ListItem> = app
+        .sections
+        .iter()
+        .enumerate()
+        .map(|(i, section)| {
+            // Level 2 is the top-level "== Heading ==" tier; deeper levels
+            // get progressively indented.
+            let indent = "  ".repeat(section.level.saturating_sub(2) as usize);
+            let style = if i == app.selected_section {
+                Style::default().bg(Color::Blue).fg(Color::White)
+            } else {
+                Style::default()
+            };
+            ListItem::new(Line::from(format!("{indent}{}", section.title))).style(style)
+        })
+        .collect();
+
+    let title = format!("Table of contents ({} sections)", app.sections.len());
+    let list = List::new(items).block(UiBlock::default().borders(Borders::ALL).title(title));
+    frame.render_widget(list, area);
+}
+
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let text = match app.mode {
         Mode::Search => format!("/{}", app.search_input),
         Mode::Results => "Enter: open   Esc: cancel   j/k: move".to_string(),
+        Mode::Toc => "Enter: jump to section   Esc: cancel   j/k: move".to_string(),
         Mode::Help => "Press any key to close help".to_string(),
         Mode::Reading if app.loading => "Loading…".to_string(),
         Mode::Reading => match app.focused_link.and_then(|i| app.links.get(i)) {
@@ -344,6 +369,7 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect) {
         Line::from("Tab/S-Tab    cycle links"),
         Line::from("Enter        follow link / open selected result"),
         Line::from("H / L        back / forward"),
+        Line::from("t            table of contents"),
         Line::from("/            search"),
         Line::from("Esc          cancel / close"),
         Line::from("?            toggle this help"),
@@ -355,4 +381,66 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect) {
         Paragraph::new(help_text).block(UiBlock::default().borders(Borders::ALL).title("Help")),
         popup,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::doc::{parse_article_html, section_outline};
+
+    /// Exercises every block variant that carries a line count in
+    /// `doc::block_line_count` (heading, paragraph, list item, blockquote,
+    /// code, rule, table, infobox, image), so a mismatch between that
+    /// function and this module's actual line emission would show up here.
+    const FIXTURE: &str = r##"
+    <html><body>
+    <table class="infobox"><tbody>
+      <tr><th colspan="2">Subject</th></tr>
+      <tr><th>Field</th><td>Testing</td></tr>
+    </tbody></table>
+    <p>Intro paragraph.</p>
+    <h2>First Section</h2>
+    <p>Some text.</p>
+    <ul><li>One</li><li>Two</li></ul>
+    <blockquote><p>A quote.</p></blockquote>
+    <pre>line one
+line two</pre>
+    <hr/>
+    <table class="wikitable"><tbody>
+      <tr><th>A</th><th>B</th></tr>
+      <tr><td>1</td><td>2</td></tr>
+    </tbody></table>
+    <figure><img src="x.jpg" alt="An image"/></figure>
+    <h2>Second Section</h2>
+    <p>More text.</p>
+    </body></html>
+    "##;
+
+    /// `doc::section_outline` computes each heading's line index without
+    /// ever building a ratatui `Text` — it must agree with what
+    /// `document_to_text` actually renders, or "jump to section" would land
+    /// on the wrong line. This proves the two independent implementations
+    /// stay in sync as block types are added or their rendering changes.
+    #[test]
+    fn section_outline_lines_match_the_rendered_heading_lines() {
+        let doc = parse_article_html("Test Article", FIXTURE);
+        let sections = section_outline(&doc);
+        assert_eq!(sections.len(), 2, "fixture has exactly two headings");
+
+        let text = document_to_text(&doc, None);
+
+        for section in &sections {
+            let rendered_line = &text.lines[section.line as usize];
+            let rendered_text: String = rendered_line
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect();
+            assert_eq!(
+                rendered_text, section.title,
+                "section_outline's line {} for {:?} doesn't match the rendered line",
+                section.line, section.title
+            );
+        }
+    }
 }

@@ -185,6 +185,23 @@ async fn handle_key(client: &WikiClient, app: &mut App, code: KeyCode, modifiers
             }
             _ => {}
         },
+        Mode::Toc => match code {
+            KeyCode::Esc => app.mode = Mode::Reading,
+            KeyCode::Char('j') | KeyCode::Down => {
+                if !app.sections.is_empty() {
+                    app.selected_section = (app.selected_section + 1).min(app.sections.len() - 1);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                app.selected_section = app.selected_section.saturating_sub(1);
+            }
+            KeyCode::Enter => app.jump_to_section(app.selected_section),
+            KeyCode::Char('?') => {
+                app.prior_mode = app.mode;
+                app.mode = Mode::Help;
+            }
+            _ => {}
+        },
         Mode::Reading => match code {
             KeyCode::Char('q') => app.should_quit = true,
             KeyCode::Char('/') => {
@@ -222,6 +239,13 @@ async fn handle_key(client: &WikiClient, app: &mut App, code: KeyCode, modifiers
                     open_title_from_history(client, app, &title).await;
                 } else {
                     app.status = "No later page in history".to_string();
+                }
+            }
+            KeyCode::Char('t') => {
+                if app.sections.is_empty() {
+                    app.status = "No sections on this page".to_string();
+                } else {
+                    app.mode = Mode::Toc;
                 }
             }
             KeyCode::Char('g') => {

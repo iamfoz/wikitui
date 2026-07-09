@@ -105,6 +105,61 @@ pub fn collect_links(doc: &Document) -> Vec<LinkRef> {
     links
 }
 
+/// A heading in the reading view, located by its 0-based line index in the
+/// rendered `Text` — the target of the table-of-contents jump feature
+/// (PRD FR-NV-2).
+#[derive(Debug, Clone)]
+pub struct SectionRef {
+    pub level: u8,
+    pub title: String,
+    pub line: u16,
+}
+
+/// The number of terminal lines `ui::document_to_text` emits for a block.
+/// This must be kept in sync with that function's layout — a consistency
+/// test in `ui.rs` renders a real document both ways and checks a
+/// `SectionRef`'s line actually lands on that heading's text, which would
+/// catch the two falling out of sync.
+fn block_line_count(block: &Block) -> u16 {
+    match block {
+        Block::Heading { .. } => 2, // blank line, then the heading line
+        Block::Paragraph(_) => 2,   // content line, then a trailing blank
+        Block::ListItem { .. } => 1,
+        Block::Blockquote(_) => 2,
+        Block::Code(text) => text.lines().count() as u16 + 1,
+        Block::Rule => 1,
+        Block::Table(lines) => lines.len() as u16 + 1,
+        Block::Infobox(rows) => rows.len() as u16 + 3, // top/bottom border + trailing blank
+        Block::Image(_) => 2,
+    }
+}
+
+/// Every heading in the article, in reading order, with the line index
+/// `App` should scroll to for "jump to this section".
+pub fn section_outline(doc: &Document) -> Vec<SectionRef> {
+    let mut sections = Vec::new();
+    let mut line = 2u16; // title line + the blank line document_to_text puts after it
+    for block in &doc.blocks {
+        if let Block::Heading { level, spans } = block {
+            let title = spans
+                .iter()
+                .map(|s| s.text.as_str())
+                .collect::<Vec<_>>()
+                .join("");
+            // document_to_text emits the blank line before the heading
+            // text, so the heading's own line is one past this block's
+            // starting offset.
+            sections.push(SectionRef {
+                level: *level,
+                title,
+                line: line + 1,
+            });
+        }
+        line += block_line_count(block);
+    }
+    sections
+}
+
 /// Tags whose content is handled by a dedicated `Block`, and which
 /// `inline_spans` must therefore never descend into (otherwise their text
 /// would be captured twice: once as a block, once as part of an ancestor's
