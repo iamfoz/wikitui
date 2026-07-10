@@ -20,4 +20,9 @@ pub struct Cli {
     /// alternate screen, no cursor addressing. Requires a title.
     #[arg(long)]
     pub dump: bool,
+
+    /// Color theme: terminal (default), full, homebrew, night, paper,
+    /// contrast. Press `T` at runtime to cycle through them.
+    #[arg(long, default_value = "terminal")]
+    pub theme: String,
 }

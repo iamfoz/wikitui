@@ -2,6 +2,7 @@ mod api;
 mod app;
 mod cli;
 mod doc;
+mod theme;
 mod ui;
 
 use anyhow::Result;
@@ -18,6 +19,7 @@ use std::io::{self, Stdout};
 use api::WikiClient;
 use app::{App, Mode};
 use cli::Cli;
+use theme::Theme;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -35,9 +37,20 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    let theme = Theme::by_name(&cli.theme).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown theme {:?} — choose one of: {}",
+            cli.theme,
+            Theme::NAMES.join(", ")
+        )
+    })?;
+    // PRD FR-TH-5: NO_COLOR, when present and non-empty, strips color from
+    // every theme regardless of which one is selected.
+    let no_color = std::env::var("NO_COLOR").is_ok_and(|v| !v.is_empty());
+
     install_panic_hook();
     let mut terminal = init_terminal()?;
-    let result = run(&mut terminal, &client, cli).await;
+    let result = run(&mut terminal, &client, cli, theme, no_color).await;
     restore_terminal(&mut terminal)?;
     result
 }
@@ -73,8 +86,10 @@ async fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     client: &WikiClient,
     cli: Cli,
+    theme: Theme,
+    no_color: bool,
 ) -> Result<()> {
-    let mut app = App::new(cli.lang.clone());
+    let mut app = App::new(cli.lang.clone(), theme, no_color);
 
     if let Some(query) = cli.search {
         app.search_input = query;
@@ -248,6 +263,7 @@ async fn handle_key(client: &WikiClient, app: &mut App, code: KeyCode, modifiers
                     app.mode = Mode::Toc;
                 }
             }
+            KeyCode::Char('T') => app.cycle_theme(),
             KeyCode::Char('g') => {
                 if app.pending_g {
                     app.scroll_to_top();

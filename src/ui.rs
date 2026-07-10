@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -5,21 +7,77 @@ use ratatui::text::{Line, Span as RSpan, Text};
 use ratatui::widgets::{Block as UiBlock, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
 use crate::app::{App, Mode};
-use crate::doc::{Block, Document, SpanStyle};
+use crate::doc::{Block, Document, LinkRef, SpanStyle};
+use crate::theme::Theme;
 
-fn span_style(kind: &SpanStyle) -> Style {
+/// Every article title opened this session — back-stack, forward-stack, and
+/// the one currently on screen — used to style already-read links
+/// differently from unread ones (PRD FR-HS-2).
+fn visited_titles(app: &App) -> HashSet<&str> {
+    let mut set: HashSet<&str> = app.back_stack.iter().map(String::as_str).collect();
+    set.extend(app.forward_stack.iter().map(String::as_str));
+    if let Some(doc) = &app.doc {
+        set.insert(doc.title.as_str());
+    }
+    set
+}
+
+/// A single color, respecting `NO_COLOR` (PRD FR-TH-5): when set, every
+/// style still carries its modifiers (bold/italic/underline) so meaning
+/// isn't lost, just the color.
+fn colored(no_color: bool, color: Color) -> Style {
+    if no_color {
+        Style::default()
+    } else {
+        Style::default().fg(color)
+    }
+}
+
+fn colored_bg(no_color: bool, fg: Color, bg: Color) -> Style {
+    if no_color {
+        Style::default()
+    } else {
+        Style::default().fg(fg).bg(bg)
+    }
+}
+
+/// The base style for a full-area widget: the theme's background/foreground
+/// (or nothing at all for `terminal`, which must inherit the user's
+/// palette), skipped entirely under `NO_COLOR`.
+fn base_style(theme: &Theme, no_color: bool) -> Style {
+    if no_color {
+        return Style::default();
+    }
+    let mut style = Style::default();
+    if let Some(bg) = theme.bg {
+        style = style.bg(bg);
+    }
+    if let Some(fg) = theme.fg {
+        style = style.fg(fg);
+    }
+    style
+}
+
+fn span_style(kind: &SpanStyle, theme: &Theme, no_color: bool) -> Style {
     match kind {
         SpanStyle::Plain => Style::default(),
         SpanStyle::Bold => Style::default().add_modifier(Modifier::BOLD),
         SpanStyle::Italic => Style::default().add_modifier(Modifier::ITALIC),
-        SpanStyle::Superscript => Style::default().fg(Color::DarkGray),
-        SpanStyle::Link(_) => Style::default()
-            .fg(Color::Blue)
-            .add_modifier(Modifier::UNDERLINED),
+        SpanStyle::Superscript => colored(no_color, theme.dim),
+        // Unvisited-link fallback; `spans_to_rspans` handles the
+        // focused/visited cases itself and never delegates a Link span here.
+        SpanStyle::Link(_) => colored(no_color, theme.link).add_modifier(Modifier::UNDERLINED),
     }
 }
 
-fn document_to_text(doc: &Document, focused_link: Option<usize>) -> Text<'static> {
+fn document_to_text(
+    doc: &Document,
+    focused_link: Option<usize>,
+    links: &[LinkRef],
+    visited: &HashSet<&str>,
+    theme: &Theme,
+    no_color: bool,
+) -> Text<'static> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     // Must advance in the exact same order as `doc::collect_links` (which
     // only visits Paragraph/ListItem/Blockquote spans) so a cycled-to link
@@ -28,9 +86,7 @@ fn document_to_text(doc: &Document, focused_link: Option<usize>) -> Text<'static
 
     lines.push(Line::from(RSpan::styled(
         doc.title.clone(),
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD),
+        Style::default().add_modifier(Modifier::BOLD),
     )));
     lines.push(Line::from(""));
 
@@ -38,7 +94,7 @@ fn document_to_text(doc: &Document, focused_link: Option<usize>) -> Text<'static
         match block {
             Block::Heading { level, spans } => {
                 lines.push(Line::from(""));
-                let style = Style::default().fg(Color::Cyan).add_modifier(
+                let style = colored(no_color, theme.heading).add_modifier(
                     Modifier::BOLD
                         | if *level <= 2 {
                             Modifier::UNDERLINED
@@ -58,6 +114,11 @@ fn document_to_text(doc: &Document, focused_link: Option<usize>) -> Text<'static
                     spans,
                     &mut link_counter,
                     focused_link,
+                    links,
+                    visited,
+                    None,
+                    theme,
+                    no_color,
                 )));
                 lines.push(Line::from(""));
             }
@@ -74,12 +135,30 @@ fn document_to_text(doc: &Document, focused_link: Option<usize>) -> Text<'static
                     "•".to_string()
                 };
                 let mut rspans = vec![RSpan::raw(format!("{indent}{bullet} "))];
-                rspans.extend(spans_to_rspans(spans, &mut link_counter, focused_link));
+                rspans.extend(spans_to_rspans(
+                    spans,
+                    &mut link_counter,
+                    focused_link,
+                    links,
+                    visited,
+                    None,
+                    theme,
+                    no_color,
+                ));
                 lines.push(Line::from(rspans));
             }
             Block::Blockquote(spans) => {
-                let mut rspans = vec![RSpan::styled("▌ ", Style::default().fg(Color::DarkGray))];
-                rspans.extend(spans_to_rspans(spans, &mut link_counter, focused_link));
+                let mut rspans = vec![RSpan::styled("▌ ", colored(no_color, theme.dim))];
+                rspans.extend(spans_to_rspans(
+                    spans,
+                    &mut link_counter,
+                    focused_link,
+                    links,
+                    visited,
+                    Some(theme.quote),
+                    theme,
+                    no_color,
+                ));
                 lines.push(Line::from(rspans));
                 lines.push(Line::from(""));
             }
@@ -87,7 +166,7 @@ fn document_to_text(doc: &Document, focused_link: Option<usize>) -> Text<'static
                 for line in text.lines() {
                     lines.push(Line::from(RSpan::styled(
                         format!("    {line}"),
-                        Style::default().fg(Color::Green),
+                        colored(no_color, theme.code),
                     )));
                 }
                 lines.push(Line::from(""));
@@ -95,22 +174,23 @@ fn document_to_text(doc: &Document, focused_link: Option<usize>) -> Text<'static
             Block::Rule => {
                 lines.push(Line::from(RSpan::styled(
                     "─".repeat(40),
-                    Style::default().fg(Color::DarkGray),
+                    colored(no_color, theme.dim),
                 )));
             }
             Block::Table(rows) => {
                 for row in rows {
                     lines.push(Line::from(RSpan::styled(
                         row.clone(),
-                        Style::default().fg(Color::Gray),
+                        colored(no_color, theme.table),
                     )));
                 }
                 lines.push(Line::from(""));
             }
             Block::Infobox(rows) => {
+                let style = colored(no_color, theme.infobox);
                 lines.push(Line::from(RSpan::styled(
                     "┌─ infobox ─────────────────",
-                    Style::default().fg(Color::Yellow),
+                    style,
                 )));
                 for (label, value) in rows {
                     let text = if label.is_empty() {
@@ -118,23 +198,23 @@ fn document_to_text(doc: &Document, focused_link: Option<usize>) -> Text<'static
                     } else {
                         format!("│ {label}: {value}")
                     };
-                    lines.push(Line::from(RSpan::styled(
-                        text,
-                        Style::default().fg(Color::Yellow),
-                    )));
+                    lines.push(Line::from(RSpan::styled(text, style)));
                 }
                 lines.push(Line::from(RSpan::styled(
                     "└───────────────────────────",
-                    Style::default().fg(Color::Yellow),
+                    style,
                 )));
                 lines.push(Line::from(""));
             }
             Block::Image(alt) => {
+                let suffix = if theme.images {
+                    ""
+                } else {
+                    " (images off in this theme)"
+                };
                 lines.push(Line::from(RSpan::styled(
-                    format!("[image: {alt}]"),
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::ITALIC),
+                    format!("[image: {alt}{suffix}]"),
+                    colored(no_color, theme.image).add_modifier(Modifier::ITALIC),
                 )));
                 lines.push(Line::from(""));
             }
@@ -161,32 +241,50 @@ fn strip_tags(html: &str) -> String {
     out
 }
 
-/// Converts spans to styled ratatui spans, giving the `focused` link index
-/// (as counted by `doc::collect_links`'s ordering) a distinct highlight so
-/// the reader can see which link Tab/Shift-Tab and Enter act on.
+/// Converts spans to styled ratatui spans. `focused` highlights the
+/// Tab/Shift-Tab-selected link (indexed the same way as `doc::collect_links`,
+/// hence needing the parallel `links` list to look up whether a given
+/// occurrence's target has been visited this session). `plain_color`
+/// overrides `SpanStyle::Plain`'s color for contexts with their own body
+/// color (a blockquote's `theme.quote`); pass `None` for ordinary body text.
+#[allow(clippy::too_many_arguments)]
 fn spans_to_rspans(
     spans: &[crate::doc::Span],
     link_counter: &mut usize,
     focused: Option<usize>,
+    links: &[LinkRef],
+    visited: &HashSet<&str>,
+    plain_color: Option<Color>,
+    theme: &Theme,
+    no_color: bool,
 ) -> Vec<RSpan<'static>> {
     spans
         .iter()
-        .map(|s| {
-            if matches!(s.style, SpanStyle::Link(_)) {
+        .map(|s| match &s.style {
+            SpanStyle::Link(_) => {
                 let this_index = *link_counter;
                 *link_counter += 1;
                 let style = if Some(this_index) == focused {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Yellow)
+                    colored_bg(no_color, theme.focus_fg, theme.focus_bg)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    span_style(&s.style)
+                    let is_visited = links
+                        .get(this_index)
+                        .and_then(|l| l.internal_title.as_deref())
+                        .is_some_and(|title| visited.contains(title));
+                    let color = if is_visited {
+                        theme.link_visited
+                    } else {
+                        theme.link
+                    };
+                    colored(no_color, color).add_modifier(Modifier::UNDERLINED)
                 };
                 RSpan::styled(s.text.clone(), style)
-            } else {
-                RSpan::styled(s.text.clone(), span_style(&s.style))
             }
+            SpanStyle::Plain if plain_color.is_some() => {
+                RSpan::styled(s.text.clone(), colored(no_color, plain_color.unwrap()))
+            }
+            other => RSpan::styled(s.text.clone(), span_style(other, theme, no_color)),
         })
         .collect()
 }
@@ -198,6 +296,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(area);
 
+    // Paint the whole frame in the theme's background/foreground first so
+    // areas a widget doesn't explicitly style (e.g. the empty tail of a
+    // short article) still match the theme, not the terminal default.
+    frame.render_widget(
+        UiBlock::default().style(base_style(&app.theme, app.no_color)),
+        area,
+    );
+
     match app.mode {
         Mode::Reading | Mode::Help => draw_reading(frame, app, chunks[0]),
         Mode::Search => draw_reading(frame, app, chunks[0]),
@@ -208,20 +314,29 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_status_bar(frame, app, chunks[1]);
 
     if app.mode == Mode::Help {
-        draw_help_overlay(frame, area);
+        draw_help_overlay(frame, app, area);
     }
 }
 
 fn draw_reading(frame: &mut Frame, app: &mut App, area: Rect) {
     match &app.doc {
         Some(doc) => {
-            let text = document_to_text(doc, app.focused_link);
+            let visited = visited_titles(app);
+            let text = document_to_text(
+                doc,
+                app.focused_link,
+                &app.links,
+                &visited,
+                &app.theme,
+                app.no_color,
+            );
             let visible_height = area.height.max(1);
             let total_lines = text.lines.len() as u16;
             app.max_scroll = total_lines.saturating_sub(visible_height);
             app.scroll = app.scroll.min(app.max_scroll);
 
             let paragraph = Paragraph::new(text)
+                .style(base_style(&app.theme, app.no_color))
                 .wrap(Wrap { trim: false })
                 .scroll((app.scroll, 0));
             frame.render_widget(paragraph, area);
@@ -231,18 +346,21 @@ fn draw_reading(frame: &mut Frame, app: &mut App, area: Rect) {
                 Line::from(""),
                 Line::from(RSpan::styled(
                     "wikitui",
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().add_modifier(Modifier::BOLD),
                 )),
                 Line::from(RSpan::styled(
-                    format!("{}.wikipedia.org", app.lang),
-                    Style::default().fg(Color::DarkGray),
+                    format!("{}.wikipedia.org — theme: {}", app.lang, app.theme.name),
+                    colored(app.no_color, app.theme.dim),
                 )),
                 Line::from(""),
-                Line::from("Press / to search Wikipedia, ? for help, q to quit."),
+                Line::from(
+                    "Press / to search Wikipedia, T to cycle themes, ? for help, q to quit.",
+                ),
             ]);
-            frame.render_widget(Paragraph::new(welcome), area);
+            frame.render_widget(
+                Paragraph::new(welcome).style(base_style(&app.theme, app.no_color)),
+                area,
+            );
         }
     }
 }
@@ -260,7 +378,7 @@ fn draw_results(frame: &mut Frame, app: &App, area: Rect) {
             if let Some(desc) = &r.description {
                 lines.push(Line::from(RSpan::styled(
                     desc.clone(),
-                    Style::default().fg(Color::DarkGray),
+                    colored(app.no_color, app.theme.dim),
                 )));
             }
             if let Some(excerpt) = &r.excerpt {
@@ -272,14 +390,12 @@ fn draw_results(frame: &mut Frame, app: &App, area: Rect) {
                 if !plain.is_empty() {
                     lines.push(Line::from(RSpan::styled(
                         plain,
-                        Style::default()
-                            .fg(Color::Gray)
-                            .add_modifier(Modifier::ITALIC),
+                        colored(app.no_color, app.theme.dim).add_modifier(Modifier::ITALIC),
                     )));
                 }
             }
             let style = if i == app.selected_result {
-                Style::default().bg(Color::Blue).fg(Color::White)
+                colored_bg(app.no_color, app.theme.selected_fg, app.theme.selected_bg)
             } else {
                 Style::default()
             };
@@ -292,7 +408,9 @@ fn draw_results(frame: &mut Frame, app: &App, area: Rect) {
         app.search_input,
         app.results.len()
     );
-    let list = List::new(items).block(UiBlock::default().borders(Borders::ALL).title(title));
+    let list = List::new(items)
+        .style(base_style(&app.theme, app.no_color))
+        .block(UiBlock::default().borders(Borders::ALL).title(title));
     frame.render_widget(list, area);
 }
 
@@ -306,7 +424,7 @@ fn draw_toc(frame: &mut Frame, app: &App, area: Rect) {
             // get progressively indented.
             let indent = "  ".repeat(section.level.saturating_sub(2) as usize);
             let style = if i == app.selected_section {
-                Style::default().bg(Color::Blue).fg(Color::White)
+                colored_bg(app.no_color, app.theme.selected_fg, app.theme.selected_bg)
             } else {
                 Style::default()
             };
@@ -315,7 +433,9 @@ fn draw_toc(frame: &mut Frame, app: &App, area: Rect) {
         .collect();
 
     let title = format!("Table of contents ({} sections)", app.sections.len());
-    let list = List::new(items).block(UiBlock::default().borders(Borders::ALL).title(title));
+    let list = List::new(items)
+        .style(base_style(&app.theme, app.no_color))
+        .block(UiBlock::default().borders(Borders::ALL).title(title));
     frame.render_widget(list, area);
 }
 
@@ -340,16 +460,16 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         },
     };
     let style = if app.mode == Mode::Search {
-        Style::default().fg(Color::Black).bg(Color::Yellow)
+        colored_bg(app.no_color, app.theme.focus_fg, app.theme.focus_bg)
     } else {
-        Style::default().fg(Color::White).bg(Color::DarkGray)
+        colored_bg(app.no_color, app.theme.status_fg, app.theme.status_bg)
     };
     frame.render_widget(Paragraph::new(text).style(style), area);
 }
 
-fn draw_help_overlay(frame: &mut Frame, area: Rect) {
+fn draw_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
     let width = 60.min(area.width.saturating_sub(4)).max(20);
-    let height = 16.min(area.height.saturating_sub(4)).max(8);
+    let height = 17.min(area.height.saturating_sub(4)).max(8);
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
         y: area.y + (area.height.saturating_sub(height)) / 2,
@@ -370,6 +490,7 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect) {
         Line::from("Enter        follow link / open selected result"),
         Line::from("H / L        back / forward"),
         Line::from("t            table of contents"),
+        Line::from("T            cycle color theme"),
         Line::from("/            search"),
         Line::from("Esc          cancel / close"),
         Line::from("?            toggle this help"),
@@ -378,7 +499,9 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect) {
 
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new(help_text).block(UiBlock::default().borders(Borders::ALL).title("Help")),
+        Paragraph::new(help_text)
+            .style(base_style(&app.theme, app.no_color))
+            .block(UiBlock::default().borders(Borders::ALL).title("Help")),
         popup,
     );
 }
@@ -427,7 +550,8 @@ line two</pre>
         let sections = section_outline(&doc);
         assert_eq!(sections.len(), 2, "fixture has exactly two headings");
 
-        let text = document_to_text(&doc, None);
+        let theme = Theme::terminal();
+        let text = document_to_text(&doc, None, &[], &HashSet::new(), &theme, false);
 
         for section in &sections {
             let rendered_line = &text.lines[section.line as usize];
@@ -442,5 +566,76 @@ line two</pre>
                 section.line, section.title
             );
         }
+    }
+
+    #[test]
+    fn no_color_strips_fg_and_bg_but_keeps_modifiers() {
+        let theme = Theme::full();
+        let style = colored_bg(true, theme.focus_fg, theme.focus_bg).add_modifier(Modifier::BOLD);
+        assert_eq!(style.fg, None, "NO_COLOR must not set a foreground color");
+        assert_eq!(style.bg, None, "NO_COLOR must not set a background color");
+        assert!(
+            style.add_modifier.contains(Modifier::BOLD),
+            "NO_COLOR must still preserve modifiers"
+        );
+    }
+
+    #[test]
+    fn terminal_theme_base_style_sets_nothing() {
+        let theme = Theme::terminal();
+        let style = base_style(&theme, false);
+        assert_eq!(style.bg, None);
+        assert_eq!(style.fg, None);
+    }
+
+    #[test]
+    fn full_theme_base_style_sets_both() {
+        let theme = Theme::full();
+        let style = base_style(&theme, false);
+        assert_eq!(style.bg, theme.bg);
+        assert_eq!(style.fg, theme.fg);
+    }
+
+    /// A link to an article already visited this session (PRD FR-HS-2)
+    /// renders in `theme.link_visited`; an unvisited one stays `theme.link`
+    /// — proving `visited_titles`'s output actually reaches the renderer,
+    /// not just that the two colors differ in the abstract.
+    #[test]
+    fn visited_link_gets_the_visited_color_unvisited_does_not() {
+        let html = r##"<html><body><p>See <a href="./Visited_Page">Visited Page</a> and
+            <a href="./Unvisited_Page">Unvisited Page</a>.</p></body></html>"##;
+        let doc = parse_article_html("Test Article", html);
+        let links = crate::doc::collect_links(&doc);
+        assert_eq!(links.len(), 2);
+
+        let mut visited = HashSet::new();
+        visited.insert("Visited Page");
+
+        let theme = Theme::full();
+        let text = document_to_text(&doc, None, &links, &visited, &theme, false);
+
+        let paragraph_line = text
+            .lines
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content.contains("Visited Page")))
+            .expect("paragraph line present");
+
+        let visited_span = paragraph_line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("Visited Page"))
+            .unwrap();
+        let unvisited_span = paragraph_line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("Unvisited Page"))
+            .unwrap();
+
+        assert_eq!(visited_span.style.fg, Some(theme.link_visited));
+        assert_eq!(unvisited_span.style.fg, Some(theme.link));
+        assert_ne!(
+            theme.link_visited, theme.link,
+            "the two colors must actually differ for this test to mean anything"
+        );
     }
 }

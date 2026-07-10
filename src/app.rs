@@ -1,5 +1,6 @@
 use crate::api::SearchResult;
 use crate::doc::{Document, LinkRef, SectionRef, collect_links, section_outline};
+use crate::theme::Theme;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -30,10 +31,15 @@ pub struct App {
     pub lang: String,
     pub loading: bool,
     pub pending_g: bool,
+    pub theme: Theme,
+    /// Set once at startup from the `NO_COLOR` environment variable (PRD
+    /// FR-TH-5): when true, every style still applies but with colors
+    /// stripped, regardless of which theme is selected.
+    pub no_color: bool,
 }
 
 impl App {
-    pub fn new(lang: String) -> Self {
+    pub fn new(lang: String, theme: Theme, no_color: bool) -> Self {
         Self {
             mode: Mode::Reading,
             prior_mode: Mode::Reading,
@@ -54,7 +60,14 @@ impl App {
             lang,
             loading: false,
             pending_g: false,
+            theme,
+            no_color,
         }
+    }
+
+    pub fn cycle_theme(&mut self) {
+        self.theme = self.theme.next();
+        self.status = format!("Theme: {}", self.theme.name);
     }
 
     /// Open a document reached by a fresh navigation (search result, CLI
@@ -160,7 +173,7 @@ mod tests {
 
     #[test]
     fn back_and_forward_mirror_browser_semantics() {
-        let mut app = App::new("en".to_string());
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
 
         app.open_document(doc("A"));
         app.open_document(doc("B"));
@@ -185,7 +198,7 @@ mod tests {
 
     #[test]
     fn following_a_link_after_going_back_discards_forward_history() {
-        let mut app = App::new("en".to_string());
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
         app.open_document(doc("A"));
         app.open_document(doc("B"));
 
@@ -203,14 +216,14 @@ mod tests {
 
     #[test]
     fn navigate_back_on_empty_history_returns_none_and_does_not_panic() {
-        let mut app = App::new("en".to_string());
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
         assert_eq!(app.navigate_back_target(), None);
         assert_eq!(app.navigate_forward_target(), None);
     }
 
     #[test]
     fn cycle_link_wraps_in_both_directions() {
-        let mut app = App::new("en".to_string());
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
         app.links = vec![
             LinkRef {
                 href: "./A".into(),
@@ -243,14 +256,14 @@ mod tests {
 
     #[test]
     fn cycle_link_on_linkless_page_leaves_focus_unset() {
-        let mut app = App::new("en".to_string());
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
         app.cycle_link(true);
         assert_eq!(app.focused_link, None);
     }
 
     #[test]
     fn jump_to_section_clamps_to_max_scroll() {
-        let mut app = App::new("en".to_string());
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
         app.sections = vec![SectionRef {
             level: 2,
             title: "Late Section".to_string(),
@@ -266,9 +279,24 @@ mod tests {
 
     #[test]
     fn jump_to_section_out_of_range_does_not_panic() {
-        let mut app = App::new("en".to_string());
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
         app.mode = Mode::Toc;
         app.jump_to_section(5); // no sections at all
         assert_eq!(app.mode, Mode::Reading, "should still return to Reading");
+    }
+
+    #[test]
+    fn cycle_theme_advances_through_all_builtins() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        let mut seen = vec![app.theme.name];
+        for _ in 0..Theme::NAMES.len() {
+            app.cycle_theme();
+            seen.push(app.theme.name);
+        }
+        // Started at terminal, cycled through every theme, and landed back
+        // on terminal — proving `T` really does visit all six.
+        assert_eq!(seen.first(), Some(&"terminal"));
+        assert_eq!(seen.last(), Some(&"terminal"));
+        assert_eq!(seen.len(), Theme::NAMES.len() + 1);
     }
 }
