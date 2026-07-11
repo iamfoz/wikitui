@@ -1,5 +1,5 @@
 use crate::api::SearchResult;
-use crate::doc::{Document, LinkRef, SectionRef, collect_links, section_outline};
+use crate::doc::{Document, LinkRef, SectionRef, collect_links, find_matches, section_outline};
 use crate::theme::Theme;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8,6 +8,7 @@ pub enum Mode {
     Search,
     Results,
     Toc,
+    Find,
     Help,
 }
 
@@ -36,6 +37,13 @@ pub struct App {
     /// FR-TH-5): when true, every style still applies but with colors
     /// stripped, regardless of which theme is selected.
     pub no_color: bool,
+    /// In-page find (PRD FR-NV-6): what the reader typed into `Ctrl-f`.
+    pub find_input: String,
+    /// Lines to scroll to for each block matching `find_input`, in reading
+    /// order.
+    pub find_matches: Vec<u16>,
+    /// Which entry in `find_matches` `n`/`N` last jumped to.
+    pub find_index: usize,
 }
 
 impl App {
@@ -62,6 +70,9 @@ impl App {
             pending_g: false,
             theme,
             no_color,
+            find_input: String::new(),
+            find_matches: Vec::new(),
+            find_index: 0,
         }
     }
 
@@ -121,6 +132,44 @@ impl App {
         self.doc = Some(doc);
         self.scroll = 0;
         self.mode = Mode::Reading;
+        self.clear_find();
+    }
+
+    /// Clears any in-page find state — a fresh article's matches would be
+    /// meaningless leftovers from whatever was open before.
+    pub fn clear_find(&mut self) {
+        self.find_input.clear();
+        self.find_matches.clear();
+        self.find_index = 0;
+    }
+
+    /// Recomputes `find_matches` for the current `find_input` against the
+    /// open document and jumps to the first hit, if any.
+    pub fn update_find(&mut self) {
+        self.find_matches = match &self.doc {
+            Some(doc) => find_matches(doc, &self.find_input),
+            None => Vec::new(),
+        };
+        self.find_index = 0;
+        if let Some(&line) = self.find_matches.first() {
+            self.scroll = line.min(self.max_scroll);
+        }
+    }
+
+    pub fn find_next(&mut self) {
+        if self.find_matches.is_empty() {
+            return;
+        }
+        self.find_index = (self.find_index + 1) % self.find_matches.len();
+        self.scroll = self.find_matches[self.find_index].min(self.max_scroll);
+    }
+
+    pub fn find_prev(&mut self) {
+        if self.find_matches.is_empty() {
+            return;
+        }
+        self.find_index = (self.find_index + self.find_matches.len() - 1) % self.find_matches.len();
+        self.scroll = self.find_matches[self.find_index].min(self.max_scroll);
     }
 
     /// Scroll to the given section's heading line, clamped to what's
@@ -298,5 +347,74 @@ mod tests {
         assert_eq!(seen.first(), Some(&"terminal"));
         assert_eq!(seen.last(), Some(&"terminal"));
         assert_eq!(seen.len(), Theme::NAMES.len() + 1);
+    }
+
+    #[test]
+    fn update_find_locates_matches_and_jumps_to_the_first() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        let html = "<html><body><p>alpha</p><p>bravo alpha</p><p>charlie</p></body></html>";
+        app.set_document(crate::doc::parse_article_html("Test", html));
+        app.max_scroll = 100; // pretend a long article so clamping never kicks in
+
+        app.find_input = "alpha".to_string();
+        app.update_find();
+
+        assert_eq!(app.find_matches.len(), 2, "two paragraphs mention alpha");
+        assert_eq!(
+            app.scroll, app.find_matches[0],
+            "should jump straight to the first match"
+        );
+    }
+
+    #[test]
+    fn find_next_and_prev_wrap_around() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        let html = "<html><body><p>alpha</p><p>alpha</p><p>alpha</p></body></html>";
+        app.set_document(crate::doc::parse_article_html("Test", html));
+        app.max_scroll = 100;
+        app.find_input = "alpha".to_string();
+        app.update_find();
+        assert_eq!(app.find_matches.len(), 3);
+
+        assert_eq!(app.find_index, 0);
+        app.find_next();
+        assert_eq!(app.find_index, 1);
+        app.find_next();
+        assert_eq!(app.find_index, 2);
+        app.find_next(); // wraps forward past the last match
+        assert_eq!(app.find_index, 0);
+        app.find_prev(); // wraps backward past the first match
+        assert_eq!(app.find_index, 2);
+    }
+
+    #[test]
+    fn opening_a_new_document_clears_stale_find_state() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(crate::doc::parse_article_html(
+            "First",
+            "<html><body><p>alpha</p></body></html>",
+        ));
+        app.max_scroll = 100;
+        app.find_input = "alpha".to_string();
+        app.update_find();
+        assert_eq!(app.find_matches.len(), 1);
+
+        app.set_document(crate::doc::parse_article_html(
+            "Second",
+            "<html><body><p>bravo</p></body></html>",
+        ));
+        assert!(
+            app.find_input.is_empty(),
+            "a new article's matches must not carry over from the old one"
+        );
+        assert!(app.find_matches.is_empty());
+    }
+
+    #[test]
+    fn find_next_and_prev_on_no_matches_do_not_panic() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.find_next();
+        app.find_prev();
+        assert_eq!(app.find_index, 0);
     }
 }

@@ -305,8 +305,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     );
 
     match app.mode {
-        Mode::Reading | Mode::Help => draw_reading(frame, app, chunks[0]),
-        Mode::Search => draw_reading(frame, app, chunks[0]),
+        Mode::Reading | Mode::Help | Mode::Search | Mode::Find => {
+            draw_reading(frame, app, chunks[0])
+        }
         Mode::Results => draw_results(frame, app, chunks[0]),
         Mode::Toc => draw_toc(frame, app, chunks[0]),
     }
@@ -442,10 +443,30 @@ fn draw_toc(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let text = match app.mode {
         Mode::Search => format!("/{}", app.search_input),
+        Mode::Find if app.find_matches.is_empty() && !app.find_input.is_empty() => {
+            format!("find: {} (no matches)", app.find_input)
+        }
+        Mode::Find if !app.find_matches.is_empty() => {
+            format!(
+                "find: {} ({}/{})",
+                app.find_input,
+                app.find_index + 1,
+                app.find_matches.len()
+            )
+        }
+        Mode::Find => format!("find: {}", app.find_input),
         Mode::Results => "Enter: open   Esc: cancel   j/k: move".to_string(),
         Mode::Toc => "Enter: jump to section   Esc: cancel   j/k: move".to_string(),
         Mode::Help => "Press any key to close help".to_string(),
         Mode::Reading if app.loading => "Loading…".to_string(),
+        Mode::Reading if !app.find_matches.is_empty() => {
+            format!(
+                "match {}/{} for \"{}\"   n/N: cycle   Esc: clear",
+                app.find_index + 1,
+                app.find_matches.len(),
+                app.find_input
+            )
+        }
         Mode::Reading => match app.focused_link.and_then(|i| app.links.get(i)) {
             Some(link) if link.internal_title.is_some() => {
                 format!(
@@ -459,7 +480,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             None => app.status.clone(),
         },
     };
-    let style = if app.mode == Mode::Search {
+    let style = if matches!(app.mode, Mode::Search | Mode::Find) {
         colored_bg(app.no_color, app.theme.focus_fg, app.theme.focus_bg)
     } else {
         colored_bg(app.no_color, app.theme.status_fg, app.theme.status_bg)
@@ -491,7 +512,8 @@ fn draw_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
         Line::from("H / L        back / forward"),
         Line::from("t            table of contents"),
         Line::from("T            cycle color theme"),
-        Line::from("/            search"),
+        Line::from("/            search Wikipedia"),
+        Line::from("Ctrl-f       find in this page, n/N: cycle matches"),
         Line::from("Esc          cancel / close"),
         Line::from("?            toggle this help"),
         Line::from("q            quit"),

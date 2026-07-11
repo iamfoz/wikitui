@@ -177,6 +177,22 @@ async fn handle_key(client: &WikiClient, app: &mut App, code: KeyCode, modifiers
             }
             _ => {}
         },
+        Mode::Find => match code {
+            KeyCode::Esc => {
+                app.mode = Mode::Reading;
+                app.clear_find();
+            }
+            KeyCode::Enter => app.mode = Mode::Reading,
+            KeyCode::Backspace => {
+                app.find_input.pop();
+                app.update_find();
+            }
+            KeyCode::Char(c) => {
+                app.find_input.push(c);
+                app.update_find();
+            }
+            _ => {}
+        },
         Mode::Results => match code {
             KeyCode::Esc => {
                 app.mode = Mode::Search;
@@ -264,6 +280,24 @@ async fn handle_key(client: &WikiClient, app: &mut App, code: KeyCode, modifiers
                 }
             }
             KeyCode::Char('T') => app.cycle_theme(),
+            KeyCode::Char('f') if modifiers.contains(KeyModifiers::CONTROL) => {
+                app.mode = Mode::Find;
+                app.clear_find();
+            }
+            KeyCode::Char('n') => {
+                if app.find_matches.is_empty() {
+                    app.status = "No active search — Ctrl-f to find in this page".to_string();
+                } else {
+                    app.find_next();
+                }
+            }
+            KeyCode::Char('N') => {
+                if app.find_matches.is_empty() {
+                    app.status = "No active search — Ctrl-f to find in this page".to_string();
+                } else {
+                    app.find_prev();
+                }
+            }
             KeyCode::Char('g') => {
                 if app.pending_g {
                     app.scroll_to_top();
@@ -273,7 +307,10 @@ async fn handle_key(client: &WikiClient, app: &mut App, code: KeyCode, modifiers
                 }
             }
             KeyCode::Char('G') => app.scroll_to_bottom(),
-            KeyCode::Esc => app.pending_g = false,
+            KeyCode::Esc => {
+                app.pending_g = false;
+                app.clear_find();
+            }
             _ => {}
         },
     }

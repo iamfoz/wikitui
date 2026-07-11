@@ -134,12 +134,26 @@ fn block_line_count(block: &Block) -> u16 {
     }
 }
 
+/// The line each block starts on in `ui::document_to_text`'s output, in
+/// `doc.blocks` order. Shared by `section_outline` (a heading's own line is
+/// one past its block's start) and `find_matches` (which only needs to
+/// scroll to a block, not a specific line within it).
+fn block_line_starts(doc: &Document) -> Vec<u16> {
+    let mut starts = Vec::with_capacity(doc.blocks.len());
+    let mut line = 2u16; // title line + the blank line document_to_text puts after it
+    for block in &doc.blocks {
+        starts.push(line);
+        line += block_line_count(block);
+    }
+    starts
+}
+
 /// Every heading in the article, in reading order, with the line index
 /// `App` should scroll to for "jump to this section".
 pub fn section_outline(doc: &Document) -> Vec<SectionRef> {
+    let starts = block_line_starts(doc);
     let mut sections = Vec::new();
-    let mut line = 2u16; // title line + the blank line document_to_text puts after it
-    for block in &doc.blocks {
+    for (block, start) in doc.blocks.iter().zip(starts) {
         if let Block::Heading { level, spans } = block {
             let title = spans
                 .iter()
@@ -152,12 +166,52 @@ pub fn section_outline(doc: &Document) -> Vec<SectionRef> {
             sections.push(SectionRef {
                 level: *level,
                 title,
-                line: line + 1,
+                line: start + 1,
             });
         }
-        line += block_line_count(block);
     }
     sections
+}
+
+/// The plain, unstyled text of a block — used only for case-insensitive
+/// substring matching in `find_matches`, not for display.
+fn block_plain_text(block: &Block) -> String {
+    match block {
+        Block::Heading { spans, .. } | Block::Paragraph(spans) | Block::Blockquote(spans) => {
+            spans.iter().map(|s| s.text.as_str()).collect()
+        }
+        Block::ListItem { spans, .. } => spans.iter().map(|s| s.text.as_str()).collect(),
+        Block::Code(text) => text.clone(),
+        Block::Table(lines) => lines.join(" "),
+        Block::Infobox(rows) => rows
+            .iter()
+            .map(|(l, v)| format!("{l} {v}"))
+            .collect::<Vec<_>>()
+            .join(" "),
+        Block::Image(alt) => alt.clone(),
+        Block::Rule => String::new(),
+    }
+}
+
+/// Every block whose visible text contains `query` (case-insensitive), as
+/// the line to scroll to — the "find in page" feature (PRD FR-NV-6).
+/// Block-level granularity: a match scrolls to (and highlights, via the
+/// caller's match counter) the whole block containing it, not the exact
+/// character position — coarser than a true per-character
+/// highlight-all pass, but needs no separate layout tracking to place a
+/// highlight span at an arbitrary column within a wrapped line.
+pub fn find_matches(doc: &Document, query: &str) -> Vec<u16> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let needle = query.to_lowercase();
+    let starts = block_line_starts(doc);
+    doc.blocks
+        .iter()
+        .zip(starts)
+        .filter(|(block, _)| block_plain_text(block).to_lowercase().contains(&needle))
+        .map(|(_, start)| start)
+        .collect()
 }
 
 /// Tags whose content is handled by a dedicated `Block`, and which
@@ -874,5 +928,46 @@ mod tests {
                 .iter()
                 .all(|l| l.href != "#cite_note-1" || l.internal_title.is_none())
         );
+    }
+
+    #[test]
+    fn find_matches_is_case_insensitive_and_locates_multiple_blocks() {
+        let doc = parse_article_html("Test Article", FIXTURE);
+
+        // FIXTURE's list has "First item", "Second item", and a nested
+        // "Nested item" (three separate ListItem blocks).
+        let matches = find_matches(&doc, "ITEM");
+        assert_eq!(matches.len(), 3, "all three list items mention 'item'");
+
+        let bold_matches = find_matches(&doc, "bold");
+        assert_eq!(bold_matches.len(), 1);
+    }
+
+    #[test]
+    fn find_matches_line_actually_starts_the_matching_block() {
+        let doc = parse_article_html("Test Article", FIXTURE);
+        let sections = section_outline(&doc);
+        let history_matches = find_matches(&doc, "History");
+        // Case-insensitive "history" matches both the "History" heading and
+        // the "Some history text." paragraph right after it; the heading
+        // comes first in document order, so it's the first match. Its
+        // block-start line should be exactly one less than
+        // section_outline's own-line (which points at the heading text
+        // itself, one past the block's start — see block_line_starts's doc
+        // comment).
+        assert_eq!(history_matches.len(), 2);
+        assert_eq!(history_matches[0] + 1, sections[0].line);
+    }
+
+    #[test]
+    fn find_matches_empty_query_returns_nothing() {
+        let doc = parse_article_html("Test Article", FIXTURE);
+        assert!(find_matches(&doc, "").is_empty());
+    }
+
+    #[test]
+    fn find_matches_no_hits_returns_empty_without_panicking() {
+        let doc = parse_article_html("Test Article", FIXTURE);
+        assert!(find_matches(&doc, "xyzzy-not-present").is_empty());
     }
 }
