@@ -48,6 +48,23 @@ pub enum Block {
 pub struct Document {
     pub title: String,
     pub blocks: Vec<Block>,
+    /// Sources this article itself cites, extracted from its References
+    /// section — the raw material for Research mode's "sources cited by
+    /// this entry" half (the other half being the article's own citation,
+    /// generated on demand — see `research::self_citation`).
+    pub citations: Vec<Citation>,
+}
+
+/// One entry from an article's References/bibliography list: the raw
+/// citation text (author, title, publisher, date — whatever the article's
+/// citation template rendered) and, where present, the first external URL
+/// in it. Extraction is a heuristic over common MediaWiki Cite-extension
+/// markup, not a bibliographic parser — see `extract_citations`.
+#[derive(Debug, Clone)]
+pub struct Citation {
+    pub id: String,
+    pub text: String,
+    pub url: Option<String>,
 }
 
 /// A link encountered while reading, in document order. `internal_title` is
@@ -597,6 +614,19 @@ fn walk_blocks(node: NodeRef<Node>, blocks: &mut Vec<Block>, list_depth: u8) {
 }
 
 /// Parse a Parsoid (or legacy-parser) HTML document into a `Document`.
+/// The page's real display title, from Parsoid HTML's `<head><title>`
+/// (MediaWiki always renders this with spaces, not underscores). Preferred
+/// over the caller-supplied title, which may be whatever underscored or
+/// differently-cased form a link href or CLI argument happened to use —
+/// this matters beyond cosmetics: it's what ends up in a saved citation's
+/// text (`research::self_citation`).
+fn page_display_title(parsed: &Html) -> Option<String> {
+    let sel = Selector::parse("head > title").unwrap();
+    let text: String = parsed.select(&sel).next()?.text().collect();
+    let normalized = normalize_ws(&text);
+    (!normalized.is_empty()).then_some(normalized)
+}
+
 pub fn parse_article_html(title: &str, html: &str) -> Document {
     let parsed = Html::parse_document(html);
     let body_sel = Selector::parse("body").unwrap();
@@ -608,10 +638,53 @@ pub fn parse_article_html(title: &str, html: &str) -> Document {
 
     let mut blocks = Vec::new();
     walk_blocks(start, &mut blocks, 0);
+    let citations = extract_citations(&parsed);
+    let display_title = page_display_title(&parsed).unwrap_or_else(|| title.to_string());
     Document {
-        title: title.to_string(),
+        title: display_title,
         blocks,
+        citations,
     }
+}
+
+/// Wikipedia's leading reference-list backlink glyph (a caret or, for
+/// multiply-cited references, lettered backlinks like "a b c") gets swept
+/// up by `ElementRef::text()` along with the actual citation; strip a
+/// short leading run of those before the real content starts.
+fn strip_backlink_markers(s: &str) -> String {
+    s.trim_start()
+        .trim_start_matches(['^', '↑'])
+        .trim_start()
+        .to_string()
+}
+
+/// Extracts each entry of an article's References section (PRD-adjacent:
+/// Research mode's "sources this article cites" half). Heuristic over the
+/// common MediaWiki Cite-extension markup (`<ol class="references">`, a
+/// `.reference-text` span holding the rendered citation) — not a full
+/// bibliographic parser, and third-party wikis without that convention
+/// simply yield no citations.
+fn extract_citations(parsed: &Html) -> Vec<Citation> {
+    let li_sel = Selector::parse("ol.references li").unwrap();
+    let reftext_sel = Selector::parse(".reference-text").unwrap();
+    let link_sel = Selector::parse("a[href^='http']").unwrap();
+
+    parsed
+        .select(&li_sel)
+        .map(|li| {
+            let id = li.value().attr("id").unwrap_or_default().to_string();
+            let text_source = li.select(&reftext_sel).next().unwrap_or(li);
+            let raw_text: String = text_source.text().collect();
+            let text = normalize_ws(&strip_backlink_markers(&raw_text));
+            let url = text_source
+                .select(&link_sel)
+                .next()
+                .or_else(|| li.select(&link_sel).next())
+                .and_then(|a| a.value().attr("href"))
+                .map(str::to_string);
+            Citation { id, text, url }
+        })
+        .collect()
 }
 
 /// Render a document as plain text (FR-RD-12, the `--dump` linear mode and
@@ -969,5 +1042,97 @@ mod tests {
     fn find_matches_no_hits_returns_empty_without_panicking() {
         let doc = parse_article_html("Test Article", FIXTURE);
         assert!(find_matches(&doc, "xyzzy-not-present").is_empty());
+    }
+
+    /// Approximates real MediaWiki Cite-extension output: a backlink caret,
+    /// a `.reference-text` span holding the actual citation (with an
+    /// external URL), and — separately — a reference with no URL at all.
+    const CITATIONS_FIXTURE: &str = r##"
+    <html><body>
+    <p>A claim needing support<sup id="cite_ref-1" class="reference"><a href="#cite_note-1">[1]</a></sup>
+    and another<sup id="cite_ref-2" class="reference"><a href="#cite_note-2">[2]</a></sup>.</p>
+    <div class="mw-references-wrap">
+      <ol class="references">
+        <li id="cite_note-1">
+          <span class="mw-cite-backlink"><a href="#cite_ref-1">^</a></span>
+          <span class="reference-text">Smith, John. <cite>A Book About Things</cite>. Example Press, 2020.
+            <a href="https://example.com/book">https://example.com/book</a></span>
+        </li>
+        <li id="cite_note-2">
+          <span class="mw-cite-backlink"><a href="#cite_ref-2">^</a></span>
+          <span class="reference-text">Doe, Jane. "An Article With No Link." Journal of Examples, 2019.</span>
+        </li>
+      </ol>
+    </div>
+    <table class="navbox"><tbody><tr><td>Not a reference list, must be ignored</td></tr></tbody></table>
+    </body></html>
+    "##;
+
+    #[test]
+    fn extracts_citations_with_and_without_urls() {
+        let doc = parse_article_html("Test Article", CITATIONS_FIXTURE);
+        assert_eq!(doc.citations.len(), 2, "exactly two <li> in ol.references");
+
+        let with_url = &doc.citations[0];
+        assert_eq!(with_url.id, "cite_note-1");
+        assert!(with_url.text.contains("Smith, John"));
+        assert!(with_url.text.contains("A Book About Things"));
+        assert_eq!(with_url.url.as_deref(), Some("https://example.com/book"));
+
+        let without_url = &doc.citations[1];
+        assert_eq!(without_url.id, "cite_note-2");
+        assert!(without_url.text.contains("Doe, Jane"));
+        assert_eq!(
+            without_url.url, None,
+            "a reference with no link must not fabricate one"
+        );
+    }
+
+    #[test]
+    fn citation_text_strips_the_backlink_caret() {
+        let doc = parse_article_html("Test Article", CITATIONS_FIXTURE);
+        let text = &doc.citations[0].text;
+        assert!(
+            !text.starts_with('^'),
+            "backlink caret must be stripped, got {text:?}"
+        );
+        assert!(
+            text.starts_with("Smith"),
+            "should start at the real citation content, got {text:?}"
+        );
+    }
+
+    #[test]
+    fn non_reference_tables_never_become_citations() {
+        let doc = parse_article_html("Test Article", CITATIONS_FIXTURE);
+        assert!(
+            doc.citations
+                .iter()
+                .all(|c| !c.text.contains("Not a reference list")),
+            "only ol.references entries should be extracted, not arbitrary tables"
+        );
+    }
+
+    #[test]
+    fn article_with_no_references_section_has_no_citations() {
+        let doc = parse_article_html("Test Article", FIXTURE);
+        assert!(doc.citations.is_empty());
+    }
+
+    #[test]
+    fn prefers_the_page_display_title_over_an_underscored_caller_title() {
+        // FIXTURE's <title> is "Test Article" (spaces); passing the
+        // underscored form a link href or CLI arg might use should not
+        // leak into the Document — a saved citation would otherwise read
+        // "Test_Article" instead of "Test Article".
+        let doc = parse_article_html("Test_Article", FIXTURE);
+        assert_eq!(doc.title, "Test Article");
+    }
+
+    #[test]
+    fn falls_back_to_the_caller_title_when_html_has_no_title_element() {
+        let html = "<html><body><p>No head/title here.</p></body></html>";
+        let doc = parse_article_html("Fallback Title", html);
+        assert_eq!(doc.title, "Fallback Title");
     }
 }

@@ -1,5 +1,8 @@
 use crate::api::SearchResult;
-use crate::doc::{Document, LinkRef, SectionRef, collect_links, find_matches, section_outline};
+use crate::doc::{
+    Citation, Document, LinkRef, SectionRef, collect_links, find_matches, section_outline,
+};
+use crate::research::{ResearchStore, SavedCitation};
 use crate::theme::Theme;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9,6 +12,7 @@ pub enum Mode {
     Results,
     Toc,
     Find,
+    Research,
     Help,
 }
 
@@ -44,6 +48,16 @@ pub struct App {
     pub find_matches: Vec<u16>,
     /// Which entry in `find_matches` `n`/`N` last jumped to.
     pub find_index: usize,
+    /// Research mode's candidate list for the open article: element 0 is
+    /// always the article's own citation (`research::self_citation`);
+    /// the rest are its extracted References entries, in document order.
+    pub citations: Vec<Citation>,
+    pub selected_citation: usize,
+    /// Parallel to `citations`: whether that entry has been saved to
+    /// `research` this session, so the picker can show it's already done.
+    pub citation_saved: Vec<bool>,
+    /// The running bibliography, persisted to disk (PRD §6.4 plain files).
+    pub research: ResearchStore,
 }
 
 impl App {
@@ -73,6 +87,10 @@ impl App {
             find_input: String::new(),
             find_matches: Vec::new(),
             find_index: 0,
+            citations: Vec::new(),
+            selected_citation: 0,
+            citation_saved: Vec::new(),
+            research: ResearchStore::load(),
         }
     }
 
@@ -122,17 +140,67 @@ impl App {
         self.focused_link = if self.links.is_empty() { None } else { Some(0) };
         self.sections = section_outline(&doc);
         self.selected_section = 0;
+
+        // Element 0 is always this article's own citation; the rest are
+        // whatever it cites (Research mode, PRD-adjacent feature request).
+        let mut citations = vec![crate::research::self_citation(&doc.title, &self.lang)];
+        citations.extend(doc.citations.iter().cloned());
+        self.citation_saved = vec![false; citations.len()];
+        self.citations = citations;
+        self.selected_citation = 0;
+
         self.status = format!(
-            "{} — {} blocks, {} links, {} sections",
+            "{} — {} blocks, {} links, {} sections, {} citations",
             doc.title,
             doc.blocks.len(),
             self.links.len(),
-            self.sections.len()
+            self.sections.len(),
+            self.citations.len()
         );
         self.doc = Some(doc);
         self.scroll = 0;
         self.mode = Mode::Reading;
         self.clear_find();
+    }
+
+    pub fn cycle_citation(&mut self, forward: bool) {
+        if self.citations.is_empty() {
+            return;
+        }
+        let len = self.citations.len();
+        self.selected_citation = if forward {
+            (self.selected_citation + 1) % len
+        } else {
+            (self.selected_citation + len - 1) % len
+        };
+    }
+
+    /// Saves the currently-selected citation (the article's own, or one of
+    /// its references) to the research bibliography, and marks it saved so
+    /// the picker shows it's already been added.
+    pub fn save_selected_citation(&mut self) {
+        let Some(citation) = self.citations.get(self.selected_citation).cloned() else {
+            return;
+        };
+        let source_article = self
+            .doc
+            .as_ref()
+            .map(|d| d.title.clone())
+            .unwrap_or_default();
+        self.research.add(SavedCitation {
+            source_article,
+            source_lang: self.lang.clone(),
+            text: citation.text,
+            url: citation.url,
+            saved_at: crate::research::today(),
+        });
+        if let Some(flag) = self.citation_saved.get_mut(self.selected_citation) {
+            *flag = true;
+        }
+        self.status = format!(
+            "Saved to research collection ({} total)",
+            self.research.citations.len()
+        );
     }
 
     /// Clears any in-page find state — a fresh article's matches would be
@@ -217,6 +285,7 @@ mod tests {
         Document {
             title: title.to_string(),
             blocks: Vec::new(),
+            citations: Vec::new(),
         }
     }
 
@@ -416,5 +485,125 @@ mod tests {
         app.find_next();
         app.find_prev();
         assert_eq!(app.find_index, 0);
+    }
+
+    /// A citations-bearing fixture, used instead of the plain `doc()`
+    /// helper so `set_document`'s extracted-citations wiring has real
+    /// References-section content to pick up.
+    fn doc_with_two_references(title: &str) -> Document {
+        let html = r##"<html><body>
+            <ol class="references">
+              <li id="cite_note-1"><span class="reference-text">First source</span></li>
+              <li id="cite_note-2"><span class="reference-text">Second source. <a href="https://example.com/b">https://example.com/b</a></span></li>
+            </ol>
+        </body></html>"##;
+        crate::doc::parse_article_html(title, html)
+    }
+
+    #[test]
+    fn set_document_puts_the_self_citation_first() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(doc_with_two_references("Test Article"));
+
+        assert_eq!(
+            app.citations.len(),
+            3,
+            "self-citation plus two extracted references"
+        );
+        assert_eq!(app.citations[0].id, "self");
+        assert!(app.citations[0].text.contains("Test Article"));
+        assert_eq!(app.citations[1].id, "cite_note-1");
+        assert_eq!(app.citations[2].id, "cite_note-2");
+        assert_eq!(app.citation_saved, vec![false, false, false]);
+    }
+
+    #[test]
+    fn cycle_citation_wraps_in_both_directions() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(doc_with_two_references("Test"));
+        assert_eq!(app.citations.len(), 3);
+
+        assert_eq!(app.selected_citation, 0);
+        app.cycle_citation(true);
+        assert_eq!(app.selected_citation, 1);
+        app.cycle_citation(true);
+        assert_eq!(app.selected_citation, 2);
+        app.cycle_citation(true); // wraps forward past the last
+        assert_eq!(app.selected_citation, 0);
+        app.cycle_citation(false); // wraps backward past the first
+        assert_eq!(app.selected_citation, 2);
+    }
+
+    #[test]
+    fn cycle_citation_with_no_document_is_a_no_op() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.cycle_citation(true);
+        assert_eq!(app.selected_citation, 0);
+    }
+
+    #[test]
+    fn save_selected_citation_marks_it_saved_and_records_the_source_article() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        // Never touch the real platform data directory from a test.
+        app.research = crate::research::ResearchStore::in_memory();
+        app.set_document(doc_with_two_references("Test Article"));
+
+        app.selected_citation = 2; // the reference with a URL
+        app.save_selected_citation();
+
+        assert_eq!(app.citation_saved, vec![false, false, true]);
+        assert_eq!(app.research.citations.len(), 1);
+        let saved = &app.research.citations[0];
+        assert_eq!(saved.source_article, "Test Article");
+        assert!(saved.text.contains("Second source"));
+        assert_eq!(saved.url.as_deref(), Some("https://example.com/b"));
+    }
+
+    #[test]
+    fn saving_the_self_citation_entry_works_too() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.research = crate::research::ResearchStore::in_memory();
+        app.set_document(doc_with_two_references("Test Article"));
+
+        app.selected_citation = 0; // the article's own citation
+        app.save_selected_citation();
+
+        assert_eq!(app.research.citations.len(), 1);
+        assert!(app.research.citations[0].text.contains("Test Article"));
+    }
+
+    #[test]
+    fn save_selected_citation_out_of_range_does_not_panic() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.research = crate::research::ResearchStore::in_memory();
+        app.selected_citation = 99; // no document loaded, citations is empty
+        app.save_selected_citation();
+        assert!(app.research.citations.is_empty());
+    }
+
+    #[test]
+    fn opening_a_new_document_resets_citation_selection_and_saved_flags() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.research = crate::research::ResearchStore::in_memory();
+        app.set_document(doc_with_two_references("First"));
+        app.selected_citation = 2;
+        app.save_selected_citation();
+        assert_eq!(app.citation_saved, vec![false, false, true]);
+
+        app.set_document(doc("Second")); // no references section
+        assert_eq!(
+            app.citations.len(),
+            1,
+            "just the self-citation for the new article"
+        );
+        assert_eq!(
+            app.citation_saved,
+            vec![false],
+            "stale saved-flags must not carry over"
+        );
+        assert_eq!(app.selected_citation, 0);
+        // The previous save is still in the running bibliography, though —
+        // switching articles must not lose earlier session saves.
+        assert_eq!(app.research.citations.len(), 1);
     }
 }

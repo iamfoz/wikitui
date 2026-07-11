@@ -2,6 +2,7 @@ mod api;
 mod app;
 mod cli;
 mod doc;
+mod research;
 mod theme;
 mod ui;
 
@@ -193,6 +194,17 @@ async fn handle_key(client: &WikiClient, app: &mut App, code: KeyCode, modifiers
             }
             _ => {}
         },
+        Mode::Research => match code {
+            KeyCode::Esc => app.mode = Mode::Reading,
+            KeyCode::Char('j') | KeyCode::Down => app.cycle_citation(true),
+            KeyCode::Char('k') | KeyCode::Up => app.cycle_citation(false),
+            KeyCode::Enter | KeyCode::Char('s') => app.save_selected_citation(),
+            KeyCode::Char('?') => {
+                app.prior_mode = app.mode;
+                app.mode = Mode::Help;
+            }
+            _ => {}
+        },
         Mode::Results => match code {
             KeyCode::Esc => {
                 app.mode = Mode::Search;
@@ -280,6 +292,13 @@ async fn handle_key(client: &WikiClient, app: &mut App, code: KeyCode, modifiers
                 }
             }
             KeyCode::Char('T') => app.cycle_theme(),
+            KeyCode::Char('r') => {
+                if app.doc.is_some() {
+                    app.mode = Mode::Research;
+                } else {
+                    app.status = "Open an article first".to_string();
+                }
+            }
             KeyCode::Char('f') if modifiers.contains(KeyModifiers::CONTROL) => {
                 app.mode = Mode::Find;
                 app.clear_find();

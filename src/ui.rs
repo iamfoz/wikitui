@@ -310,6 +310,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         }
         Mode::Results => draw_results(frame, app, chunks[0]),
         Mode::Toc => draw_toc(frame, app, chunks[0]),
+        Mode::Research => draw_research(frame, app, chunks[0]),
     }
 
     draw_status_bar(frame, app, chunks[1]);
@@ -440,6 +441,56 @@ fn draw_toc(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(list, area);
 }
 
+fn draw_research(frame: &mut Frame, app: &App, area: Rect) {
+    let items: Vec<ListItem> = app
+        .citations
+        .iter()
+        .enumerate()
+        .map(|(i, citation)| {
+            // Element 0 is the synthetic self-citation (id "self", set by
+            // research::self_citation); everything else is a real
+            // footnote anchor from the article's References section, shown
+            // so it can be cross-referenced against the live page.
+            let label = if citation.id == "self" {
+                "[this article]".to_string()
+            } else {
+                format!("[{}] {}", i, citation.id)
+            };
+            let saved_marker = if app.citation_saved.get(i).copied().unwrap_or(false) {
+                "✓ "
+            } else {
+                "  "
+            };
+            let mut lines = vec![Line::from(RSpan::styled(
+                format!("{saved_marker}{label} — {}", citation.text),
+                Style::default().add_modifier(Modifier::BOLD),
+            ))];
+            if let Some(url) = &citation.url {
+                lines.push(Line::from(RSpan::styled(
+                    format!("      {url}"),
+                    colored(app.no_color, app.theme.dim),
+                )));
+            }
+            let style = if i == app.selected_citation {
+                colored_bg(app.no_color, app.theme.selected_fg, app.theme.selected_bg)
+            } else {
+                Style::default()
+            };
+            ListItem::new(lines).style(style)
+        })
+        .collect();
+
+    let title = format!(
+        "Research — {} citations here, {} saved overall",
+        app.citations.len(),
+        app.research.citations.len()
+    );
+    let list = List::new(items)
+        .style(base_style(&app.theme, app.no_color))
+        .block(UiBlock::default().borders(Borders::ALL).title(title));
+    frame.render_widget(list, area);
+}
+
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let text = match app.mode {
         Mode::Search => format!("/{}", app.search_input),
@@ -457,6 +508,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Find => format!("find: {}", app.find_input),
         Mode::Results => "Enter: open   Esc: cancel   j/k: move".to_string(),
         Mode::Toc => "Enter: jump to section   Esc: cancel   j/k: move".to_string(),
+        Mode::Research => "Enter/s: save citation   Esc: done   j/k: move".to_string(),
         Mode::Help => "Press any key to close help".to_string(),
         Mode::Reading if app.loading => "Loading…".to_string(),
         Mode::Reading if !app.find_matches.is_empty() => {
@@ -490,7 +542,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
     let width = 60.min(area.width.saturating_sub(4)).max(20);
-    let height = 17.min(area.height.saturating_sub(4)).max(8);
+    let height = 18.min(area.height.saturating_sub(4)).max(8);
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
         y: area.y + (area.height.saturating_sub(height)) / 2,
@@ -512,6 +564,7 @@ fn draw_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
         Line::from("H / L        back / forward"),
         Line::from("t            table of contents"),
         Line::from("T            cycle color theme"),
+        Line::from("r            research mode: cite this page & its sources"),
         Line::from("/            search Wikipedia"),
         Line::from("Ctrl-f       find in this page, n/N: cycle matches"),
         Line::from("Esc          cancel / close"),
