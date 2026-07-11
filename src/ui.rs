@@ -581,16 +581,25 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                 app.find_input
             )
         }
+        // The focused-link line takes over the status bar on any page with
+        // links (nearly all of them), so the page-source indicator must
+        // prefix it too or ◐/○ would never actually be seen (app.status
+        // already carries the prefix via set_document).
         Mode::Reading => match app.focused_link.and_then(|i| app.links.get(i)) {
             Some(link) if link.internal_title.is_some() => {
                 format!(
-                    "→ {} ({}/{})   Tab/S-Tab: cycle   Enter: open   H: back   L: forward",
+                    "{}→ {} ({}/{})   Tab/S-Tab: cycle   Enter: open   H: back   L: forward",
+                    app.page_source.prefix(),
                     link.text,
                     app.focused_link.unwrap() + 1,
                     app.links.len()
                 )
             }
-            Some(link) => format!("→ {} (external, not yet followable)", link.text),
+            Some(link) => format!(
+                "{}→ {} (external, not yet followable)",
+                app.page_source.prefix(),
+                link.text
+            ),
             None => app.status.clone(),
         },
     };

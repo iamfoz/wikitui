@@ -1,5 +1,6 @@
 mod api;
 mod app;
+mod cache;
 mod cite;
 mod cli;
 mod doc;
@@ -19,7 +20,8 @@ use ratatui::backend::CrosstermBackend;
 use std::io::{self, Stdout};
 
 use api::WikiClient;
-use app::{App, Mode};
+use app::{App, Mode, PageSource};
+use cache::PageCache;
 use cli::Cli;
 use theme::Theme;
 
@@ -42,14 +44,15 @@ async fn main() -> Result<()> {
     }
 
     let client = WikiClient::new(cli.lang.clone())?;
+    let page_cache = PageCache::open();
 
     if cli.dump {
         let title = cli
             .title
             .clone()
             .ok_or_else(|| anyhow::anyhow!("--dump requires an article title"))?;
-        let (canonical, html) = client.fetch_article_html(&title).await?;
-        let document = doc::parse_article_html(&canonical, &html);
+        let (html, _) = fetch_page(&client, &page_cache, &cli.lang, &title).await?;
+        let document = doc::parse_article_html(&title, &html);
         print!("{}", doc::render_plain(&document));
         return Ok(());
     }
@@ -67,9 +70,48 @@ async fn main() -> Result<()> {
 
     install_panic_hook();
     let mut terminal = init_terminal()?;
-    let result = run(&mut terminal, &client, cli, theme, no_color).await;
+    let result = run(&mut terminal, &client, &page_cache, cli, theme, no_color).await;
     restore_terminal(&mut terminal)?;
     result
+}
+
+/// The cache-aware fetch (PRD FR-OFF-2's MVP serve policy): a fresh-enough
+/// cached copy skips the network entirely; otherwise fetch and cache; and
+/// if the network fails, any cached copy — however stale — beats the
+/// error, which is what makes offline reading work. Returns the HTML and
+/// where it came from.
+async fn fetch_page(
+    client: &WikiClient,
+    cache: &PageCache,
+    lang: &str,
+    title: &str,
+) -> Result<(String, PageSource)> {
+    let cached = cache.get(lang, title);
+    if let Some(page) = &cached
+        && page.age_secs < cache::FRESH_TTL_SECS
+    {
+        return Ok((
+            page.html.clone(),
+            PageSource::Cached {
+                age_secs: page.age_secs,
+            },
+        ));
+    }
+    match client.fetch_article_html(title).await {
+        Ok((_, html)) => {
+            cache.put(lang, title, &html);
+            Ok((html, PageSource::Live))
+        }
+        Err(network_error) => match cached {
+            Some(page) => Ok((
+                page.html,
+                PageSource::Offline {
+                    age_secs: page.age_secs,
+                },
+            )),
+            None => Err(network_error),
+        },
+    }
 }
 
 fn init_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
@@ -102,6 +144,7 @@ fn install_panic_hook() {
 async fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     client: &WikiClient,
+    cache: &PageCache,
     cli: Cli,
     theme: Theme,
     no_color: bool,
@@ -112,7 +155,7 @@ async fn run(
         app.search_input = query;
         run_search(client, &mut app).await;
     } else if let Some(title) = cli.title {
-        open_title(client, &mut app, &title).await;
+        open_title(client, cache, &mut app, &title).await;
     }
 
     loop {
@@ -124,7 +167,7 @@ async fn run(
             if key.kind != KeyEventKind::Press {
                 continue;
             }
-            handle_key(client, &mut app, key.code, key.modifiers).await;
+            handle_key(client, cache, &mut app, key.code, key.modifiers).await;
         }
 
         if app.should_quit {
@@ -138,11 +181,12 @@ async fn run(
 /// Fetch and open `title` as a fresh navigation (pushes the current article
 /// onto the back stack — see `App::open_document`). Used for the initial
 /// CLI title, search results, and following a link.
-async fn open_title(client: &WikiClient, app: &mut App, title: &str) {
+async fn open_title(client: &WikiClient, cache: &PageCache, app: &mut App, title: &str) {
     app.loading = true;
-    match client.fetch_article_html(title).await {
-        Ok((canonical, html)) => {
-            let document = doc::parse_article_html(&canonical, &html);
+    match fetch_page(client, cache, &app.lang, title).await {
+        Ok((html, source)) => {
+            let document = doc::parse_article_html(title, &html);
+            app.page_source = source;
             app.open_document(document);
         }
         Err(e) => {
@@ -156,11 +200,17 @@ async fn open_title(client: &WikiClient, app: &mut App, title: &str) {
 /// Fetch and install `title` without touching the back/forward stacks —
 /// used for `H`/`L` navigation, which already adjusted the stacks via
 /// `App::navigate_back_target`/`navigate_forward_target`.
-async fn open_title_from_history(client: &WikiClient, app: &mut App, title: &str) {
+async fn open_title_from_history(
+    client: &WikiClient,
+    cache: &PageCache,
+    app: &mut App,
+    title: &str,
+) {
     app.loading = true;
-    match client.fetch_article_html(title).await {
-        Ok((canonical, html)) => {
-            let document = doc::parse_article_html(&canonical, &html);
+    match fetch_page(client, cache, &app.lang, title).await {
+        Ok((html, source)) => {
+            let document = doc::parse_article_html(title, &html);
+            app.page_source = source;
             app.set_document(document);
         }
         Err(e) => {
@@ -170,7 +220,13 @@ async fn open_title_from_history(client: &WikiClient, app: &mut App, title: &str
     app.loading = false;
 }
 
-async fn handle_key(client: &WikiClient, app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+async fn handle_key(
+    client: &WikiClient,
+    cache: &PageCache,
+    app: &mut App,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+) {
     match app.mode {
         Mode::Help => {
             // Any key closes the help overlay.
@@ -249,7 +305,7 @@ async fn handle_key(client: &WikiClient, app: &mut App, code: KeyCode, modifiers
             }
             KeyCode::Enter => {
                 if let Some(result) = app.results.get(app.selected_result).cloned() {
-                    open_title(client, app, &result.title).await;
+                    open_title(client, cache, app, &result.title).await;
                 }
             }
             KeyCode::Char('?') => {
@@ -295,21 +351,21 @@ async fn handle_key(client: &WikiClient, app: &mut App, code: KeyCode, modifiers
             KeyCode::Enter => {
                 if let Some(link) = app.focused_link.and_then(|i| app.links.get(i)).cloned() {
                     match link.internal_title {
-                        Some(title) => open_title(client, app, &title).await,
+                        Some(title) => open_title(client, cache, app, &title).await,
                         None => app.status = format!("External link: {}", link.href),
                     }
                 }
             }
             KeyCode::Char('H') => {
                 if let Some(title) = app.navigate_back_target() {
-                    open_title_from_history(client, app, &title).await;
+                    open_title_from_history(client, cache, app, &title).await;
                 } else {
                     app.status = "No earlier page in history".to_string();
                 }
             }
             KeyCode::Char('L') => {
                 if let Some(title) = app.navigate_forward_target() {
-                    open_title_from_history(client, app, &title).await;
+                    open_title_from_history(client, cache, app, &title).await;
                 } else {
                     app.status = "No later page in history".to_string();
                 }

@@ -18,6 +18,34 @@ pub enum Mode {
     Help,
 }
 
+/// Where the currently open article's content came from (PRD FR-OFF-6's
+/// offline-indicator states): ● fresh from the network, ◐ served from
+/// cache, ○ network failed and a (possibly stale) cached copy stood in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageSource {
+    None,
+    Live,
+    Cached { age_secs: u64 },
+    Offline { age_secs: u64 },
+}
+
+impl PageSource {
+    /// The status-bar prefix, e.g. "◐ cached 3h ago · ".
+    pub fn prefix(&self) -> String {
+        match self {
+            Self::None => String::new(),
+            Self::Live => "● ".to_string(),
+            Self::Cached { age_secs } => {
+                format!("◐ cached {} ago · ", crate::cache::age_human(*age_secs))
+            }
+            Self::Offline { age_secs } => format!(
+                "○ offline — cached {} ago · ",
+                crate::cache::age_human(*age_secs)
+            ),
+        }
+    }
+}
+
 pub struct App {
     pub mode: Mode,
     pub prior_mode: Mode,
@@ -67,6 +95,9 @@ pub struct App {
     /// Export-overwrite confirmation: the filename the user was just
     /// warned about; a second `e` for the same filename proceeds.
     pub pending_export_overwrite: Option<String>,
+    /// Where the open article's content came from — set by the fetch path
+    /// before `set_document`, which folds it into the status line.
+    pub page_source: PageSource,
 }
 
 impl App {
@@ -103,6 +134,7 @@ impl App {
             cite_style: CiteStyle::Apa,
             library_prior_mode: Mode::Reading,
             pending_export_overwrite: None,
+            page_source: PageSource::None,
         }
     }
 
@@ -161,7 +193,8 @@ impl App {
         self.selected_citation = 0;
 
         self.status = format!(
-            "{} — {} blocks, {} links, {} sections, {} citations",
+            "{}{} — {} blocks, {} links, {} sections, {} citations",
+            self.page_source.prefix(),
             doc.title,
             doc.blocks.len(),
             self.links.len(),
