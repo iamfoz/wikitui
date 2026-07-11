@@ -23,9 +23,11 @@ use crate::doc::Citation;
 pub enum CitationKind {
     Article,
     /// The serde default so `citations.jsonl` files written before this
-    /// field existed still load; misclassifying an old self-citation as a
-    /// reference only costs it style formatting, never data.
+    /// field existed still load, and (via `serde(other)`) the catch-all
+    /// for kinds written by future wikitui versions — misclassifying an
+    /// entry as a reference only costs it style formatting, never data.
     #[default]
+    #[serde(other)]
     Reference,
 }
 
@@ -116,34 +118,93 @@ impl ResearchStore {
         writeln!(file, "{line}")
     }
 
-    /// Deletes the entry at `index`, rewriting the whole file — deletion is
-    /// the one operation that can't be append-only. Returns the removed
-    /// entry, or `None` if the index was out of range. The rewrite goes via
-    /// a temp file + rename so a crash mid-write can't destroy the whole
-    /// bibliography.
-    pub fn remove(&mut self, index: usize) -> Option<SavedCitation> {
+    /// Deletes the entry at `index` — deletion is the one operation that
+    /// can't be append-only. Returns the removed entry and the outcome of
+    /// persisting the deletion (an in-memory-only store trivially
+    /// succeeds), or `None` if the index was out of range. Callers must
+    /// surface a persistence failure: reporting "deleted" for an entry
+    /// that will resurrect on the next launch is worse than failing.
+    pub fn remove(&mut self, index: usize) -> Option<(SavedCitation, std::io::Result<()>)> {
         if index >= self.citations.len() {
             return None;
         }
         let removed = self.citations.remove(index);
-        if let Some(path) = &self.path {
-            let _ = Self::rewrite(path, &self.citations);
-        }
-        Some(removed)
+        let persisted = match &self.path {
+            Some(path) => Self::remove_line_from_file(path, &removed),
+            None => Ok(()),
+        };
+        Some((removed, persisted))
     }
 
-    fn rewrite(path: &Path, citations: &[SavedCitation]) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+    /// Removes from the file the first line that parses to a citation
+    /// equal to `target`, keeping every other line byte-for-byte. Working
+    /// from a fresh read of the file — never from this instance's
+    /// in-memory snapshot — means lines this version can't parse (a
+    /// corrupt byte, an entry written by a newer wikitui) and citations
+    /// appended by another running instance since we loaded all survive a
+    /// delete instead of being silently erased with it.
+    ///
+    /// The write goes through a unique (per-call) temp file in the same
+    /// directory, fsynced before an atomic rename, so neither a process
+    /// crash nor — on typical filesystems — a power loss can destroy the
+    /// bibliography. Two instances deleting at the same moment can still
+    /// race on the final rename; the loser's *deletion* may not stick
+    /// (its entry reappears), but no other entry is ever lost.
+    fn remove_line_from_file(path: &Path, target: &SavedCitation) -> std::io::Result<()> {
+        let content = match std::fs::read_to_string(path) {
+            Ok(content) => content,
+            // No file yet (nothing this store added ever persisted):
+            // there's nothing the deletion needs to update.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let mut kept: Vec<&str> = Vec::new();
+        let mut removed_one = false;
+        for line in content.lines() {
+            if !removed_one
+                && serde_json::from_str::<SavedCitation>(line).ok().as_ref() == Some(target)
+            {
+                removed_one = true;
+                continue;
+            }
+            kept.push(line);
         }
-        let mut content = String::new();
-        for citation in citations {
-            content.push_str(&serde_json::to_string(citation).map_err(std::io::Error::other)?);
-            content.push('\n');
+        if !removed_one {
+            // Not on disk (already removed externally, or its add() never
+            // persisted) — nothing to rewrite.
+            return Ok(());
         }
-        let tmp = path.with_extension("jsonl.tmp");
-        std::fs::write(&tmp, content)?;
-        std::fs::rename(&tmp, path)
+
+        let mut out = kept.join("\n");
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        // The temp name must be unique per *call*, not just per process:
+        // two concurrent removes (different threads, or different stores
+        // sharing a directory) would otherwise clobber each other's temp
+        // file between write and rename.
+        static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let base = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("citations.jsonl");
+        let tmp = path.with_file_name(format!(".{base}.{}.{unique}.tmp", std::process::id()));
+        {
+            let mut file = std::fs::File::create(&tmp)?;
+            file.write_all(out.as_bytes())?;
+            file.sync_all()?;
+        }
+        std::fs::rename(&tmp, path)?;
+        // Best-effort directory sync so the rename itself is durable;
+        // opening a directory for sync only works on Unix, and its
+        // failure shouldn't fail the (already-visible) rename.
+        if let Some(parent) = path.parent()
+            && let Ok(dir) = std::fs::File::open(parent)
+        {
+            let _ = dir.sync_all();
+        }
+        Ok(())
     }
 }
 
@@ -168,8 +229,10 @@ pub fn self_citation(title: &str, lang: &str) -> Citation {
 }
 
 /// Today's date as `YYYY-MM-DD`, for a citation's "retrieved on" field.
+/// Local time, not UTC: an access date is the date on the researcher's
+/// own calendar (UTC would date an evening US save "tomorrow").
 pub fn today() -> String {
-    chrono::Utc::now().format("%Y-%m-%d").to_string()
+    chrono::Local::now().format("%Y-%m-%d").to_string()
 }
 
 #[cfg(test)]
@@ -273,8 +336,9 @@ mod tests {
         store.add(sample("Delete me"));
         store.add(sample("Keep me too"));
 
-        let removed = store.remove(1).expect("index 1 exists");
+        let (removed, persisted) = store.remove(1).expect("index 1 exists");
         assert_eq!(removed.text, "Delete me");
+        assert!(persisted.is_ok());
         assert_eq!(store.citations.len(), 2);
 
         let reloaded = ResearchStore::load_from(path.clone());
@@ -290,6 +354,93 @@ mod tests {
         store.add(sample("Only entry"));
         assert!(store.remove(5).is_none());
         assert_eq!(store.citations.len(), 1);
+    }
+
+    /// The data-loss scenario the code-review reproduced against the old
+    /// implementation: a corrupt line and a line from a future file format
+    /// must survive an unrelated delete, not be silently erased with it.
+    #[test]
+    fn remove_preserves_lines_it_cannot_parse() {
+        let path = temp_path();
+        let mut store = ResearchStore::load_from(path.clone());
+        store.add(sample("Delete me"));
+        store.add(sample("Keep me"));
+
+        // Simulate corruption and a future format version, appended
+        // directly to the file behind the store's back.
+        let mut raw = std::fs::read_to_string(&path).unwrap();
+        raw.push_str("{\"truncated\":\n");
+        raw.push_str("{\"source_article\":\"X\",\"source_lang\":\"en\",\"text\":\"From the future\",\"url\":null,\"saved_at\":\"2027-01-01\",\"kind\":\"book\",\"new_field\":42}\n");
+        std::fs::write(&path, raw).unwrap();
+
+        let (_, persisted) = store.remove(0).expect("index 0 exists");
+        assert!(persisted.is_ok());
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(!after.contains("Delete me"));
+        assert!(after.contains("Keep me"));
+        assert!(
+            after.contains("{\"truncated\":"),
+            "corrupt line must survive a delete byte-for-byte"
+        );
+        assert!(
+            after.contains("\"new_field\":42"),
+            "future-format line must survive with unknown fields intact"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Citations appended by another instance after this one loaded must
+    /// survive a delete — remove works from a fresh read of the file, not
+    /// this instance's stale snapshot.
+    #[test]
+    fn remove_preserves_citations_appended_by_another_instance() {
+        let path = temp_path();
+        let mut ours = ResearchStore::load_from(path.clone());
+        ours.add(sample("Ours: delete me"));
+
+        // A second instance appends after we loaded.
+        let mut theirs = ResearchStore::load_from(path.clone());
+        theirs.add(sample("Theirs: must survive"));
+
+        let (_, persisted) = ours.remove(0).expect("our entry exists");
+        assert!(persisted.is_ok());
+
+        let reloaded = ResearchStore::load_from(path.clone());
+        let texts: Vec<_> = reloaded.citations.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec!["Theirs: must survive"]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `kind` values written by future versions degrade to Reference
+    /// instead of failing the whole line (serde(other)).
+    #[test]
+    fn unknown_citation_kind_degrades_to_reference() {
+        let line = r#"{"source_article":"X","source_lang":"en","text":"T","url":null,"saved_at":"2027-01-01","kind":"holotape"}"#;
+        let parsed: SavedCitation =
+            serde_json::from_str(line).expect("unknown kind must still parse");
+        assert_eq!(parsed.kind, CitationKind::Reference);
+    }
+
+    /// Deleting an entry whose add() never reached the disk (or that was
+    /// already removed externally) reports success without rewriting.
+    #[test]
+    fn remove_of_an_entry_missing_from_disk_is_ok() {
+        let path = temp_path();
+        let mut store = ResearchStore::load_from(path.clone());
+        store.add(sample("On disk"));
+        // Entry present in memory only:
+        store.citations.push(sample("Memory only"));
+
+        let (removed, persisted) = store.remove(1).expect("index 1 exists in memory");
+        assert_eq!(removed.text, "Memory only");
+        assert!(persisted.is_ok());
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("On disk"));
+
+        let _ = std::fs::remove_file(&path);
     }
 
     /// A line written by the previous version of this file format (no

@@ -4,7 +4,9 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span as RSpan, Text};
-use ratatui::widgets::{Block as UiBlock, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block as UiBlock, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
+};
 
 use crate::app::{App, Mode};
 use crate::doc::{Block, Document, LinkRef, SpanStyle};
@@ -368,6 +370,16 @@ fn draw_reading(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
+/// Renders a list statefully with the given index selected, so ratatui
+/// scrolls the list to keep the selection visible. A plain `render_widget`
+/// on a `List` always shows the first page — on long lists j/k would move
+/// the selection out of view, which for the library made `d` a blind
+/// destructive action.
+fn render_selectable_list(frame: &mut Frame, list: List, area: Rect, selected: usize) {
+    let mut state = ListState::default().with_selected(Some(selected));
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
 fn draw_results(frame: &mut Frame, app: &App, area: Rect) {
     let items: Vec<ListItem> = app
         .results
@@ -414,7 +426,7 @@ fn draw_results(frame: &mut Frame, app: &App, area: Rect) {
     let list = List::new(items)
         .style(base_style(&app.theme, app.no_color))
         .block(UiBlock::default().borders(Borders::ALL).title(title));
-    frame.render_widget(list, area);
+    render_selectable_list(frame, list, area, app.selected_result);
 }
 
 fn draw_toc(frame: &mut Frame, app: &App, area: Rect) {
@@ -439,7 +451,7 @@ fn draw_toc(frame: &mut Frame, app: &App, area: Rect) {
     let list = List::new(items)
         .style(base_style(&app.theme, app.no_color))
         .block(UiBlock::default().borders(Borders::ALL).title(title));
-    frame.render_widget(list, area);
+    render_selectable_list(frame, list, area, app.selected_section);
 }
 
 fn draw_research(frame: &mut Frame, app: &App, area: Rect) {
@@ -457,7 +469,7 @@ fn draw_research(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 format!("[{}] {}", i, citation.id)
             };
-            let saved_marker = if app.citation_saved.get(i).copied().unwrap_or(false) {
+            let saved_marker = if app.is_citation_saved(i) {
                 "✓ "
             } else {
                 "  "
@@ -489,13 +501,17 @@ fn draw_research(frame: &mut Frame, app: &App, area: Rect) {
     let list = List::new(items)
         .style(base_style(&app.theme, app.no_color))
         .block(UiBlock::default().borders(Borders::ALL).title(title));
-    frame.render_widget(list, area);
+    render_selectable_list(frame, list, area, app.selected_citation);
 }
 
 /// The full saved bibliography, every entry previewed live in the current
 /// citation style (`s` cycles styles, so what you see is exactly what `e`
 /// exports).
 fn draw_library(frame: &mut Frame, app: &App, area: Rect) {
+    // List items don't soft-wrap, and formatted citations (URLs included)
+    // routinely exceed the terminal width — wrap them ourselves so the
+    // preview really is what exports, not a truncation of it.
+    let wrap_width = area.width.saturating_sub(4).max(20) as usize;
     let items: Vec<ListItem> = app
         .research
         .citations
@@ -503,7 +519,10 @@ fn draw_library(frame: &mut Frame, app: &App, area: Rect) {
         .enumerate()
         .map(|(i, saved)| {
             let formatted = crate::cite::format_citation(saved, app.cite_style);
-            let mut lines = vec![Line::from(RSpan::raw(formatted))];
+            let mut lines: Vec<Line> = textwrap::wrap(&formatted, wrap_width)
+                .into_iter()
+                .map(|piece| Line::from(RSpan::raw(piece.into_owned())))
+                .collect();
             lines.push(Line::from(RSpan::styled(
                 format!(
                     "      saved {} while reading \"{}\"",
@@ -528,7 +547,7 @@ fn draw_library(frame: &mut Frame, app: &App, area: Rect) {
     let list = List::new(items)
         .style(base_style(&app.theme, app.no_color))
         .block(UiBlock::default().borders(Borders::ALL).title(title));
-    frame.render_widget(list, area);
+    render_selectable_list(frame, list, area, app.selected_library);
 }
 
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {

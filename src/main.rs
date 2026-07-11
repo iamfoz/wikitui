@@ -223,7 +223,7 @@ async fn handle_key(client: &WikiClient, app: &mut App, code: KeyCode, modifiers
             _ => {}
         },
         Mode::Library => match code {
-            KeyCode::Esc => app.mode = Mode::Reading,
+            KeyCode::Esc => app.close_library(),
             KeyCode::Char('j') | KeyCode::Down => app.cycle_library(true),
             KeyCode::Char('k') | KeyCode::Up => app.cycle_library(false),
             KeyCode::Char('s') => app.cycle_cite_style(),

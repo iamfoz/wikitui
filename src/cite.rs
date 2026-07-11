@@ -124,6 +124,12 @@ pub fn format_citation(citation: &SavedCitation, style: CiteStyle) -> String {
 
 fn format_article(citation: &SavedCitation, style: CiteStyle) -> String {
     let title = &citation.source_article;
+    // In APA and MLA the template puts a period right after the title, so
+    // a title with its own terminal period ("Washington, D.C.") would
+    // double it — both styles collapse that to a single period. Harvard
+    // and Chicago put a quote/comma there instead, so they keep the full
+    // title.
+    let title_dotless = title.strip_suffix('.').unwrap_or(title);
     let url = citation.url.as_deref().unwrap_or("");
     match style {
         // Title. (n.d.). In Wikipedia. Retrieved Month D, YYYY, from URL
@@ -131,7 +137,7 @@ fn format_article(citation: &SavedCitation, style: CiteStyle) -> String {
         // the client doesn't fetch yet — the retrieval-date form is the
         // documented alternative for unarchived pages.)
         CiteStyle::Apa => format!(
-            "{title}. (n.d.). In Wikipedia. Retrieved {}, from {url}",
+            "{title_dotless}. (n.d.). In Wikipedia. Retrieved {}, from {url}",
             date_mdy(&citation.saved_at)
         ),
         // 'Title' (n.d.) Wikipedia. Available at: URL (Accessed: D Month YYYY).
@@ -143,7 +149,7 @@ fn format_article(citation: &SavedCitation, style: CiteStyle) -> String {
         // URL. Accessed D Mon. YYYY.  (last-modified date omitted: needs
         // revision metadata the client doesn't fetch yet)
         CiteStyle::Mla => format!(
-            "\"{title}.\" Wikipedia, The Free Encyclopedia, Wikimedia Foundation, {}. Accessed {}.",
+            "\"{title_dotless}.\" Wikipedia, The Free Encyclopedia, Wikimedia Foundation, {}. Accessed {}.",
             url_without_scheme(url),
             date_mla(&citation.saved_at)
         ),
@@ -158,16 +164,40 @@ fn format_article(citation: &SavedCitation, style: CiteStyle) -> String {
 
 /// A verbatim reference from some article's References section, reproduced
 /// as-is with the style's secondary-source wording pointing back to the
-/// Wikipedia article it was found in.
+/// Wikipedia article it was found in. Genuinely verbatim: nothing is ever
+/// stripped from the text (an ellipsis or "?" ending stays exactly as
+/// printed) — a period is only *added* when the text has no terminal
+/// punctuation of its own.
 fn format_reference(citation: &SavedCitation, style: CiteStyle) -> String {
-    let text = citation.text.trim_end_matches('.');
+    let text = citation.text.trim_end();
+    let sep = if text.ends_with(['.', '?', '!']) {
+        ""
+    } else {
+        "."
+    };
     let via = &citation.source_article;
     match style {
-        CiteStyle::Apa => format!("{text}. (As cited in \"{via},\" Wikipedia.)"),
-        CiteStyle::Harvard => format!("{text}. (Cited in '{via}', Wikipedia.)"),
-        CiteStyle::Mla => format!("{text}. Qtd. in \"{via}.\" Wikipedia."),
-        CiteStyle::Chicago => format!("{text}. Quoted in \"{via},\" Wikipedia."),
+        CiteStyle::Apa => format!("{text}{sep} (As cited in \"{via},\" Wikipedia.)"),
+        CiteStyle::Harvard => format!("{text}{sep} (Cited in '{via}', Wikipedia.)"),
+        CiteStyle::Mla => format!("{text}{sep} Qtd. in \"{via}.\" Wikipedia."),
+        CiteStyle::Chicago => format!("{text}{sep} Quoted in \"{via},\" Wikipedia."),
     }
+}
+
+/// Escapes the Markdown emphasis/code/link metacharacters that real
+/// article titles actually contain ("M*A*S*H (TV series)" would otherwise
+/// render as italicized "MASH"). Underscores are deliberately NOT escaped:
+/// CommonMark doesn't emphasize intraword `_`, and escaping it would
+/// mangle every wiki URL (`Alan\_Turing`).
+fn escape_markdown(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if matches!(ch, '*' | '`' | '[') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// The whole bibliography as an export-ready Markdown document: the
@@ -191,7 +221,7 @@ pub fn format_bibliography(citations: &[SavedCitation], style: CiteStyle) -> Str
         let mut lines: Vec<String> = citations
             .iter()
             .filter(|c| c.kind == kind)
-            .map(|c| format_citation(c, style))
+            .map(|c| escape_markdown(&format_citation(c, style)))
             .collect();
         if lines.is_empty() {
             return;
@@ -320,6 +350,74 @@ mod tests {
         let mut c = article();
         c.saved_at = "not-a-date".to_string();
         assert!(format_citation(&c, CiteStyle::Apa).contains("Retrieved not-a-date, from"));
+    }
+
+    /// Titles with their own terminal period ("Washington, D.C.") must not
+    /// double it where the style's template adds one (APA, MLA); Harvard
+    /// and Chicago put a quote/comma there and keep the title intact.
+    #[test]
+    fn title_ending_in_a_period_is_not_doubled() {
+        let mut c = article();
+        c.source_article = "Washington, D.C.".to_string();
+        let apa = format_citation(&c, CiteStyle::Apa);
+        assert!(apa.starts_with("Washington, D.C. (n.d.)."), "{apa}");
+        assert!(!apa.contains(".."), "{apa}");
+        let mla = format_citation(&c, CiteStyle::Mla);
+        assert!(mla.starts_with("\"Washington, D.C.\""), "{mla}");
+        assert!(!mla.contains(".."), "{mla}");
+        let chicago = format_citation(&c, CiteStyle::Chicago);
+        assert!(
+            chicago.contains("\"Washington, D.C.,\""),
+            "Chicago keeps the full title: {chicago}"
+        );
+        let harvard = format_citation(&c, CiteStyle::Harvard);
+        assert!(harvard.starts_with("'Washington, D.C.'"), "{harvard}");
+    }
+
+    /// "Verbatim" means verbatim: an ellipsis or question-mark ending
+    /// survives untouched, trailing whitespace doesn't produce ". .", and
+    /// a period is only added when the text has no terminal punctuation.
+    #[test]
+    fn reference_text_is_truly_verbatim() {
+        let ellipsis = reference("The Long Title...");
+        assert!(
+            format_citation(&ellipsis, CiteStyle::Apa)
+                .starts_with("The Long Title... (As cited in"),
+            "{}",
+            format_citation(&ellipsis, CiteStyle::Apa)
+        );
+
+        let question = reference("Is God Real?");
+        assert!(
+            format_citation(&question, CiteStyle::Apa).starts_with("Is God Real? (As cited in")
+        );
+
+        let trailing_space = reference("Trailing space. ");
+        assert!(
+            format_citation(&trailing_space, CiteStyle::Apa)
+                .starts_with("Trailing space. (As cited in")
+        );
+
+        let no_punctuation = reference("No punctuation at all");
+        assert!(
+            format_citation(&no_punctuation, CiteStyle::Apa)
+                .starts_with("No punctuation at all. (As cited in")
+        );
+    }
+
+    /// "M*A*S*H (TV series)" must survive a Markdown renderer — emphasis
+    /// metacharacters are escaped in the export document (but underscores
+    /// aren't, so wiki URLs stay copy-pasteable).
+    #[test]
+    fn bibliography_escapes_markdown_emphasis_in_titles() {
+        let mut c = article();
+        c.source_article = "M*A*S*H (TV series)".to_string();
+        let bib = format_bibliography(&[c], CiteStyle::Apa);
+        assert!(bib.contains("M\\*A\\*S\\*H"), "{bib}");
+        assert!(
+            bib.contains("en.wikipedia.org/wiki/Alan_Turing"),
+            "URL underscores must stay unescaped: {bib}"
+        );
     }
 
     #[test]

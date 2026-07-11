@@ -55,15 +55,18 @@ pub struct App {
     /// the rest are its extracted References entries, in document order.
     pub citations: Vec<Citation>,
     pub selected_citation: usize,
-    /// Parallel to `citations`: whether that entry has been saved to
-    /// `research` this session, so the picker can show it's already done.
-    pub citation_saved: Vec<bool>,
     /// The running bibliography, persisted to disk (PRD §6.4 plain files).
     pub research: ResearchStore,
     /// The library view's selection into `research.citations`.
     pub selected_library: usize,
     /// The citation style the library view previews and exports in.
     pub cite_style: CiteStyle,
+    /// The mode `open_library` was entered from, restored on Esc (the
+    /// library is reachable from both Reading and Research).
+    pub library_prior_mode: Mode,
+    /// Export-overwrite confirmation: the filename the user was just
+    /// warned about; a second `e` for the same filename proceeds.
+    pub pending_export_overwrite: Option<String>,
 }
 
 impl App {
@@ -95,10 +98,11 @@ impl App {
             find_index: 0,
             citations: Vec::new(),
             selected_citation: 0,
-            citation_saved: Vec::new(),
             research: ResearchStore::load(),
             selected_library: 0,
             cite_style: CiteStyle::Apa,
+            library_prior_mode: Mode::Reading,
+            pending_export_overwrite: None,
         }
     }
 
@@ -153,7 +157,6 @@ impl App {
         // whatever it cites (Research mode, PRD-adjacent feature request).
         let mut citations = vec![crate::research::self_citation(&doc.title, &self.lang)];
         citations.extend(doc.citations.iter().cloned());
-        self.citation_saved = vec![false; citations.len()];
         self.citations = citations;
         self.selected_citation = 0;
 
@@ -184,8 +187,7 @@ impl App {
     }
 
     /// Saves the currently-selected citation (the article's own, or one of
-    /// its references) to the research bibliography, and marks it saved so
-    /// the picker shows it's already been added.
+    /// its references) to the research bibliography.
     pub fn save_selected_citation(&mut self) {
         let Some(citation) = self.citations.get(self.selected_citation).cloned() else {
             return;
@@ -211,13 +213,23 @@ impl App {
             saved_at: crate::research::today(),
             kind,
         });
-        if let Some(flag) = self.citation_saved.get_mut(self.selected_citation) {
-            *flag = true;
-        }
         self.status = format!(
             "Saved to research collection ({} total)",
             self.research.citations.len()
         );
+    }
+
+    /// Whether the Research picker's entry at `index` is currently present
+    /// in the saved bibliography. A live lookup rather than a session flag,
+    /// so deleting the entry from the library immediately un-checks it in
+    /// the picker instead of leaving a stale "already saved" marker.
+    pub fn is_citation_saved(&self, index: usize) -> bool {
+        self.citations.get(index).is_some_and(|c| {
+            self.research
+                .citations
+                .iter()
+                .any(|saved| saved.text == c.text && saved.url == c.url)
+        })
     }
 
     /// Opens the library view over the whole saved bibliography. The
@@ -225,12 +237,25 @@ impl App {
     /// and export overwrite it with their outcome), so it starts as a key
     /// hint.
     pub fn open_library(&mut self) {
+        self.library_prior_mode = self.mode;
         self.mode = Mode::Library;
         self.selected_library = self
             .selected_library
             .min(self.research.citations.len().saturating_sub(1));
+        self.pending_export_overwrite = None;
         self.status =
             "j/k: move   s: style   d: delete   e: export to file   Esc: close".to_string();
+    }
+
+    /// Returns to wherever the library was opened from (Reading or
+    /// Research), clearing the library's transient status so its key hints
+    /// don't linger on the reading status bar.
+    pub fn close_library(&mut self) {
+        self.mode = self.library_prior_mode;
+        self.status = match &self.doc {
+            Some(doc) => doc.title.clone(),
+            None => "Press / to search, ? for help, q to quit".to_string(),
+        };
     }
 
     pub fn cycle_library(&mut self, forward: bool) {
@@ -252,15 +277,22 @@ impl App {
 
     /// Deletes the library-selected entry from the bibliography (and its
     /// on-disk file), keeping the selection on a valid index afterwards.
+    /// A persistence failure is reported honestly — the entry is gone from
+    /// this session but will be back next launch.
     pub fn delete_selected_library(&mut self) {
-        if self.research.remove(self.selected_library).is_some() {
+        if let Some((_, persisted)) = self.research.remove(self.selected_library) {
             let len = self.research.citations.len();
             if len == 0 {
                 self.selected_library = 0;
             } else {
                 self.selected_library = self.selected_library.min(len - 1);
             }
-            self.status = format!("Deleted — {len} citations remain");
+            self.status = match persisted {
+                Ok(()) => format!("Deleted — {len} citations remain"),
+                Err(e) => {
+                    format!("Deleted from this session, but updating the file failed: {e}")
+                }
+            };
         }
     }
 
@@ -272,15 +304,23 @@ impl App {
     }
 
     /// The testable core of `export_bibliography`: same behavior, explicit
-    /// target directory.
+    /// target directory. Overwriting an existing export (which the user
+    /// may have hand-annotated) requires a second confirming `e` press.
     pub fn export_bibliography_to(&mut self, dir: &std::path::Path) {
         if self.research.citations.is_empty() {
             self.status = "Nothing to export — the bibliography is empty".to_string();
             return;
         }
-        let content = crate::cite::format_bibliography(&self.research.citations, self.cite_style);
         let filename = format!("bibliography-{}.md", self.cite_style.name());
-        self.status = match std::fs::write(dir.join(&filename), content) {
+        let target = dir.join(&filename);
+        if target.exists() && self.pending_export_overwrite.as_deref() != Some(filename.as_str()) {
+            self.pending_export_overwrite = Some(filename.clone());
+            self.status = format!("./{filename} already exists — press e again to overwrite");
+            return;
+        }
+        self.pending_export_overwrite = None;
+        let content = crate::cite::format_bibliography(&self.research.citations, self.cite_style);
+        self.status = match std::fs::write(&target, content) {
             Ok(()) => format!(
                 "Exported {} citations to ./{filename} ({})",
                 self.research.citations.len(),
@@ -601,7 +641,10 @@ mod tests {
         assert!(app.citations[0].text.contains("Test Article"));
         assert_eq!(app.citations[1].id, "cite_note-1");
         assert_eq!(app.citations[2].id, "cite_note-2");
-        assert_eq!(app.citation_saved, vec![false, false, false]);
+        assert!(
+            (0..3).all(|i| !app.is_citation_saved(i)),
+            "nothing saved yet"
+        );
     }
 
     #[test]
@@ -638,7 +681,9 @@ mod tests {
         app.selected_citation = 2; // the reference with a URL
         app.save_selected_citation();
 
-        assert_eq!(app.citation_saved, vec![false, false, true]);
+        assert!(!app.is_citation_saved(0));
+        assert!(!app.is_citation_saved(1));
+        assert!(app.is_citation_saved(2));
         assert_eq!(app.research.citations.len(), 1);
         let saved = &app.research.citations[0];
         assert_eq!(saved.source_article, "Test Article");
@@ -675,7 +720,7 @@ mod tests {
         app.set_document(doc_with_two_references("First"));
         app.selected_citation = 2;
         app.save_selected_citation();
-        assert_eq!(app.citation_saved, vec![false, false, true]);
+        assert!(app.is_citation_saved(2));
 
         app.set_document(doc("Second")); // no references section
         assert_eq!(
@@ -683,15 +728,38 @@ mod tests {
             1,
             "just the self-citation for the new article"
         );
-        assert_eq!(
-            app.citation_saved,
-            vec![false],
-            "stale saved-flags must not carry over"
+        assert!(
+            !app.is_citation_saved(0),
+            "the new article's own citation hasn't been saved"
         );
         assert_eq!(app.selected_citation, 0);
         // The previous save is still in the running bibliography, though —
         // switching articles must not lose earlier session saves.
         assert_eq!(app.research.citations.len(), 1);
+    }
+
+    /// The staleness bug from the code review: save a citation, delete it
+    /// from the library, and the Research picker's checkmark must clear —
+    /// telling the user something is in their bibliography when it isn't
+    /// would silently hole the bibliography.
+    #[test]
+    fn deleting_from_the_library_unchecks_the_research_picker() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.research = crate::research::ResearchStore::in_memory();
+        app.set_document(doc_with_two_references("Test Article"));
+
+        app.selected_citation = 1;
+        app.save_selected_citation();
+        assert!(app.is_citation_saved(1));
+
+        app.open_library();
+        app.selected_library = 0;
+        app.delete_selected_library();
+
+        assert!(
+            !app.is_citation_saved(1),
+            "the picker must reflect the deletion immediately"
+        );
     }
 
     /// An App with an in-memory store pre-seeded with three saved
@@ -767,6 +835,69 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Overwriting an existing export (which the user may have edited)
+    /// needs a confirming second press; changing style resets the pending
+    /// confirmation because the target filename changes.
+    #[test]
+    fn export_over_an_existing_file_requires_a_second_press() {
+        let dir =
+            std::env::temp_dir().join(format!("wikitui-export-confirm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = app_with_library();
+        let target = dir.join("bibliography-apa.md");
+        std::fs::write(&target, "hand-annotated notes").unwrap();
+
+        app.export_bibliography_to(&dir);
+        assert!(
+            app.status.contains("press e again to overwrite"),
+            "{}",
+            app.status
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "hand-annotated notes",
+            "the first press must not touch the file"
+        );
+
+        app.export_bibliography_to(&dir);
+        assert!(
+            app.status.contains("Exported 3 citations"),
+            "{}",
+            app.status
+        );
+        assert!(
+            std::fs::read_to_string(&target)
+                .unwrap()
+                .contains("## Sources consulted")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn library_esc_returns_to_the_mode_it_was_opened_from() {
+        let mut app = app_with_library();
+        app.mode = Mode::Research;
+        app.open_library();
+        assert_eq!(app.mode, Mode::Library);
+        app.close_library();
+        assert_eq!(
+            app.mode,
+            Mode::Research,
+            "opened from Research, must return there"
+        );
+
+        app.mode = Mode::Reading;
+        app.open_library();
+        app.close_library();
+        assert_eq!(app.mode, Mode::Reading);
+        assert!(
+            !app.status.contains("d: delete"),
+            "library key hints must not linger on the reading status bar"
+        );
     }
 
     #[test]
