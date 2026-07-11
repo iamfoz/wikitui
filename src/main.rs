@@ -5,6 +5,7 @@ mod cite;
 mod cli;
 mod doc;
 mod research;
+mod target;
 mod theme;
 mod ui;
 
@@ -27,7 +28,17 @@ use theme::Theme;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+
+    // The TITLE argument may be a full wikipedia.org URL or a
+    // lang-prefixed title (FR-CS-6); either overrides --lang.
+    if let Some(raw) = &cli.title {
+        let target = target::parse(raw);
+        if let Some(lang) = target.lang {
+            cli.lang = lang;
+        }
+        cli.title = Some(target.title);
+    }
 
     // No network, no TTY — just format the saved bibliography and exit.
     if let Some(style_name) = &cli.export_bibliography {
@@ -112,6 +123,19 @@ async fn fetch_page(
             None => Err(network_error),
         },
     }
+}
+
+/// Copies text to the system clipboard via OSC 52 (PRD FR-NV-10), which
+/// works over SSH because the *terminal emulator* performs the copy.
+/// Terminals without OSC 52 support silently ignore the sequence — the
+/// status line still reports what was yanked so the user can tell.
+fn yank_to_clipboard(text: &str) -> std::io::Result<()> {
+    use base64::Engine as _;
+    use std::io::Write as _;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    let mut out = io::stdout();
+    write!(out, "\x1b]52;c;{encoded}\x07")?;
+    out.flush()
 }
 
 fn init_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
@@ -378,6 +402,26 @@ async fn handle_key(
                 }
             }
             KeyCode::Char('T') => app.cycle_theme(),
+            KeyCode::Char('y') => {
+                if let Some(url) = app.yank_url() {
+                    app.status = match yank_to_clipboard(&url) {
+                        Ok(()) => format!("Yanked {url}"),
+                        Err(e) => format!("Yank failed: {e}"),
+                    };
+                } else {
+                    app.status = "Open an article first".to_string();
+                }
+            }
+            KeyCode::Char('Y') => {
+                if let Some(link) = app.yank_markdown() {
+                    app.status = match yank_to_clipboard(&link) {
+                        Ok(()) => format!("Yanked {link}"),
+                        Err(e) => format!("Yank failed: {e}"),
+                    };
+                } else {
+                    app.status = "Open an article first".to_string();
+                }
+            }
             KeyCode::Char('r') => {
                 if app.doc.is_some() {
                     app.mode = Mode::Research;

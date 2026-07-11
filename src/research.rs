@@ -217,15 +217,20 @@ fn citations_path() -> Option<PathBuf> {
 /// — the "cite this entry" half of Research mode, formatted close to a
 /// plain-text MLA-style web citation.
 pub fn self_citation(title: &str, lang: &str) -> Citation {
-    let url = format!(
-        "https://{lang}.wikipedia.org/wiki/{}",
-        title.replace(' ', "_")
-    );
     Citation {
         id: "self".to_string(),
         text: format!("\"{title}.\" Wikipedia, The Free Encyclopedia. Wikimedia Foundation."),
-        url: Some(url),
+        url: Some(article_url(title, lang)),
     }
+}
+
+/// The canonical web URL for an article — shared by citations and the
+/// clipboard-yank keys.
+pub fn article_url(title: &str, lang: &str) -> String {
+    format!(
+        "https://{lang}.wikipedia.org/wiki/{}",
+        title.replace(' ', "_")
+    )
 }
 
 /// Today's date as `YYYY-MM-DD`, for a citation's "retrieved on" field.

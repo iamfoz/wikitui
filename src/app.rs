@@ -143,6 +143,25 @@ impl App {
         self.status = format!("Theme: {}", self.theme.name);
     }
 
+    /// The open article's canonical URL — the `y` yank payload (FR-NV-10).
+    pub fn yank_url(&self) -> Option<String> {
+        self.doc
+            .as_ref()
+            .map(|d| crate::research::article_url(&d.title, &self.lang))
+    }
+
+    /// A Markdown link to the open article — the `Y` yank payload; terminal
+    /// users paste these into notes constantly (PRD FR-NV-10's rationale).
+    pub fn yank_markdown(&self) -> Option<String> {
+        self.doc.as_ref().map(|d| {
+            format!(
+                "[{}]({})",
+                d.title,
+                crate::research::article_url(&d.title, &self.lang)
+            )
+        })
+    }
+
     /// Open a document reached by a fresh navigation (search result, CLI
     /// title, or following a link): the article we were reading, if any,
     /// becomes the back-stack top, and any forward history is discarded —

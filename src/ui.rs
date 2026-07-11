@@ -613,7 +613,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
     let width = 60.min(area.width.saturating_sub(4)).max(20);
-    let height = 19.min(area.height.saturating_sub(4)).max(8);
+    let height = 20.min(area.height.saturating_sub(4)).max(8);
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
         y: area.y + (area.height.saturating_sub(height)) / 2,
@@ -635,6 +635,7 @@ fn draw_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
         Line::from("H / L        back / forward"),
         Line::from("t            table of contents"),
         Line::from("T            cycle color theme"),
+        Line::from("y / Y        yank URL / Markdown link"),
         Line::from("r            research mode: cite this page & its sources"),
         Line::from("R            library: browse/export saved bibliography"),
         Line::from("/            search Wikipedia"),
