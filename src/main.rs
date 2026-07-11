@@ -1,5 +1,6 @@
 mod api;
 mod app;
+mod cite;
 mod cli;
 mod doc;
 mod research;
@@ -25,6 +26,21 @@ use theme::Theme;
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // No network, no TTY — just format the saved bibliography and exit.
+    if let Some(style_name) = &cli.export_bibliography {
+        let style = cite::CiteStyle::by_name(style_name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown citation style {:?} — choose one of: {}",
+                style_name,
+                cite::CiteStyle::NAMES.join(", ")
+            )
+        })?;
+        let store = research::ResearchStore::load();
+        print!("{}", cite::format_bibliography(&store.citations, style));
+        return Ok(());
+    }
+
     let client = WikiClient::new(cli.lang.clone())?;
 
     if cli.dump {
@@ -199,6 +215,20 @@ async fn handle_key(client: &WikiClient, app: &mut App, code: KeyCode, modifiers
             KeyCode::Char('j') | KeyCode::Down => app.cycle_citation(true),
             KeyCode::Char('k') | KeyCode::Up => app.cycle_citation(false),
             KeyCode::Enter | KeyCode::Char('s') => app.save_selected_citation(),
+            KeyCode::Char('R') => app.open_library(),
+            KeyCode::Char('?') => {
+                app.prior_mode = app.mode;
+                app.mode = Mode::Help;
+            }
+            _ => {}
+        },
+        Mode::Library => match code {
+            KeyCode::Esc => app.mode = Mode::Reading,
+            KeyCode::Char('j') | KeyCode::Down => app.cycle_library(true),
+            KeyCode::Char('k') | KeyCode::Up => app.cycle_library(false),
+            KeyCode::Char('s') => app.cycle_cite_style(),
+            KeyCode::Char('d') => app.delete_selected_library(),
+            KeyCode::Char('e') => app.export_bibliography(),
             KeyCode::Char('?') => {
                 app.prior_mode = app.mode;
                 app.mode = Mode::Help;
@@ -299,6 +329,7 @@ async fn handle_key(client: &WikiClient, app: &mut App, code: KeyCode, modifiers
                     app.status = "Open an article first".to_string();
                 }
             }
+            KeyCode::Char('R') => app.open_library(),
             KeyCode::Char('f') if modifiers.contains(KeyModifiers::CONTROL) => {
                 app.mode = Mode::Find;
                 app.clear_find();

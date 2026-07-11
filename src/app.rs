@@ -1,4 +1,5 @@
 use crate::api::SearchResult;
+use crate::cite::CiteStyle;
 use crate::doc::{
     Citation, Document, LinkRef, SectionRef, collect_links, find_matches, section_outline,
 };
@@ -13,6 +14,7 @@ pub enum Mode {
     Toc,
     Find,
     Research,
+    Library,
     Help,
 }
 
@@ -58,6 +60,10 @@ pub struct App {
     pub citation_saved: Vec<bool>,
     /// The running bibliography, persisted to disk (PRD §6.4 plain files).
     pub research: ResearchStore,
+    /// The library view's selection into `research.citations`.
+    pub selected_library: usize,
+    /// The citation style the library view previews and exports in.
+    pub cite_style: CiteStyle,
 }
 
 impl App {
@@ -91,6 +97,8 @@ impl App {
             selected_citation: 0,
             citation_saved: Vec::new(),
             research: ResearchStore::load(),
+            selected_library: 0,
+            cite_style: CiteStyle::Apa,
         }
     }
 
@@ -187,12 +195,21 @@ impl App {
             .as_ref()
             .map(|d| d.title.clone())
             .unwrap_or_default();
+        // The synthetic self-citation (id "self", always element 0 — see
+        // set_document) is the only entry with known structure that styles
+        // can re-format; everything else is verbatim reference text.
+        let kind = if citation.id == "self" {
+            crate::research::CitationKind::Article
+        } else {
+            crate::research::CitationKind::Reference
+        };
         self.research.add(SavedCitation {
             source_article,
             source_lang: self.lang.clone(),
             text: citation.text,
             url: citation.url,
             saved_at: crate::research::today(),
+            kind,
         });
         if let Some(flag) = self.citation_saved.get_mut(self.selected_citation) {
             *flag = true;
@@ -201,6 +218,76 @@ impl App {
             "Saved to research collection ({} total)",
             self.research.citations.len()
         );
+    }
+
+    /// Opens the library view over the whole saved bibliography. The
+    /// status line doubles as the transient-feedback channel here (delete
+    /// and export overwrite it with their outcome), so it starts as a key
+    /// hint.
+    pub fn open_library(&mut self) {
+        self.mode = Mode::Library;
+        self.selected_library = self
+            .selected_library
+            .min(self.research.citations.len().saturating_sub(1));
+        self.status =
+            "j/k: move   s: style   d: delete   e: export to file   Esc: close".to_string();
+    }
+
+    pub fn cycle_library(&mut self, forward: bool) {
+        let len = self.research.citations.len();
+        if len == 0 {
+            return;
+        }
+        self.selected_library = if forward {
+            (self.selected_library + 1) % len
+        } else {
+            (self.selected_library + len - 1) % len
+        };
+    }
+
+    pub fn cycle_cite_style(&mut self) {
+        self.cite_style = self.cite_style.next();
+        self.status = format!("Citation style: {}", self.cite_style.label());
+    }
+
+    /// Deletes the library-selected entry from the bibliography (and its
+    /// on-disk file), keeping the selection on a valid index afterwards.
+    pub fn delete_selected_library(&mut self) {
+        if self.research.remove(self.selected_library).is_some() {
+            let len = self.research.citations.len();
+            if len == 0 {
+                self.selected_library = 0;
+            } else {
+                self.selected_library = self.selected_library.min(len - 1);
+            }
+            self.status = format!("Deleted — {len} citations remain");
+        }
+    }
+
+    /// Exports the whole bibliography, in the current style, to a Markdown
+    /// file in the working directory (where a researcher's project lives;
+    /// `--export-bibliography` covers the pipe-to-anywhere case).
+    pub fn export_bibliography(&mut self) {
+        self.export_bibliography_to(std::path::Path::new("."));
+    }
+
+    /// The testable core of `export_bibliography`: same behavior, explicit
+    /// target directory.
+    pub fn export_bibliography_to(&mut self, dir: &std::path::Path) {
+        if self.research.citations.is_empty() {
+            self.status = "Nothing to export — the bibliography is empty".to_string();
+            return;
+        }
+        let content = crate::cite::format_bibliography(&self.research.citations, self.cite_style);
+        let filename = format!("bibliography-{}.md", self.cite_style.name());
+        self.status = match std::fs::write(dir.join(&filename), content) {
+            Ok(()) => format!(
+                "Exported {} citations to ./{filename} ({})",
+                self.research.citations.len(),
+                self.cite_style.label()
+            ),
+            Err(e) => format!("Export failed: {e}"),
+        };
     }
 
     /// Clears any in-page find state — a fresh article's matches would be
@@ -605,5 +692,95 @@ mod tests {
         // The previous save is still in the running bibliography, though —
         // switching articles must not lose earlier session saves.
         assert_eq!(app.research.citations.len(), 1);
+    }
+
+    /// An App with an in-memory store pre-seeded with three saved
+    /// citations, for exercising the library view's state machine.
+    fn app_with_library() -> App {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.research = crate::research::ResearchStore::in_memory();
+        app.set_document(doc_with_two_references("Test Article"));
+        for i in 0..3 {
+            app.selected_citation = i;
+            app.save_selected_citation();
+        }
+        app
+    }
+
+    #[test]
+    fn open_library_clamps_a_stale_selection() {
+        let mut app = app_with_library();
+        app.selected_library = 99;
+        app.open_library();
+        assert_eq!(app.mode, Mode::Library);
+        assert_eq!(app.selected_library, 2, "clamped to the last valid index");
+    }
+
+    #[test]
+    fn open_library_with_empty_store_does_not_underflow() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.research = crate::research::ResearchStore::in_memory();
+        app.open_library();
+        assert_eq!(app.selected_library, 0);
+    }
+
+    #[test]
+    fn cycle_library_wraps_and_delete_keeps_selection_valid() {
+        let mut app = app_with_library();
+        app.open_library();
+
+        app.cycle_library(false); // wraps backward from 0
+        assert_eq!(app.selected_library, 2);
+
+        // Deleting the last entry must pull the selection back in range.
+        app.delete_selected_library();
+        assert_eq!(app.research.citations.len(), 2);
+        assert_eq!(app.selected_library, 1);
+
+        app.delete_selected_library();
+        app.delete_selected_library();
+        assert!(app.research.citations.is_empty());
+        assert_eq!(app.selected_library, 0);
+        // One more delete on an empty library must be a no-op.
+        app.delete_selected_library();
+        assert_eq!(app.selected_library, 0);
+    }
+
+    #[test]
+    fn export_writes_the_bibliography_file_where_asked() {
+        let dir = std::env::temp_dir().join(format!("wikitui-export-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = app_with_library();
+        app.cite_style = crate::cite::CiteStyle::Harvard;
+        app.export_bibliography_to(&dir);
+
+        let exported = std::fs::read_to_string(dir.join("bibliography-harvard.md"))
+            .expect("export file written");
+        assert!(exported.contains("Harvard"));
+        assert!(exported.contains("## Sources consulted"));
+        assert!(exported.contains("'Test Article' (n.d.) Wikipedia."));
+        assert!(
+            app.status.contains("Exported 3 citations"),
+            "{}",
+            app.status
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_with_empty_library_reports_instead_of_writing() {
+        let dir = std::env::temp_dir().join(format!("wikitui-export-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.research = crate::research::ResearchStore::in_memory();
+        app.export_bibliography_to(&dir);
+
+        assert!(app.status.contains("Nothing to export"));
+        assert!(!dir.join("bibliography-apa.md").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

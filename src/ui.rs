@@ -311,6 +311,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Mode::Results => draw_results(frame, app, chunks[0]),
         Mode::Toc => draw_toc(frame, app, chunks[0]),
         Mode::Research => draw_research(frame, app, chunks[0]),
+        Mode::Library => draw_library(frame, app, chunks[0]),
     }
 
     draw_status_bar(frame, app, chunks[1]);
@@ -491,6 +492,45 @@ fn draw_research(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(list, area);
 }
 
+/// The full saved bibliography, every entry previewed live in the current
+/// citation style (`s` cycles styles, so what you see is exactly what `e`
+/// exports).
+fn draw_library(frame: &mut Frame, app: &App, area: Rect) {
+    let items: Vec<ListItem> = app
+        .research
+        .citations
+        .iter()
+        .enumerate()
+        .map(|(i, saved)| {
+            let formatted = crate::cite::format_citation(saved, app.cite_style);
+            let mut lines = vec![Line::from(RSpan::raw(formatted))];
+            lines.push(Line::from(RSpan::styled(
+                format!(
+                    "      saved {} while reading \"{}\"",
+                    saved.saved_at, saved.source_article
+                ),
+                colored(app.no_color, app.theme.dim),
+            )));
+            let style = if i == app.selected_library {
+                colored_bg(app.no_color, app.theme.selected_fg, app.theme.selected_bg)
+            } else {
+                Style::default()
+            };
+            ListItem::new(lines).style(style)
+        })
+        .collect();
+
+    let title = format!(
+        "Library — {} saved citations, style: {}",
+        app.research.citations.len(),
+        app.cite_style.label()
+    );
+    let list = List::new(items)
+        .style(base_style(&app.theme, app.no_color))
+        .block(UiBlock::default().borders(Borders::ALL).title(title));
+    frame.render_widget(list, area);
+}
+
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let text = match app.mode {
         Mode::Search => format!("/{}", app.search_input),
@@ -508,7 +548,10 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Find => format!("find: {}", app.find_input),
         Mode::Results => "Enter: open   Esc: cancel   j/k: move".to_string(),
         Mode::Toc => "Enter: jump to section   Esc: cancel   j/k: move".to_string(),
-        Mode::Research => "Enter/s: save citation   Esc: done   j/k: move".to_string(),
+        Mode::Research => "Enter/s: save citation   R: library   Esc: done   j/k: move".to_string(),
+        // The library's status line carries transient action feedback
+        // (delete/export/style outcomes overwrite it) — see open_library.
+        Mode::Library => app.status.clone(),
         Mode::Help => "Press any key to close help".to_string(),
         Mode::Reading if app.loading => "Loading…".to_string(),
         Mode::Reading if !app.find_matches.is_empty() => {
@@ -542,7 +585,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
     let width = 60.min(area.width.saturating_sub(4)).max(20);
-    let height = 18.min(area.height.saturating_sub(4)).max(8);
+    let height = 19.min(area.height.saturating_sub(4)).max(8);
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
         y: area.y + (area.height.saturating_sub(height)) / 2,
@@ -565,6 +608,7 @@ fn draw_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
         Line::from("t            table of contents"),
         Line::from("T            cycle color theme"),
         Line::from("r            research mode: cite this page & its sources"),
+        Line::from("R            library: browse/export saved bibliography"),
         Line::from("/            search Wikipedia"),
         Line::from("Ctrl-f       find in this page, n/N: cycle matches"),
         Line::from("Esc          cancel / close"),

@@ -25,4 +25,10 @@ pub struct Cli {
     /// contrast. Press `T` at runtime to cycle through them.
     #[arg(long, default_value = "terminal")]
     pub theme: String,
+
+    /// Print the saved research bibliography to stdout in the given
+    /// citation style (apa, harvard, mla, chicago) and exit — pipe it
+    /// wherever you like: `wikitui --export-bibliography apa > refs.md`.
+    #[arg(long, value_name = "STYLE")]
+    pub export_bibliography: Option<String>,
 }
