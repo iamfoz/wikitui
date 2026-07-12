@@ -1,8 +1,9 @@
 use crate::api::SearchResult;
 use crate::cite::CiteStyle;
 use crate::doc::{
-    Citation, Document, LinkRef, SectionRef, collect_links, find_matches, section_outline,
+    Citation, Document, LinkRef, SectionRef, collect_links, matching_blocks, section_outline,
 };
+use crate::layout::{self, Layout, LayoutOptions};
 use crate::research::{ResearchStore, SavedCitation};
 use crate::theme::Theme;
 
@@ -106,6 +107,25 @@ pub struct App {
     /// focused-link line — which would otherwise hide it instantly on any
     /// page with links — until the next keypress clears it.
     pub notice: Option<String>,
+    /// The width-aware layout of the current document, cached and keyed by
+    /// `(width, options)`; invalidated on doc change (set to `None`) and
+    /// recomputed on resize. Scroll math, section jump, find, and
+    /// focused-link auto-scroll read line positions from here, so a
+    /// theme/focus change stays O(paint) with no relayout.
+    pub layout: Option<Layout>,
+    /// The terminal width the reading view last drew at; layout is built for
+    /// this width. Defaults to a sane 80 so line mappings resolve even before
+    /// the first draw (e.g. in tests).
+    pub layout_width: u16,
+    /// The reading viewport height from the last draw, used to center find
+    /// matches and to scroll a focused link into view. Zero until first draw.
+    pub viewport_height: u16,
+    /// Maximum line measure in cells (FR-RD-9, default 88); a config file
+    /// will wire this later.
+    pub measure: u16,
+    /// East-Asian-Ambiguous width toggle (FR-RD-10, default false); a config
+    /// file will wire this later.
+    pub ambiguous_wide: bool,
 }
 
 impl App {
@@ -145,7 +165,46 @@ impl App {
             page_source: PageSource::None,
             command_input: String::new(),
             notice: None,
+            layout: None,
+            layout_width: 80,
+            viewport_height: 0,
+            measure: 88,
+            ambiguous_wide: false,
         }
+    }
+
+    /// The layout options derived from the current reading preferences.
+    pub fn layout_options(&self) -> LayoutOptions {
+        LayoutOptions {
+            measure: self.measure,
+            ambiguous_wide: self.ambiguous_wide,
+        }
+    }
+
+    /// Ensure `self.layout` is current for `(layout_width, options)`,
+    /// recomputing only when stale — so scrolling never triggers a relayout.
+    /// A no-op when no document is open.
+    pub fn ensure_layout(&mut self) {
+        let width = self.layout_width;
+        let opts = self.layout_options();
+        let stale = match &self.layout {
+            Some(l) => l.width != width || l.options != opts,
+            None => true,
+        };
+        if stale {
+            self.layout = self
+                .doc
+                .as_ref()
+                .map(|doc| layout::layout_document(doc, width, opts));
+        }
+    }
+
+    /// The scroll offset that centers `line` in the viewport, clamped to the
+    /// scrollable range. Before the first draw `viewport_height` is 0, which
+    /// degrades gracefully to top-aligning the line.
+    fn center_scroll(&self, line: u16) -> u16 {
+        line.saturating_sub(self.viewport_height / 2)
+            .min(self.max_scroll)
     }
 
     pub fn cycle_theme(&mut self) {
@@ -233,6 +292,9 @@ impl App {
         self.doc = Some(doc);
         self.scroll = 0;
         self.mode = Mode::Reading;
+        // A new document invalidates the cached layout; it is rebuilt lazily
+        // on the next draw (or the next mapping lookup) at the current width.
+        self.layout = None;
         self.clear_find();
     }
 
@@ -401,15 +463,21 @@ impl App {
     }
 
     /// Recomputes `find_matches` for the current `find_input` against the
-    /// open document and jumps to the first hit, if any.
+    /// open document and jumps to the first hit, if any. Matches are the
+    /// laid-out lines the matching blocks start on (mapped through the cached
+    /// layout), so `n`/`N` land on the right rows on wrapped pages.
     pub fn update_find(&mut self) {
-        self.find_matches = match &self.doc {
-            Some(doc) => find_matches(doc, &self.find_input),
-            None => Vec::new(),
+        self.ensure_layout();
+        self.find_matches = match (&self.doc, &self.layout) {
+            (Some(doc), Some(layout)) => matching_blocks(doc, &self.find_input)
+                .into_iter()
+                .filter_map(|b| layout.block_lines.get(b).map(|&l| l as u16))
+                .collect(),
+            _ => Vec::new(),
         };
         self.find_index = 0;
         if let Some(&line) = self.find_matches.first() {
-            self.scroll = line.min(self.max_scroll);
+            self.scroll = self.center_scroll(line);
         }
     }
 
@@ -418,7 +486,7 @@ impl App {
             return;
         }
         self.find_index = (self.find_index + 1) % self.find_matches.len();
-        self.scroll = self.find_matches[self.find_index].min(self.max_scroll);
+        self.scroll = self.center_scroll(self.find_matches[self.find_index]);
     }
 
     pub fn find_prev(&mut self) {
@@ -426,15 +494,22 @@ impl App {
             return;
         }
         self.find_index = (self.find_index + self.find_matches.len() - 1) % self.find_matches.len();
-        self.scroll = self.find_matches[self.find_index].min(self.max_scroll);
+        self.scroll = self.center_scroll(self.find_matches[self.find_index]);
     }
 
     /// Scroll to the given section's heading line, clamped to what's
     /// actually scrollable (a section near the end of a short article may
-    /// not have `max_scroll` lines below it).
+    /// not have `max_scroll` lines below it). The heading's line is resolved
+    /// from the layout's block→line map.
     pub fn jump_to_section(&mut self, index: usize) {
-        if let Some(section) = self.sections.get(index) {
-            self.scroll = section.line.min(self.max_scroll);
+        self.ensure_layout();
+        let line = self.sections.get(index).and_then(|section| {
+            self.layout
+                .as_ref()
+                .and_then(|l| l.block_lines.get(section.block).copied())
+        });
+        if let Some(line) = line {
+            self.scroll = (line as u16).min(self.max_scroll);
         }
         self.mode = Mode::Reading;
     }
@@ -450,6 +525,37 @@ impl App {
             Some(i) if forward => (i + 1) % len,
             Some(i) => (i + len - 1) % len,
         });
+        self.scroll_focused_link_into_view();
+    }
+
+    /// Scroll so the currently focused link's first line is visible, if it
+    /// isn't already — links cycled past the bottom of a long page would
+    /// otherwise be highlighted off-screen. A no-op before the first draw
+    /// (no viewport height) or when the layout has no line for the link.
+    fn scroll_focused_link_into_view(&mut self) {
+        if self.viewport_height == 0 {
+            return;
+        }
+        let Some(occ) = self.focused_link else {
+            return;
+        };
+        self.ensure_layout();
+        let Some(line) = self
+            .layout
+            .as_ref()
+            .and_then(|l| l.link_lines.get(occ).copied())
+        else {
+            return;
+        };
+        let line = line as u16;
+        let bottom = self.scroll.saturating_add(self.viewport_height);
+        if line < self.scroll {
+            self.scroll = line.min(self.max_scroll);
+        } else if line >= bottom {
+            self.scroll = line
+                .saturating_sub(self.viewport_height.saturating_sub(1))
+                .min(self.max_scroll);
+        }
     }
 
     pub fn scroll_by(&mut self, delta: i32) {
@@ -571,14 +677,19 @@ mod tests {
     #[test]
     fn jump_to_section_clamps_to_max_scroll() {
         let mut app = App::new("en".to_string(), Theme::terminal(), false);
-        app.sections = vec![SectionRef {
-            level: 2,
-            title: "Late Section".to_string(),
-            line: 500,
-        }];
-        app.max_scroll = 30; // a short article: the recorded line is past the end
+        // A heading far down the article: its laid-out line is well past a
+        // deliberately tiny max_scroll, so the jump must clamp.
+        let mut html = String::from("<html><body>");
+        for _ in 0..40 {
+            html.push_str("<p>filler paragraph number something</p>");
+        }
+        html.push_str("<h2>Late Section</h2><p>tail</p></body></html>");
+        app.set_document(crate::doc::parse_article_html("T", &html));
+        app.layout_width = 80;
+        app.max_scroll = 30; // a short viewport: the heading's line is past the end
         app.mode = Mode::Toc;
 
+        assert_eq!(app.sections.len(), 1);
         app.jump_to_section(0);
         assert_eq!(app.scroll, 30);
         assert_eq!(app.mode, Mode::Reading);
@@ -674,6 +785,101 @@ mod tests {
         app.find_next();
         app.find_prev();
         assert_eq!(app.find_index, 0);
+    }
+
+    /// A document whose paragraphs wrap: find matches must land on
+    /// laid-out-line positions (the row the block starts on in the layout),
+    /// not on the logical-line counts the old renderer used — this is the
+    /// scroll-unit defect the layout engine exists to fix.
+    #[test]
+    fn find_matches_are_laid_line_positions_on_a_wrapped_page() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        let long = "word ".repeat(60); // ~300 cells: wraps to several lines at width 40
+        let html = format!("<html><body><p>{long}</p><p>needle paragraph</p></body></html>");
+        app.set_document(crate::doc::parse_article_html("Test", &html));
+        app.layout_width = 40;
+        app.max_scroll = 100;
+
+        app.find_input = "needle".to_string();
+        app.update_find();
+
+        assert_eq!(app.find_matches.len(), 1);
+        let layout = app.layout.as_ref().expect("layout built by update_find");
+        let wrapped_first_para = layout.block_lines[1] - layout.block_lines[0];
+        assert!(
+            wrapped_first_para > 2,
+            "the first paragraph must actually wrap for this test to bite"
+        );
+        assert_eq!(
+            app.find_matches[0] as usize, layout.block_lines[1],
+            "the match must be the needle block's laid-out line"
+        );
+    }
+
+    #[test]
+    fn cycling_to_an_offscreen_link_scrolls_it_into_view() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        let mut html = String::from("<html><body>");
+        html.push_str(r##"<p>Top <a href="./A">first link</a>.</p>"##);
+        for _ in 0..30 {
+            html.push_str("<p>filler paragraph text</p>");
+        }
+        html.push_str(r##"<p>Bottom <a href="./B">second link</a>.</p></body></html>"##);
+        app.set_document(crate::doc::parse_article_html("Test", &html));
+        app.layout_width = 80;
+        app.viewport_height = 10;
+        app.ensure_layout();
+        app.max_scroll = (app.layout.as_ref().unwrap().lines.len() as u16).saturating_sub(10);
+
+        assert_eq!(app.focused_link, Some(0));
+        assert_eq!(app.scroll, 0);
+        app.cycle_link(true); // second link, far below the 10-row viewport
+        let link_line = app.layout.as_ref().unwrap().link_lines[1] as u16;
+        assert!(link_line > 10, "second link must start off-screen");
+        assert!(
+            app.scroll <= link_line && link_line < app.scroll + 10,
+            "focused link line {link_line} must be inside viewport starting at {}",
+            app.scroll
+        );
+
+        app.cycle_link(true); // wraps to the first link back at the top
+        let first_line = app.layout.as_ref().unwrap().link_lines[0] as u16;
+        assert!(
+            app.scroll <= first_line && first_line < app.scroll + 10,
+            "wrapping back to the top link must scroll it into view (scroll {}, line {first_line})",
+            app.scroll
+        );
+    }
+
+    #[test]
+    fn layout_cache_survives_scrolling_but_invalidates_on_width_and_options() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(crate::doc::parse_article_html(
+            "Test",
+            "<html><body><p>some content here</p></body></html>",
+        ));
+        assert!(app.layout.is_none(), "a new document starts unlaid");
+
+        app.layout_width = 80;
+        app.ensure_layout();
+        let first = app.layout.clone().expect("layout built");
+        app.ensure_layout();
+        assert_eq!(
+            app.layout.as_ref().unwrap().lines,
+            first.lines,
+            "same width + options must reuse (not change) the layout"
+        );
+
+        app.layout_width = 40;
+        app.ensure_layout();
+        assert_eq!(app.layout.as_ref().unwrap().width, 40, "resize relaid");
+
+        app.ambiguous_wide = true;
+        app.ensure_layout();
+        assert!(
+            app.layout.as_ref().unwrap().options.ambiguous_wide,
+            "option change relaid"
+        );
     }
 
     /// A citations-bearing fixture, used instead of the plain `doc()`

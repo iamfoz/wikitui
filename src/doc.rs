@@ -122,72 +122,34 @@ pub fn collect_links(doc: &Document) -> Vec<LinkRef> {
     links
 }
 
-/// A heading in the reading view, located by its 0-based line index in the
-/// rendered `Text` — the target of the table-of-contents jump feature
-/// (PRD FR-NV-2).
+/// A heading in the reading view, identified by the index of its block in
+/// `doc.blocks` — the target of the table-of-contents jump (PRD FR-NV-2). The
+/// laid-out line it maps to is resolved by `layout::Layout::block_lines`, so
+/// there is a single source of line truth (the layout), not two competing
+/// ones.
 #[derive(Debug, Clone)]
 pub struct SectionRef {
     pub level: u8,
     pub title: String,
-    pub line: u16,
+    /// Index into `doc.blocks`.
+    pub block: usize,
 }
 
-/// The number of terminal lines `ui::document_to_text` emits for a block.
-/// This must be kept in sync with that function's layout — a consistency
-/// test in `ui.rs` renders a real document both ways and checks a
-/// `SectionRef`'s line actually lands on that heading's text, which would
-/// catch the two falling out of sync.
-fn block_line_count(block: &Block) -> u16 {
-    match block {
-        Block::Heading { .. } => 2, // blank line, then the heading line
-        Block::Paragraph(_) => 2,   // content line, then a trailing blank
-        Block::ListItem { .. } => 1,
-        Block::Blockquote(_) => 2,
-        Block::Code(text) => text.lines().count() as u16 + 1,
-        Block::Rule => 1,
-        Block::Table(lines) => lines.len() as u16 + 1,
-        Block::Infobox(rows) => rows.len() as u16 + 3, // top/bottom border + trailing blank
-        Block::Image(_) => 2,
-    }
-}
-
-/// The line each block starts on in `ui::document_to_text`'s output, in
-/// `doc.blocks` order. Shared by `section_outline` (a heading's own line is
-/// one past its block's start) and `find_matches` (which only needs to
-/// scroll to a block, not a specific line within it).
-fn block_line_starts(doc: &Document) -> Vec<u16> {
-    let mut starts = Vec::with_capacity(doc.blocks.len());
-    let mut line = 2u16; // title line + the blank line document_to_text puts after it
-    for block in &doc.blocks {
-        starts.push(line);
-        line += block_line_count(block);
-    }
-    starts
-}
-
-/// Every heading in the article, in reading order, with the line index
-/// `App` should scroll to for "jump to this section".
+/// Every heading in the article, in reading order, tagged with its block
+/// index. The width-aware layout maps that block index to a laid-out line.
 pub fn section_outline(doc: &Document) -> Vec<SectionRef> {
-    let starts = block_line_starts(doc);
-    let mut sections = Vec::new();
-    for (block, start) in doc.blocks.iter().zip(starts) {
-        if let Block::Heading { level, spans } = block {
-            let title = spans
-                .iter()
-                .map(|s| s.text.as_str())
-                .collect::<Vec<_>>()
-                .join("");
-            // document_to_text emits the blank line before the heading
-            // text, so the heading's own line is one past this block's
-            // starting offset.
-            sections.push(SectionRef {
+    doc.blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(i, block)| match block {
+            Block::Heading { level, spans } => Some(SectionRef {
                 level: *level,
-                title,
-                line: start + 1,
-            });
-        }
-    }
-    sections
+                title: spans.iter().map(|s| s.text.as_str()).collect(),
+                block: i,
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The plain, unstyled text of a block — used only for case-insensitive
@@ -210,24 +172,22 @@ fn block_plain_text(block: &Block) -> String {
     }
 }
 
-/// Every block whose visible text contains `query` (case-insensitive), as
-/// the line to scroll to — the "find in page" feature (PRD FR-NV-6).
-/// Block-level granularity: a match scrolls to (and highlights, via the
-/// caller's match counter) the whole block containing it, not the exact
-/// character position — coarser than a true per-character
-/// highlight-all pass, but needs no separate layout tracking to place a
-/// highlight span at an arbitrary column within a wrapped line.
-pub fn find_matches(doc: &Document, query: &str) -> Vec<u16> {
+/// Indices (into `doc.blocks`) of every block whose visible text contains
+/// `query` (case-insensitive) — the "find in page" feature (PRD FR-NV-6).
+/// Block-level granularity: a match scrolls to the whole block containing it,
+/// not an exact character position. The caller maps each block index to a
+/// laid-out line via `layout::Layout::block_lines`, keeping the layout the
+/// single source of line positions.
+pub fn matching_blocks(doc: &Document, query: &str) -> Vec<usize> {
     if query.is_empty() {
         return Vec::new();
     }
     let needle = query.to_lowercase();
-    let starts = block_line_starts(doc);
     doc.blocks
         .iter()
-        .zip(starts)
-        .filter(|(block, _)| block_plain_text(block).to_lowercase().contains(&needle))
-        .map(|(_, start)| start)
+        .enumerate()
+        .filter(|(_, block)| block_plain_text(block).to_lowercase().contains(&needle))
+        .map(|(i, _)| i)
         .collect()
 }
 
@@ -304,6 +264,57 @@ fn normalize_ws(s: &str) -> String {
     out
 }
 
+/// Collapse whitespace runs to single spaces WITHOUT trimming the ends —
+/// the boundary space between a text node and an adjacent inline element
+/// ("See <a>X</a> and…") is real content; end-trimming each text node (as
+/// `normalize_ws` does) jams words together across span boundaries, which
+/// both reads wrong and defeats space-based line breaking in the layout
+/// engine. Block-level end-trimming happens once, in `trim_inline_ends`.
+fn collapse_ws(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_was_space = false;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            if !last_was_space {
+                out.push(' ');
+            }
+            last_was_space = true;
+        } else {
+            out.push(ch);
+            last_was_space = false;
+        }
+    }
+    out
+}
+
+/// Trim leading/trailing whitespace across a whole inline run (dropping
+/// spans that become empty) — the block-level counterpart of `collapse_ws`,
+/// keeping paragraphs from starting or ending with stray boundary spaces.
+fn trim_inline_ends(spans: &mut Vec<Span>) {
+    while let Some(first) = spans.first_mut() {
+        let trimmed = first.text.trim_start();
+        if trimmed.is_empty() {
+            spans.remove(0);
+        } else {
+            if trimmed.len() != first.text.len() {
+                first.text = trimmed.to_string();
+            }
+            break;
+        }
+    }
+    while let Some(last) = spans.last_mut() {
+        let trimmed = last.text.trim_end();
+        if trimmed.is_empty() {
+            spans.pop();
+        } else {
+            if trimmed.len() != last.text.len() {
+                last.text = trimmed.to_string();
+            }
+            break;
+        }
+    }
+}
+
 fn text_content(node: NodeRef<Node>) -> String {
     let mut out = String::new();
     collect_text(node, &mut out);
@@ -329,7 +340,7 @@ fn collect_inline(node: NodeRef<Node>, style: &SpanStyle, spans: &mut Vec<Span>)
     for child in node.children() {
         match child.value() {
             Node::Text(t) => {
-                let s = normalize_ws(&t.text);
+                let s = collapse_ws(&t.text);
                 if !s.is_empty() {
                     spans.push(Span {
                         text: s,
@@ -372,6 +383,7 @@ fn collect_inline(node: NodeRef<Node>, style: &SpanStyle, spans: &mut Vec<Span>)
 fn inline_spans(node: NodeRef<Node>) -> Vec<Span> {
     let mut spans = Vec::new();
     collect_inline(node, &SpanStyle::Plain, &mut spans);
+    trim_inline_ends(&mut spans);
     spans
 }
 
@@ -929,6 +941,40 @@ mod tests {
         assert!(flattened.contains('.'));
     }
 
+    /// The space between a text node and an adjacent inline element is real
+    /// content: "See <a>X</a> and" must flatten to "See X and", never
+    /// "SeeXand". Per-text-node end-trimming used to eat these boundary
+    /// spaces, which jammed words together and defeated space-based line
+    /// breaking in the layout engine.
+    #[test]
+    fn preserves_boundary_spaces_around_inline_elements() {
+        let html = r##"<html><body><p>See <a href="./A">Alpha Beta</a> and <b>bold</b> text.</p></body></html>"##;
+        let doc = parse_article_html("T", html);
+        let flattened: String = doc
+            .blocks
+            .iter()
+            .find_map(|b| match b {
+                Block::Paragraph(spans) => {
+                    Some(spans.iter().map(|s| s.text.as_str()).collect::<String>())
+                }
+                _ => None,
+            })
+            .expect("paragraph present");
+        assert_eq!(flattened, "See Alpha Beta and bold text.");
+    }
+
+    /// Paragraph-level leading/trailing whitespace (indentation in the HTML
+    /// source) must still be trimmed even though boundary spaces are kept.
+    #[test]
+    fn paragraphs_do_not_start_or_end_with_stray_spaces() {
+        let html = "<html><body><p>\n      Indented source.\n    </p></body></html>";
+        let doc = parse_article_html("T", html);
+        let Block::Paragraph(spans) = &doc.blocks[0] else {
+            panic!("paragraph expected")
+        };
+        assert_eq!(spans[0].text, "Indented source.");
+    }
+
     #[test]
     fn infobox_collapses_to_label_value_pairs() {
         let doc = parse_article_html("Test Article", FIXTURE);
@@ -1004,44 +1050,39 @@ mod tests {
     }
 
     #[test]
-    fn find_matches_is_case_insensitive_and_locates_multiple_blocks() {
+    fn matching_blocks_is_case_insensitive_and_locates_multiple_blocks() {
         let doc = parse_article_html("Test Article", FIXTURE);
 
         // FIXTURE's list has "First item", "Second item", and a nested
         // "Nested item" (three separate ListItem blocks).
-        let matches = find_matches(&doc, "ITEM");
+        let matches = matching_blocks(&doc, "ITEM");
         assert_eq!(matches.len(), 3, "all three list items mention 'item'");
 
-        let bold_matches = find_matches(&doc, "bold");
+        let bold_matches = matching_blocks(&doc, "bold");
         assert_eq!(bold_matches.len(), 1);
     }
 
     #[test]
-    fn find_matches_line_actually_starts_the_matching_block() {
+    fn matching_blocks_returns_block_indices_in_document_order() {
         let doc = parse_article_html("Test Article", FIXTURE);
-        let sections = section_outline(&doc);
-        let history_matches = find_matches(&doc, "History");
-        // Case-insensitive "history" matches both the "History" heading and
-        // the "Some history text." paragraph right after it; the heading
-        // comes first in document order, so it's the first match. Its
-        // block-start line should be exactly one less than
-        // section_outline's own-line (which points at the heading text
-        // itself, one past the block's start — see block_line_starts's doc
-        // comment).
-        assert_eq!(history_matches.len(), 2);
-        assert_eq!(history_matches[0] + 1, sections[0].line);
+        // "History" matches both the heading block and the paragraph after
+        // it; the heading comes first in document order.
+        let matches = matching_blocks(&doc, "History");
+        assert_eq!(matches.len(), 2);
+        assert!(matches[0] < matches[1], "indices are in document order");
+        assert!(matches!(doc.blocks[matches[0]], Block::Heading { .. }));
     }
 
     #[test]
-    fn find_matches_empty_query_returns_nothing() {
+    fn matching_blocks_empty_query_returns_nothing() {
         let doc = parse_article_html("Test Article", FIXTURE);
-        assert!(find_matches(&doc, "").is_empty());
+        assert!(matching_blocks(&doc, "").is_empty());
     }
 
     #[test]
-    fn find_matches_no_hits_returns_empty_without_panicking() {
+    fn matching_blocks_no_hits_returns_empty_without_panicking() {
         let doc = parse_article_html("Test Article", FIXTURE);
-        assert!(find_matches(&doc, "xyzzy-not-present").is_empty());
+        assert!(matching_blocks(&doc, "xyzzy-not-present").is_empty());
     }
 
     /// Approximates real MediaWiki Cite-extension output: a backlink caret,

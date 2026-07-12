@@ -26,27 +26,25 @@ pub fn parse(input: &str) -> Target {
     if let Some(rest) = input
         .strip_prefix("https://")
         .or_else(|| input.strip_prefix("http://"))
+        && let Some((host, path)) = rest.split_once('/')
+        && let Some(lang) = host.strip_suffix(".wikipedia.org")
     {
-        if let Some((host, path)) = rest.split_once('/') {
-            if let Some(lang) = host.strip_suffix(".wikipedia.org") {
-                // "m.": Wikipedia's mobile hosts are {lang}.m.wikipedia.org.
-                let lang = lang.strip_suffix(".m").unwrap_or(lang);
-                if let Some(encoded_title) = path.strip_prefix("wiki/") {
-                    let encoded_title = encoded_title
-                        .split(['#', '?'])
-                        .next()
-                        .unwrap_or(encoded_title);
-                    let title = urlencoding::decode(encoded_title)
-                        .map(|t| t.into_owned())
-                        .unwrap_or_else(|_| encoded_title.to_string())
-                        .replace('_', " ");
-                    if !title.is_empty() && is_lang_code(lang) {
-                        return Target {
-                            lang: Some(lang.to_string()),
-                            title,
-                        };
-                    }
-                }
+        // "m.": Wikipedia's mobile hosts are {lang}.m.wikipedia.org.
+        let lang = lang.strip_suffix(".m").unwrap_or(lang);
+        if let Some(encoded_title) = path.strip_prefix("wiki/") {
+            let encoded_title = encoded_title
+                .split(['#', '?'])
+                .next()
+                .unwrap_or(encoded_title);
+            let title = urlencoding::decode(encoded_title)
+                .map(|t| t.into_owned())
+                .unwrap_or_else(|_| encoded_title.to_string())
+                .replace('_', " ");
+            if !title.is_empty() && is_lang_code(lang) {
+                return Target {
+                    lang: Some(lang.to_string()),
+                    title,
+                };
             }
         }
         // A URL we don't understand: fall through and treat the whole
@@ -59,13 +57,15 @@ pub fn parse(input: &str) -> Target {
     // prefix as a language when it actually looks like one — and never
     // when the remainder starts with "//" (that's a URL scheme like
     // "https:", which is all lowercase letters and would otherwise pass).
-    if let Some((prefix, rest)) = input.split_once(':') {
-        if is_lang_code(prefix) && !rest.is_empty() && !rest.starts_with("//") {
-            return Target {
-                lang: Some(prefix.to_string()),
-                title: rest.trim().replace('_', " "),
-            };
-        }
+    if let Some((prefix, rest)) = input.split_once(':')
+        && is_lang_code(prefix)
+        && !rest.is_empty()
+        && !rest.starts_with("//")
+    {
+        return Target {
+            lang: Some(prefix.to_string()),
+            title: rest.trim().replace('_', " "),
+        };
     }
 
     Target {

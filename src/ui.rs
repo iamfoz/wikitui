@@ -1,15 +1,14 @@
 use std::collections::HashSet;
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout as UiLayout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span as RSpan, Text};
-use ratatui::widgets::{
-    Block as UiBlock, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
-};
+use ratatui::widgets::{Block as UiBlock, Borders, Clear, List, ListItem, ListState, Paragraph};
 
 use crate::app::{App, Mode};
-use crate::doc::{Block, Document, LinkRef, SpanStyle};
+use crate::doc::LinkRef;
+use crate::layout::{LaidLine, Layout, SpanKind};
 use crate::theme::Theme;
 
 /// Every article title opened this session — back-stack, forward-stack, and
@@ -60,170 +59,102 @@ fn base_style(theme: &Theme, no_color: bool) -> Style {
     style
 }
 
-fn span_style(kind: &SpanStyle, theme: &Theme, no_color: bool) -> Style {
+/// Map a semantic span kind (from the width-aware layout) to a concrete
+/// `ratatui` style, applying the theme, focus state, and visited state at
+/// paint time — the layout itself is theme-independent (PRD §6.3), so this is
+/// the only place colors enter and a theme/focus change is O(paint).
+fn kind_style(
+    kind: &SpanKind,
+    focused_link: Option<usize>,
+    links: &[LinkRef],
+    visited: &HashSet<&str>,
+    theme: &Theme,
+    no_color: bool,
+) -> Style {
     match kind {
-        SpanStyle::Plain => Style::default(),
-        SpanStyle::Bold => Style::default().add_modifier(Modifier::BOLD),
-        SpanStyle::Italic => Style::default().add_modifier(Modifier::ITALIC),
-        SpanStyle::Superscript => colored(no_color, theme.dim),
-        // Unvisited-link fallback; `spans_to_rspans` handles the
-        // focused/visited cases itself and never delegates a Link span here.
-        SpanStyle::Link(_) => colored(no_color, theme.link).add_modifier(Modifier::UNDERLINED),
+        SpanKind::Plain => Style::default(),
+        SpanKind::Bold => Style::default().add_modifier(Modifier::BOLD),
+        SpanKind::Italic => Style::default().add_modifier(Modifier::ITALIC),
+        SpanKind::Dim => colored(no_color, theme.dim),
+        SpanKind::Title => Style::default().add_modifier(Modifier::BOLD),
+        SpanKind::Heading(level) => colored(no_color, theme.heading).add_modifier(
+            Modifier::BOLD
+                | if *level <= 2 {
+                    Modifier::UNDERLINED
+                } else {
+                    Modifier::empty()
+                },
+        ),
+        SpanKind::Quote => colored(no_color, theme.quote),
+        SpanKind::Code => colored(no_color, theme.code),
+        SpanKind::Table => colored(no_color, theme.table),
+        SpanKind::Infobox => colored(no_color, theme.infobox),
+        SpanKind::Image => colored(no_color, theme.image).add_modifier(Modifier::ITALIC),
+        SpanKind::Link(occ) => {
+            if Some(*occ) == focused_link {
+                colored_bg(no_color, theme.focus_fg, theme.focus_bg).add_modifier(Modifier::BOLD)
+            } else {
+                let is_visited = links
+                    .get(*occ)
+                    .and_then(|l| l.internal_title.as_deref())
+                    .is_some_and(|title| visited.contains(title));
+                let color = if is_visited {
+                    theme.link_visited
+                } else {
+                    theme.link
+                };
+                colored(no_color, color).add_modifier(Modifier::UNDERLINED)
+            }
+        }
     }
 }
 
-fn document_to_text(
-    doc: &Document,
+fn paint_line(
+    line: &LaidLine,
+    focused_link: Option<usize>,
+    links: &[LinkRef],
+    visited: &HashSet<&str>,
+    theme: &Theme,
+    no_color: bool,
+) -> Line<'static> {
+    let mut spans: Vec<RSpan<'static>> = line
+        .spans
+        .iter()
+        .map(|s| {
+            RSpan::styled(
+                s.text.clone(),
+                kind_style(&s.kind, focused_link, links, visited, theme, no_color),
+            )
+        })
+        .collect();
+    // Image placeholders note whether the active theme would actually render
+    // the image; kept out of the (theme-independent) layout and applied here.
+    if !theme.images && line.spans.iter().any(|s| matches!(s.kind, SpanKind::Image)) {
+        spans.push(RSpan::styled(
+            " (images off in this theme)".to_string(),
+            colored(no_color, theme.image).add_modifier(Modifier::ITALIC),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// Paint a laid-out document into styled text — one laid line per row, no
+/// runtime wrapping (the layout already broke lines to width).
+fn paint_document(
+    layout: &Layout,
     focused_link: Option<usize>,
     links: &[LinkRef],
     visited: &HashSet<&str>,
     theme: &Theme,
     no_color: bool,
 ) -> Text<'static> {
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    // Must advance in the exact same order as `doc::collect_links` (which
-    // only visits Paragraph/ListItem/Blockquote spans) so a cycled-to link
-    // index highlights the same occurrence the app will actually follow.
-    let mut link_counter = 0usize;
-
-    lines.push(Line::from(RSpan::styled(
-        doc.title.clone(),
-        Style::default().add_modifier(Modifier::BOLD),
-    )));
-    lines.push(Line::from(""));
-
-    for block in &doc.blocks {
-        match block {
-            Block::Heading { level, spans } => {
-                lines.push(Line::from(""));
-                let style = colored(no_color, theme.heading).add_modifier(
-                    Modifier::BOLD
-                        | if *level <= 2 {
-                            Modifier::UNDERLINED
-                        } else {
-                            Modifier::empty()
-                        },
-                );
-                let text = spans
-                    .iter()
-                    .map(|s| s.text.as_str())
-                    .collect::<Vec<_>>()
-                    .join("");
-                lines.push(Line::from(RSpan::styled(text, style)));
-            }
-            Block::Paragraph(spans) => {
-                lines.push(Line::from(spans_to_rspans(
-                    spans,
-                    &mut link_counter,
-                    focused_link,
-                    links,
-                    visited,
-                    None,
-                    theme,
-                    no_color,
-                )));
-                lines.push(Line::from(""));
-            }
-            Block::ListItem {
-                ordered,
-                index,
-                depth,
-                spans,
-            } => {
-                let indent = "  ".repeat(*depth as usize);
-                let bullet = if *ordered {
-                    format!("{index}.")
-                } else {
-                    "•".to_string()
-                };
-                let mut rspans = vec![RSpan::raw(format!("{indent}{bullet} "))];
-                rspans.extend(spans_to_rspans(
-                    spans,
-                    &mut link_counter,
-                    focused_link,
-                    links,
-                    visited,
-                    None,
-                    theme,
-                    no_color,
-                ));
-                lines.push(Line::from(rspans));
-            }
-            Block::Blockquote(spans) => {
-                let mut rspans = vec![RSpan::styled("▌ ", colored(no_color, theme.dim))];
-                rspans.extend(spans_to_rspans(
-                    spans,
-                    &mut link_counter,
-                    focused_link,
-                    links,
-                    visited,
-                    Some(theme.quote),
-                    theme,
-                    no_color,
-                ));
-                lines.push(Line::from(rspans));
-                lines.push(Line::from(""));
-            }
-            Block::Code(text) => {
-                for line in text.lines() {
-                    lines.push(Line::from(RSpan::styled(
-                        format!("    {line}"),
-                        colored(no_color, theme.code),
-                    )));
-                }
-                lines.push(Line::from(""));
-            }
-            Block::Rule => {
-                lines.push(Line::from(RSpan::styled(
-                    "─".repeat(40),
-                    colored(no_color, theme.dim),
-                )));
-            }
-            Block::Table(rows) => {
-                for row in rows {
-                    lines.push(Line::from(RSpan::styled(
-                        row.clone(),
-                        colored(no_color, theme.table),
-                    )));
-                }
-                lines.push(Line::from(""));
-            }
-            Block::Infobox(rows) => {
-                let style = colored(no_color, theme.infobox);
-                lines.push(Line::from(RSpan::styled(
-                    "┌─ infobox ─────────────────",
-                    style,
-                )));
-                for (label, value) in rows {
-                    let text = if label.is_empty() {
-                        format!("│ {value}")
-                    } else {
-                        format!("│ {label}: {value}")
-                    };
-                    lines.push(Line::from(RSpan::styled(text, style)));
-                }
-                lines.push(Line::from(RSpan::styled(
-                    "└───────────────────────────",
-                    style,
-                )));
-                lines.push(Line::from(""));
-            }
-            Block::Image(alt) => {
-                let suffix = if theme.images {
-                    ""
-                } else {
-                    " (images off in this theme)"
-                };
-                lines.push(Line::from(RSpan::styled(
-                    format!("[image: {alt}{suffix}]"),
-                    colored(no_color, theme.image).add_modifier(Modifier::ITALIC),
-                )));
-                lines.push(Line::from(""));
-            }
-        }
-    }
-
-    Text::from(lines)
+    Text::from(
+        layout
+            .lines
+            .iter()
+            .map(|l| paint_line(l, focused_link, links, visited, theme, no_color))
+            .collect::<Vec<_>>(),
+    )
 }
 
 /// The search-excerpt field arrives with `<span class="searchmatch">` tags
@@ -243,57 +174,9 @@ fn strip_tags(html: &str) -> String {
     out
 }
 
-/// Converts spans to styled ratatui spans. `focused` highlights the
-/// Tab/Shift-Tab-selected link (indexed the same way as `doc::collect_links`,
-/// hence needing the parallel `links` list to look up whether a given
-/// occurrence's target has been visited this session). `plain_color`
-/// overrides `SpanStyle::Plain`'s color for contexts with their own body
-/// color (a blockquote's `theme.quote`); pass `None` for ordinary body text.
-#[allow(clippy::too_many_arguments)]
-fn spans_to_rspans(
-    spans: &[crate::doc::Span],
-    link_counter: &mut usize,
-    focused: Option<usize>,
-    links: &[LinkRef],
-    visited: &HashSet<&str>,
-    plain_color: Option<Color>,
-    theme: &Theme,
-    no_color: bool,
-) -> Vec<RSpan<'static>> {
-    spans
-        .iter()
-        .map(|s| match &s.style {
-            SpanStyle::Link(_) => {
-                let this_index = *link_counter;
-                *link_counter += 1;
-                let style = if Some(this_index) == focused {
-                    colored_bg(no_color, theme.focus_fg, theme.focus_bg)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    let is_visited = links
-                        .get(this_index)
-                        .and_then(|l| l.internal_title.as_deref())
-                        .is_some_and(|title| visited.contains(title));
-                    let color = if is_visited {
-                        theme.link_visited
-                    } else {
-                        theme.link
-                    };
-                    colored(no_color, color).add_modifier(Modifier::UNDERLINED)
-                };
-                RSpan::styled(s.text.clone(), style)
-            }
-            SpanStyle::Plain if plain_color.is_some() => {
-                RSpan::styled(s.text.clone(), colored(no_color, plain_color.unwrap()))
-            }
-            other => RSpan::styled(s.text.clone(), span_style(other, theme, no_color)),
-        })
-        .collect()
-}
-
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
-    let chunks = Layout::default()
+    let chunks = UiLayout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(area);
@@ -324,49 +207,57 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 }
 
 fn draw_reading(frame: &mut Frame, app: &mut App, area: Rect) {
-    match &app.doc {
-        Some(doc) => {
-            let visited = visited_titles(app);
-            let text = document_to_text(
-                doc,
+    if app.doc.is_some() {
+        let visible_height = area.height.max(1);
+        // Build (or reuse) the width-aware layout for this width, so scroll
+        // offset is measured in the same laid-out lines the app's mappings
+        // use. No runtime Wrap: the layout already broke lines to width.
+        app.layout_width = area.width;
+        app.viewport_height = visible_height;
+        app.ensure_layout();
+
+        let total_lines = app
+            .layout
+            .as_ref()
+            .map(|l| l.lines.len() as u16)
+            .unwrap_or(0);
+        app.max_scroll = total_lines.saturating_sub(visible_height);
+        app.scroll = app.scroll.min(app.max_scroll);
+        let scroll = app.scroll;
+
+        let visited = visited_titles(app);
+        if let Some(layout) = app.layout.as_ref() {
+            let text = paint_document(
+                layout,
                 app.focused_link,
                 &app.links,
                 &visited,
                 &app.theme,
                 app.no_color,
             );
-            let visible_height = area.height.max(1);
-            let total_lines = text.lines.len() as u16;
-            app.max_scroll = total_lines.saturating_sub(visible_height);
-            app.scroll = app.scroll.min(app.max_scroll);
-
             let paragraph = Paragraph::new(text)
                 .style(base_style(&app.theme, app.no_color))
-                .wrap(Wrap { trim: false })
-                .scroll((app.scroll, 0));
+                .scroll((scroll, 0));
             frame.render_widget(paragraph, area);
         }
-        None => {
-            let welcome = Text::from(vec![
-                Line::from(""),
-                Line::from(RSpan::styled(
-                    "wikitui",
-                    Style::default().add_modifier(Modifier::BOLD),
-                )),
-                Line::from(RSpan::styled(
-                    format!("{}.wikipedia.org — theme: {}", app.lang, app.theme.name),
-                    colored(app.no_color, app.theme.dim),
-                )),
-                Line::from(""),
-                Line::from(
-                    "Press / to search Wikipedia, T to cycle themes, ? for help, q to quit.",
-                ),
-            ]);
-            frame.render_widget(
-                Paragraph::new(welcome).style(base_style(&app.theme, app.no_color)),
-                area,
-            );
-        }
+    } else {
+        let welcome = Text::from(vec![
+            Line::from(""),
+            Line::from(RSpan::styled(
+                "wikitui",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(RSpan::styled(
+                format!("{}.wikipedia.org — theme: {}", app.lang, app.theme.name),
+                colored(app.no_color, app.theme.dim),
+            )),
+            Line::from(""),
+            Line::from("Press / to search Wikipedia, T to cycle themes, ? for help, q to quit."),
+        ]);
+        frame.render_widget(
+            Paragraph::new(welcome).style(base_style(&app.theme, app.no_color)),
+            area,
+        );
     }
 }
 
@@ -663,60 +554,45 @@ fn draw_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
 mod tests {
     use super::*;
     use crate::doc::{parse_article_html, section_outline};
+    use crate::layout::{LayoutOptions, layout_document};
 
-    /// Exercises every block variant that carries a line count in
-    /// `doc::block_line_count` (heading, paragraph, list item, blockquote,
-    /// code, rule, table, infobox, image), so a mismatch between that
-    /// function and this module's actual line emission would show up here.
-    const FIXTURE: &str = r##"
-    <html><body>
-    <table class="infobox"><tbody>
-      <tr><th colspan="2">Subject</th></tr>
-      <tr><th>Field</th><td>Testing</td></tr>
-    </tbody></table>
-    <p>Intro paragraph.</p>
-    <h2>First Section</h2>
-    <p>Some text.</p>
-    <ul><li>One</li><li>Two</li></ul>
-    <blockquote><p>A quote.</p></blockquote>
-    <pre>line one
-line two</pre>
-    <hr/>
-    <table class="wikitable"><tbody>
-      <tr><th>A</th><th>B</th></tr>
-      <tr><td>1</td><td>2</td></tr>
-    </tbody></table>
-    <figure><img src="x.jpg" alt="An image"/></figure>
-    <h2>Second Section</h2>
-    <p>More text.</p>
-    </body></html>
-    "##;
-
-    /// `doc::section_outline` computes each heading's line index without
-    /// ever building a ratatui `Text` — it must agree with what
-    /// `document_to_text` actually renders, or "jump to section" would land
-    /// on the wrong line. This proves the two independent implementations
-    /// stay in sync as block types are added or their rendering changes.
+    /// The paint step maps each heading's layout line (via
+    /// `section_outline` + `Layout::block_lines`) back to the rendered row.
+    /// This proves the single line-truth source (the layout) drives both the
+    /// table of contents and the painted output, so "jump to section" lands
+    /// on the heading.
     #[test]
-    fn section_outline_lines_match_the_rendered_heading_lines() {
-        let doc = parse_article_html("Test Article", FIXTURE);
+    fn painted_heading_lines_match_the_section_outline() {
+        let html = r##"
+        <html><body>
+        <p>Intro paragraph.</p>
+        <h2>First Section</h2>
+        <p>Some text.</p>
+        <ul><li>One</li><li>Two</li></ul>
+        <blockquote><p>A quote.</p></blockquote>
+        <h2>Second Section</h2>
+        <p>More text.</p>
+        </body></html>
+        "##;
+        let doc = parse_article_html("Test Article", html);
         let sections = section_outline(&doc);
         assert_eq!(sections.len(), 2, "fixture has exactly two headings");
 
+        let layout = layout_document(&doc, 80, LayoutOptions::default());
         let theme = Theme::terminal();
-        let text = document_to_text(&doc, None, &[], &HashSet::new(), &theme, false);
+        let text = paint_document(&layout, None, &[], &HashSet::new(), &theme, false);
 
         for section in &sections {
-            let rendered_line = &text.lines[section.line as usize];
-            let rendered_text: String = rendered_line
+            let line = layout.block_lines[section.block];
+            let rendered: String = text.lines[line]
                 .spans
                 .iter()
                 .map(|s| s.content.as_ref())
                 .collect();
             assert_eq!(
-                rendered_text, section.title,
-                "section_outline's line {} for {:?} doesn't match the rendered line",
-                section.line, section.title
+                rendered.trim(),
+                section.title,
+                "the heading's layout line must render its own text"
             );
         }
     }
@@ -765,7 +641,8 @@ line two</pre>
         visited.insert("Visited Page");
 
         let theme = Theme::full();
-        let text = document_to_text(&doc, None, &links, &visited, &theme, false);
+        let layout = layout_document(&doc, 80, LayoutOptions::default());
+        let text = paint_document(&layout, None, &links, &visited, &theme, false);
 
         let paragraph_line = text
             .lines

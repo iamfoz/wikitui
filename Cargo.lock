@@ -3275,6 +3275,7 @@ dependencies = [
  "serde_json",
  "textwrap",
  "tokio",
+ "unicode-segmentation",
  "unicode-width",
  "urlencoding",
 ]

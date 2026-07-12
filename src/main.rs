@@ -5,6 +5,7 @@ mod cite;
 mod cli;
 mod command;
 mod doc;
+mod layout;
 mod research;
 mod target;
 mod theme;
