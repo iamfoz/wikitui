@@ -124,6 +124,17 @@ pub struct Layout {
     /// `doc::collect_links`, so cycling links can scroll the focused link
     /// into view.
     pub link_lines: Vec<usize>,
+    /// `continuation[i]` is true when `lines[i]` is a soft-wrapped
+    /// continuation of the very same content run as `lines[i + 1]` — no
+    /// block boundary (paragraph break, list-item edge, table row, ...)
+    /// separates them, only a visual wrap. Length `lines.len() - 1` (empty
+    /// for a one-line document). The only consumer is `find_matches`, which
+    /// uses it to glue adjacent lines back together so a query straddling a
+    /// wrap point is still found (PRD FR-NV-6b) — nothing else may rely on
+    /// this reconstructing the original unwrapped text exactly, since a
+    /// space dropped at the wrap is spliced back in heuristically (see
+    /// `find_matches`'s doc comment).
+    pub continuation: Vec<bool>,
 }
 
 /// Display width of a string, one grapheme cluster is measured as a unit.
@@ -483,14 +494,30 @@ fn finalize(pad_width: usize, prefix: &[LaidSpan], content: &[Cluster]) -> LaidL
 /// A helper carrying the emit state through the per-block builders.
 struct Emitter<'a> {
     lines: &'a mut Vec<LaidLine>,
+    /// Parallel to `lines`, one entry shorter (see `Layout::continuation`):
+    /// `push_line`'s `continues_prev` argument for every line after the
+    /// first.
+    continuation: &'a mut Vec<bool>,
     pad_width: usize,
     content_width: usize,
     ambiguous_wide: bool,
 }
 
 impl Emitter<'_> {
+    /// The single point every laid-out line passes through, so
+    /// `continuation` always stays exactly one shorter than `lines`.
+    /// `continues_prev` records whether this line is a soft-wrap
+    /// continuation of the line just pushed (see `Layout::continuation`) —
+    /// meaningless (and ignored) for the very first line of the document.
+    fn push_line(&mut self, line: LaidLine, continues_prev: bool) {
+        if !self.lines.is_empty() {
+            self.continuation.push(continues_prev);
+        }
+        self.lines.push(line);
+    }
+
     fn blank(&mut self) {
-        self.lines.push(finalize(self.pad_width, &[], &[]));
+        self.push_line(finalize(self.pad_width, &[], &[]), false);
     }
 
     /// Emit a block whose content wraps under an optional hanging prefix
@@ -516,13 +543,12 @@ impl Emitter<'_> {
         let avail = self.content_width - prefix_width;
         let wrapped = wrap_content(content, avail);
         if wrapped.is_empty() {
-            self.lines
-                .push(finalize(self.pad_width, &first_prefix, &[]));
+            self.push_line(finalize(self.pad_width, &first_prefix, &[]), false);
             return;
         }
         for (i, line) in wrapped.iter().enumerate() {
             let prefix = if i == 0 { &first_prefix } else { &cont_prefix };
-            self.lines.push(finalize(self.pad_width, prefix, line));
+            self.push_line(finalize(self.pad_width, prefix, line), i > 0);
         }
     }
 
@@ -540,12 +566,14 @@ pub fn layout_document(doc: &Document, width: u16, options: LayoutOptions) -> La
     let aw = options.ambiguous_wide;
 
     let mut lines: Vec<LaidLine> = Vec::new();
+    let mut continuation: Vec<bool> = Vec::new();
     let mut block_lines: Vec<usize> = Vec::with_capacity(doc.blocks.len());
     let mut link_counter = 0usize;
 
     {
         let mut em = Emitter {
             lines: &mut lines,
+            continuation: &mut continuation,
             pad_width,
             content_width,
             ambiguous_wide: aw,
@@ -616,24 +644,36 @@ pub fn layout_document(doc: &Document, width: u16, options: LayoutOptions) -> La
                         let chunks =
                             chunk_by_width(clusters_from_str(src, SpanKind::Code, aw), avail);
                         if chunks.is_empty() {
-                            em.lines.push(finalize(
-                                pad_width,
-                                &[LaidSpan {
-                                    text: gutter.to_string(),
-                                    kind: SpanKind::Code,
-                                }],
-                                &[],
-                            ));
+                            em.push_line(
+                                finalize(
+                                    pad_width,
+                                    &[LaidSpan {
+                                        text: gutter.to_string(),
+                                        kind: SpanKind::Code,
+                                    }],
+                                    &[],
+                                ),
+                                false,
+                            );
                         }
-                        for chunk in chunks {
-                            em.lines.push(finalize(
-                                pad_width,
-                                &[LaidSpan {
-                                    text: gutter.to_string(),
-                                    kind: SpanKind::Code,
-                                }],
-                                &chunk,
-                            ));
+                        // A source line hard-split across several chunks (it
+                        // overflowed `avail`) is one continuous run with no
+                        // separator dropped at the cut — every chunk after
+                        // the first continues the previous one. Different
+                        // source lines never do: that boundary is a real
+                        // `\n`, not a wrap.
+                        for (i, chunk) in chunks.into_iter().enumerate() {
+                            em.push_line(
+                                finalize(
+                                    pad_width,
+                                    &[LaidSpan {
+                                        text: gutter.to_string(),
+                                        kind: SpanKind::Code,
+                                    }],
+                                    &chunk,
+                                ),
+                                i > 0,
+                            );
                         }
                     }
                     em.blank();
@@ -646,14 +686,17 @@ pub fn layout_document(doc: &Document, width: u16, options: LayoutOptions) -> La
                     // not by character count.
                     let dash_w = display_width("─", aw).max(1);
                     let n = content_width.min(40) / dash_w;
-                    em.lines.push(finalize(
-                        pad_width,
-                        &[LaidSpan {
-                            text: "─".repeat(n),
-                            kind: SpanKind::Dim,
-                        }],
-                        &[],
-                    ));
+                    em.push_line(
+                        finalize(
+                            pad_width,
+                            &[LaidSpan {
+                                text: "─".repeat(n),
+                                kind: SpanKind::Dim,
+                            }],
+                            &[],
+                        ),
+                        false,
+                    );
                     block_lines.push(anchor);
                 }
                 Block::Table(rows) => {
@@ -671,14 +714,17 @@ pub fn layout_document(doc: &Document, width: u16, options: LayoutOptions) -> La
                     let dash_w = display_width("─", aw).max(1);
                     let top = truncate_to_width("┌─ infobox ", content_width, aw);
                     let top_fill = content_width.saturating_sub(display_width(&top, aw)) / dash_w;
-                    em.lines.push(finalize(
-                        pad_width,
-                        &[LaidSpan {
-                            text: format!("{top}{}", "─".repeat(top_fill)),
-                            kind: SpanKind::Infobox,
-                        }],
-                        &[],
-                    ));
+                    em.push_line(
+                        finalize(
+                            pad_width,
+                            &[LaidSpan {
+                                text: format!("{top}{}", "─".repeat(top_fill)),
+                                kind: SpanKind::Infobox,
+                            }],
+                            &[],
+                        ),
+                        false,
+                    );
                     let gutter = vec![LaidSpan {
                         text: "│ ".to_string(),
                         kind: SpanKind::Infobox,
@@ -696,14 +742,17 @@ pub fn layout_document(doc: &Document, width: u16, options: LayoutOptions) -> La
                         );
                     }
                     let bottom_fill = content_width.saturating_sub(display_width("└", aw)) / dash_w;
-                    em.lines.push(finalize(
-                        pad_width,
-                        &[LaidSpan {
-                            text: format!("└{}", "─".repeat(bottom_fill)),
-                            kind: SpanKind::Infobox,
-                        }],
-                        &[],
-                    ));
+                    em.push_line(
+                        finalize(
+                            pad_width,
+                            &[LaidSpan {
+                                text: format!("└{}", "─".repeat(bottom_fill)),
+                                kind: SpanKind::Infobox,
+                            }],
+                            &[],
+                        ),
+                        false,
+                    );
                     em.blank();
                     block_lines.push(anchor);
                 }
@@ -744,7 +793,182 @@ pub fn layout_document(doc: &Document, width: u16, options: LayoutOptions) -> La
         lines,
         block_lines,
         link_lines,
+        continuation,
     }
+}
+
+/// PRD FR-NV-6's smart-case rule for in-page find: an all-lowercase query
+/// (including one with no letters at all — punctuation, digits) matches
+/// case-insensitively; a query with *any* uppercase letter matches exact
+/// case only. Same rule real editors use (vim's `smartcase`, most browser
+/// finders): typing a capital is read as intentional.
+pub fn is_case_sensitive(query: &str) -> bool {
+    query.chars().any(char::is_uppercase)
+}
+
+/// One in-page-find match's grapheme-index range `[start, end)` on a single
+/// rendered line — counted in grapheme clusters from the line's own start
+/// (as `LaidLine::spans` concatenate), never bytes or code points, so a
+/// caller can never slice inside a combining-mark cluster or a ZWJ sequence
+/// (the same invariant the layout engine itself keeps, see the module
+/// docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MatchSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// One occurrence of the find query, as the one or more per-line pieces a
+/// visual line wrap split it into. `(line_index, MatchSpan)` per piece, top-
+/// to-bottom. Almost always a single piece; exactly two when the query
+/// straddled a wrap point (PRD FR-NV-6b) — never collapsed back into "one
+/// entry per line" upstream of this type, because that would double-count
+/// a single occurrence as two for the match counter and n/N cycling, and
+/// only highlight half of it as "current."
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Occurrence {
+    pub pieces: Vec<(usize, MatchSpan)>,
+}
+
+/// A laid-out line's own text, exactly as painted (pad/prefix included) —
+/// concatenating `LaidSpan`s never splits a cluster since each span's text
+/// is already whole clusters.
+fn laid_line_text(line: &LaidLine) -> String {
+    line.spans.iter().map(|s| s.text.as_str()).collect()
+}
+
+/// Finds every occurrence of `query` across laid-out `lines`, smart-case
+/// (`is_case_sensitive`), grapheme-safe throughout, in reading order.
+///
+/// A run of lines chained by `continuation` (soft wraps within one content
+/// block — see `Layout::continuation`) is searched as a single joined
+/// string, so a query that happens to straddle a visual line break is still
+/// found — as one `Occurrence` with two pieces (one per line it touches),
+/// not two separate occurrences, so the match counter and "which one is
+/// current" stay meaningful. The join glues in a single space at a wrap
+/// point that dropped one (ordinary word-wrap) but nothing at all between
+/// two CJK characters, which never had a space there to begin with
+/// (FR-RD-10) — determined by inspecting the two characters immediately
+/// either side of the break, not by recording the original separator, so
+/// the rare case of an unbreakable non-CJK token that was hard-split purely
+/// for width (no separator ever existed there either) is spliced with a
+/// phantom space too. That's a narrow, documented miss (a query landing
+/// exactly on such a cut goes unfound), not a wrong highlight — nothing is
+/// ever painted that isn't a real, correctly-cased occurrence of `query`.
+pub fn find_matches(lines: &[LaidLine], continuation: &[bool], query: &str) -> Vec<Occurrence> {
+    let mut out: Vec<Occurrence> = Vec::new();
+    if query.is_empty() || lines.is_empty() {
+        return out;
+    }
+    let case_sensitive = is_case_sensitive(query);
+    let normalize = |g: &str| -> String {
+        if case_sensitive {
+            g.to_string()
+        } else {
+            g.to_lowercase()
+        }
+    };
+    let q_graphemes: Vec<String> = query.graphemes(true).map(&normalize).collect();
+    if q_graphemes.is_empty() {
+        return out;
+    }
+
+    let mut i = 0usize;
+    while i < lines.len() {
+        let mut end = i;
+        while end + 1 < lines.len() && continuation.get(end).copied().unwrap_or(false) {
+            end += 1;
+        }
+        find_in_run(lines, i, end, &q_graphemes, &normalize, &mut out);
+        i = end + 1;
+    }
+    out
+}
+
+/// Searches one continuation-chained run of lines (`start..=end`) and
+/// appends every hit to `out`, in left-to-right order within the run — runs
+/// themselves are processed top-to-bottom by `find_matches`, so `out` stays
+/// in overall reading order throughout. See `find_matches` for the glue
+/// rule.
+fn find_in_run(
+    lines: &[LaidLine],
+    start: usize,
+    end: usize,
+    q_graphemes: &[String],
+    normalize: &impl Fn(&str) -> String,
+    out: &mut Vec<Occurrence>,
+) {
+    // `origin[k]` is which (line, column) grapheme `graphemes[k]` came from;
+    // `None` marks a synthetic glue grapheme (a spliced-in dropped space)
+    // that exists on no rendered line and must never itself be reported as
+    // part of a match.
+    let mut graphemes: Vec<String> = Vec::new();
+    let mut origin: Vec<Option<(usize, usize)>> = Vec::new();
+
+    for li in start..=end {
+        let text = laid_line_text(&lines[li]);
+        for (col, g) in text.graphemes(true).enumerate() {
+            graphemes.push(normalize(g));
+            origin.push(Some((li, col)));
+        }
+        if li < end {
+            let next_text = laid_line_text(&lines[li + 1]);
+            let glue_is_space = matches!(
+                (text.chars().next_back(), next_text.chars().next()),
+                (Some(a), Some(b)) if !is_cjk(a) && !is_cjk(b)
+            );
+            if glue_is_space {
+                graphemes.push(normalize(" "));
+                origin.push(None);
+            }
+        }
+    }
+
+    let q_len = q_graphemes.len();
+    if graphemes.len() < q_len {
+        return;
+    }
+    let mut pos = 0usize;
+    while pos + q_len <= graphemes.len() {
+        if graphemes[pos..pos + q_len] == q_graphemes[..] {
+            if let Some(occurrence) = occurrence_from_origins(&origin[pos..pos + q_len]) {
+                out.push(occurrence);
+            }
+            pos += q_len; // non-overlapping, like every find-in-page implementation
+        } else {
+            pos += 1;
+        }
+    }
+}
+
+/// Folds one match's per-grapheme origins into an `Occurrence`, starting a
+/// new piece at every point the match crosses from one line to another
+/// (including across a glue grapheme, which contributes nothing itself but
+/// still ends whatever piece came before it). `None` only when every
+/// grapheme was glue — i.e. the query matched nothing that actually exists
+/// on screen, which `find_in_run`'s search can't produce but this stays
+/// total rather than assuming that.
+fn occurrence_from_origins(origins: &[Option<(usize, usize)>]) -> Option<Occurrence> {
+    let mut pieces: Vec<(usize, MatchSpan)> = Vec::new();
+    let mut current: Option<(usize, usize, usize)> = None; // (line, start_col, end_col_exclusive)
+    for o in origins {
+        match (o, current) {
+            (Some((line, col)), Some((cur_line, s, _))) if *line == cur_line => {
+                current = Some((cur_line, s, col + 1));
+            }
+            (Some((line, col)), _) => {
+                if let Some((cur_line, s, e)) = current {
+                    pieces.push((cur_line, MatchSpan { start: s, end: e }));
+                }
+                current = Some((*line, *col, col + 1));
+            }
+            (None, _) => {} // glue grapheme: doesn't exist on screen, skip
+        }
+    }
+    if let Some((cur_line, s, e)) = current {
+        pieces.push((cur_line, MatchSpan { start: s, end: e }));
+    }
+    (!pieces.is_empty()).then_some(Occurrence { pieces })
 }
 
 #[cfg(test)]
@@ -1043,6 +1267,194 @@ mod tests {
         assert!(x_lines.len() >= 7, "300 x's at width 40 need >=8 rows");
         for l in x_lines {
             assert!(l.width(false) <= 40);
+        }
+    }
+
+    fn plain_line(text: &str) -> LaidLine {
+        LaidLine {
+            spans: vec![LaidSpan {
+                text: text.to_string(),
+                kind: SpanKind::Plain,
+            }],
+        }
+    }
+
+    /// PRD FR-NV-6's smart-case rule, exhaustively: any uppercase letter
+    /// anywhere in the query flips it to case-sensitive; an all-lowercase
+    /// query (including one with no letters at all) stays insensitive.
+    #[test]
+    fn is_case_sensitive_truth_table() {
+        assert!(!is_case_sensitive("turing"));
+        assert!(!is_case_sensitive(""));
+        assert!(!is_case_sensitive("123"));
+        assert!(
+            !is_case_sensitive("über"),
+            "lowercase diacritic stays insensitive"
+        );
+        assert!(is_case_sensitive("Turing"));
+        assert!(is_case_sensitive("TURING"));
+        assert!(
+            is_case_sensitive("turinG"),
+            "one trailing capital is enough"
+        );
+        assert!(is_case_sensitive("Über"));
+    }
+
+    /// A one-piece occurrence entirely on `line`, for asserting equality
+    /// against `find_matches` output tersely.
+    fn one_piece(line: usize, start: usize, end: usize) -> Occurrence {
+        Occurrence {
+            pieces: vec![(line, MatchSpan { start, end })],
+        }
+    }
+
+    #[test]
+    fn find_matches_is_case_insensitive_for_an_all_lowercase_query() {
+        let lines = vec![plain_line("Alan Turing was here")];
+        let matches = find_matches(&lines, &[], "turing");
+        assert_eq!(matches, vec![one_piece(0, 5, 11)]);
+    }
+
+    #[test]
+    fn find_matches_smart_case_rejects_wrong_case_when_query_has_uppercase() {
+        let lines = vec![plain_line("alan turing was here")];
+        let matches = find_matches(&lines, &[], "Turing");
+        assert!(
+            matches.is_empty(),
+            "a capitalized query must not match lowercase text"
+        );
+
+        let lines = vec![plain_line("Alan Turing was here")];
+        let matches = find_matches(&lines, &[], "Turing");
+        assert_eq!(matches, vec![one_piece(0, 5, 11)]);
+    }
+
+    #[test]
+    fn find_matches_reports_every_occurrence_non_overlapping() {
+        let lines = vec![plain_line("turing turing turing")];
+        let matches = find_matches(&lines, &[], "turing");
+        assert_eq!(
+            matches,
+            vec![
+                one_piece(0, 0, 6),
+                one_piece(0, 7, 13),
+                one_piece(0, 14, 20)
+            ]
+        );
+    }
+
+    /// A query straddling a soft wrap where a space was dropped (ordinary
+    /// word-wrap) must be found as ONE occurrence with two pieces — not two
+    /// separate occurrences, which would double-count it for the match
+    /// counter and only let one half take the current-match emphasis.
+    #[test]
+    fn find_matches_spans_a_soft_wrap_where_a_space_was_dropped() {
+        let lines = vec![plain_line("computer"), plain_line("science is fun")];
+        let matches = find_matches(&lines, &[true], "computer science");
+        assert_eq!(
+            matches,
+            vec![Occurrence {
+                pieces: vec![
+                    (0, MatchSpan { start: 0, end: 8 }),
+                    (1, MatchSpan { start: 0, end: 7 }),
+                ],
+            }],
+            "one occurrence, split into a piece per line it touches"
+        );
+    }
+
+    /// Without a recorded continuation (a real block boundary — separate
+    /// list items, table rows, ...), adjacent lines must never be glued:
+    /// "cat" ending one block and "dog" starting the next is not "cat dog".
+    #[test]
+    fn find_matches_does_not_glue_across_a_block_boundary() {
+        let lines = vec![plain_line("the cat"), plain_line("dog sat")];
+        let matches = find_matches(&lines, &[false], "cat dog");
+        assert!(matches.is_empty());
+    }
+
+    /// CJK per-character wrapping never had a space at the break — the glue
+    /// must be empty, not a phantom space, or a genuine adjacency would go
+    /// unfound. Still one occurrence, two pieces.
+    #[test]
+    fn find_matches_spans_a_cjk_wrap_with_no_glue_character() {
+        let lines = vec![plain_line("計算機科"), plain_line("学は面白い")];
+        let matches = find_matches(&lines, &[true], "科学");
+        assert_eq!(
+            matches,
+            vec![Occurrence {
+                pieces: vec![
+                    (0, MatchSpan { start: 3, end: 4 }),
+                    (1, MatchSpan { start: 0, end: 1 }),
+                ],
+            }]
+        );
+    }
+
+    /// A combining-mark grapheme cluster (base + combining acute, two code
+    /// points) must count and match as exactly one grapheme column, never
+    /// split — the same invariant `grapheme_clusters_are_never_split`
+    /// locks for the layout engine itself.
+    #[test]
+    fn find_matches_never_splits_a_combining_grapheme_cluster() {
+        let combining_e = "e\u{0301}"; // "é" as base 'e' + combining acute accent
+        let text = format!("caf{combining_e} borrowed word");
+        let lines = vec![plain_line(&text)];
+        let query = format!("caf{combining_e}");
+        let matches = find_matches(&lines, &[], &query);
+        assert_eq!(
+            matches,
+            vec![one_piece(0, 0, 4)],
+            "c, a, f, and the combined e-acute cluster = 4 grapheme columns"
+        );
+    }
+
+    #[test]
+    fn find_matches_empty_query_or_lines_finds_nothing_and_does_not_panic() {
+        let lines = vec![plain_line("some text")];
+        assert!(find_matches(&lines, &[], "").is_empty());
+        assert!(find_matches(&[], &[], "text").is_empty());
+    }
+
+    /// Wires `find_matches` to real `layout_document` output: a paragraph
+    /// that actually wraps at a narrow width must mark at least one
+    /// continuation, while two separate (unwrapped) list items must not be
+    /// glued to each other.
+    #[test]
+    fn continuation_marks_wrapped_paragraph_lines_but_not_separate_list_items() {
+        let html = r##"<html><body>
+            <p>alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron</p>
+            <ul><li>first item</li><li>second item</li></ul>
+        </body></html>"##;
+        let doc = parse_article_html("T", html);
+        let layout = layout_document(&doc, 20, LayoutOptions::default());
+        assert!(
+            layout.continuation.iter().any(|&c| c),
+            "the long paragraph must wrap and mark a continuation"
+        );
+
+        let bullet_lines: Vec<usize> = layout
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| line_text(l).contains('•'))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(bullet_lines.len(), 2, "two separate list items");
+        assert!(
+            !layout.continuation[bullet_lines[0]],
+            "separate list items must not be glued for find purposes"
+        );
+    }
+
+    #[test]
+    fn continuation_length_is_always_one_less_than_lines() {
+        for doc in [
+            parse_article_html("Test Article", FIXTURE),
+            parse_article_html("アラン・チューリング", JA_FIXTURE),
+        ] {
+            let layout = layout_document(&doc, 30, LayoutOptions::default());
+            assert_eq!(layout.continuation.len(), layout.lines.len() - 1);
         }
     }
 }

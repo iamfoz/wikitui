@@ -25,14 +25,35 @@ use ratatui::backend::CrosstermBackend;
 use std::io::{self, Stdout};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc::{self, UnboundedSender};
 
-use api::WikiClient;
+use api::{TitleSuggestion, WikiClient};
 use app::{App, Mode, PageSource};
 use cache::PageCache;
 use cite::CiteStyle;
 use cli::{Cli, Commands, ConfigAction};
 use config::ConfigContext;
 use theme::Theme;
+
+/// How often the loop wakes up while the Search prompt is open, purely so
+/// the typeahead debounce timer (PRD FR-SR-1) has a chance to fire even
+/// when the user pauses mid-query with no new keystroke arriving. Every
+/// other mode still blocks in `event::read()` indefinitely (PRD FR-ACS-2:
+/// no gratuitous redraws/CPU use while idle) — this cost is scoped to
+/// Search mode alone, not paid while reading.
+const TYPEAHEAD_POLL: Duration = Duration::from_millis(30);
+
+/// How many typeahead rows to request/show (PRD FR-SR-1).
+const TYPEAHEAD_LIMIT: u32 = 10;
+
+/// One completed (or failed) typeahead request, tagged with the query it
+/// answers so the receiver can drop it if it's gone stale (`app::
+/// typeahead_is_current`) — PRD FR-SR-1's in-flight cancellation.
+struct TypeaheadOutcome {
+    query: String,
+    result: std::result::Result<Vec<TitleSuggestion>, String>,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -305,6 +326,11 @@ async fn run(
         open_title(client, cache, &mut app, &title).await;
     }
 
+    // Delivers typeahead responses back to the loop (PRD FR-SR-1): fetches
+    // run on spawned tasks, never inline in the loop, so a slow request
+    // can't stall redraws or keystrokes — see `fire_typeahead`.
+    let (typeahead_tx, mut typeahead_rx) = mpsc::unbounded_channel::<TypeaheadOutcome>();
+
     loop {
         // Checked once per turn rather than mid-`event::read()`, which
         // blocks on real input and can't be interrupted without
@@ -317,13 +343,41 @@ async fn run(
 
         terminal.draw(|f| ui::draw(f, &mut app))?;
 
-        // Block until an event arrives instead of redrawing on a timer —
-        // an idle reader shouldn't spin the CPU or spam hide-cursor codes.
-        if let Event::Key(key) = event::read()? {
-            if key.kind != KeyEventKind::Press {
-                continue;
+        if app.mode == Mode::Search {
+            // The only mode that wakes on a timer instead of blocking
+            // forever in `event::read()` — the typeahead debounce needs the
+            // loop to notice time passing even with no new keystroke.
+            // Everywhere else keeps the original block-until-input
+            // behavior (PRD FR-ACS-2: no gratuitous redraws/CPU use idle).
+            if event::poll(TYPEAHEAD_POLL)?
+                && let Event::Key(key) = event::read()?
+                && key.kind == KeyEventKind::Press
+            {
+                handle_key(client, cache, &mut app, key.code, key.modifiers).await;
             }
-            handle_key(client, cache, &mut app, key.code, key.modifiers).await;
+            if let Some(deadline) = app.search_debounce_at
+                && app::debounce_due(deadline, Instant::now())
+            {
+                app.search_debounce_at = None;
+                fire_typeahead(client, &app, &typeahead_tx);
+            }
+            // Non-blocking drain: a response for a query the user has since
+            // typed past (`typeahead_is_current` says no) is silently
+            // discarded — PRD FR-SR-1's in-flight cancellation.
+            while let Ok(outcome) = typeahead_rx.try_recv() {
+                if app::typeahead_is_current(&outcome.query, &app.search_input)
+                    && let Ok(suggestions) = outcome.result
+                {
+                    app.typeahead = suggestions;
+                    app.selected_suggestion = 0;
+                }
+            }
+        } else if let Event::Key(key) = event::read()? {
+            // Block until an event arrives instead of redrawing on a timer —
+            // an idle reader shouldn't spin the CPU or spam hide-cursor codes.
+            if key.kind == KeyEventKind::Press {
+                handle_key(client, cache, &mut app, key.code, key.modifiers).await;
+            }
         }
 
         if app.should_quit {
@@ -332,6 +386,25 @@ async fn run(
     }
 
     Ok(())
+}
+
+/// Spawns the actual HTTP request for one typeahead debounce firing (PRD
+/// FR-SR-1) so it can never block the event loop; the query travels with
+/// the result so a reply that arrives after the user has typed further is
+/// recognizable as stale at the receiving end (`app::typeahead_is_current`)
+/// instead of clobbering a newer, still-relevant dropdown.
+fn fire_typeahead(client: &WikiClient, app: &App, tx: &UnboundedSender<TypeaheadOutcome>) {
+    let query = app.search_input.clone();
+    let lang = app.lang.clone();
+    let client = client.clone();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let result = client
+            .search_title(&lang, &query, TYPEAHEAD_LIMIT)
+            .await
+            .map_err(|e| e.to_string());
+        let _ = tx.send(TypeaheadOutcome { query, result });
+    });
 }
 
 /// `:config reload` and SIGHUP both land here (PRD §6.7): re-resolve
@@ -419,21 +492,49 @@ async fn handle_key(
             // Any key closes the help overlay.
             app.mode = app.prior_mode;
         }
+        // PRD Appendix B's search keybindings: Enter opens the highlighted
+        // typeahead suggestion directly (FR-SR-1); Tab runs a full-text
+        // search of the typed query instead (FR-SR-2's mode toggle) — the
+        // two are deliberately separate actions, not Enter-falls-back-to-
+        // search, so the dropdown and full-text results never fight over
+        // what Enter means.
         Mode::Search => match code {
             KeyCode::Esc => {
                 app.mode = Mode::Reading;
                 app.search_input.clear();
+                app.typeahead.clear();
+                app.search_debounce_at = None;
             }
             KeyCode::Enter => {
+                if let Some(suggestion) = app.typeahead.get(app.selected_suggestion).cloned() {
+                    let title = suggestion.title;
+                    app.typeahead.clear();
+                    app.search_debounce_at = None;
+                    open_title(client, cache, app, &title).await;
+                } else {
+                    app.status = "No suggestion selected — Tab searches full text".to_string();
+                }
+            }
+            KeyCode::Tab => {
                 if !app.search_input.trim().is_empty() {
                     run_search(client, app).await;
                 }
             }
+            KeyCode::Up => app.move_suggestion(false),
+            KeyCode::Down => app.move_suggestion(true),
+            KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => {
+                app.move_suggestion(true)
+            }
+            KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => {
+                app.move_suggestion(false)
+            }
             KeyCode::Backspace => {
                 app.search_input.pop();
+                app.queue_typeahead();
             }
             KeyCode::Char(c) => {
                 app.search_input.push(c);
+                app.queue_typeahead();
             }
             _ => {}
         },
@@ -515,6 +616,12 @@ async fn handle_key(
             KeyCode::Enter => {
                 if let Some(result) = app.results.get(app.selected_result).cloned() {
                     open_title(client, cache, app, &result.title).await;
+                } else if let Some(suggestion) = app.search_suggestion.clone() {
+                    // PRD FR-SR-4 / §7's zero-results row: "Did you mean X?
+                    // (Enter to search)" — re-runs the search with the
+                    // suggested spelling.
+                    app.search_input = suggestion;
+                    run_search(client, app).await;
                 }
             }
             KeyCode::Char('?') => {
@@ -547,6 +654,9 @@ async fn handle_key(
                 KeyCode::Char('/') => {
                     app.mode = Mode::Search;
                     app.search_input.clear();
+                    app.typeahead.clear();
+                    app.search_suggestion = None;
+                    app.search_debounce_at = None;
                 }
                 KeyCode::Char('?') => {
                     app.prior_mode = app.mode;
@@ -738,8 +848,9 @@ async fn execute_command(
 async fn run_search(client: &WikiClient, app: &mut App) {
     app.loading = true;
     match client.search(&app.lang, &app.search_input, 20).await {
-        Ok(results) => {
-            app.results = results;
+        Ok(outcome) => {
+            app.results = outcome.results;
+            app.search_suggestion = outcome.suggestion;
             app.selected_result = 0;
             app.mode = Mode::Results;
         }

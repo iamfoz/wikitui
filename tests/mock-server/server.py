@@ -1,4 +1,4 @@
-import http.server, urllib.parse, json
+import http.server, urllib.parse, json, time
 
 PAGES = {
     "Alan_Turing": """<html><head><title>Alan Turing</title></head><body>
@@ -74,26 +74,160 @@ PAGES["計算機科学"] = """<html><head><title>計算機科学</title></head><
   <p>計算機科学は、情報と計算の理論的基礎、およびそのコンピュータ上への実装と応用に関する研究分野である。</p>
 </body></html>"""
 
+# Typeahead fixtures (FR-SR-1): title + a Wikidata-style one-line
+# description, matched by case-insensitive prefix. Every title here is also
+# a real key in PAGES, so "Enter opens the suggestion" always resolves to a
+# real article instead of a 404 — including the CJK one (FR-ML-6).
+TITLE_SUGGESTIONS = [
+    ("Alan Turing", "British mathematician, logician, cryptanalyst, and computer scientist (1912-1954)"),
+    ("Enigma machine", "German electro-mechanical rotor cipher machine"),
+    ("Computer science", "study of computation, automation, and information"),
+    ("アラン・チューリング", "イギリスの数学者・計算機科学者・暗号解読者 (1912-1954)"),
+    ("計算機科学", "計算と情報に関する学問分野"),
+]
+
+# Full-text search fixtures (FR-SR-2): title, body text to excerpt/match
+# against, and the size/wordcount/last-edit-date fields the PRD's "size,
+# last-edit date" line wants (§5.3 FR-SR-2). Kept as plain prose distinct
+# from PAGES' HTML so excerpting doesn't have to strip markup.
+SEARCH_PAGES = [
+    {
+        "title": "Alan Turing",
+        "description": "British mathematician, logician, cryptanalyst, and computer scientist (1912-1954)",
+        "text": (
+            "Alan Mathison Turing was an English mathematician, computer scientist, logician, "
+            "cryptanalyst, philosopher and theoretical biologist. He was highly influential in "
+            "the development of theoretical computer science, providing a formalisation of the "
+            "concepts of algorithm and computation with the Turing machine."
+        ),
+        "size": 4820,
+        "wordcount": 812,
+        "timestamp": "2026-06-30T10:15:00Z",
+    },
+    {
+        "title": "Enigma machine",
+        "description": "German electro-mechanical rotor cipher machine",
+        "text": (
+            "The Enigma machine is a cipher device developed and used in the early to "
+            "mid-20th century to protect commercial, diplomatic, and military communication."
+        ),
+        "size": 1024,
+        "wordcount": 180,
+        "timestamp": "2026-05-14T08:00:00Z",
+    },
+    {
+        "title": "Computer science",
+        "description": "Study of computation, automation, and information",
+        "text": (
+            "Computer science is the study of computation, information, and automation. "
+            "Computer science spans theoretical disciplines to applied disciplines."
+        ),
+        "size": 512,
+        "wordcount": 90,
+        "timestamp": "2026-04-01T00:00:00Z",
+    },
+]
+
+# Did-you-mean corrections (FR-SR-4 / §7's zero-results row) for queries
+# that hit no SEARCH_PAGES text at all. Keyed lowercase; see
+# `api::SearchOutcome`'s doc comment for why this rides the REST
+# `search/page` response as a schema extension rather than a second
+# Action-API round trip.
+DID_YOU_MEAN = {
+    "alan truing": "Alan Turing",
+    "enigma mahcine": "Enigma machine",
+}
+
+
+def make_excerpt(text, query):
+    """Wraps the first case-insensitive occurrence of `query` in `text` with
+    the same `<span class="searchmatch">` markup the real REST search/page
+    endpoint emits, with a little surrounding context — exercising the
+    client's searchmatch-span parser end to end."""
+    idx = text.lower().find(query.lower())
+    if idx == -1:
+        return text[:120]
+    start = max(0, idx - 40)
+    end = min(len(text), idx + len(query) + 40)
+    prefix = ("…" if start > 0 else "") + text[start:idx]
+    matched = text[idx : idx + len(query)]
+    suffix = text[idx + len(query) : end] + ("…" if end < len(text) else "")
+    return f'{prefix}<span class="searchmatch">{matched}</span>{suffix}'
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         parts = parsed.path.split('/')
+        params = urllib.parse.parse_qs(parsed.query)
+
         if '/page/' in parsed.path and parsed.path.endswith('/html'):
-            title = urllib.parse.unquote(parts[-2])
-            html = PAGES.get(title)
-            if html is None:
-                self.send_response(404)
-                self.end_headers()
-                return
-            body = html.encode()
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/html')
-            self.send_header('Content-Length', str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._serve_article(parts)
+        elif parsed.path.endswith('/search/title'):
+            self._serve_search_title(params)
+        elif parsed.path.endswith('/search/page'):
+            self._serve_search_page(params)
         else:
             self.send_response(404)
             self.end_headers()
+
+    def _serve_article(self, parts):
+        title = urllib.parse.unquote(parts[-2])
+        html = PAGES.get(title)
+        if html is None:
+            self.send_response(404)
+            self.end_headers()
+            return
+        body = html.encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_search_title(self, params):
+        # Artificial latency (PRD FR-SR-1 / §6.8: "debounce 150-250ms") so
+        # manual pty verification can actually see the typeahead dropdown
+        # arrive after the debounce, instead of it resolving instantly.
+        time.sleep(0.1)
+        q = (params.get('q', [''])[0]).lower()
+        limit = int(params.get('limit', ['10'])[0])
+        hits = [(t, d) for t, d in TITLE_SUGGESTIONS if t.lower().startswith(q)]
+        pages = [{"title": t, "description": d} for t, d in hits[:limit]]
+        self._send_json({"pages": pages})
+
+    def _serve_search_page(self, params):
+        q = params.get('q', [''])[0]
+        limit = int(params.get('limit', ['20'])[0])
+        ql = q.lower().strip()
+        hits = [
+            p for p in SEARCH_PAGES
+            if ql and (ql in p["title"].lower() or ql in p["text"].lower())
+        ]
+        hits = hits[:limit]
+        pages = [
+            {
+                "title": p["title"],
+                "description": p["description"],
+                "excerpt": make_excerpt(p["text"], q),
+                "size": p["size"],
+                "wordcount": p["wordcount"],
+                "timestamp": p["timestamp"],
+            }
+            for p in hits
+        ]
+        body = {"pages": pages}
+        if not pages and ql in DID_YOU_MEAN:
+            body["suggestion"] = DID_YOU_MEAN[ql]
+        self._send_json(body)
+
+    def _send_json(self, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def log_message(self, *a):
         pass

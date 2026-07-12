@@ -1,12 +1,17 @@
-use crate::api::SearchResult;
+use std::time::{Duration, Instant};
+
+use crate::api::{SearchResult, TitleSuggestion};
 use crate::cite::CiteStyle;
 use crate::config::ConfigContext;
-use crate::doc::{
-    Citation, Document, LinkRef, SectionRef, collect_links, matching_blocks, section_outline,
-};
+use crate::doc::{Citation, Document, LinkRef, SectionRef, collect_links, section_outline};
 use crate::layout::{self, Layout, LayoutOptions};
 use crate::research::{ResearchStore, SavedCitation};
 use crate::theme::Theme;
+
+/// PRD FR-SR-1's typeahead debounce window (spec calls for 150-250ms; 200ms
+/// splits the difference). Reset on every keystroke while the Search prompt
+/// has a query, so a burst of typing only fires one request, after it stops.
+pub const TYPEAHEAD_DEBOUNCE: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -65,6 +70,22 @@ pub struct App {
     pub search_input: String,
     pub results: Vec<SearchResult>,
     pub selected_result: usize,
+    /// PRD FR-SR-1's typeahead dropdown: title completions for the current
+    /// `search_input`, most-recently-applied response only (stale ones are
+    /// discarded before they ever reach this field — see
+    /// `typeahead_is_current`).
+    pub typeahead: Vec<TitleSuggestion>,
+    /// Which `typeahead` entry Up/Down/Ctrl-n/Ctrl-p has highlighted; Enter
+    /// opens this one directly.
+    pub selected_suggestion: usize,
+    /// When the typeahead debounce timer should fire next, set on every
+    /// keystroke in Search mode (`queue_typeahead`) and cleared once sent.
+    /// `None` means no request is queued.
+    pub search_debounce_at: Option<Instant>,
+    /// PRD FR-SR-4 / §7's "did you mean" suggestion from the last full-text
+    /// search, shown by the zero-results view; `None` when the search had
+    /// results or hasn't run yet.
+    pub search_suggestion: Option<String>,
     pub should_quit: bool,
     pub lang: String,
     pub loading: bool,
@@ -76,10 +97,21 @@ pub struct App {
     pub no_color: bool,
     /// In-page find (PRD FR-NV-6): what the reader typed into `Ctrl-f`.
     pub find_input: String,
-    /// Lines to scroll to for each block matching `find_input`, in reading
-    /// order.
+    /// The laid-out line each occurrence of `find_input` starts on, in
+    /// reading (top-to-bottom, left-to-right) order — one entry per
+    /// individual occurrence now (char-level, FR-NV-6b), not one per
+    /// matching block as before. `find_matches[i]` is always
+    /// `find_occurrences[i].pieces[0].0`; kept as its own field because
+    /// scrolling and the "N/M" counter only ever need the line.
     pub find_matches: Vec<u16>,
-    /// Which entry in `find_matches` `n`/`N` last jumped to.
+    /// Every occurrence of `find_input`, same order as `find_matches` — the
+    /// data `ui::paint_document` needs to highlight every match (each of an
+    /// occurrence's pieces, plural only when it straddled a line wrap) and
+    /// emphasize the current one, at char precision, with every piece of it
+    /// getting the emphasis rather than just the first.
+    pub find_occurrences: Vec<layout::Occurrence>,
+    /// Which entry in `find_matches`/`find_occurrences` `n`/`N` last jumped
+    /// to.
     pub find_index: usize,
     /// Research mode's candidate list for the open article: element 0 is
     /// always the article's own citation (`research::self_citation`);
@@ -153,6 +185,10 @@ impl App {
             search_input: String::new(),
             results: Vec::new(),
             selected_result: 0,
+            typeahead: Vec::new(),
+            selected_suggestion: 0,
+            search_debounce_at: None,
+            search_suggestion: None,
             should_quit: false,
             lang,
             loading: false,
@@ -161,6 +197,7 @@ impl App {
             no_color,
             find_input: String::new(),
             find_matches: Vec::new(),
+            find_occurrences: Vec::new(),
             find_index: 0,
             citations: Vec::new(),
             selected_citation: 0,
@@ -467,22 +504,31 @@ impl App {
     pub fn clear_find(&mut self) {
         self.find_input.clear();
         self.find_matches.clear();
+        self.find_occurrences.clear();
         self.find_index = 0;
     }
 
-    /// Recomputes `find_matches` for the current `find_input` against the
-    /// open document and jumps to the first hit, if any. Matches are the
-    /// laid-out lines the matching blocks start on (mapped through the cached
-    /// layout), so `n`/`N` land on the right rows on wrapped pages.
+    /// Recomputes every occurrence of `find_input` in the open document and
+    /// jumps to the first hit, if any (PRD FR-NV-6). Char-level, via
+    /// `layout::find_matches` on the cached layout — smart-case and
+    /// highlight-all fall out of that function, one `Occurrence` per hit
+    /// (never split back into one entry per line-piece: that would
+    /// double-count a match that straddles a wrap). `find_matches` mirrors
+    /// each occurrence's first piece's line, for the scroll/counter code
+    /// that only ever needed a line to jump to.
     pub fn update_find(&mut self) {
         self.ensure_layout();
-        self.find_matches = match (&self.doc, &self.layout) {
-            (Some(doc), Some(layout)) => matching_blocks(doc, &self.find_input)
-                .into_iter()
-                .filter_map(|b| layout.block_lines.get(b).map(|&l| l as u16))
-                .collect(),
-            _ => Vec::new(),
+        self.find_occurrences = match &self.layout {
+            Some(layout) => {
+                layout::find_matches(&layout.lines, &layout.continuation, &self.find_input)
+            }
+            None => Vec::new(),
         };
+        self.find_matches = self
+            .find_occurrences
+            .iter()
+            .filter_map(|occ| occ.pieces.first().map(|&(line, _)| line as u16))
+            .collect();
         self.find_index = 0;
         if let Some(&line) = self.find_matches.first() {
             self.scroll = self.center_scroll(line);
@@ -577,6 +623,61 @@ impl App {
 
     pub fn scroll_to_bottom(&mut self) {
         self.scroll = self.max_scroll;
+    }
+
+    /// Arms (or disarms) the typeahead debounce timer on every Search-mode
+    /// keystroke (PRD FR-SR-1): an empty query cancels outright — the
+    /// dropdown has nothing to complete and shouldn't hold stale
+    /// suggestions from a moment ago.
+    pub fn queue_typeahead(&mut self) {
+        if self.search_input.trim().is_empty() {
+            self.search_debounce_at = None;
+            self.typeahead.clear();
+        } else {
+            self.search_debounce_at = Some(Instant::now() + TYPEAHEAD_DEBOUNCE);
+        }
+    }
+
+    /// Moves the highlighted typeahead suggestion, wrapping like every other
+    /// selectable list in the app. A no-op with nothing to select.
+    pub fn move_suggestion(&mut self, forward: bool) {
+        if self.typeahead.is_empty() {
+            return;
+        }
+        let len = self.typeahead.len();
+        self.selected_suggestion = if forward {
+            (self.selected_suggestion + 1) % len
+        } else {
+            (self.selected_suggestion + len - 1) % len
+        };
+    }
+}
+
+/// Pure debounce-elapsed check (PRD FR-SR-1), isolated from the real clock
+/// and the channel/async plumbing around it so the decision itself is
+/// trivially unit-testable: has `now` reached the `deadline` a keystroke
+/// armed?
+pub fn debounce_due(deadline: Instant, now: Instant) -> bool {
+    now >= deadline
+}
+
+/// PRD FR-SR-1's in-flight-cancellation rule, as a pure decision: a
+/// typeahead response is applied only if the query it answers is still the
+/// one in the box. A response for a query the user has since typed past is
+/// stale and must be silently dropped — this is the whole discard decision,
+/// deliberately kept free of the channel/spawn machinery that delivers the
+/// response so it can be tested in isolation from timing and async.
+pub fn typeahead_is_current(response_query: &str, live_query: &str) -> bool {
+    response_query == live_query
+}
+
+/// PRD FR-SR-4 / §7's "Search: zero results" copy: the did-you-mean
+/// suggestion when the server offered one, with the exact "(Enter to
+/// search)" affordance §7 specifies; a plain "no results" line otherwise.
+pub fn zero_results_message(query: &str, suggestion: Option<&str>) -> String {
+    match suggestion {
+        Some(s) => format!("No results for \"{query}\". Did you mean {s}? (Enter to search)"),
+        None => format!("No results for \"{query}\""),
     }
 }
 
@@ -1189,5 +1290,210 @@ mod tests {
         assert!(!dir.join("bibliography-apa.md").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn debounce_due_fires_only_once_the_deadline_has_passed() {
+        let t0 = Instant::now();
+        let deadline = t0 + Duration::from_millis(200);
+        assert!(!debounce_due(deadline, t0 + Duration::from_millis(199)));
+        assert!(debounce_due(deadline, t0 + Duration::from_millis(200)));
+        assert!(debounce_due(deadline, t0 + Duration::from_millis(500)));
+    }
+
+    #[test]
+    fn typeahead_is_current_discards_stale_responses() {
+        assert!(typeahead_is_current("Alan Tur", "Alan Tur"));
+        assert!(
+            !typeahead_is_current("Alan Tur", "Alan Turi"),
+            "a response for an earlier keystroke's query must be dropped"
+        );
+        assert!(!typeahead_is_current("Alan Tur", ""));
+    }
+
+    #[test]
+    fn zero_results_message_offers_did_you_mean_when_present() {
+        assert_eq!(
+            zero_results_message("Alan Truing", Some("Alan Turing")),
+            "No results for \"Alan Truing\". Did you mean Alan Turing? (Enter to search)"
+        );
+        assert_eq!(
+            zero_results_message("xyzzy", None),
+            "No results for \"xyzzy\""
+        );
+    }
+
+    #[test]
+    fn queue_typeahead_arms_the_debounce_for_a_nonempty_query_and_disarms_for_empty() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.search_input = "Alan".to_string();
+        app.queue_typeahead();
+        assert!(app.search_debounce_at.is_some());
+
+        app.search_input = "   ".to_string(); // whitespace-only counts as empty
+        app.queue_typeahead();
+        assert!(app.search_debounce_at.is_none());
+        assert!(
+            app.typeahead.is_empty(),
+            "clearing the query must drop stale suggestions too"
+        );
+    }
+
+    #[test]
+    fn move_suggestion_wraps_in_both_directions() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.typeahead = vec![
+            TitleSuggestion {
+                title: "A".into(),
+                description: None,
+            },
+            TitleSuggestion {
+                title: "B".into(),
+                description: None,
+            },
+            TitleSuggestion {
+                title: "C".into(),
+                description: None,
+            },
+        ];
+
+        assert_eq!(app.selected_suggestion, 0);
+        app.move_suggestion(true);
+        assert_eq!(app.selected_suggestion, 1);
+        app.move_suggestion(false);
+        assert_eq!(app.selected_suggestion, 0);
+        app.move_suggestion(false); // wraps backward past the start
+        assert_eq!(app.selected_suggestion, 2);
+        app.move_suggestion(true); // wraps forward past the end
+        assert_eq!(app.selected_suggestion, 0);
+    }
+
+    #[test]
+    fn move_suggestion_on_empty_list_is_a_no_op() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.move_suggestion(true);
+        assert_eq!(app.selected_suggestion, 0);
+    }
+
+    /// FR-NV-6b: highlighting now covers every literal occurrence, not just
+    /// one entry per matching block — locks the upgrade this feature made
+    /// over the old block-granularity behavior.
+    #[test]
+    fn update_find_counts_every_occurrence_not_just_every_block() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(crate::doc::parse_article_html(
+            "Test",
+            "<html><body><p>turing turing turing</p></body></html>",
+        ));
+        app.max_scroll = 100;
+        app.find_input = "turing".to_string();
+        app.update_find();
+
+        assert_eq!(
+            app.find_matches.len(),
+            3,
+            "one match per occurrence, all on the same block/line"
+        );
+        assert_eq!(app.find_occurrences.len(), 3);
+        // All three occurrences land on the same line (the block didn't
+        // wrap), each a single piece, at increasing column ranges.
+        let cols: Vec<usize> = app
+            .find_occurrences
+            .iter()
+            .map(|occ| {
+                assert_eq!(occ.pieces.len(), 1, "no wrap here, so no split occurrence");
+                occ.pieces[0].1.start
+            })
+            .collect();
+        assert!(cols.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    /// The bug this data model exists to avoid: a query that straddles a
+    /// visual line wrap must count as ONE occurrence (not two). Bypasses
+    /// real wrapping (whose exact break point is an implementation detail)
+    /// by handing `update_find` a hand-built `Layout` where the wrap is
+    /// exactly where the test needs it — `App` only ever delegates to
+    /// `layout::find_matches` and assigns its result verbatim, so this
+    /// pins that delegation stays a straight passthrough, never a
+    /// re-flatten-per-line that would double-count a split match (the bug
+    /// interactive verification caught before this test existed).
+    #[test]
+    fn update_find_treats_a_wrapped_match_as_one_occurrence() {
+        use crate::layout::{LaidLine, LaidSpan, Layout, LayoutOptions, SpanKind};
+
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(crate::doc::parse_article_html(
+            "Test",
+            "<html><body><p>placeholder</p></body></html>",
+        ));
+        app.layout = Some(Layout {
+            width: 20,
+            options: LayoutOptions::default(),
+            lines: vec![
+                LaidLine {
+                    spans: vec![LaidSpan {
+                        text: "computer".to_string(),
+                        kind: SpanKind::Plain,
+                    }],
+                },
+                LaidLine {
+                    spans: vec![LaidSpan {
+                        text: "science is fun".to_string(),
+                        kind: SpanKind::Plain,
+                    }],
+                },
+            ],
+            block_lines: vec![0],
+            link_lines: vec![],
+            continuation: vec![true],
+        });
+        app.layout_width = 20; // matches the hand-built Layout's `width`, so `ensure_layout` (which `update_find` calls) sees it as fresh and doesn't discard it
+        app.max_scroll = 100;
+
+        app.find_input = "computer science".to_string();
+        app.update_find();
+
+        assert_eq!(
+            app.find_occurrences.len(),
+            1,
+            "one query occurrence must stay one entry even though a wrap splits it"
+        );
+        assert_eq!(
+            app.find_occurrences[0].pieces.len(),
+            2,
+            "split across both lines"
+        );
+        assert_eq!(app.find_matches.len(), 1);
+    }
+
+    /// Smart-case (FR-NV-6a) reaches all the way through `App::update_find`,
+    /// not just the lower-level `layout::find_matches` it delegates to.
+    #[test]
+    fn update_find_is_smart_case() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(crate::doc::parse_article_html(
+            "Test",
+            "<html><body><p>Alan Turing was here</p></body></html>",
+        ));
+        app.max_scroll = 100;
+
+        app.find_input = "turing".to_string();
+        app.update_find();
+        assert_eq!(
+            app.find_matches.len(),
+            1,
+            "lowercase query is case-insensitive"
+        );
+
+        app.find_input = "Turing".to_string();
+        app.update_find();
+        assert_eq!(app.find_matches.len(), 1, "matching case still matches");
+
+        app.find_input = "TURING".to_string();
+        app.update_find();
+        assert!(
+            app.find_matches.is_empty(),
+            "wrong-case query with an uppercase letter must not match"
+        );
     }
 }

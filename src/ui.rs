@@ -5,10 +5,11 @@ use ratatui::layout::{Constraint, Direction, Layout as UiLayout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span as RSpan, Text};
 use ratatui::widgets::{Block as UiBlock, Borders, Clear, List, ListItem, ListState, Paragraph};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::app::{App, Mode};
 use crate::doc::LinkRef;
-use crate::layout::{LaidLine, Layout, SpanKind};
+use crate::layout::{LaidLine, Layout, MatchSpan, SpanKind};
 use crate::theme::Theme;
 
 /// Every article title opened this session — back-stack, forward-stack, and
@@ -109,6 +110,21 @@ fn kind_style(
     }
 }
 
+/// The in-page-find highlight style (PRD FR-NV-6b): the theme's `match`
+/// slot, bold so it reads at a glance against any other semantic color it
+/// overrides (`Style::patch`'d on top of the span's own `kind_style`).
+fn match_style(theme: &Theme, no_color: bool) -> Style {
+    colored(no_color, theme.match_fg).add_modifier(Modifier::BOLD)
+}
+
+/// Paints one laid-out line, splicing in find-match highlighting where
+/// `matches` (ascending, non-overlapping grapheme-column ranges local to
+/// this line) says to. `is_current` marks exactly one of those ranges (the
+/// `n`/`N` cursor) for extra emphasis — a closure rather than a plain value
+/// so the caller can compare `(line, range)` instead of `range` alone,
+/// since two different lines can easily share an identical column range
+/// (e.g. every row of a list starting at the same indent).
+#[allow(clippy::too_many_arguments)]
 fn paint_line(
     line: &LaidLine,
     focused_link: Option<usize>,
@@ -116,17 +132,44 @@ fn paint_line(
     visited: &HashSet<&str>,
     theme: &Theme,
     no_color: bool,
+    matches: &[MatchSpan],
+    is_current: &dyn Fn(MatchSpan) -> bool,
 ) -> Line<'static> {
-    let mut spans: Vec<RSpan<'static>> = line
-        .spans
-        .iter()
-        .map(|s| {
-            RSpan::styled(
-                s.text.clone(),
-                kind_style(&s.kind, focused_link, links, visited, theme, no_color),
-            )
-        })
-        .collect();
+    let mut spans: Vec<RSpan<'static>> = Vec::new();
+    let mut col = 0usize; // grapheme column from the start of the line
+    let mut mi = 0usize; // index into `matches`, advances monotonically
+
+    for s in &line.spans {
+        let base_style = kind_style(&s.kind, focused_link, links, visited, theme, no_color);
+        let graphemes: Vec<&str> = s.text.graphemes(true).collect();
+        let mut cursor = 0usize;
+        while cursor < graphemes.len() {
+            let abs = col + cursor;
+            while mi < matches.len() && matches[mi].end <= abs {
+                mi += 1;
+            }
+            if mi < matches.len() && matches[mi].start <= abs {
+                let end_in_span = (matches[mi].end - col).min(graphemes.len());
+                let text: String = graphemes[cursor..end_in_span].concat();
+                let mut style = base_style.patch(match_style(theme, no_color));
+                if is_current(matches[mi]) {
+                    style = style.add_modifier(Modifier::REVERSED);
+                }
+                spans.push(RSpan::styled(text, style));
+                cursor = end_in_span;
+            } else {
+                let next_start = if mi < matches.len() {
+                    (matches[mi].start - col).min(graphemes.len())
+                } else {
+                    graphemes.len()
+                };
+                let text: String = graphemes[cursor..next_start].concat();
+                spans.push(RSpan::styled(text, base_style));
+                cursor = next_start;
+            }
+        }
+        col += graphemes.len();
+    }
     // Image placeholders note whether the active theme would actually render
     // the image; kept out of the (theme-independent) layout and applied here.
     if !theme.images && line.spans.iter().any(|s| matches!(s.kind, SpanKind::Image)) {
@@ -140,6 +183,15 @@ fn paint_line(
 
 /// Paint a laid-out document into styled text — one laid line per row, no
 /// runtime wrapping (the layout already broke lines to width).
+///
+/// `find_occurrences` is `App::find_occurrences` verbatim — one entry per
+/// query occurrence, in document order, each carrying one or more `(line,
+/// range)` pieces (more than one only when a wrap split it) — and
+/// `find_index` is `App::find_index`. Every piece of the occurrence `n`/`N`
+/// last landed on gets the current-match emphasis, not just its first
+/// piece, so a match straddling a wrap reads as one highlighted unit
+/// (PRD FR-NV-6b); every other occurrence gets just the plain highlight.
+#[allow(clippy::too_many_arguments)]
 fn paint_document(
     layout: &Layout,
     focused_link: Option<usize>,
@@ -147,29 +199,94 @@ fn paint_document(
     visited: &HashSet<&str>,
     theme: &Theme,
     no_color: bool,
+    find_occurrences: &[crate::layout::Occurrence],
+    find_index: usize,
 ) -> Text<'static> {
+    let mut per_line: Vec<Vec<MatchSpan>> = vec![Vec::new(); layout.lines.len()];
+    for occurrence in find_occurrences {
+        for &(line, range) in &occurrence.pieces {
+            if let Some(slot) = per_line.get_mut(line) {
+                slot.push(range);
+            }
+        }
+    }
+    let current_pieces: &[(usize, MatchSpan)] = find_occurrences
+        .get(find_index)
+        .map(|occ| occ.pieces.as_slice())
+        .unwrap_or(&[]);
+
     Text::from(
         layout
             .lines
             .iter()
-            .map(|l| paint_line(l, focused_link, links, visited, theme, no_color))
+            .enumerate()
+            .map(|(i, l)| {
+                let is_current = |m: MatchSpan| current_pieces.contains(&(i, m));
+                paint_line(
+                    l,
+                    focused_link,
+                    links,
+                    visited,
+                    theme,
+                    no_color,
+                    &per_line[i],
+                    &is_current,
+                )
+            })
             .collect::<Vec<_>>(),
     )
 }
 
-/// The search-excerpt field arrives with `<span class="searchmatch">` tags
-/// wrapping matched terms; the results list is plain-styled for now, so
-/// strip them down to plain text.
-fn strip_tags(html: &str) -> String {
-    let mut out = String::with_capacity(html.len());
-    let mut in_tag = false;
-    for ch in html.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => out.push(ch),
-            _ => {}
+/// Parses the REST search API's highlighted excerpt markup (PRD §6.2 rule
+/// 5 / Appendix A: `<span class="searchmatch">…</span>` wraps each matched
+/// term) into plain-text runs tagged with whether they're inside a match,
+/// for `draw_results` to paint in `theme.match_fg` (FR-SR-2) instead of the
+/// old plain-strip behavior this replaces. Any other markup the API might
+/// emit is dropped like plain HTML, matching that old behavior.
+///
+/// Hostile-markup safe: nesting is tracked with a depth counter rather than
+/// a boolean, so `<span class="searchmatch">a<span class="searchmatch">b</span>c</span>`
+/// stays highlighted throughout instead of dropping out after the inner
+/// close; an unclosed opening span highlights to the end of the string
+/// instead of losing the rest; a stray closing tag with no opener
+/// saturates at depth zero instead of underflowing. Never panics on
+/// malformed input.
+pub fn parse_searchmatch(html: &str) -> Vec<(String, bool)> {
+    const OPEN: &str = "<span class=\"searchmatch\">";
+    const CLOSE: &str = "</span>";
+    let mut out: Vec<(String, bool)> = Vec::new();
+    let mut depth: u32 = 0;
+    let mut current = String::new();
+    let mut rest = html;
+
+    while !rest.is_empty() {
+        if let Some(tail) = rest.strip_prefix(OPEN) {
+            if !current.is_empty() {
+                out.push((std::mem::take(&mut current), depth > 0));
+            }
+            depth += 1;
+            rest = tail;
+        } else if let Some(tail) = rest.strip_prefix(CLOSE) {
+            if !current.is_empty() {
+                out.push((std::mem::take(&mut current), depth > 0));
+            }
+            depth = depth.saturating_sub(1);
+            rest = tail;
+        } else if rest.starts_with('<') {
+            // Any other tag, or a lone unmatched '<': drop through the next
+            // '>', or the rest of the string if it's never terminated.
+            match rest.find('>') {
+                Some(i) => rest = &rest[i + 1..],
+                None => break,
+            }
+        } else {
+            let ch_len = rest.chars().next().map(char::len_utf8).unwrap_or(1);
+            current.push_str(&rest[..ch_len]);
+            rest = &rest[ch_len..];
         }
+    }
+    if !current.is_empty() {
+        out.push((current, depth > 0));
     }
     out
 }
@@ -200,6 +317,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     draw_status_bar(frame, app, chunks[1]);
+
+    // The typeahead dropdown floats over the reading view, anchored just
+    // above the prompt it belongs to (PRD FR-SR-1) — drawn after the status
+    // bar so it layers on top, same ordering as the help overlay below.
+    if app.mode == Mode::Search && !app.typeahead.is_empty() {
+        draw_search_suggestions(frame, app, chunks[0]);
+    }
 
     if app.mode == Mode::Help {
         draw_help_overlay(frame, app, area);
@@ -234,6 +358,8 @@ fn draw_reading(frame: &mut Frame, app: &mut App, area: Rect) {
                 &visited,
                 &app.theme,
                 app.no_color,
+                &app.find_occurrences,
+                app.find_index,
             );
             let paragraph = Paragraph::new(text)
                 .style(base_style(&app.theme, app.no_color))
@@ -272,6 +398,11 @@ fn render_selectable_list(frame: &mut Frame, list: List, area: Rect, selected: u
 }
 
 fn draw_results(frame: &mut Frame, app: &App, area: Rect) {
+    if app.results.is_empty() {
+        draw_zero_results(frame, app, area);
+        return;
+    }
+
     let items: Vec<ListItem> = app
         .results
         .iter()
@@ -288,17 +419,31 @@ fn draw_results(frame: &mut Frame, app: &App, area: Rect) {
                 )));
             }
             if let Some(excerpt) = &r.excerpt {
-                // The API returns highlight markup as HTML <span> tags around
-                // matched terms; strip tags here since the results list is
-                // plain-styled (FR-SR-2's full "highlighted snippet" styling
-                // is future work, see PRD FR-SR-2).
-                let plain = strip_tags(excerpt);
-                if !plain.is_empty() {
-                    lines.push(Line::from(RSpan::styled(
-                        plain,
-                        colored(app.no_color, app.theme.dim).add_modifier(Modifier::ITALIC),
-                    )));
+                // FR-SR-2: paint the API's own highlighted terms in
+                // `theme.match_fg` instead of stripping the markup down to
+                // plain text — the rest of the snippet stays dim italic.
+                let runs = parse_searchmatch(excerpt);
+                if runs.iter().any(|(text, _)| !text.trim().is_empty()) {
+                    let spans: Vec<RSpan<'static>> = runs
+                        .into_iter()
+                        .map(|(text, is_match)| {
+                            let style = if is_match {
+                                colored(app.no_color, app.theme.match_fg)
+                                    .add_modifier(Modifier::BOLD | Modifier::ITALIC)
+                            } else {
+                                colored(app.no_color, app.theme.dim).add_modifier(Modifier::ITALIC)
+                            };
+                            RSpan::styled(text, style)
+                        })
+                        .collect();
+                    lines.push(Line::from(spans));
                 }
+            }
+            if let Some(meta) = result_meta_line(r) {
+                lines.push(Line::from(RSpan::styled(
+                    meta,
+                    colored(app.no_color, app.theme.dim),
+                )));
             }
             let style = if i == app.selected_result {
                 colored_bg(app.no_color, app.theme.selected_fg, app.theme.selected_bg)
@@ -318,6 +463,108 @@ fn draw_results(frame: &mut Frame, app: &App, area: Rect) {
         .style(base_style(&app.theme, app.no_color))
         .block(UiBlock::default().borders(Borders::ALL).title(title));
     render_selectable_list(frame, list, area, app.selected_result);
+}
+
+/// FR-SR-2's "size, wordcount, last-edit date" line: omits whatever fields
+/// the endpoint didn't provide, and the whole line if it provided none —
+/// callers never see a line of empty punctuation.
+fn result_meta_line(r: &crate::api::SearchResult) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(size) = r.size {
+        parts.push(human_bytes(size));
+    }
+    if let Some(words) = r.wordcount {
+        parts.push(format!("{words} words"));
+    }
+    if let Some(ts) = &r.timestamp {
+        parts.push(format!("edited {}", ts.get(..10).unwrap_or(ts)));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+fn human_bytes(bytes: u64) -> String {
+    if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
+/// PRD FR-SR-4 / §7's "Search: zero results" row: offers the did-you-mean
+/// suggestion (when the server sent one) in place of an empty list, with
+/// the exact "(Enter to search)" affordance §7 specifies.
+fn draw_zero_results(frame: &mut Frame, app: &App, area: Rect) {
+    let message =
+        crate::app::zero_results_message(&app.search_input, app.search_suggestion.as_deref());
+    let text = Text::from(vec![
+        Line::from(""),
+        Line::from(RSpan::styled(
+            message,
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+    ]);
+    let title = format!("Results for \"{}\" (0 found)", app.search_input);
+    frame.render_widget(
+        Paragraph::new(text)
+            .style(base_style(&app.theme, app.no_color))
+            .block(UiBlock::default().borders(Borders::ALL).title(title)),
+        area,
+    );
+}
+
+/// FR-SR-1's typeahead dropdown: floats over the reading view, anchored to
+/// the bottom of `content_area` — just above the status-bar prompt line
+/// it's completing. Reuses the same per-item-styled selectable-list
+/// pattern as `draw_results`/`draw_toc` rather than introducing a second
+/// selection-styling mechanism.
+fn draw_search_suggestions(frame: &mut Frame, app: &App, content_area: Rect) {
+    let visible = app.typeahead.len().clamp(1, 8) as u16;
+    let height = (visible * 2 + 2).min(content_area.height);
+    let width = content_area.width.clamp(20, 70);
+    let popup = Rect {
+        x: content_area.x,
+        y: content_area
+            .y
+            .saturating_add(content_area.height)
+            .saturating_sub(height),
+        width,
+        height,
+    };
+
+    let items: Vec<ListItem> = app
+        .typeahead
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let mut lines = vec![Line::from(RSpan::styled(
+                s.title.clone(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ))];
+            if let Some(desc) = &s.description {
+                lines.push(Line::from(RSpan::styled(
+                    desc.clone(),
+                    colored(app.no_color, app.theme.dim),
+                )));
+            }
+            let style = if i == app.selected_suggestion {
+                colored_bg(app.no_color, app.theme.selected_fg, app.theme.selected_bg)
+            } else {
+                Style::default()
+            };
+            ListItem::new(lines).style(style)
+        })
+        .collect();
+
+    let list = List::new(items)
+        .style(base_style(&app.theme, app.no_color))
+        .block(
+            UiBlock::default()
+                .borders(Borders::ALL)
+                .title("Suggestions"),
+        );
+
+    frame.render_widget(Clear, popup);
+    render_selectable_list(frame, list, popup, app.selected_suggestion);
 }
 
 fn draw_toc(frame: &mut Frame, app: &App, area: Rect) {
@@ -443,7 +690,14 @@ fn draw_library(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let text = match app.mode {
-        Mode::Search => format!("/{}", app.search_input),
+        Mode::Search if app.typeahead.is_empty() => format!(
+            "/{}   Tab: full-text search   Esc: cancel",
+            app.search_input
+        ),
+        Mode::Search => format!(
+            "/{}   \u{2191}/\u{2193} or Ctrl-n/p: move   Enter: open   Tab: full-text search",
+            app.search_input
+        ),
         Mode::Command => format!(":{}", app.command_input),
         Mode::Find if app.find_matches.is_empty() && !app.find_input.is_empty() => {
             format!("find: {} (no matches)", app.find_input)
@@ -457,6 +711,9 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             )
         }
         Mode::Find => format!("find: {}", app.find_input),
+        Mode::Results if app.results.is_empty() && app.search_suggestion.is_some() => {
+            "Enter: search the suggestion   Esc: cancel".to_string()
+        }
         Mode::Results => "Enter: open   Esc: cancel   j/k: move".to_string(),
         Mode::Toc => "Enter: jump to section   Esc: cancel   j/k: move".to_string(),
         Mode::Research => "Enter/s: save citation   R: library   Esc: done   j/k: move".to_string(),
@@ -534,8 +791,8 @@ fn draw_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(":            command line (:open, :lang, :theme, :export, :q)"),
         Line::from("r            research mode: cite this page & its sources"),
         Line::from("R            library: browse/export saved bibliography"),
-        Line::from("/            search Wikipedia"),
-        Line::from("Ctrl-f       find in this page, n/N: cycle matches"),
+        Line::from("/            search: type for suggestions, Enter opens, Tab full-text"),
+        Line::from("Ctrl-f       find in this page (smart-case), n/N: cycle matches"),
         Line::from("Esc          cancel / close"),
         Line::from("?            toggle this help"),
         Line::from("q            quit"),
@@ -580,7 +837,7 @@ mod tests {
 
         let layout = layout_document(&doc, 80, LayoutOptions::default());
         let theme = Theme::terminal();
-        let text = paint_document(&layout, None, &[], &HashSet::new(), &theme, false);
+        let text = paint_document(&layout, None, &[], &HashSet::new(), &theme, false, &[], 0);
 
         for section in &sections {
             let line = layout.block_lines[section.block];
@@ -642,7 +899,7 @@ mod tests {
 
         let theme = Theme::full();
         let layout = layout_document(&doc, 80, LayoutOptions::default());
-        let text = paint_document(&layout, None, &links, &visited, &theme, false);
+        let text = paint_document(&layout, None, &links, &visited, &theme, false, &[], 0);
 
         let paragraph_line = text
             .lines
@@ -666,6 +923,184 @@ mod tests {
         assert_ne!(
             theme.link_visited, theme.link,
             "the two colors must actually differ for this test to mean anything"
+        );
+    }
+
+    #[test]
+    fn parse_searchmatch_splits_matched_and_plain_runs() {
+        let runs =
+            parse_searchmatch(r#"Alan <span class="searchmatch">Turing</span> was born in 1912"#);
+        assert_eq!(
+            runs,
+            vec![
+                ("Alan ".to_string(), false),
+                ("Turing".to_string(), true),
+                (" was born in 1912".to_string(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_searchmatch_treats_nested_spans_as_still_matched() {
+        // Real MediaWiki output never nests, but the parser must not corrupt
+        // state (or panic) if a hostile/malformed response does.
+        let runs = parse_searchmatch(
+            r#"<span class="searchmatch">a<span class="searchmatch">b</span>c</span>d"#,
+        );
+        assert_eq!(
+            runs,
+            vec![
+                ("a".to_string(), true),
+                ("b".to_string(), true),
+                ("c".to_string(), true),
+                ("d".to_string(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_searchmatch_unclosed_span_highlights_to_the_end() {
+        let runs = parse_searchmatch(r#"before <span class="searchmatch">after"#);
+        assert_eq!(
+            runs,
+            vec![("before ".to_string(), false), ("after".to_string(), true)]
+        );
+    }
+
+    #[test]
+    fn parse_searchmatch_stray_closing_tag_does_not_underflow_or_panic() {
+        let runs = parse_searchmatch("before</span> middle </span>after");
+        assert_eq!(
+            runs,
+            vec![
+                ("before".to_string(), false),
+                (" middle ".to_string(), false),
+                ("after".to_string(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_searchmatch_strips_other_markup_outside_spans() {
+        let runs = parse_searchmatch(r#"<b>bold</b> <span class="searchmatch">hit</span>"#);
+        assert_eq!(
+            runs,
+            // The space between the tags is real text, not markup, and
+            // stays — only the `<b>`/`</b>` tags themselves are dropped.
+            vec![("bold ".to_string(), false), ("hit".to_string(), true)]
+        );
+    }
+
+    #[test]
+    fn parse_searchmatch_empty_input_is_empty() {
+        assert!(parse_searchmatch("").is_empty());
+    }
+
+    /// End-to-end through `paint_document`: a find match on one line paints
+    /// in `theme.match_fg`, and the *current* occurrence additionally gets
+    /// `Modifier::REVERSED` while a non-current one on another line doesn't.
+    #[test]
+    fn paint_document_highlights_matches_and_emphasizes_the_current_one() {
+        let doc = parse_article_html(
+            "Test",
+            "<html><body><p>turing</p><p>turing again</p></body></html>",
+        );
+        let theme = Theme::full();
+        let layout = layout_document(&doc, 80, LayoutOptions::default());
+        let occurrences =
+            crate::layout::find_matches(&layout.lines, &layout.continuation, "turing");
+        assert_eq!(occurrences.len(), 2, "one hit per paragraph");
+
+        let text = paint_document(
+            &layout,
+            None,
+            &[],
+            &HashSet::new(),
+            &theme,
+            false,
+            &occurrences,
+            0, // the first occurrence is "current"
+        );
+
+        let match_spans: Vec<_> = text
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .filter(|s| s.content.as_ref() == "turing")
+            .collect();
+        assert_eq!(match_spans.len(), 2, "both occurrences painted as matches");
+        for s in &match_spans {
+            assert_eq!(s.style.fg, Some(theme.match_fg));
+        }
+        let reversed_count = match_spans
+            .iter()
+            .filter(|s| s.style.add_modifier.contains(Modifier::REVERSED))
+            .count();
+        assert_eq!(
+            reversed_count, 1,
+            "exactly the current occurrence gets REVERSED emphasis"
+        );
+    }
+
+    /// The exact bug interactive pty verification caught: a query that
+    /// straddles a visual line wrap must have BOTH of its pieces get the
+    /// current-match emphasis when it's the current occurrence — not just
+    /// the piece on whichever line happens to come first.
+    #[test]
+    fn paint_document_emphasizes_every_piece_of_a_wrapped_current_match() {
+        use crate::layout::{MatchSpan, Occurrence};
+
+        let doc = parse_article_html("Test", "<html><body><p>filler</p></body></html>");
+        let layout = layout_document(&doc, 80, LayoutOptions::default());
+        // Two lines, standing in for a paragraph that wrapped mid-phrase;
+        // the occurrence has one piece on each.
+        let mut layout = layout;
+        layout.lines = vec![
+            crate::layout::LaidLine {
+                spans: vec![crate::layout::LaidSpan {
+                    text: "computer".to_string(),
+                    kind: SpanKind::Plain,
+                }],
+            },
+            crate::layout::LaidLine {
+                spans: vec![crate::layout::LaidSpan {
+                    text: "science".to_string(),
+                    kind: SpanKind::Plain,
+                }],
+            },
+        ];
+        layout.continuation = vec![true];
+
+        let occurrence = Occurrence {
+            pieces: vec![
+                (0, MatchSpan { start: 0, end: 8 }),
+                (1, MatchSpan { start: 0, end: 7 }),
+            ],
+        };
+        let theme = Theme::full();
+        let text = paint_document(
+            &layout,
+            None,
+            &[],
+            &HashSet::new(),
+            &theme,
+            false,
+            &[occurrence],
+            0,
+        );
+
+        let reversed_on = |line: usize, needle: &str| {
+            text.lines[line].spans.iter().any(|s| {
+                s.content.as_ref() == needle && s.style.add_modifier.contains(Modifier::REVERSED)
+            })
+        };
+        assert!(
+            reversed_on(0, "computer"),
+            "the first piece of the wrapped current match must be emphasized"
+        );
+        assert!(
+            reversed_on(1, "science"),
+            "the second piece of the SAME wrapped current match must be emphasized too"
         );
     }
 }

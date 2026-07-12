@@ -35,6 +35,13 @@ pub struct Theme {
     /// only `full` does today; real image rendering is future work (FR-RD-8),
     /// so this presently only changes a hint in the placeholder text.
     pub images: bool,
+    /// The `match` semantic slot (PRD FR-TH-1 / Appendix C's theme schema):
+    /// shared by in-page find highlighting (FR-NV-6) and full-text search
+    /// snippet highlighting (FR-SR-2's `<span class="searchmatch">` spans).
+    /// Painted bold; the *current* find match additionally gets
+    /// `Modifier::REVERSED` on top (ui.rs) rather than a second color slot,
+    /// so it stands out without every theme needing to define one.
+    pub match_fg: Color,
 }
 
 const fn rgb(hex: u32) -> Color {
@@ -67,6 +74,7 @@ impl Theme {
             selected_bg: Color::Blue,
             selected_fg: Color::White,
             images: false,
+            match_fg: Color::Yellow,
         }
     }
 
@@ -91,6 +99,10 @@ impl Theme {
             selected_bg: rgb(0x6fb3ff),
             selected_fg: rgb(0x101418),
             images: true,
+            // The exact value from Appendix C's theme-file schema example
+            // (`[colors] match = "#ebcb8b"`) — `full` is the truecolor
+            // reference theme that example was written against.
+            match_fg: rgb(0xebcb8b),
         }
     }
 
@@ -115,6 +127,7 @@ impl Theme {
             selected_bg: rgb(0x66ff66),
             selected_fg: rgb(0x000000),
             images: false,
+            match_fg: rgb(0xccffcc),
         }
     }
 
@@ -139,6 +152,11 @@ impl Theme {
             selected_bg: rgb(0xff5555),
             selected_fg: rgb(0x000000),
             images: false,
+            // Amber, not red — the PRD's own "night-amber" variant accent
+            // (Appendix C), reused here since search highlighting is a
+            // different semantic axis than body-text hierarchy (which
+            // stays red-only "via weight, never dimming" by design).
+            match_fg: rgb(0xffb000),
         }
     }
 
@@ -163,6 +181,7 @@ impl Theme {
             selected_bg: rgb(0x1a5276),
             selected_fg: rgb(0xf5f0e1),
             images: false,
+            match_fg: rgb(0xb8860b), // dark goldenrod, readable on the cream bg
         }
     }
 
@@ -187,6 +206,9 @@ impl Theme {
             selected_bg: Color::LightCyan,
             selected_fg: Color::Black,
             images: false,
+            // Named ANSI color, like every other `contrast` slot (kept out
+            // of the RGB contrast lint below for the same reason `link` is).
+            match_fg: Color::LightYellow,
         }
     }
 
@@ -397,6 +419,35 @@ mod tests {
         assert_eq!(Theme::paper().fg, Some(rgb(0x3a3a3a)));
         assert_eq!(Theme::paper().heading, rgb(0x1a1a1a));
         assert_eq!(Theme::paper().link, rgb(0x1a5276));
+
+        // Appendix C's theme-file schema excerpt literally writes
+        // `match = "#ebcb8b"` under `[colors]` — `full` is the truecolor
+        // reference theme, so it gets that exact value.
+        assert_eq!(Theme::full().match_fg, rgb(0xebcb8b));
+    }
+
+    /// Every built-in theme must give `match_fg` a color that's actually
+    /// distinct from its body/link/heading colors — otherwise a highlighted
+    /// find match would be invisible against its own surroundings.
+    #[test]
+    fn match_color_is_distinct_from_body_link_and_heading_in_every_theme() {
+        for name in Theme::NAMES {
+            let theme = Theme::by_name(name).unwrap();
+            assert_ne!(
+                theme.match_fg, theme.link,
+                "{name}: match color collides with link color"
+            );
+            assert_ne!(
+                theme.match_fg, theme.heading,
+                "{name}: match color collides with heading color"
+            );
+            if let Some(fg) = theme.fg {
+                assert_ne!(
+                    theme.match_fg, fg,
+                    "{name}: match color collides with body fg"
+                );
+            }
+        }
     }
 
     /// The night-red contrast claim from the PRD ("pure red/black ≈

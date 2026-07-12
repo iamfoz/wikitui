@@ -152,45 +152,6 @@ pub fn section_outline(doc: &Document) -> Vec<SectionRef> {
         .collect()
 }
 
-/// The plain, unstyled text of a block — used only for case-insensitive
-/// substring matching in `find_matches`, not for display.
-fn block_plain_text(block: &Block) -> String {
-    match block {
-        Block::Heading { spans, .. } | Block::Paragraph(spans) | Block::Blockquote(spans) => {
-            spans.iter().map(|s| s.text.as_str()).collect()
-        }
-        Block::ListItem { spans, .. } => spans.iter().map(|s| s.text.as_str()).collect(),
-        Block::Code(text) => text.clone(),
-        Block::Table(lines) => lines.join(" "),
-        Block::Infobox(rows) => rows
-            .iter()
-            .map(|(l, v)| format!("{l} {v}"))
-            .collect::<Vec<_>>()
-            .join(" "),
-        Block::Image(alt) => alt.clone(),
-        Block::Rule => String::new(),
-    }
-}
-
-/// Indices (into `doc.blocks`) of every block whose visible text contains
-/// `query` (case-insensitive) — the "find in page" feature (PRD FR-NV-6).
-/// Block-level granularity: a match scrolls to the whole block containing it,
-/// not an exact character position. The caller maps each block index to a
-/// laid-out line via `layout::Layout::block_lines`, keeping the layout the
-/// single source of line positions.
-pub fn matching_blocks(doc: &Document, query: &str) -> Vec<usize> {
-    if query.is_empty() {
-        return Vec::new();
-    }
-    let needle = query.to_lowercase();
-    doc.blocks
-        .iter()
-        .enumerate()
-        .filter(|(_, block)| block_plain_text(block).to_lowercase().contains(&needle))
-        .map(|(i, _)| i)
-        .collect()
-}
-
 /// Tags whose content is handled by a dedicated `Block`, and which
 /// `inline_spans` must therefore never descend into (otherwise their text
 /// would be captured twice: once as a block, once as part of an ancestor's
@@ -1047,42 +1008,6 @@ mod tests {
                 .iter()
                 .all(|l| l.href != "#cite_note-1" || l.internal_title.is_none())
         );
-    }
-
-    #[test]
-    fn matching_blocks_is_case_insensitive_and_locates_multiple_blocks() {
-        let doc = parse_article_html("Test Article", FIXTURE);
-
-        // FIXTURE's list has "First item", "Second item", and a nested
-        // "Nested item" (three separate ListItem blocks).
-        let matches = matching_blocks(&doc, "ITEM");
-        assert_eq!(matches.len(), 3, "all three list items mention 'item'");
-
-        let bold_matches = matching_blocks(&doc, "bold");
-        assert_eq!(bold_matches.len(), 1);
-    }
-
-    #[test]
-    fn matching_blocks_returns_block_indices_in_document_order() {
-        let doc = parse_article_html("Test Article", FIXTURE);
-        // "History" matches both the heading block and the paragraph after
-        // it; the heading comes first in document order.
-        let matches = matching_blocks(&doc, "History");
-        assert_eq!(matches.len(), 2);
-        assert!(matches[0] < matches[1], "indices are in document order");
-        assert!(matches!(doc.blocks[matches[0]], Block::Heading { .. }));
-    }
-
-    #[test]
-    fn matching_blocks_empty_query_returns_nothing() {
-        let doc = parse_article_html("Test Article", FIXTURE);
-        assert!(matching_blocks(&doc, "").is_empty());
-    }
-
-    #[test]
-    fn matching_blocks_no_hits_returns_empty_without_panicking() {
-        let doc = parse_article_html("Test Article", FIXTURE);
-        assert!(matching_blocks(&doc, "xyzzy-not-present").is_empty());
     }
 
     /// Approximates real MediaWiki Cite-extension output: a backlink caret,

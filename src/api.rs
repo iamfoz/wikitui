@@ -22,6 +22,12 @@ const USER_AGENT_BASE: &str = concat!(
     " (https://github.com/iamfoz/wikitui) reqwest"
 );
 
+/// Cloned to hand a copy to a spawned background task (PRD FR-SR-1's
+/// typeahead can't block the UI thread on the loop's redraw/`event::poll`
+/// cycle) — cheap, since `reqwest::Client` is itself an `Arc` internally
+/// and `base_url_template` is a small `String`. Mirrors reqwest's own
+/// documented pattern of cloning the client rather than wrapping it.
+#[derive(Clone)]
 pub struct WikiClient {
     http: reqwest::Client,
     /// The resolved `[wiki.*].base_url` / `WIKITUI_BASE_URL` template
@@ -34,11 +40,54 @@ pub struct SearchResult {
     pub title: String,
     pub description: Option<String>,
     pub excerpt: Option<String>,
+    /// Article size in bytes (PRD FR-SR-2's "size" line) — optional since
+    /// it isn't part of every `search/page` deployment's response, only
+    /// what this mock (and some real ones) additionally provide.
+    pub size: Option<u64>,
+    /// Word count, same optionality as `size`.
+    pub wordcount: Option<u32>,
+    /// Last-edit timestamp (ISO 8601), same optionality as `size`.
+    pub timestamp: Option<String>,
+}
+
+/// A typeahead completion (PRD FR-SR-1): just enough to render one dropdown
+/// row and open the article directly — no excerpt/size/wordcount, unlike a
+/// full-text `SearchResult`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct TitleSuggestion {
+    pub title: String,
+    /// The Wikidata-style one-line description `search/title` returns
+    /// alongside each candidate (PRD FR-SR-1, Appendix A).
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct SearchPageResponse {
+    pages: Vec<SearchResult>,
+    /// Not part of the core REST `search/page` response — PRD Appendix A
+    /// lists `srinfo=suggestion` under the Action API's `list=search`, the
+    /// documented *fallback* for full-text search, not the REST endpoint
+    /// this client calls as primary. Added here as a schema extension
+    /// (`#[serde(default)]`, so a real deployment that omits it just leaves
+    /// this `None`, not an error) so MVP can surface did-you-mean (FR-SR-4
+    /// / §7's zero-results row) without a second round trip to the Action
+    /// API. The mock server emits it the same way, documented in its own
+    /// comment.
+    #[serde(default)]
+    suggestion: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-struct SearchPageResponse {
-    pages: Vec<SearchResult>,
+struct SearchTitleResponse {
+    pages: Vec<TitleSuggestion>,
+}
+
+/// Full-text search results plus the did-you-mean suggestion, when the
+/// server offered one (PRD FR-SR-4).
+#[derive(Debug, Clone)]
+pub struct SearchOutcome {
+    pub results: Vec<SearchResult>,
+    pub suggestion: Option<String>,
 }
 
 impl WikiClient {
@@ -95,7 +144,7 @@ impl WikiClient {
     }
 
     /// Full-text search (PRD Appendix A: `GET /w/rest.php/v1/search/page`).
-    pub async fn search(&self, lang: &str, query: &str, limit: u32) -> Result<Vec<SearchResult>> {
+    pub async fn search(&self, lang: &str, query: &str, limit: u32) -> Result<SearchOutcome> {
         let url = format!(
             "{}/w/rest.php/v1/search/page?q={}&limit={}",
             self.host(lang),
@@ -111,6 +160,37 @@ impl WikiClient {
             .error_for_status()
             .context("search request failed")?;
         let parsed: SearchPageResponse = resp.json().await.context("parsing search response")?;
+        Ok(SearchOutcome {
+            results: parsed.pages,
+            suggestion: parsed.suggestion,
+        })
+    }
+
+    /// Typeahead title completion (PRD FR-SR-1, Appendix A: `GET
+    /// /w/rest.php/v1/search/title`). Called on a debounce timer, not on
+    /// every keystroke, from a spawned task — see `main::fire_typeahead`.
+    pub async fn search_title(
+        &self,
+        lang: &str,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<TitleSuggestion>> {
+        let url = format!(
+            "{}/w/rest.php/v1/search/title?q={}&limit={}",
+            self.host(lang),
+            urlencoding::encode(query),
+            limit
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .context("requesting typeahead suggestions")?
+            .error_for_status()
+            .context("typeahead request failed")?;
+        let parsed: SearchTitleResponse =
+            resp.json().await.context("parsing typeahead response")?;
         Ok(parsed.pages)
     }
 }
@@ -143,5 +223,60 @@ mod tests {
         let client = WikiClient::new("http://127.0.0.1:8943".to_string()).unwrap();
         assert_eq!(client.host("en"), "http://127.0.0.1:8943");
         assert_eq!(client.host("de"), "http://127.0.0.1:8943");
+    }
+
+    /// FR-SR-4's did-you-mean: the `suggestion` field this module's own
+    /// schema extension adds (see `SearchPageResponse`'s doc comment) must
+    /// round-trip, and its absence must deserialize to `None`, not an
+    /// error — a real deployment that never sends it must still work.
+    #[test]
+    fn search_page_response_parses_the_suggestion_extension() {
+        let with_suggestion = r#"{"pages": [], "suggestion": "Alan Turing"}"#;
+        let parsed: SearchPageResponse = serde_json::from_str(with_suggestion).unwrap();
+        assert!(parsed.pages.is_empty());
+        assert_eq!(parsed.suggestion.as_deref(), Some("Alan Turing"));
+
+        let without_suggestion = r#"{"pages": []}"#;
+        let parsed: SearchPageResponse = serde_json::from_str(without_suggestion).unwrap();
+        assert_eq!(parsed.suggestion, None);
+    }
+
+    /// FR-SR-2's size/wordcount/timestamp are all optional per-result — a
+    /// response that omits them (today's fixture-free REST schema) must
+    /// still parse, not error, and a response that includes them must
+    /// carry them through.
+    #[test]
+    fn search_result_size_wordcount_timestamp_are_optional() {
+        let minimal = r#"{"pages": [{"title": "Alan Turing"}]}"#;
+        let parsed: SearchPageResponse = serde_json::from_str(minimal).unwrap();
+        assert_eq!(parsed.pages[0].size, None);
+        assert_eq!(parsed.pages[0].wordcount, None);
+        assert_eq!(parsed.pages[0].timestamp, None);
+
+        let full = r#"{"pages": [{"title": "Alan Turing", "size": 4820, "wordcount": 812, "timestamp": "2026-06-30T10:15:00Z"}]}"#;
+        let parsed: SearchPageResponse = serde_json::from_str(full).unwrap();
+        assert_eq!(parsed.pages[0].size, Some(4820));
+        assert_eq!(parsed.pages[0].wordcount, Some(812));
+        assert_eq!(
+            parsed.pages[0].timestamp.as_deref(),
+            Some("2026-06-30T10:15:00Z")
+        );
+    }
+
+    /// The typeahead schema: title + optional Wikidata-style description.
+    #[test]
+    fn search_title_response_parses_titles_and_descriptions() {
+        let json = r#"{"pages": [
+            {"title": "Alan Turing", "description": "British mathematician"},
+            {"title": "Enigma machine"}
+        ]}"#;
+        let parsed: SearchTitleResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.pages.len(), 2);
+        assert_eq!(parsed.pages[0].title, "Alan Turing");
+        assert_eq!(
+            parsed.pages[0].description.as_deref(),
+            Some("British mathematician")
+        );
+        assert_eq!(parsed.pages[1].description, None);
     }
 }

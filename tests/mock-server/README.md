@@ -9,8 +9,25 @@ manual verification against a real HTTP server instead of live Wikipedia
 It is a fixed set of fixture pages (`PAGES` in `server.py`), including an
 `en`-ish set (Alan Turing / Enigma machine / Computer science, cross-linked)
 and a Japanese fixture (`アラン・チューリング`) for CJK-correctness checks
-(FR-RD-10 / FR-ML-6). It does not implement search, summaries, or any other
-endpoint — only what article rendering needs.
+(FR-RD-10 / FR-ML-6).
+
+It also serves search (FR-SR-1/2/4), against separate fixture lists so the
+corpus can stay small and readable:
+
+- `GET /w/rest.php/v1/search/title?q=&limit=` — typeahead completions
+  (`TITLE_SUGGESTIONS`), title + a Wikidata-style one-line description.
+  Every suggested title is also a real `PAGES` key, so opening one always
+  resolves. Sleeps 100ms before responding, so the debounce/latency is
+  actually visible during manual verification.
+- `GET /w/rest.php/v1/search/page?q=&limit=` — full-text search
+  (`SEARCH_PAGES`), substring-matched against title/body, returning a
+  `<span class="searchmatch">`-highlighted excerpt plus `size`/`wordcount`/
+  `timestamp`. A query with zero hits that's in `DID_YOU_MEAN` gets a
+  `suggestion` field instead (see `api::SearchOutcome`'s doc comment for why
+  that field rides this response rather than a second Action-API request).
+
+It does not implement summaries or any other endpoint — only what article
+rendering and search need.
 
 ## Running it
 
@@ -61,5 +78,7 @@ resurrect it.
 
 ## Extending it
 
-Add new titles to the `PAGES` dict in `server.py` and keep existing ones
-working — other tests and manual verification runs depend on them.
+Add new titles to the `PAGES` dict (and, for search coverage, matching
+entries in `TITLE_SUGGESTIONS`/`SEARCH_PAGES`) in `server.py` and keep
+existing ones working — other tests and manual verification runs depend on
+them.
