@@ -1,5 +1,6 @@
 use crate::api::SearchResult;
 use crate::cite::CiteStyle;
+use crate::config::ConfigContext;
 use crate::doc::{
     Citation, Document, LinkRef, SectionRef, collect_links, matching_blocks, section_outline,
 };
@@ -126,6 +127,12 @@ pub struct App {
     /// East-Asian-Ambiguous width toggle (FR-RD-10, default false); a config
     /// file will wire this later.
     pub ambiguous_wide: bool,
+    /// The CLI/env overrides and config file path resolved at startup
+    /// (PRD §6.7), kept so `:config reload` and SIGHUP can re-run
+    /// resolution against the exact same precedence layers. Defaulted by
+    /// `App::new` and overwritten by `main` right after construction — most
+    /// tests never touch it (there's no file to reload from `::default()`).
+    pub config_ctx: ConfigContext,
 }
 
 impl App {
@@ -170,6 +177,7 @@ impl App {
             viewport_height: 0,
             measure: 88,
             ambiguous_wide: false,
+            config_ctx: ConfigContext::default(),
         }
     }
 

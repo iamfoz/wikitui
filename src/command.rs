@@ -29,11 +29,16 @@ pub enum Command {
     Export(Option<String>),
     /// `:help` / `:h` — the help overlay.
     Help,
+    /// `:config reload` — re-read the config file and live-apply
+    /// theme/measure/ambiguous_wide (PRD §6.7). Network/storage settings
+    /// are documented as restart-only, so this deliberately leaves them
+    /// alone; the same reload also fires on SIGHUP.
+    ConfigReload,
     /// `:q` / `:quit` — exit.
     Quit,
 }
 
-pub const USAGE: &str = "commands: open <title>, lang <code>, theme <name>, style <name>, library, research, toc, export [style], help, quit";
+pub const USAGE: &str = "commands: open <title>, lang <code>, theme <name>, style <name>, library, research, toc, export [style], config reload, help, quit";
 
 pub fn parse(input: &str) -> Result<Command, String> {
     let input = input.trim();
@@ -84,6 +89,13 @@ pub fn parse(input: &str) -> Result<Command, String> {
                 ))
             }
         }
+        "config" => match arg {
+            "reload" => Ok(Command::ConfigReload),
+            "" => Err("usage: :config reload".to_string()),
+            other => Err(format!(
+                "unknown config subcommand {other:?} — try: config reload"
+            )),
+        },
         "library" | "lib" => Ok(Command::Library),
         "research" => Ok(Command::Research),
         "toc" => Ok(Command::Toc),
@@ -161,6 +173,13 @@ mod tests {
         assert_eq!(parse("q"), Ok(Command::Quit));
         assert_eq!(parse("quit"), Ok(Command::Quit));
         assert_eq!(parse("help"), Ok(Command::Help));
+    }
+
+    #[test]
+    fn config_reload_parses_and_rejects_other_subcommands() {
+        assert_eq!(parse("config reload"), Ok(Command::ConfigReload));
+        assert!(parse("config").is_err());
+        assert!(parse("config bogus").is_err());
     }
 
     #[test]

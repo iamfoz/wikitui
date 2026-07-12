@@ -28,6 +28,10 @@ pub struct PageCache {
     /// misses and every store is a no-op, but reading still works.
     dir: Option<PathBuf>,
     max_bytes: u64,
+    /// PRD §6.7's `[cache] fresh_ttl_hours`, config-resolved. Storage
+    /// settings are documented as restart-only (not part of `:config
+    /// reload`), so this is fixed for the process's lifetime.
+    fresh_ttl_secs: u64,
 }
 
 pub struct CachedPage {
@@ -37,19 +41,23 @@ pub struct CachedPage {
 }
 
 impl PageCache {
-    pub fn open() -> Self {
+    /// `max_bytes`/`fresh_ttl_secs` come from the resolved config's
+    /// `[cache]` section (§6.7); `cache::DEFAULT_MAX_BYTES`/`FRESH_TTL_SECS`
+    /// are what that resolution falls back to absent a config file.
+    pub fn open(max_bytes: u64, fresh_ttl_secs: u64) -> Self {
         match directories::ProjectDirs::from("", "", "wikitui") {
-            Some(dirs) => Self::at(dirs.cache_dir().join("pages"), DEFAULT_MAX_BYTES),
+            Some(dirs) => Self::at(dirs.cache_dir().join("pages"), max_bytes, fresh_ttl_secs),
             None => Self::disabled(),
         }
     }
 
-    /// A cache rooted at an explicit directory — tests, and later a
-    /// config override (PRD FR-PR-5: cache dir relocatable).
-    pub fn at(dir: PathBuf, max_bytes: u64) -> Self {
+    /// A cache rooted at an explicit directory — tests, and `--config`'s
+    /// `[cache]` override in production.
+    pub fn at(dir: PathBuf, max_bytes: u64, fresh_ttl_secs: u64) -> Self {
         Self {
             dir: Some(dir),
             max_bytes,
+            fresh_ttl_secs,
         }
     }
 
@@ -58,7 +66,14 @@ impl PageCache {
         Self {
             dir: None,
             max_bytes: 0,
+            fresh_ttl_secs: FRESH_TTL_SECS,
         }
+    }
+
+    /// Whether cached content this old still counts as fresh enough to
+    /// skip the network entirely (PRD FR-OFF-2's serve policy).
+    pub fn is_fresh(&self, age_secs: u64) -> bool {
+        age_secs < self.fresh_ttl_secs
     }
 
     fn entry_path(&self, lang: &str, title: &str) -> Option<PathBuf> {
@@ -202,7 +217,7 @@ mod tests {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir =
             std::env::temp_dir().join(format!("wikitui-cache-test-{}-{n}", std::process::id()));
-        (PageCache::at(dir.clone(), max_bytes), dir)
+        (PageCache::at(dir.clone(), max_bytes, FRESH_TTL_SECS), dir)
     }
 
     #[test]
@@ -217,6 +232,16 @@ mod tests {
             hit.age_secs
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_fresh_honors_the_configured_ttl_not_the_hardcoded_default() {
+        let short_ttl = PageCache::at(std::env::temp_dir(), DEFAULT_MAX_BYTES, 10);
+        assert!(short_ttl.is_fresh(5));
+        assert!(
+            !short_ttl.is_fresh(15),
+            "config TTL of 10s must be honored, not the 24h default"
+        );
     }
 
     #[test]

@@ -220,6 +220,116 @@ impl Theme {
     }
 }
 
+/// `Some((r,g,b))` for a truecolor slot, `None` for anything defined in
+/// terms of the terminal's 16-color palette (`Color::Black`, `Color::Gray`,
+/// …) or left unset. FR-TH-6's linter only has real pixels to compare for
+/// the former — a named ANSI color's actual RGB is up to the terminal, so
+/// `contrast` (which uses named colors throughout) is correctly out of
+/// scope for the numeric lint, not silently wrong.
+fn as_rgb(color: Color) -> Option<(u8, u8, u8)> {
+    match color {
+        Color::Rgb(r, g, b) => Some((r, g, b)),
+        _ => None,
+    }
+}
+
+/// WCAG 2.x relative luminance of one sRGB channel (0-255), the piecewise
+/// gamma-decode both the 2.1 and 2.2 formulas use.
+fn channel_luminance(c: u8) -> f64 {
+    let c = f64::from(c) / 255.0;
+    if c <= 0.03928 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn relative_luminance((r, g, b): (u8, u8, u8)) -> f64 {
+    0.2126 * channel_luminance(r) + 0.7152 * channel_luminance(g) + 0.0722 * channel_luminance(b)
+}
+
+/// WCAG 2.x contrast ratio between two sRGB colors, from 1:1 (identical) to
+/// 21:1 (black on white) — the metric FR-TH-6's "warn below 4.5:1" and
+/// `contrast`'s "≥ 7:1" claims (Appendix C) are both stated in.
+pub fn contrast_ratio(a: (u8, u8, u8), b: (u8, u8, u8)) -> f64 {
+    let (la, lb) = (relative_luminance(a), relative_luminance(b));
+    let (lighter, darker) = if la > lb { (la, lb) } else { (lb, la) };
+    (lighter + 0.05) / (darker + 0.05)
+}
+
+/// One fg/bg-style pair FR-TH-6's linter checked for a built-in theme.
+#[derive(Debug, Clone, Copy)]
+pub struct ContrastCheck {
+    pub theme: &'static str,
+    /// "fg/bg", "link/bg", or "dim/bg".
+    pub pair: &'static str,
+    pub ratio: f64,
+}
+
+impl ContrastCheck {
+    /// FR-TH-6's own threshold: below this, the pair warns.
+    pub const AA_THRESHOLD: f64 = 4.5;
+    /// The stricter bar Appendix C invokes for `contrast` (not checked here
+    /// since `contrast` uses named, not RGB, colors) and for explaining
+    /// why `night` — which clears `AA_THRESHOLD` — still isn't AAA.
+    pub const AAA_THRESHOLD: f64 = 7.0;
+
+    pub fn passes(&self) -> bool {
+        self.ratio >= Self::AA_THRESHOLD
+    }
+
+    /// "AAA" (≥ 7:1), "AA" (≥ 4.5:1, FR-TH-6's own bar), or "FAIL".
+    /// `night`'s fg/bg lands in "AA" by design (Appendix C: red held near
+    /// full brightness makes pure red/black ~5.25:1 — passes AA, fails
+    /// AAA); that is a documented tradeoff, not a lint finding to chase to
+    /// AAA by dimming the red, which would undo the reason it's there.
+    pub fn level(&self) -> &'static str {
+        if self.ratio >= Self::AAA_THRESHOLD {
+            "AAA"
+        } else if self.ratio >= Self::AA_THRESHOLD {
+            "AA"
+        } else {
+            "FAIL"
+        }
+    }
+}
+
+/// FR-TH-6's contrast lint: fg/bg, link/bg, and dim/bg for every built-in
+/// theme whose relevant slots are RGB-defined (`terminal` has no
+/// bg/fg to check; `contrast` is defined in named ANSI colors, not RGB —
+/// both are correctly absent from this report, not silently passing it).
+pub fn builtin_contrast_report() -> Vec<ContrastCheck> {
+    let mut out = Vec::new();
+    for name in Theme::NAMES {
+        let theme = Theme::by_name(name).expect("NAMES only lists valid themes");
+        let Some(bg) = theme.bg.and_then(as_rgb) else {
+            continue;
+        };
+        if let Some(fg) = theme.fg.and_then(as_rgb) {
+            out.push(ContrastCheck {
+                theme: name,
+                pair: "fg/bg",
+                ratio: contrast_ratio(fg, bg),
+            });
+        }
+        if let Some(link) = as_rgb(theme.link) {
+            out.push(ContrastCheck {
+                theme: name,
+                pair: "link/bg",
+                ratio: contrast_ratio(link, bg),
+            });
+        }
+        if let Some(dim) = as_rgb(theme.dim) {
+            out.push(ContrastCheck {
+                theme: name,
+                pair: "dim/bg",
+                ratio: contrast_ratio(dim, bg),
+            });
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,9 +402,10 @@ mod tests {
     /// The night-red contrast claim from the PRD ("pure red/black ≈
     /// 5.25:1") only holds if the red channel is kept near full brightness,
     /// as the PRD requires ("held near full brightness... never dimming").
-    /// This doesn't recompute WCAG luminance (that's the theme-lint feature,
-    /// FR-TH-6, not yet built) — it just guards against someone quietly
-    /// dimming the red and silently breaking that documented guarantee.
+    /// `builtin_contrast_report` (FR-TH-6) recomputes the real ratio from
+    /// whatever `fg` currently is; this test guards the brightness
+    /// precondition directly so a future edit can't quietly dim the red
+    /// and drop the ratio below the AA line that claim depends on.
     #[test]
     fn night_theme_keeps_red_near_full_brightness() {
         let Color::Rgb(r, _, _) = Theme::night().fg.unwrap() else {
@@ -315,5 +426,78 @@ mod tests {
                 "{name} should not claim image support yet"
             );
         }
+    }
+
+    /// Locks the doctor's headline example (PRD §6.7 verification target):
+    /// paper's fg/bg (#3a3a3a on #f5f0e1) clears FR-TH-6's 4.5:1 bar.
+    #[test]
+    fn known_good_pair_passes_contrast_lint() {
+        let ratio = contrast_ratio((0x3a, 0x3a, 0x3a), (0xf5, 0xf0, 0xe1));
+        assert!(ratio >= ContrastCheck::AA_THRESHOLD, "ratio was {ratio}");
+    }
+
+    /// A deliberately bad pair — two nearly-identical mid-grays — must fail
+    /// the same lint, so the "known good" test above isn't just tautology.
+    #[test]
+    fn deliberately_similar_pair_fails_contrast_lint() {
+        let ratio = contrast_ratio((0x77, 0x77, 0x77), (0x88, 0x88, 0x88));
+        assert!(ratio < ContrastCheck::AA_THRESHOLD, "ratio was {ratio}");
+    }
+
+    #[test]
+    fn contrast_ratio_is_symmetric_and_bottoms_out_at_one() {
+        let a = (0x10, 0x20, 0x30);
+        let b = (0xe0, 0xd0, 0xc0);
+        assert_eq!(contrast_ratio(a, b), contrast_ratio(b, a));
+        assert!((contrast_ratio(a, a) - 1.0).abs() < 1e-9);
+    }
+
+    /// `terminal` never sets bg/fg and `contrast` is defined in named ANSI
+    /// colors, not RGB — both are meaningfully absent from the report
+    /// rather than silently reported as passing.
+    #[test]
+    fn contrast_report_only_covers_rgb_defined_themes() {
+        let report = builtin_contrast_report();
+        let themes_covered: std::collections::BTreeSet<&str> =
+            report.iter().map(|c| c.theme).collect();
+        assert_eq!(
+            themes_covered,
+            ["full", "homebrew", "night", "paper"].into_iter().collect()
+        );
+        // Each covered theme reports exactly its three pairs.
+        for name in ["full", "homebrew", "night", "paper"] {
+            let pairs: std::collections::BTreeSet<&str> = report
+                .iter()
+                .filter(|c| c.theme == name)
+                .map(|c| c.pair)
+                .collect();
+            assert_eq!(pairs, ["fg/bg", "link/bg", "dim/bg"].into_iter().collect());
+        }
+    }
+
+    /// Locks the two known findings this feature surfaced: `night`'s fg/bg
+    /// clears FR-TH-6's bar but only into AA (Appendix C's documented
+    /// tradeoff, not a bug), while its `dim` — deliberately low-contrast,
+    /// being the de-emphasized slot — genuinely fails the same bar. Both
+    /// are expected; neither should be "fixed" by editing the theme.
+    #[test]
+    fn night_fg_is_aa_only_and_night_dim_fails() {
+        let report = builtin_contrast_report();
+        let find = |pair| {
+            report
+                .iter()
+                .find(|c| c.theme == "night" && c.pair == pair)
+                .unwrap()
+        };
+        let fg = find("fg/bg");
+        assert!(fg.passes(), "night fg/bg ratio was {}", fg.ratio);
+        assert_eq!(fg.level(), "AA");
+        let dim = find("dim/bg");
+        assert!(
+            !dim.passes(),
+            "expected night dim/bg to fail, was {}",
+            dim.ratio
+        );
+        assert_eq!(dim.level(), "FAIL");
     }
 }

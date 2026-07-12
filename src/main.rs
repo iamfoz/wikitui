@@ -4,7 +4,9 @@ mod cache;
 mod cite;
 mod cli;
 mod command;
+mod config;
 mod doc;
+mod doctor;
 mod layout;
 mod research;
 mod target;
@@ -21,23 +23,46 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use std::io::{self, Stdout};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use api::WikiClient;
 use app::{App, Mode, PageSource};
 use cache::PageCache;
-use cli::Cli;
+use cite::CiteStyle;
+use cli::{Cli, Commands, ConfigAction};
+use config::ConfigContext;
 use theme::Theme;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut cli = Cli::parse();
 
+    // `wikitui config doctor` runs before anything else touches the
+    // network, the cache, or the terminal (PRD §6.7: plain stdout, no TUI
+    // init) — it's a standalone diagnostic, not a mode of the reader.
+    if let Some(Commands::Config {
+        action: ConfigAction::Doctor,
+    }) = &cli.command
+    {
+        let cli_overrides = cli_overrides_from(&cli);
+        let env_overrides = config::EnvOverrides::from_process_env();
+        let config_path =
+            config::resolve_config_path(cli.config.clone(), std::env::var("WIKITUI_CONFIG").ok());
+        let resolved = config::resolve(&cli_overrides, &env_overrides, config_path.as_deref());
+        std::process::exit(doctor::run(&resolved));
+    }
+
+    let mut cli_overrides = cli_overrides_from(&cli);
+
     // The TITLE argument may be a full wikipedia.org URL or a
-    // lang-prefixed title (FR-CS-6); either overrides --lang.
+    // lang-prefixed title (FR-CS-6); either overrides --lang, and — same
+    // precedence-independent priority as before this config system
+    // existed — config file and env too.
     if let Some(raw) = &cli.title {
         let target = target::parse(raw);
         if let Some(lang) = target.lang {
-            cli.lang = lang;
+            cli_overrides.lang = Some(lang);
         }
         cli.title = Some(target.title);
     }
@@ -56,37 +81,122 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let client = WikiClient::new()?;
-    let page_cache = PageCache::open();
+    let env_overrides = config::EnvOverrides::from_process_env();
+    let config_path =
+        config::resolve_config_path(cli.config.clone(), std::env::var("WIKITUI_CONFIG").ok());
+    let resolved = config::resolve(&cli_overrides, &env_overrides, config_path.as_deref());
+
+    // §6.7: unknown keys and rejected values warn, never crash — printed
+    // once, before any terminal state change (raw mode/the alternate
+    // screen would otherwise swallow or mangle them). `config doctor`
+    // reports the same issues in its own format, so this only fires on
+    // the normal run path.
+    for issue in &resolved.issues {
+        eprintln!("wikitui: config: {}", issue.message);
+    }
+    if let Some(summary) = &resolved.migration_summary {
+        eprintln!("wikitui: config: {summary}");
+    }
+
+    let client = WikiClient::new(resolved.base_url_template.value.clone())?;
+    let page_cache = PageCache::open(
+        resolved.cache_max_mb.value.saturating_mul(1024 * 1024),
+        resolved.cache_fresh_ttl_hours.value.saturating_mul(3600),
+    );
 
     if cli.dump {
         let title = cli
             .title
             .clone()
             .ok_or_else(|| anyhow::anyhow!("--dump requires an article title"))?;
-        let (html, _) = fetch_page(&client, &page_cache, &cli.lang, &title).await?;
+        let (html, _) = fetch_page(&client, &page_cache, &resolved.lang.value, &title).await?;
         let document = doc::parse_article_html(&title, &html);
         print!("{}", doc::render_plain(&document));
         return Ok(());
     }
 
-    let theme = Theme::by_name(&cli.theme).ok_or_else(|| {
-        anyhow::anyhow!(
-            "unknown theme {:?} — choose one of: {}",
-            cli.theme,
-            Theme::NAMES.join(", ")
-        )
-    })?;
-    // PRD FR-TH-5: NO_COLOR, when present and non-empty, strips color from
-    // every theme regardless of which one is selected.
-    let no_color = std::env::var("NO_COLOR").is_ok_and(|v| !v.is_empty());
+    // Already validated during resolution (unknown names fall back to the
+    // default with a warning above), so these can't fail here — the
+    // `unwrap_or_else` is a belt-and-braces guard, not an expected path.
+    let theme = Theme::by_name(&resolved.theme.value).unwrap_or_else(Theme::terminal);
+    let cite_style = CiteStyle::by_name(&resolved.cite_style.value).unwrap_or(CiteStyle::Apa);
+    let no_color = no_color_active();
+
+    let config_ctx = ConfigContext {
+        cli: cli_overrides,
+        env: env_overrides,
+        config_path,
+    };
+
+    // A flag rather than a direct callback: the event loop blocks on
+    // `event::read()`, so a background signal task can't reach into it —
+    // it can only leave a note that's picked up on the next loop turn
+    // (PRD §6.7: SIGHUP does the same reload as `:config reload`).
+    let reload_flag = Arc::new(AtomicBool::new(false));
+    spawn_sighup_listener(Arc::clone(&reload_flag));
 
     install_panic_hook();
     let mut terminal = init_terminal()?;
-    let result = run(&mut terminal, &client, &page_cache, cli, theme, no_color).await;
+    let result = run(
+        &mut terminal,
+        &client,
+        &page_cache,
+        cli,
+        resolved.lang.value,
+        theme,
+        no_color,
+        resolved.measure.value,
+        resolved.ambiguous_wide.value,
+        cite_style,
+        config_ctx,
+        reload_flag,
+    )
+    .await;
     restore_terminal(&mut terminal)?;
     result
 }
+
+/// The CLI-flag layer of PRD §6.7's precedence chain, read off the parsed
+/// `Cli` once so both the `config doctor` path and the normal run path
+/// build it identically.
+fn cli_overrides_from(cli: &Cli) -> config::CliOverrides {
+    config::CliOverrides {
+        lang: cli.lang.clone(),
+        theme: cli.theme.clone(),
+        measure: cli.measure,
+        ambiguous_width: cli.ambiguous_width,
+        cite_style: cli.cite_style.clone(),
+    }
+}
+
+/// PRD FR-TH-5: NO_COLOR, when present and non-empty, strips color from
+/// every theme regardless of which one is selected. Shared with `doctor`'s
+/// capability report so both agree on what "active" means.
+pub(crate) fn no_color_active() -> bool {
+    std::env::var("NO_COLOR").is_ok_and(|v| !v.is_empty())
+}
+
+/// Listens for SIGHUP and sets `flag`, picked up by the event loop on its
+/// next turn (PRD §6.7's live-reload). No-op on non-Unix targets — there's
+/// no SIGHUP there; `:config reload` still works everywhere.
+#[cfg(unix)]
+fn spawn_sighup_listener(flag: Arc<AtomicBool>) {
+    tokio::spawn(async move {
+        let Ok(mut stream) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        else {
+            return;
+        };
+        loop {
+            if stream.recv().await.is_none() {
+                return;
+            }
+            flag.store(true, Ordering::SeqCst);
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn spawn_sighup_listener(_flag: Arc<AtomicBool>) {}
 
 /// The cache-aware fetch (PRD FR-OFF-2's MVP serve policy): a fresh-enough
 /// cached copy skips the network entirely; otherwise fetch and cache; and
@@ -101,7 +211,7 @@ async fn fetch_page(
 ) -> Result<(String, PageSource)> {
     let cached = cache.get(lang, title);
     if let Some(page) = &cached
-        && page.age_secs < cache::FRESH_TTL_SECS
+        && cache.is_fresh(page.age_secs)
     {
         return Ok((
             page.html.clone(),
@@ -167,15 +277,26 @@ fn install_panic_hook() {
     }));
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     client: &WikiClient,
     cache: &PageCache,
     cli: Cli,
+    lang: String,
     theme: Theme,
     no_color: bool,
+    measure: u16,
+    ambiguous_wide: bool,
+    cite_style: CiteStyle,
+    config_ctx: ConfigContext,
+    reload_flag: Arc<AtomicBool>,
 ) -> Result<()> {
-    let mut app = App::new(cli.lang.clone(), theme, no_color);
+    let mut app = App::new(lang, theme, no_color);
+    app.measure = measure;
+    app.ambiguous_wide = ambiguous_wide;
+    app.cite_style = cite_style;
+    app.config_ctx = config_ctx;
 
     if let Some(query) = cli.search {
         app.search_input = query;
@@ -185,6 +306,15 @@ async fn run(
     }
 
     loop {
+        // Checked once per turn rather than mid-`event::read()`, which
+        // blocks on real input and can't be interrupted without
+        // restructuring the whole loop: SIGHUP's reload takes effect on
+        // the *next* keypress, not instantly. Documented tradeoff, not a
+        // bug — §6.7 only requires SIGHUP to trigger "the same reload."
+        if reload_flag.swap(false, Ordering::SeqCst) {
+            apply_config_reload(&mut app);
+        }
+
         terminal.draw(|f| ui::draw(f, &mut app))?;
 
         // Block until an event arrives instead of redrawing on a timer —
@@ -202,6 +332,37 @@ async fn run(
     }
 
     Ok(())
+}
+
+/// `:config reload` and SIGHUP both land here (PRD §6.7): re-resolve
+/// against the exact CLI/env overrides pinned at startup — so they still
+/// outrank the file after a reload — and live-apply theme, measure, and
+/// ambiguous_wide. Network/storage settings (cache size/TTL, base URL) are
+/// documented as restart-only, so `client`/`cache` are deliberately left
+/// untouched here.
+fn apply_config_reload(app: &mut App) {
+    let resolved = config::resolve(
+        &app.config_ctx.cli,
+        &app.config_ctx.env,
+        app.config_ctx.config_path.as_deref(),
+    );
+    if let Some(theme) = Theme::by_name(&resolved.theme.value) {
+        app.theme = theme;
+    }
+    app.measure = resolved.measure.value;
+    app.ambiguous_wide = resolved.ambiguous_wide.value;
+    // Measure/ambiguous_wide feed layout, not just paint — drop the cached
+    // layout so the next `ensure_layout` recomputes instead of reusing a
+    // stale one keyed on the old options.
+    app.layout = None;
+    app.notice = Some(if resolved.issues.is_empty() {
+        "Config reloaded".to_string()
+    } else {
+        format!(
+            "Config reloaded ({} warning(s) — see `wikitui config doctor`)",
+            resolved.issues.len()
+        )
+    });
 }
 
 /// Fetch and open `title` as a fresh navigation (pushes the current article
@@ -569,6 +730,7 @@ async fn execute_command(
             app.prior_mode = Mode::Reading;
             app.mode = Mode::Help;
         }
+        Command::ConfigReload => apply_config_reload(app),
         Command::Quit => app.should_quit = true,
     }
 }
