@@ -1,6 +1,10 @@
 //! MediaWiki API client. Per PRD §6.2: per-wiki endpoints only
 //! (`{lang}.wikipedia.org`), never `api.wikimedia.org`. Per §6.5 (NF-NET-2)
 //! every request carries a descriptive User-Agent.
+//!
+//! The language edition is a per-request parameter rather than client
+//! state, so `:lang de` (FR-CS-2 / FR-ML-2's config) can switch editions
+//! mid-session without rebuilding the HTTP client.
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -13,7 +17,6 @@ const USER_AGENT_BASE: &str = concat!(
 
 pub struct WikiClient {
     http: reqwest::Client,
-    lang: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -29,20 +32,17 @@ struct SearchPageResponse {
 }
 
 impl WikiClient {
-    pub fn new(lang: impl Into<String>) -> Result<Self> {
+    pub fn new() -> Result<Self> {
         let http = reqwest::Client::builder()
             .user_agent(USER_AGENT_BASE)
             .gzip(true)
             .build()
             .context("building HTTP client")?;
-        Ok(Self {
-            http,
-            lang: lang.into(),
-        })
+        Ok(Self { http })
     }
 
-    fn host(&self) -> String {
-        format!("https://{}.wikipedia.org", self.lang)
+    fn host(lang: &str) -> String {
+        format!("https://{lang}.wikipedia.org")
     }
 
     fn title_path(title: &str) -> String {
@@ -52,10 +52,10 @@ impl WikiClient {
     /// Fetch Parsoid HTML for an article (PRD §6.2 rule 3: core REST
     /// `/w/rest.php/v1/page/{title}/html` is the primary content source).
     /// Returns `(canonical_title, html)`.
-    pub async fn fetch_article_html(&self, title: &str) -> Result<(String, String)> {
+    pub async fn fetch_article_html(&self, lang: &str, title: &str) -> Result<(String, String)> {
         let url = format!(
             "{}/w/rest.php/v1/page/{}/html",
-            self.host(),
+            Self::host(lang),
             Self::title_path(title)
         );
         let resp = self
@@ -66,7 +66,7 @@ impl WikiClient {
             .with_context(|| format!("requesting article HTML for {title:?}"))?;
 
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            bail!("no article named {title:?} on {}.wikipedia.org", self.lang);
+            bail!("no article named {title:?} on {lang}.wikipedia.org");
         }
         let resp = resp.error_for_status().context("fetching article HTML")?;
         let html = resp.text().await.context("reading article HTML body")?;
@@ -74,10 +74,10 @@ impl WikiClient {
     }
 
     /// Full-text search (PRD Appendix A: `GET /w/rest.php/v1/search/page`).
-    pub async fn search(&self, query: &str, limit: u32) -> Result<Vec<SearchResult>> {
+    pub async fn search(&self, lang: &str, query: &str, limit: u32) -> Result<Vec<SearchResult>> {
         let url = format!(
             "{}/w/rest.php/v1/search/page?q={}&limit={}",
-            self.host(),
+            Self::host(lang),
             urlencoding::encode(query),
             limit
         );

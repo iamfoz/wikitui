@@ -15,7 +15,7 @@ pub struct Target {
 /// Valid Wikipedia language subdomains are lowercase ASCII letters plus
 /// '-' (e.g. "en", "de", "zh-yue", "roa-rup"), and at least two chars —
 /// anything else ("C:", "Template:...") is not a lang prefix.
-fn is_lang_code(s: &str) -> bool {
+pub fn is_lang_code(s: &str) -> bool {
     s.len() >= 2 && s.chars().all(|c| c.is_ascii_lowercase() || c == '-')
 }
 

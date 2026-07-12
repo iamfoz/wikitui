@@ -3,6 +3,7 @@ mod app;
 mod cache;
 mod cite;
 mod cli;
+mod command;
 mod doc;
 mod research;
 mod target;
@@ -54,7 +55,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let client = WikiClient::new(cli.lang.clone())?;
+    let client = WikiClient::new()?;
     let page_cache = PageCache::open();
 
     if cli.dump {
@@ -108,7 +109,7 @@ async fn fetch_page(
             },
         ));
     }
-    match client.fetch_article_html(title).await {
+    match client.fetch_article_html(lang, title).await {
         Ok((_, html)) => {
             cache.put(lang, title, &html);
             Ok((html, PageSource::Live))
@@ -274,6 +275,28 @@ async fn handle_key(
             }
             _ => {}
         },
+        Mode::Command => match code {
+            KeyCode::Esc => {
+                app.mode = Mode::Reading;
+                app.command_input.clear();
+            }
+            KeyCode::Enter => {
+                let input = app.command_input.clone();
+                app.command_input.clear();
+                app.mode = Mode::Reading;
+                match command::parse(&input) {
+                    Ok(cmd) => execute_command(client, cache, app, cmd).await,
+                    Err(message) => app.notice = Some(message),
+                }
+            }
+            KeyCode::Backspace => {
+                app.command_input.pop();
+            }
+            KeyCode::Char(c) => {
+                app.command_input.push(c);
+            }
+            _ => {}
+        },
         Mode::Find => match code {
             KeyCode::Esc => {
                 app.mode = Mode::Reading;
@@ -355,114 +378,125 @@ async fn handle_key(
             }
             _ => {}
         },
-        Mode::Reading => match code {
-            KeyCode::Char('q') => app.should_quit = true,
-            KeyCode::Char('/') => {
-                app.mode = Mode::Search;
-                app.search_input.clear();
-            }
-            KeyCode::Char('?') => {
-                app.prior_mode = app.mode;
-                app.mode = Mode::Help;
-            }
-            KeyCode::Char('j') | KeyCode::Down => app.scroll_by(1),
-            KeyCode::Char('k') | KeyCode::Up => app.scroll_by(-1),
-            KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => app.scroll_by(10),
-            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => app.scroll_by(-10),
-            KeyCode::Char(' ') => app.scroll_by(15),
-            KeyCode::Tab => app.cycle_link(true),
-            KeyCode::BackTab => app.cycle_link(false),
-            KeyCode::Enter => {
-                if let Some(link) = app.focused_link.and_then(|i| app.links.get(i)).cloned() {
-                    match link.internal_title {
-                        Some(title) => open_title(client, cache, app, &title).await,
-                        None => app.status = format!("External link: {}", link.href),
+        Mode::Reading => {
+            app.notice = None;
+            match code {
+                KeyCode::Char('q') => app.should_quit = true,
+                KeyCode::Char('/') => {
+                    app.mode = Mode::Search;
+                    app.search_input.clear();
+                }
+                KeyCode::Char('?') => {
+                    app.prior_mode = app.mode;
+                    app.mode = Mode::Help;
+                }
+                KeyCode::Char('j') | KeyCode::Down => app.scroll_by(1),
+                KeyCode::Char('k') | KeyCode::Up => app.scroll_by(-1),
+                KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.scroll_by(10)
+                }
+                KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.scroll_by(-10)
+                }
+                KeyCode::Char(' ') => app.scroll_by(15),
+                KeyCode::Tab => app.cycle_link(true),
+                KeyCode::BackTab => app.cycle_link(false),
+                KeyCode::Enter => {
+                    if let Some(link) = app.focused_link.and_then(|i| app.links.get(i)).cloned() {
+                        match link.internal_title {
+                            Some(title) => open_title(client, cache, app, &title).await,
+                            None => app.status = format!("External link: {}", link.href),
+                        }
                     }
                 }
-            }
-            KeyCode::Char('H') => {
-                if let Some(title) = app.navigate_back_target() {
-                    open_title_from_history(client, cache, app, &title).await;
-                } else {
-                    app.status = "No earlier page in history".to_string();
+                KeyCode::Char('H') => {
+                    if let Some(title) = app.navigate_back_target() {
+                        open_title_from_history(client, cache, app, &title).await;
+                    } else {
+                        app.status = "No earlier page in history".to_string();
+                    }
                 }
-            }
-            KeyCode::Char('L') => {
-                if let Some(title) = app.navigate_forward_target() {
-                    open_title_from_history(client, cache, app, &title).await;
-                } else {
-                    app.status = "No later page in history".to_string();
+                KeyCode::Char('L') => {
+                    if let Some(title) = app.navigate_forward_target() {
+                        open_title_from_history(client, cache, app, &title).await;
+                    } else {
+                        app.status = "No later page in history".to_string();
+                    }
                 }
-            }
-            KeyCode::Char('t') => {
-                if app.sections.is_empty() {
-                    app.status = "No sections on this page".to_string();
-                } else {
-                    app.mode = Mode::Toc;
+                KeyCode::Char('t') => {
+                    if app.sections.is_empty() {
+                        app.status = "No sections on this page".to_string();
+                    } else {
+                        app.mode = Mode::Toc;
+                    }
                 }
-            }
-            KeyCode::Char('T') => app.cycle_theme(),
-            KeyCode::Char('y') => {
-                if let Some(url) = app.yank_url() {
-                    app.status = match yank_to_clipboard(&url) {
-                        Ok(()) => format!("Yanked {url}"),
-                        Err(e) => format!("Yank failed: {e}"),
-                    };
-                } else {
-                    app.status = "Open an article first".to_string();
+                KeyCode::Char('T') => app.cycle_theme(),
+                KeyCode::Char(':') => {
+                    app.mode = Mode::Command;
+                    app.command_input.clear();
                 }
-            }
-            KeyCode::Char('Y') => {
-                if let Some(link) = app.yank_markdown() {
-                    app.status = match yank_to_clipboard(&link) {
-                        Ok(()) => format!("Yanked {link}"),
-                        Err(e) => format!("Yank failed: {e}"),
-                    };
-                } else {
-                    app.status = "Open an article first".to_string();
+                KeyCode::Char('y') => {
+                    if let Some(url) = app.yank_url() {
+                        app.status = match yank_to_clipboard(&url) {
+                            Ok(()) => format!("Yanked {url}"),
+                            Err(e) => format!("Yank failed: {e}"),
+                        };
+                    } else {
+                        app.status = "Open an article first".to_string();
+                    }
                 }
-            }
-            KeyCode::Char('r') => {
-                if app.doc.is_some() {
-                    app.mode = Mode::Research;
-                } else {
-                    app.status = "Open an article first".to_string();
+                KeyCode::Char('Y') => {
+                    if let Some(link) = app.yank_markdown() {
+                        app.status = match yank_to_clipboard(&link) {
+                            Ok(()) => format!("Yanked {link}"),
+                            Err(e) => format!("Yank failed: {e}"),
+                        };
+                    } else {
+                        app.status = "Open an article first".to_string();
+                    }
                 }
-            }
-            KeyCode::Char('R') => app.open_library(),
-            KeyCode::Char('f') if modifiers.contains(KeyModifiers::CONTROL) => {
-                app.mode = Mode::Find;
-                app.clear_find();
-            }
-            KeyCode::Char('n') => {
-                if app.find_matches.is_empty() {
-                    app.status = "No active search — Ctrl-f to find in this page".to_string();
-                } else {
-                    app.find_next();
+                KeyCode::Char('r') => {
+                    if app.doc.is_some() {
+                        app.mode = Mode::Research;
+                    } else {
+                        app.status = "Open an article first".to_string();
+                    }
                 }
-            }
-            KeyCode::Char('N') => {
-                if app.find_matches.is_empty() {
-                    app.status = "No active search — Ctrl-f to find in this page".to_string();
-                } else {
-                    app.find_prev();
+                KeyCode::Char('R') => app.open_library(),
+                KeyCode::Char('f') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.mode = Mode::Find;
+                    app.clear_find();
                 }
-            }
-            KeyCode::Char('g') => {
-                if app.pending_g {
-                    app.scroll_to_top();
+                KeyCode::Char('n') => {
+                    if app.find_matches.is_empty() {
+                        app.status = "No active search — Ctrl-f to find in this page".to_string();
+                    } else {
+                        app.find_next();
+                    }
+                }
+                KeyCode::Char('N') => {
+                    if app.find_matches.is_empty() {
+                        app.status = "No active search — Ctrl-f to find in this page".to_string();
+                    } else {
+                        app.find_prev();
+                    }
+                }
+                KeyCode::Char('g') => {
+                    if app.pending_g {
+                        app.scroll_to_top();
+                        app.pending_g = false;
+                    } else {
+                        app.pending_g = true;
+                    }
+                }
+                KeyCode::Char('G') => app.scroll_to_bottom(),
+                KeyCode::Esc => {
                     app.pending_g = false;
-                } else {
-                    app.pending_g = true;
+                    app.clear_find();
                 }
+                _ => {}
             }
-            KeyCode::Char('G') => app.scroll_to_bottom(),
-            KeyCode::Esc => {
-                app.pending_g = false;
-                app.clear_find();
-            }
-            _ => {}
-        },
+        }
     }
 
     if !matches!(code, KeyCode::Char('g')) {
@@ -470,9 +504,77 @@ async fn handle_key(
     }
 }
 
+/// Executes a parsed `:` command. Parsing already validated arguments
+/// (theme/style/lang names), so the arms here mostly delegate to existing
+/// features.
+async fn execute_command(
+    client: &WikiClient,
+    cache: &PageCache,
+    app: &mut App,
+    cmd: command::Command,
+) {
+    use command::Command;
+    match cmd {
+        Command::Open(raw) => {
+            // Same grammar as the CLI TITLE argument: URLs and
+            // lang-prefixed titles work here too.
+            let target = target::parse(&raw);
+            if let Some(lang) = target.lang {
+                app.lang = lang;
+            }
+            open_title(client, cache, app, &target.title).await;
+        }
+        Command::Lang(code) => {
+            app.lang = code;
+            app.notice = Some(format!(
+                "Language: {} — searches and new articles use {}.wikipedia.org",
+                app.lang, app.lang
+            ));
+        }
+        Command::Theme(name) => {
+            if let Some(theme) = Theme::by_name(&name) {
+                app.theme = theme;
+                app.notice = Some(format!("Theme: {name}"));
+            }
+        }
+        Command::Style(name) => {
+            if let Some(style) = cite::CiteStyle::by_name(&name) {
+                app.cite_style = style;
+                app.notice = Some(format!("Citation style: {}", style.label()));
+            }
+        }
+        Command::Library => app.open_library(),
+        Command::Research => {
+            if app.doc.is_some() {
+                app.mode = Mode::Research;
+            } else {
+                app.notice = Some("Open an article first".to_string());
+            }
+        }
+        Command::Toc => {
+            if app.sections.is_empty() {
+                app.notice = Some("No sections on this page".to_string());
+            } else {
+                app.mode = Mode::Toc;
+            }
+        }
+        Command::Export(style) => {
+            if let Some(style) = style.and_then(|s| cite::CiteStyle::by_name(&s)) {
+                app.cite_style = style;
+            }
+            app.export_bibliography();
+        }
+        Command::Help => {
+            app.prior_mode = Mode::Reading;
+            app.mode = Mode::Help;
+        }
+        Command::Quit => app.should_quit = true,
+    }
+}
+
 async fn run_search(client: &WikiClient, app: &mut App) {
     app.loading = true;
-    match client.search(&app.search_input, 20).await {
+    match client.search(&app.lang, &app.search_input, 20).await {
         Ok(results) => {
             app.results = results;
             app.selected_result = 0;

@@ -15,6 +15,7 @@ pub enum Mode {
     Find,
     Research,
     Library,
+    Command,
     Help,
 }
 
@@ -98,6 +99,13 @@ pub struct App {
     /// Where the open article's content came from — set by the fetch path
     /// before `set_document`, which folds it into the status line.
     pub page_source: PageSource,
+    /// The `:` command line's in-progress input (PRD FR-CS-2).
+    pub command_input: String,
+    /// Transient feedback from the last `:` command (":lang de" →
+    /// "Language: de"), shown in the status bar with priority over the
+    /// focused-link line — which would otherwise hide it instantly on any
+    /// page with links — until the next keypress clears it.
+    pub notice: Option<String>,
 }
 
 impl App {
@@ -135,6 +143,8 @@ impl App {
             library_prior_mode: Mode::Reading,
             pending_export_overwrite: None,
             page_source: PageSource::None,
+            command_input: String::new(),
+            notice: None,
         }
     }
 
