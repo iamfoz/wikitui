@@ -971,6 +971,97 @@ fn occurrence_from_origins(origins: &[Option<(usize, usize)>]) -> Option<Occurre
     (!pieces.is_empty()).then_some(Occurrence { pieces })
 }
 
+/// Bump whenever `Layout`/`LaidLine`'s shape, or `layout_document`'s
+/// wrapping/breaking semantics, change in a way that would make an old
+/// cached `Layout` wrong to keep serving. Participates in
+/// [`LayoutCacheKey`] (PRD FR-OFF-1's L1 layer) so a stale schema can never
+/// be silently replayed across an upgrade — a version bump makes every
+/// existing L1 entry a guaranteed miss instead.
+pub const LAYOUT_SCHEMA_VERSION: u32 = 1;
+
+/// PRD §6.8's L1 hit target (< 50 ms) only holds if the cache stays small
+/// enough that a linear scan over it is free — 8 entries covers "the
+/// article you're reading plus whatever you just came from or are about to
+/// follow a link into," which is what actually gets reopened at an
+/// unchanged width in a normal reading session.
+pub const DEFAULT_L1_CAPACITY: usize = 8;
+
+/// The L1 render-cache key (PRD FR-OFF-1): a laid-out `Layout` is only
+/// reusable for the exact same document identity, at the exact same width
+/// and render options, under the exact same layout engine version. Any
+/// field differing is a cache miss, never a "close enough" reuse — a wrong
+/// layout silently reused would misplace scroll offsets, section jumps,
+/// and find matches, all of which trust line numbers absolutely.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayoutCacheKey {
+    pub lang: String,
+    pub title: String,
+    /// `0` when the content's revid is unknown (degraded mode — see
+    /// `cache`'s module doc comment); still a valid, distinct key value,
+    /// just one that can collide across different *content* at the same
+    /// title if that content was never revid-tagged (an accepted
+    /// degradation, matching L2's own).
+    pub revid: u64,
+    pub width: u16,
+    pub options: LayoutOptions,
+    pub schema_version: u32,
+}
+
+/// PRD FR-OFF-1's L1 layer: a small in-memory LRU of already-laid-out
+/// documents, so reopening an article at an unchanged identity/width/
+/// options doesn't repeat the layout pass (§6.8: L1 hit < 50 ms). Disk
+/// persistence is explicitly out of scope: an in-memory cache alone meets
+/// the target at today's article sizes, and every entry is trivially
+/// rebuildable from L2 on a miss, so losing it on restart costs one
+/// relayout, not correctness — revisit only if a future compliance audit
+/// finds the target missed at realistic article sizes.
+pub struct LayoutCache {
+    capacity: usize,
+    /// Least-recently-used at the front, most-recently-used at the back —
+    /// a plain `Vec` rather than a `HashMap`+linked-list LRU because
+    /// `DEFAULT_L1_CAPACITY` is tiny: a linear scan over 8 entries is
+    /// cheaper than maintaining a fancier structure would ever recoup.
+    entries: Vec<(LayoutCacheKey, Layout)>,
+}
+
+impl LayoutCache {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            entries: Vec::new(),
+        }
+    }
+
+    /// A hit clones the stored `Layout` out (cheap relative to a relayout)
+    /// and promotes the entry to most-recently-used; a miss leaves the
+    /// cache untouched.
+    pub fn get(&mut self, key: &LayoutCacheKey) -> Option<Layout> {
+        let pos = self.entries.iter().position(|(k, _)| k == key)?;
+        let (k, v) = self.entries.remove(pos);
+        let layout = v.clone();
+        self.entries.push((k, v));
+        Some(layout)
+    }
+
+    /// Inserts (or replaces, promoting to most-recently-used) an entry,
+    /// evicting the least-recently-used one if this pushes the cache over
+    /// capacity.
+    pub fn put(&mut self, key: LayoutCacheKey, layout: Layout) {
+        if let Some(pos) = self.entries.iter().position(|(k, _)| k == &key) {
+            self.entries.remove(pos);
+        }
+        self.entries.push((key, layout));
+        while self.entries.len() > self.capacity {
+            self.entries.remove(0);
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1456,5 +1547,118 @@ mod tests {
             let layout = layout_document(&doc, 30, LayoutOptions::default());
             assert_eq!(layout.continuation.len(), layout.lines.len() - 1);
         }
+    }
+
+    // -- L1 render cache (PRD FR-OFF-1) -------------------------------------
+
+    fn cache_key(title: &str, revid: u64, width: u16, schema_version: u32) -> LayoutCacheKey {
+        LayoutCacheKey {
+            lang: "en".to_string(),
+            title: title.to_string(),
+            revid,
+            width,
+            options: LayoutOptions::default(),
+            schema_version,
+        }
+    }
+
+    fn sample_layout(width: u16) -> Layout {
+        layout_document(
+            &parse_article_html("Test Article", FIXTURE),
+            width,
+            LayoutOptions::default(),
+        )
+    }
+
+    #[test]
+    fn layout_cache_hits_on_an_identical_key_and_misses_on_any_field_change() {
+        let mut cache = LayoutCache::new(4);
+        let key = cache_key("Article", 1, 80, LAYOUT_SCHEMA_VERSION);
+        let layout = sample_layout(80);
+        cache.put(key.clone(), layout.clone());
+
+        let hit = cache.get(&key).expect("identical key must hit");
+        assert_eq!(hit.lines, layout.lines);
+
+        let mut different_schema = key.clone();
+        different_schema.schema_version += 1;
+        assert!(
+            cache.get(&different_schema).is_none(),
+            "a schema-version bump must miss, never replay a stale layout"
+        );
+
+        let mut different_revid = key.clone();
+        different_revid.revid = 2;
+        assert!(
+            cache.get(&different_revid).is_none(),
+            "different revid must miss"
+        );
+
+        let mut different_width = key.clone();
+        different_width.width = 40;
+        assert!(
+            cache.get(&different_width).is_none(),
+            "different width must miss"
+        );
+
+        let mut different_title = key.clone();
+        different_title.title = "Other".to_string();
+        assert!(
+            cache.get(&different_title).is_none(),
+            "different title must miss"
+        );
+
+        let mut different_lang = key;
+        different_lang.lang = "de".to_string();
+        assert!(
+            cache.get(&different_lang).is_none(),
+            "different lang must miss"
+        );
+    }
+
+    #[test]
+    fn layout_cache_get_on_empty_cache_is_a_miss_not_a_panic() {
+        let mut cache = LayoutCache::new(4);
+        assert!(
+            cache
+                .get(&cache_key("Nothing", 0, 80, LAYOUT_SCHEMA_VERSION))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn layout_cache_evicts_least_recently_used_once_over_capacity() {
+        let mut cache = LayoutCache::new(2);
+        let a = cache_key("A", 1, 80, LAYOUT_SCHEMA_VERSION);
+        let b = cache_key("B", 1, 80, LAYOUT_SCHEMA_VERSION);
+        let c = cache_key("C", 1, 80, LAYOUT_SCHEMA_VERSION);
+        let layout = sample_layout(80);
+
+        cache.put(a.clone(), layout.clone());
+        cache.put(b.clone(), layout.clone());
+        assert_eq!(cache.len(), 2);
+
+        // Touch A, making B the least-recently-used entry.
+        assert!(cache.get(&a).is_some());
+        cache.put(c.clone(), layout); // must evict B, not A
+
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get(&a).is_some(), "recently touched: kept");
+        assert!(cache.get(&b).is_none(), "least recently used: evicted");
+        assert!(cache.get(&c).is_some(), "just inserted: kept");
+    }
+
+    #[test]
+    fn layout_cache_put_again_for_the_same_key_replaces_not_duplicates() {
+        let mut cache = LayoutCache::new(4);
+        let key = cache_key("Article", 1, 80, LAYOUT_SCHEMA_VERSION);
+        cache.put(key.clone(), sample_layout(80));
+        cache.put(key.clone(), sample_layout(80));
+        assert_eq!(
+            cache.len(),
+            1,
+            "re-inserting the same key must not grow the cache"
+        );
+        assert!(cache.get(&key).is_some());
     }
 }

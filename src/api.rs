@@ -26,6 +26,7 @@
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use std::time::Duration;
 
 const USER_AGENT_BASE: &str = concat!(
     "wikitui/",
@@ -133,6 +134,47 @@ struct SearchTitleResponse {
     pages: Vec<TitleSuggestion>,
 }
 
+#[derive(Debug, Deserialize)]
+struct BareLatest {
+    id: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct BareResponse {
+    latest: BareLatest,
+}
+
+/// One freshly fetched article (PRD FR-OFF-1/2): Parsoid HTML plus whatever
+/// revision identity the REST response exposed. `revid` is `0` when the
+/// `ETag` was missing or unparseable (older mock endpoints, some
+/// third-party wikis) — the two-layer cache degrades to title-keyed,
+/// always-revalidated storage in that case (see `cache`'s module doc
+/// comment) rather than refusing to open the article.
+#[derive(Debug, Clone)]
+pub struct FetchedArticle {
+    pub html: String,
+    pub revid: u64,
+    pub etag: Option<String>,
+}
+
+/// Extracts the leading numeric revid from a Parsoid-shaped `ETag`
+/// (`W/"1234567/uuid"`: weak-validator prefix and uuid suffix both
+/// optional). PRD Appendix A's "Page metadata / latest revid" identity,
+/// captured here so L2 storage can key content by revid instead of just a
+/// title. Anything that doesn't parse to a leading integer — garbage, an
+/// empty tag, a strong-validator quote with no slash-separated id — yields
+/// `None` rather than an error: an unfamiliar `ETag` shape must still let
+/// the article open, just without the immutability/SWR wins a real revid
+/// enables (the caller's `unwrap_or(0)` is the documented fallback).
+fn parse_revid_from_etag(etag: &str) -> Option<u64> {
+    let s = etag.trim();
+    let s = s.strip_prefix("W/").unwrap_or(s).trim();
+    let s = s.strip_prefix('"').unwrap_or(s);
+    let s = s.strip_suffix('"').unwrap_or(s);
+    let (first, _) = s.split_once('/').unwrap_or((s, ""));
+    first.parse::<u64>().ok()
+}
+
 /// Full-text search results plus the did-you-mean suggestion, when the
 /// server offered one (PRD FR-SR-4).
 #[derive(Debug, Clone)]
@@ -150,6 +192,11 @@ impl WikiClient {
         let http = reqwest::Client::builder()
             .user_agent(USER_AGENT_BASE)
             .gzip(true)
+            // NF-NET-8: short timeouts with immediate cache fallback — a
+            // hung request must not stall the reader (foreground fetches)
+            // or leave a background revalidation (PRD FR-OFF-2) occupying
+            // the "revalidation in flight" state indefinitely.
+            .timeout(Duration::from_secs(5))
             .build()
             .context("building HTTP client")?;
         Ok(Self {
@@ -172,8 +219,7 @@ impl WikiClient {
 
     /// Fetch Parsoid HTML for an article (PRD §6.2 rule 3: core REST
     /// `/w/rest.php/v1/page/{title}/html` is the primary content source).
-    /// Returns `(canonical_title, html)`.
-    pub async fn fetch_article_html(&self, lang: &str, title: &str) -> Result<(String, String)> {
+    pub async fn fetch_article_html(&self, lang: &str, title: &str) -> Result<FetchedArticle> {
         let url = format!(
             "{}/w/rest.php/v1/page/{}/html",
             self.host(lang),
@@ -190,6 +236,15 @@ impl WikiClient {
             bail!("no article named {title:?} on {lang}.wikipedia.org");
         }
         let resp = resp.error_for_status().context("fetching article HTML")?;
+        // Captured before the body read below consumes `resp` — PRD
+        // FR-OFF-1/Appendix A's revid identity rides the ETag on this same
+        // response, so there is no second round trip for it.
+        let etag = resp
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let revid = etag.as_deref().and_then(parse_revid_from_etag).unwrap_or(0);
         // PRD SEC-3: bounds memory during the read itself; the authoritative
         // truncate-and-flag decision for oversized article HTML is
         // `doc::parse_article_html`'s own cap, run against whatever string
@@ -199,7 +254,35 @@ impl WikiClient {
             .await
             .context("reading article HTML body")?;
         let html = decode_lossy_utf8(bytes);
-        Ok((title.to_string(), html))
+        Ok(FetchedArticle { html, revid, etag })
+    }
+
+    /// The cheap revalidation call (PRD FR-OFF-2 / Appendix A's "Page
+    /// metadata / latest revid" row): `GET /w/rest.php/v1/page/{title}/bare`
+    /// returns just `{"latest": {"id": revid}}`, so a background staleness
+    /// check costs a fraction of a full article re-fetch. Returns the
+    /// latest revid only — the caller (`main::fire_revalidation`) compares
+    /// it against what's cached via `cache::revalidate_action`.
+    pub async fn fetch_bare_metadata(&self, lang: &str, title: &str) -> Result<u64> {
+        let url = format!(
+            "{}/w/rest.php/v1/page/{}/bare",
+            self.host(lang),
+            Self::title_path(title)
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("requesting bare metadata for {title:?}"))?
+            .error_for_status()
+            .context("bare metadata request failed")?;
+        let bytes = read_capped(resp, MAX_SEARCH_RESPONSE_BYTES)
+            .await
+            .context("reading bare metadata response body")?;
+        let parsed: BareResponse =
+            serde_json::from_slice(&bytes).context("parsing bare metadata response")?;
+        Ok(parsed.latest.id)
     }
 
     /// Full-text search (PRD Appendix A: `GET /w/rest.php/v1/search/page`).
@@ -451,19 +534,136 @@ mod tests {
         });
 
         let client = WikiClient::new(format!("http://127.0.0.1:{port}")).unwrap();
-        let (_, html) = client
+        let fetched = client
             .fetch_article_html("en", "Test")
             .await
             .expect("capped read must still succeed, not error, on an oversized body");
         assert!(
-            html.len() < oversized,
+            fetched.html.len() < oversized,
             "must not buffer the full oversized body, got {} of {oversized}",
-            html.len()
+            fetched.html.len()
         );
         assert!(
-            html.len() <= crate::doc::MAX_ARTICLE_HTML_BYTES + 4_000_000,
+            fetched.html.len() <= crate::doc::MAX_ARTICLE_HTML_BYTES + 4_000_000,
             "overshoot past the cap must be bounded (a few chunks at most), got {}",
-            html.len()
+            fetched.html.len()
+        );
+    }
+
+    /// PRD FR-OFF-1/2: the `ETag` header on a Parsoid HTML response is
+    /// captured verbatim and its leading revid parsed out, so L2 storage
+    /// can key content by revision instead of just title.
+    #[tokio::test]
+    async fn fetch_article_html_captures_etag_and_parses_its_revid() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut discard = [0u8; 4096];
+                let _ = stream.read(&mut discard);
+                let body = b"<html><body>hi</body></html>";
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nETag: W/\"4242/mock-uuid\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+
+        let client = WikiClient::new(format!("http://127.0.0.1:{port}")).unwrap();
+        let fetched = client.fetch_article_html("en", "Test").await.unwrap();
+        assert_eq!(fetched.etag.as_deref(), Some("W/\"4242/mock-uuid\""));
+        assert_eq!(fetched.revid, 4242);
+    }
+
+    /// An article response with no `ETag` at all degrades to `revid = 0`
+    /// rather than failing the fetch — the documented fallback for older
+    /// mock endpoints and third-party wikis.
+    #[tokio::test]
+    async fn fetch_article_html_with_no_etag_degrades_to_revid_zero() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut discard = [0u8; 4096];
+                let _ = stream.read(&mut discard);
+                let body = b"<html><body>hi</body></html>";
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+
+        let client = WikiClient::new(format!("http://127.0.0.1:{port}")).unwrap();
+        let fetched = client.fetch_article_html("en", "Test").await.unwrap();
+        assert_eq!(fetched.etag, None);
+        assert_eq!(fetched.revid, 0);
+    }
+
+    /// PRD Appendix A's cheap "Page metadata / latest revid" call.
+    #[tokio::test]
+    async fn fetch_bare_metadata_parses_the_latest_revid() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut discard = [0u8; 4096];
+                let _ = stream.read(&mut discard);
+                let body = br#"{"latest": {"id": 99}}"#;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+
+        let client = WikiClient::new(format!("http://127.0.0.1:{port}")).unwrap();
+        let revid = client.fetch_bare_metadata("en", "Test").await.unwrap();
+        assert_eq!(revid, 99);
+    }
+
+    /// `parse_revid_from_etag`'s full behavior table: well-formed weak
+    /// validators, a bare quoted number, a strong validator, and garbage —
+    /// only the first two categories carry a parseable revid.
+    #[test]
+    fn parse_revid_from_etag_table() {
+        assert_eq!(
+            parse_revid_from_etag(r#"W/"1234567/some-uuid""#),
+            Some(1_234_567),
+            "well-formed weak validator with a uuid suffix"
+        );
+        assert_eq!(
+            parse_revid_from_etag(r#"W/"555""#),
+            Some(555),
+            "weak validator with no slash suffix"
+        );
+        assert_eq!(
+            parse_revid_from_etag(r#""777/uuid""#),
+            Some(777),
+            "strong validator (no W/ prefix) still parses"
+        );
+        assert_eq!(
+            parse_revid_from_etag(r#""not-a-number""#),
+            None,
+            "garbage payload must not panic or fake a revid"
+        );
+        assert_eq!(parse_revid_from_etag(""), None, "empty tag");
+        assert_eq!(
+            parse_revid_from_etag(r#"W/"/no-leading-number""#),
+            None,
+            "missing the leading integer entirely"
         );
     }
 }

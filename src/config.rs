@@ -160,6 +160,10 @@ pub struct ResolvedConfig {
     pub cite_style: Valued<String>,
     pub cache_max_mb: Valued<u64>,
     pub cache_fresh_ttl_hours: Valued<u64>,
+    /// PRD FR-OFF-2's force-refetch backstop: entries older than this are
+    /// treated as absent on open, network-first, regardless of what a
+    /// background revalidation might otherwise have decided.
+    pub cache_force_refetch_days: Valued<u64>,
     pub active_wiki: Valued<String>,
     /// Always concrete (defaults to `DEFAULT_BASE_URL_TEMPLATE`); `{lang}`
     /// is substituted by `api::WikiClient` when present, else used
@@ -289,7 +293,8 @@ pub fn resolve(
     );
     let measure = resolve_measure(cli, env, &table, &mut issues);
     let ambiguous_wide = resolve_ambiguous_width(cli, env, &table, &mut issues);
-    let (cache_max_mb, cache_fresh_ttl_hours) = resolve_cache(&table, &mut issues);
+    let (cache_max_mb, cache_fresh_ttl_hours, cache_force_refetch_days) =
+        resolve_cache(&table, &mut issues);
     let (active_wiki, base_url_template) = resolve_wiki(env, &table, &mut issues);
 
     ResolvedConfig {
@@ -309,6 +314,7 @@ pub fn resolve(
         cite_style,
         cache_max_mb,
         cache_fresh_ttl_hours,
+        cache_force_refetch_days,
         active_wiki,
         base_url_template,
         migration_summary: config_version.1,
@@ -671,14 +677,18 @@ fn resolve_ambiguous_width(
     }
 }
 
-fn resolve_cache(table: &toml::Table, issues: &mut Vec<Issue>) -> (Valued<u64>, Valued<u64>) {
+fn resolve_cache(
+    table: &toml::Table,
+    issues: &mut Vec<Issue>,
+) -> (Valued<u64>, Valued<u64>, Valued<u64>) {
     let default_max_mb = crate::cache::DEFAULT_MAX_BYTES / (1024 * 1024);
     let default_ttl_hours = crate::cache::FRESH_TTL_SECS / 3600;
+    let default_force_refetch_days = crate::cache::DEFAULT_FORCE_REFETCH_SECS / 86_400;
 
     let Some(cache_table) = table.get("cache").and_then(toml::Value::as_table) else {
         if table.contains_key("cache") {
             issues.push(Issue::warning(
-                "cache must be a table (use [cache] with max_mb/fresh_ttl_hours); ignoring",
+                "cache must be a table (use [cache] with max_mb/fresh_ttl_hours/force_refetch_days); ignoring",
             ));
         }
         return (
@@ -690,10 +700,16 @@ fn resolve_cache(table: &toml::Table, issues: &mut Vec<Issue>) -> (Valued<u64>, 
                 value: default_ttl_hours,
                 source: Source::Default,
             },
+            Valued {
+                value: default_force_refetch_days,
+                source: Source::Default,
+            },
         );
     };
 
-    let known: BTreeSet<&str> = ["max_mb", "fresh_ttl_hours"].into_iter().collect();
+    let known: BTreeSet<&str> = ["max_mb", "fresh_ttl_hours", "force_refetch_days"]
+        .into_iter()
+        .collect();
     for key in cache_table.keys() {
         if !known.contains(key.as_str()) {
             issues.push(Issue::warning(format!(
@@ -714,7 +730,13 @@ fn resolve_cache(table: &toml::Table, issues: &mut Vec<Issue>) -> (Valued<u64>, 
         default_ttl_hours,
         issues,
     );
-    (max_mb, fresh_ttl_hours)
+    let force_refetch_days = resolve_positive_int(
+        cache_table.get("force_refetch_days"),
+        "cache.force_refetch_days",
+        default_force_refetch_days,
+        issues,
+    );
+    (max_mb, fresh_ttl_hours, force_refetch_days)
 }
 
 fn resolve_positive_int(
@@ -1352,6 +1374,32 @@ mod tests {
             resolved.cache_fresh_ttl_hours,
             Valued {
                 value: 6,
+                source: Source::File
+            }
+        );
+        assert_eq!(
+            resolved.cache_force_refetch_days,
+            Valued {
+                value: 30,
+                source: Source::Default
+            },
+            "unset in the file: falls back to the 30-day default"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn cache_force_refetch_days_is_wired_from_the_file() {
+        let path = temp_config("[cache]\nforce_refetch_days = 7\n");
+        let resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(
+            resolved.cache_force_refetch_days,
+            Valued {
+                value: 7,
                 source: Source::File
             }
         );

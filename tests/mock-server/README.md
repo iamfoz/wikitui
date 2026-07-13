@@ -26,8 +26,25 @@ corpus can stay small and readable:
   `suggestion` field instead (see `api::SearchOutcome`'s doc comment for why
   that field rides this response rather than a second Action-API request).
 
+Two-layer cache / stale-while-revalidate fixtures (PRD FR-OFF-1/2):
+
+- `GET /w/rest.php/v1/page/{title}/html` also sends an `ETag: W/"{revid}/mock-etag"`
+  header — one stable fake revid per `PAGES` key (`REVIDS`), which
+  `api::parse_revid_from_etag` parses back out.
+- `GET /w/rest.php/v1/page/{title}/bare` — the cheap revalidation call
+  (Appendix A's "Page metadata / latest revid" row): `{"latest": {"id": revid}}`,
+  no article body.
+- `WIKITUI_MOCK_UPDATE_TITLE=<title>` (env var, checked at process start)
+  simulates an edit to exactly that one fixture: its revid reports one
+  higher everywhere (`html`'s ETag and `bare`'s `latest.id`), and its HTML
+  gets an extra trailing paragraph — so a stale-while-revalidate test can
+  start the mock once unset (seed a cache entry at the base revid), kill
+  it, then restart it with this set to the same title and confirm the
+  app's background revalidation both notices the new revid and renders
+  visibly different content after `r` reloads.
+
 It does not implement summaries or any other endpoint — only what article
-rendering and search need.
+rendering, search, and the page cache need.
 
 ## Running it
 

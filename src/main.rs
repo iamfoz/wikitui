@@ -27,8 +27,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 use api::{TitleSuggestion, WikiClient};
-use app::{App, Mode, PageSource};
-use cache::PageCache;
+use app::{App, Mode, PageSource, PendingReload};
+use cache::{PageCache, RevalidateAction, SwrDecision};
 use cite::CiteStyle;
 use cli::{Cli, Commands, ConfigAction};
 use config::ConfigContext;
@@ -46,12 +46,47 @@ const TYPEAHEAD_POLL: Duration = Duration::from_millis(30);
 /// How many typeahead rows to request/show (PRD FR-SR-1).
 const TYPEAHEAD_LIMIT: u32 = 10;
 
+/// How often the loop wakes up while a background revalidation (PRD
+/// FR-OFF-2) is in flight, so its "updated — r to reload" notice can
+/// appear without the reader having to press a key first. Coarser than
+/// `TYPEAHEAD_POLL` since nothing here is debounced against a keystroke —
+/// just waiting for a background task — and scoped the same way: only paid
+/// while `App::pending_revalidations` is nonzero, never in plain Reading
+/// mode with nothing in flight (PRD FR-ACS-2's 0%-idle-CPU property).
+const REVALIDATE_POLL: Duration = Duration::from_millis(100);
+
 /// One completed (or failed) typeahead request, tagged with the query it
 /// answers so the receiver can drop it if it's gone stale (`app::
 /// typeahead_is_current`) — PRD FR-SR-1's in-flight cancellation.
 struct TypeaheadOutcome {
     query: String,
     result: std::result::Result<Vec<TitleSuggestion>, String>,
+}
+
+/// One completed (or failed) background revalidation (PRD FR-OFF-2),
+/// tagged with the (lang, title) it's for so the receiver can tell whether
+/// it still applies to whatever's on screen.
+struct RevalidationOutcome {
+    lang: String,
+    title: String,
+    /// `None` on any network failure along the way (bare-metadata call or
+    /// the follow-up fetch): NF-NET-8's "revalidation failure is silent" —
+    /// the cached copy already on screen simply stands, nothing is logged
+    /// or shown.
+    result: Option<RevalidationResult>,
+}
+
+enum RevalidationResult {
+    /// The bare-metadata call reported the same revid already cached:
+    /// nothing to fetch, just extend the TTL window silently.
+    Unchanged,
+    /// A different (or newly-discovered) revid: fresh HTML fetched and
+    /// ready to write into L2.
+    Changed {
+        html: String,
+        revid: u64,
+        etag: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -122,6 +157,10 @@ async fn main() -> Result<()> {
     let page_cache = PageCache::open(
         resolved.cache_max_mb.value.saturating_mul(1024 * 1024),
         resolved.cache_fresh_ttl_hours.value.saturating_mul(3600),
+        resolved
+            .cache_force_refetch_days
+            .value
+            .saturating_mul(86_400),
     );
 
     if cli.dump {
@@ -129,8 +168,12 @@ async fn main() -> Result<()> {
             .title
             .clone()
             .ok_or_else(|| anyhow::anyhow!("--dump requires an article title"))?;
-        let (html, _) = fetch_page(&client, &page_cache, &resolved.lang.value, &title).await?;
-        let document = doc::parse_article_html(&title, &html);
+        // A one-shot linear render (PRD FR-RD-12) has no event loop to
+        // deliver a background revalidation's result into, so it never
+        // spawns one — the reader gets whatever's freshest synchronously
+        // (fresh cache, or a network round trip on a stale/missing one).
+        let outcome = fetch_page(&client, &page_cache, &resolved.lang.value, &title).await?;
+        let document = doc::parse_article_html(&title, &outcome.html);
         print!("{}", doc::render_plain(&document));
         return Ok(());
     }
@@ -240,42 +283,170 @@ fn spawn_sighup_listener(flag: Arc<AtomicBool>) {
 #[cfg(not(unix))]
 fn spawn_sighup_listener(_flag: Arc<AtomicBool>) {}
 
-/// The cache-aware fetch (PRD FR-OFF-2's MVP serve policy): a fresh-enough
-/// cached copy skips the network entirely; otherwise fetch and cache; and
-/// if the network fails, any cached copy — however stale — beats the
-/// error, which is what makes offline reading work. Returns the HTML and
-/// where it came from.
+/// The result of the cache-aware fetch (PRD FR-OFF-2): the HTML to render
+/// right now, where it came from (drives the ●◐○ glyph), the revid it's
+/// at, and — when the serve was a stale-but-within-backstop cache hit —
+/// the cached revid a background revalidation should compare against.
+struct FetchOutcome {
+    html: String,
+    source: PageSource,
+    revid: u64,
+    /// `Some(cached_revid)` exactly when the caller should spawn a
+    /// background revalidation (PRD FR-OFF-2's stale-while-revalidate);
+    /// `None` for a fresh cache hit (nothing to check yet) or a live/
+    /// offline network result (already as current as this session can
+    /// make it).
+    revalidate: Option<u64>,
+}
+
+/// The cache-aware fetch (PRD FR-OFF-2's serve policy): render whatever
+/// cached copy exists immediately — instantly for a fresh one, and for a
+/// stale-but-within-backstop one too, deferring the staleness check to a
+/// background revalidation the caller spawns. Only a cache miss, or an
+/// entry past the force-refetch backstop (`cache::SwrDecision::
+/// ForceRefetch` — "treated as absent on open"), goes to the network
+/// inline here. If the network fails, any cached copy — however stale —
+/// beats the error, which is what makes offline reading work.
 async fn fetch_page(
     client: &WikiClient,
     cache: &PageCache,
     lang: &str,
     title: &str,
-) -> Result<(String, PageSource)> {
+) -> Result<FetchOutcome> {
     let cached = cache.get(lang, title);
-    if let Some(page) = &cached
-        && cache.is_fresh(page.age_secs)
-    {
-        return Ok((
-            page.html.clone(),
-            PageSource::Cached {
-                age_secs: page.age_secs,
-            },
-        ));
+    if let Some(page) = &cached {
+        match cache.swr_decision(page.age_secs) {
+            SwrDecision::Fresh => {
+                return Ok(FetchOutcome {
+                    html: page.html.clone(),
+                    source: PageSource::Cached {
+                        age_secs: page.age_secs,
+                    },
+                    revid: page.revid,
+                    revalidate: None,
+                });
+            }
+            SwrDecision::RevalidateInBackground => {
+                return Ok(FetchOutcome {
+                    html: page.html.clone(),
+                    source: PageSource::Cached {
+                        age_secs: page.age_secs,
+                    },
+                    revid: page.revid,
+                    revalidate: Some(page.revid),
+                });
+            }
+            SwrDecision::ForceRefetch => {
+                // Falls through to the network-first path below; `cached`
+                // remains available there as the offline-error fallback.
+            }
+        }
     }
     match client.fetch_article_html(lang, title).await {
-        Ok((_, html)) => {
-            cache.put(lang, title, &html);
-            Ok((html, PageSource::Live))
+        Ok(fetched) => {
+            cache.put(
+                lang,
+                title,
+                &fetched.html,
+                fetched.revid,
+                fetched.etag.as_deref(),
+            );
+            Ok(FetchOutcome {
+                html: fetched.html,
+                source: PageSource::Live,
+                revid: fetched.revid,
+                revalidate: None,
+            })
         }
         Err(network_error) => match cached {
-            Some(page) => Ok((
-                page.html,
-                PageSource::Offline {
+            Some(page) => Ok(FetchOutcome {
+                html: page.html,
+                source: PageSource::Offline {
                     age_secs: page.age_secs,
                 },
-            )),
+                revid: page.revid,
+                revalidate: None,
+            }),
             None => Err(network_error),
         },
+    }
+}
+
+/// Spawns the background staleness check (PRD FR-OFF-2): a cheap
+/// bare-metadata call, then — only if the revid actually changed — a full
+/// HTML re-fetch. Mirrors `fire_typeahead`'s shape (never runs inline in
+/// the loop) but has no debounce timer to wait on; it fires right after the
+/// stale-cache-hit fetch that requested it.
+fn fire_revalidation(
+    client: &WikiClient,
+    lang: String,
+    title: String,
+    cached_revid: u64,
+    tx: &UnboundedSender<RevalidationOutcome>,
+) {
+    let client = client.clone();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let result = revalidate(&client, &lang, &title, cached_revid).await;
+        let _ = tx.send(RevalidationOutcome {
+            lang,
+            title,
+            result,
+        });
+    });
+}
+
+/// The actual bare-metadata-then-maybe-fetch sequence, isolated from the
+/// channel plumbing above so it's a plain `async fn` returning `None` on
+/// any network failure (NF-NET-8: revalidation failure is silent).
+async fn revalidate(
+    client: &WikiClient,
+    lang: &str,
+    title: &str,
+    cached_revid: u64,
+) -> Option<RevalidationResult> {
+    let latest_revid = client.fetch_bare_metadata(lang, title).await.ok()?;
+    match cache::revalidate_action(cached_revid, latest_revid) {
+        RevalidateAction::Touch => Some(RevalidationResult::Unchanged),
+        RevalidateAction::Fetch => {
+            let fetched = client.fetch_article_html(lang, title).await.ok()?;
+            Some(RevalidationResult::Changed {
+                html: fetched.html,
+                revid: fetched.revid,
+                etag: fetched.etag,
+            })
+        }
+    }
+}
+
+/// Applies a completed revalidation (PRD FR-OFF-2): writes any changed
+/// content into L2 (or silently touches `fetched_at` for an unchanged
+/// revid) regardless of what's currently on screen, then — only if the
+/// reader is still looking at that exact (lang, title) — arms the "updated
+/// — r to reload" notice. A stale result for an article the reader has
+/// since navigated away from still updates the cache (so it's ready
+/// whenever they come back) but never disturbs the current view.
+fn apply_revalidation_outcome(app: &mut App, cache: &PageCache, outcome: RevalidationOutcome) {
+    app.pending_revalidations = app.pending_revalidations.saturating_sub(1);
+    let Some(result) = outcome.result else {
+        return; // NF-NET-8: silent on failure — the cached copy stands.
+    };
+    match result {
+        RevalidationResult::Unchanged => {
+            cache.touch_fetched_at(&outcome.lang, &outcome.title);
+        }
+        RevalidationResult::Changed { html, revid, etag } => {
+            cache.put(&outcome.lang, &outcome.title, &html, revid, etag.as_deref());
+            let still_open = app.lang == outcome.lang
+                && app.doc.as_ref().is_some_and(|d| d.title == outcome.title);
+            if still_open {
+                app.pending_reload = Some(PendingReload {
+                    lang: outcome.lang,
+                    title: outcome.title,
+                });
+                app.notice = Some("updated — r to reload".to_string());
+            }
+        }
     }
 }
 
@@ -325,17 +496,18 @@ async fn run(
     app.cite_style = cite_style;
     app.config_ctx = config_ctx;
 
+    // Delivers typeahead responses and background revalidation outcomes
+    // back to the loop (PRD FR-SR-1 / FR-OFF-2): both run on spawned tasks,
+    // never inline, so neither can stall redraws or keystrokes.
+    let (typeahead_tx, mut typeahead_rx) = mpsc::unbounded_channel::<TypeaheadOutcome>();
+    let (revalidate_tx, mut revalidate_rx) = mpsc::unbounded_channel::<RevalidationOutcome>();
+
     if let Some(query) = cli.search {
         app.search_input = query;
         run_search(client, &mut app).await;
     } else if let Some(title) = cli.title {
-        open_title(client, cache, &mut app, &title).await;
+        open_title(client, cache, &mut app, &title, &revalidate_tx).await;
     }
-
-    // Delivers typeahead responses back to the loop (PRD FR-SR-1): fetches
-    // run on spawned tasks, never inline in the loop, so a slow request
-    // can't stall redraws or keystrokes — see `fire_typeahead`.
-    let (typeahead_tx, mut typeahead_rx) = mpsc::unbounded_channel::<TypeaheadOutcome>();
 
     loop {
         // Checked once per turn rather than mid-`event::read()`, which
@@ -361,40 +533,67 @@ async fn run(
             );
         }
 
-        if app.mode == Mode::Search {
-            // The only mode that wakes on a timer instead of blocking
-            // forever in `event::read()` — the typeahead debounce needs the
-            // loop to notice time passing even with no new keystroke.
-            // Everywhere else keeps the original block-until-input
-            // behavior (PRD FR-ACS-2: no gratuitous redraws/CPU use idle).
-            if event::poll(TYPEAHEAD_POLL)?
+        // Search mode's typeahead debounce and an in-flight background
+        // revalidation (PRD FR-OFF-2) are the only two reasons to wake on a
+        // timer instead of blocking forever in `event::read()`. Everywhere
+        // else — plain Reading mode with nothing revalidating — keeps the
+        // original block-until-input behavior (PRD FR-ACS-2: no gratuitous
+        // redraws/CPU use idle; verified 0% over several seconds).
+        if app.mode == Mode::Search || app.pending_revalidations > 0 {
+            let poll_interval = if app.mode == Mode::Search {
+                TYPEAHEAD_POLL
+            } else {
+                REVALIDATE_POLL
+            };
+            if event::poll(poll_interval)?
                 && let Event::Key(key) = event::read()?
                 && key.kind == KeyEventKind::Press
             {
-                handle_key(client, cache, &mut app, key.code, key.modifiers).await;
+                handle_key(
+                    client,
+                    cache,
+                    &mut app,
+                    key.code,
+                    key.modifiers,
+                    &revalidate_tx,
+                )
+                .await;
             }
-            if let Some(deadline) = app.search_debounce_at
-                && app::debounce_due(deadline, Instant::now())
-            {
-                app.search_debounce_at = None;
-                fire_typeahead(client, &app, &typeahead_tx);
-            }
-            // Non-blocking drain: a response for a query the user has since
-            // typed past (`typeahead_is_current` says no) is silently
-            // discarded — PRD FR-SR-1's in-flight cancellation.
-            while let Ok(outcome) = typeahead_rx.try_recv() {
-                if app::typeahead_is_current(&outcome.query, &app.search_input)
-                    && let Ok(suggestions) = outcome.result
+            if app.mode == Mode::Search {
+                if let Some(deadline) = app.search_debounce_at
+                    && app::debounce_due(deadline, Instant::now())
                 {
-                    app.typeahead = suggestions;
-                    app.selected_suggestion = 0;
+                    app.search_debounce_at = None;
+                    fire_typeahead(client, &app, &typeahead_tx);
                 }
+                // Non-blocking drain: a response for a query the user has
+                // since typed past (`typeahead_is_current` says no) is
+                // silently discarded — PRD FR-SR-1's in-flight cancellation.
+                while let Ok(outcome) = typeahead_rx.try_recv() {
+                    if app::typeahead_is_current(&outcome.query, &app.search_input)
+                        && let Ok(suggestions) = outcome.result
+                    {
+                        app.typeahead = suggestions;
+                        app.selected_suggestion = 0;
+                    }
+                }
+            }
+            while let Ok(outcome) = revalidate_rx.try_recv() {
+                apply_revalidation_outcome(&mut app, cache, outcome);
             }
         } else if let Event::Key(key) = event::read()? {
             // Block until an event arrives instead of redrawing on a timer —
             // an idle reader shouldn't spin the CPU or spam hide-cursor codes.
             if key.kind == KeyEventKind::Press {
-                handle_key(client, cache, &mut app, key.code, key.modifiers).await;
+                handle_key(
+                    client,
+                    cache,
+                    &mut app,
+                    key.code,
+                    key.modifiers,
+                    &revalidate_tx,
+                )
+                .await;
             }
         }
 
@@ -458,14 +657,33 @@ fn apply_config_reload(app: &mut App) {
 
 /// Fetch and open `title` as a fresh navigation (pushes the current article
 /// onto the back stack — see `App::open_document`). Used for the initial
-/// CLI title, search results, and following a link.
-async fn open_title(client: &WikiClient, cache: &PageCache, app: &mut App, title: &str) {
+/// CLI title, search results, and following a link. When the fetch served a
+/// stale-but-within-backstop cache hit, spawns the PRD FR-OFF-2 background
+/// revalidation `revalidate_tx` will eventually report back.
+async fn open_title(
+    client: &WikiClient,
+    cache: &PageCache,
+    app: &mut App,
+    title: &str,
+    revalidate_tx: &UnboundedSender<RevalidationOutcome>,
+) {
     app.loading = true;
     match fetch_page(client, cache, &app.lang, title).await {
-        Ok((html, source)) => {
-            let document = doc::parse_article_html(title, &html);
-            app.page_source = source;
+        Ok(outcome) => {
+            let document = doc::parse_article_html(title, &outcome.html);
+            app.page_source = outcome.source;
+            app.current_revid = outcome.revid;
             app.open_document(document);
+            if let Some(cached_revid) = outcome.revalidate {
+                fire_revalidation(
+                    client,
+                    app.lang.clone(),
+                    title.to_string(),
+                    cached_revid,
+                    revalidate_tx,
+                );
+                app.pending_revalidations += 1;
+            }
         }
         Err(e) => {
             app.status = format!("Error: {e}");
@@ -477,19 +695,32 @@ async fn open_title(client: &WikiClient, cache: &PageCache, app: &mut App, title
 
 /// Fetch and install `title` without touching the back/forward stacks —
 /// used for `H`/`L` navigation, which already adjusted the stacks via
-/// `App::navigate_back_target`/`navigate_forward_target`.
+/// `App::navigate_back_target`/`navigate_forward_target`. Same background
+/// revalidation behavior as `open_title`.
 async fn open_title_from_history(
     client: &WikiClient,
     cache: &PageCache,
     app: &mut App,
     title: &str,
+    revalidate_tx: &UnboundedSender<RevalidationOutcome>,
 ) {
     app.loading = true;
     match fetch_page(client, cache, &app.lang, title).await {
-        Ok((html, source)) => {
-            let document = doc::parse_article_html(title, &html);
-            app.page_source = source;
+        Ok(outcome) => {
+            let document = doc::parse_article_html(title, &outcome.html);
+            app.page_source = outcome.source;
+            app.current_revid = outcome.revid;
             app.set_document(document);
+            if let Some(cached_revid) = outcome.revalidate {
+                fire_revalidation(
+                    client,
+                    app.lang.clone(),
+                    title.to_string(),
+                    cached_revid,
+                    revalidate_tx,
+                );
+                app.pending_revalidations += 1;
+            }
         }
         Err(e) => {
             app.status = format!("Error: {e}");
@@ -504,6 +735,7 @@ async fn handle_key(
     app: &mut App,
     code: KeyCode,
     modifiers: KeyModifiers,
+    revalidate_tx: &UnboundedSender<RevalidationOutcome>,
 ) {
     match app.mode {
         Mode::Help => {
@@ -528,7 +760,7 @@ async fn handle_key(
                     let title = suggestion.title;
                     app.typeahead.clear();
                     app.search_debounce_at = None;
-                    open_title(client, cache, app, &title).await;
+                    open_title(client, cache, app, &title, revalidate_tx).await;
                 } else {
                     app.status = "No suggestion selected — Tab searches full text".to_string();
                 }
@@ -566,7 +798,7 @@ async fn handle_key(
                 app.command_input.clear();
                 app.mode = Mode::Reading;
                 match command::parse(&input) {
-                    Ok(cmd) => execute_command(client, cache, app, cmd).await,
+                    Ok(cmd) => execute_command(client, cache, app, cmd, revalidate_tx).await,
                     Err(message) => app.notice = Some(message),
                 }
             }
@@ -633,7 +865,7 @@ async fn handle_key(
             }
             KeyCode::Enter => {
                 if let Some(result) = app.results.get(app.selected_result).cloned() {
-                    open_title(client, cache, app, &result.title).await;
+                    open_title(client, cache, app, &result.title, revalidate_tx).await;
                 } else if let Some(suggestion) = app.search_suggestion.clone() {
                     // PRD FR-SR-4 / §7's zero-results row: "Did you mean X?
                     // (Enter to search)" — re-runs the search with the
@@ -666,6 +898,11 @@ async fn handle_key(
             _ => {}
         },
         Mode::Reading => {
+            // Captured before `app.notice` is cleared below: PRD FR-OFF-2's
+            // "updated — r to reload" notice means this keypress, if it's
+            // `r`, reloads instead of opening Research mode — see the `r`
+            // arm's own comment for why the two share a key.
+            let had_pending_reload = app.pending_reload.is_some();
             app.notice = None;
             match code {
                 KeyCode::Char('q') => app.should_quit = true,
@@ -694,21 +931,23 @@ async fn handle_key(
                 KeyCode::Enter => {
                     if let Some(link) = app.focused_link.and_then(|i| app.links.get(i)).cloned() {
                         match link.internal_title {
-                            Some(title) => open_title(client, cache, app, &title).await,
+                            Some(title) => {
+                                open_title(client, cache, app, &title, revalidate_tx).await
+                            }
                             None => app.status = format!("External link: {}", link.href),
                         }
                     }
                 }
                 KeyCode::Char('H') => {
                     if let Some(title) = app.navigate_back_target() {
-                        open_title_from_history(client, cache, app, &title).await;
+                        open_title_from_history(client, cache, app, &title, revalidate_tx).await;
                     } else {
                         app.status = "No earlier page in history".to_string();
                     }
                 }
                 KeyCode::Char('L') => {
                     if let Some(title) = app.navigate_forward_target() {
-                        open_title_from_history(client, cache, app, &title).await;
+                        open_title_from_history(client, cache, app, &title, revalidate_tx).await;
                     } else {
                         app.status = "No later page in history".to_string();
                     }
@@ -744,6 +983,17 @@ async fn handle_key(
                     } else {
                         app.status = "Open an article first".to_string();
                     }
+                }
+                // PRD FR-OFF-2's "r to reload" and Research mode's own `r`
+                // entrypoint share a key: when a background revalidation
+                // just posted an update notice, `r` reloads the article
+                // (the notice already told the reader what `r` means right
+                // now); otherwise it opens Research mode as always. The
+                // notice text is the only affordance for this, matching how
+                // `g`/`gg` and find's `n`/`N` are already context-sensitive
+                // in this same match.
+                KeyCode::Char('r') if had_pending_reload => {
+                    app.reload_from_pending_update(cache);
                 }
                 KeyCode::Char('r') => {
                     if app.doc.is_some() {
@@ -802,6 +1052,7 @@ async fn execute_command(
     cache: &PageCache,
     app: &mut App,
     cmd: command::Command,
+    revalidate_tx: &UnboundedSender<RevalidationOutcome>,
 ) {
     use command::Command;
     match cmd {
@@ -812,7 +1063,7 @@ async fn execute_command(
             if let Some(lang) = target.lang {
                 app.lang = lang;
             }
-            open_title(client, cache, app, &target.title).await;
+            open_title(client, cache, app, &target.title, revalidate_tx).await;
         }
         Command::Lang(code) => {
             app.lang = code;

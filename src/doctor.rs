@@ -75,6 +75,10 @@ fn print_resolved_config(resolved: &ResolvedConfig) {
         resolved.cache_fresh_ttl_hours.value, resolved.cache_fresh_ttl_hours.source
     );
     println!(
+        "  cache.force_refetch_days = {} ({})",
+        resolved.cache_force_refetch_days.value, resolved.cache_force_refetch_days.source
+    );
+    println!(
         "  active_wiki = {:?} ({})",
         resolved.active_wiki.value, resolved.active_wiki.source
     );

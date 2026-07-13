@@ -1,4 +1,42 @@
-import http.server, urllib.parse, json, time
+import http.server, urllib.parse, json, time, os
+
+# PRD FR-OFF-1/2 fixture revids: stable fake MediaWiki revision ids, one per
+# PAGES key, exposed via the `ETag` header on `/page/{title}/html`
+# (`W/"{revid}/mock-etag"`, the Parsoid ETag shape `api.rs::
+# parse_revid_from_etag` parses) and via `/page/{title}/bare`'s
+# `{"latest": {"id": revid}}` (Appendix A's cheap revalidation call).
+REVIDS = {
+    "Alan_Turing": 1001,
+    "Enigma_machine": 1002,
+    "Computer_science": 1003,
+    "Terminal_Injection_Test": 1004,
+    "アラン・チューリング": 1005,
+    "計算機科学": 1006,
+}
+
+# Simulates a wiki edit for exactly one fixture, for stale-while-revalidate
+# pty verification: when set to a PAGES key, that title's revid is reported
+# one higher than its REVIDS entry (on both the html ETag and the bare
+# endpoint) and its HTML gets an extra trailing paragraph, so a test can
+# start the mock once with this unset (seed a cache entry at the base
+# revid), then restart it with this set to the same title and confirm the
+# app's background revalidation notices the new revid and fetches visibly
+# different content.
+UPDATED_TITLE = os.environ.get("WIKITUI_MOCK_UPDATE_TITLE")
+
+
+def current_revid(title):
+    revid = REVIDS.get(title, 0)
+    return revid + 1 if title == UPDATED_TITLE else revid
+
+
+def current_html(title, html):
+    if title == UPDATED_TITLE:
+        return html.replace(
+            "</body>", "<p>Updated content marker: this revision was bumped.</p></body>"
+        )
+    return html
+
 
 PAGES = {
     "Alan_Turing": """<html><head><title>Alan Turing</title></head><body>
@@ -183,6 +221,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if '/page/' in parsed.path and parsed.path.endswith('/html'):
             self._serve_article(parts)
+        elif '/page/' in parsed.path and parsed.path.endswith('/bare'):
+            self._serve_bare(parts)
         elif parsed.path.endswith('/search/title'):
             self._serve_search_title(params)
         elif parsed.path.endswith('/search/page'):
@@ -198,12 +238,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
             return
-        body = html.encode()
+        body = current_html(title, html).encode()
         self.send_response(200)
         self.send_header('Content-Type', 'text/html')
         self.send_header('Content-Length', str(len(body)))
+        # PRD FR-OFF-1/2: the Parsoid-shaped ETag api.rs's
+        # parse_revid_from_etag parses the revid out of.
+        self.send_header('ETag', f'W/"{current_revid(title)}/mock-etag"')
         self.end_headers()
         self.wfile.write(body)
+
+    def _serve_bare(self, parts):
+        # PRD Appendix A's cheap "Page metadata / latest revid" call
+        # (`GET /w/rest.php/v1/page/{title}/bare`): just the current revid,
+        # none of the article body. A small artificial delay (mirroring
+        # `_serve_search_title`'s debounce-visibility sleep) so manual/pty
+        # verification of stale-while-revalidate can actually observe the
+        # cached copy rendering before the background revalidation's
+        # "updated — r to reload" notice lands, instead of both happening
+        # within the same terminal frame on loopback-fast localhost.
+        time.sleep(0.4)
+        title = urllib.parse.unquote(parts[-2])
+        if title not in PAGES:
+            self.send_response(404)
+            self.end_headers()
+            return
+        self._send_json({"latest": {"id": current_revid(title)}})
 
     def _serve_search_title(self, params):
         # Artificial latency (PRD FR-SR-1 / §6.8: "debounce 150-250ms") so

@@ -1,10 +1,11 @@
 use std::time::{Duration, Instant};
 
 use crate::api::{SearchResult, TitleSuggestion};
+use crate::cache::PageCache;
 use crate::cite::CiteStyle;
 use crate::config::ConfigContext;
 use crate::doc::{Citation, Document, LinkRef, SectionRef, collect_links, section_outline};
-use crate::layout::{self, Layout, LayoutOptions};
+use crate::layout::{self, Layout, LayoutCache, LayoutOptions};
 use crate::research::{ResearchStore, SavedCitation};
 use crate::theme::Theme;
 
@@ -35,6 +36,18 @@ pub enum PageSource {
     Live,
     Cached { age_secs: u64 },
     Offline { age_secs: u64 },
+}
+
+/// A background revalidation (PRD FR-OFF-2) found a newer revid and wrote
+/// it into L2 while this exact (lang, title) was on screen; the "updated —
+/// r to reload" notice and this value travel together, and `r` reloads
+/// from L2 by that identity. Scoped this tightly so a revalidation result
+/// for an article the reader has since navigated away from can never
+/// clobber whatever they're reading now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingReload {
+    pub lang: String,
+    pub title: String,
 }
 
 impl PageSource {
@@ -140,12 +153,45 @@ pub struct App {
     /// focused-link line — which would otherwise hide it instantly on any
     /// page with links — until the next keypress clears it.
     pub notice: Option<String>,
-    /// The width-aware layout of the current document, cached and keyed by
-    /// `(width, options)`; invalidated on doc change (set to `None`) and
-    /// recomputed on resize. Scroll math, section jump, find, and
-    /// focused-link auto-scroll read line positions from here, so a
-    /// theme/focus change stays O(paint) with no relayout.
+    /// The width-aware layout of the current document at the current
+    /// `(width, options)` — a plain cache of the L1 lookup below, kept as
+    /// its own field so painting and scroll math never touch `layout_cache`
+    /// directly. Invalidated on doc change (set to `None`) and recomputed
+    /// (or reused from `layout_cache`) on resize. Scroll math, section
+    /// jump, find, and focused-link auto-scroll read line positions from
+    /// here, so a theme/focus change stays O(paint) with no relayout.
     pub layout: Option<Layout>,
+    /// PRD FR-OFF-1's L1 layer: a small in-memory LRU of already-laid-out
+    /// documents (`ensure_layout` is the only reader/writer), so reopening
+    /// an article at an unchanged identity/width/options doesn't repeat the
+    /// layout pass. Keyed additionally by `current_revid` and the layout
+    /// engine's schema version — see `layout::LayoutCacheKey`.
+    pub layout_cache: LayoutCache,
+    /// Incremented only when `ensure_layout` actually calls
+    /// `layout::layout_document` (an L1 cache miss) — never on a hit or on
+    /// the fast "nothing changed since last draw" path. A plain counter
+    /// instrumentation point: proving an L1 hit skips relayout this way is
+    /// far simpler than rigging up pointer-identity checks through a clone.
+    pub layout_computations: u32,
+    /// The revid of the currently open document, when known (PRD FR-OFF-1),
+    /// `0` in degraded mode. Set by the fetch path (`main::open_title`/
+    /// `open_title_from_history`) right before installing the document;
+    /// participates in the L1 cache key so a background-revalidated
+    /// article (new revid, same title) never replays a layout computed for
+    /// its predecessor.
+    pub current_revid: u64,
+    /// Set when a background revalidation (PRD FR-OFF-2) wrote newer
+    /// content for the article currently on screen into L2; `r` reloads
+    /// from it (see `reload_from_pending_update`). `None` most of the time.
+    pub pending_reload: Option<PendingReload>,
+    /// How many background revalidations are currently in flight (PRD
+    /// FR-OFF-2). The main loop scopes its `event::poll` timeout to this
+    /// being nonzero (mirroring Search mode's debounce-driven poll) so a
+    /// revalidation's result is noticed without a keypress, while Reading
+    /// mode still blocks in `event::read()` (0% idle CPU, PRD FR-ACS-2)
+    /// whenever nothing is in flight. A counter rather than a bool because
+    /// rapid navigation can overlap two revalidations (one per article).
+    pub pending_revalidations: u32,
     /// The terminal width the reading view last drew at; layout is built for
     /// this width. Defaults to a sane 80 so line mappings resolve even before
     /// the first draw (e.g. in tests).
@@ -210,6 +256,11 @@ impl App {
             command_input: String::new(),
             notice: None,
             layout: None,
+            layout_cache: LayoutCache::new(layout::DEFAULT_L1_CAPACITY),
+            layout_computations: 0,
+            current_revid: 0,
+            pending_reload: None,
+            pending_revalidations: 0,
             layout_width: 80,
             viewport_height: 0,
             measure: 88,
@@ -226,9 +277,14 @@ impl App {
         }
     }
 
-    /// Ensure `self.layout` is current for `(layout_width, options)`,
-    /// recomputing only when stale — so scrolling never triggers a relayout.
-    /// A no-op when no document is open.
+    /// Ensure `self.layout` is current for `(layout_width, options)`. Three
+    /// tiers, cheapest first: (1) nothing changed since the last draw at
+    /// this width/options — reuse `self.layout` outright, never touching
+    /// the L1 cache (so scrolling never even does a cache lookup); (2) the
+    /// document/width/options changed but an L1 entry for that exact
+    /// identity already exists (PRD FR-OFF-1) — reuse it, no relayout; (3)
+    /// a genuine miss — lay out fresh and store it in L1 for next time. A
+    /// no-op when no document is open.
     pub fn ensure_layout(&mut self) {
         let width = self.layout_width;
         let opts = self.layout_options();
@@ -236,12 +292,29 @@ impl App {
             Some(l) => l.width != width || l.options != opts,
             None => true,
         };
-        if stale {
-            self.layout = self
-                .doc
-                .as_ref()
-                .map(|doc| layout::layout_document(doc, width, opts));
+        if !stale {
+            return;
         }
+        let Some(doc) = self.doc.as_ref() else {
+            self.layout = None;
+            return;
+        };
+        let key = layout::LayoutCacheKey {
+            lang: self.lang.clone(),
+            title: doc.title.clone(),
+            revid: self.current_revid,
+            width,
+            options: opts,
+            schema_version: layout::LAYOUT_SCHEMA_VERSION,
+        };
+        if let Some(cached) = self.layout_cache.get(&key) {
+            self.layout = Some(cached);
+            return;
+        }
+        self.layout_computations += 1;
+        let computed = layout::layout_document(doc, width, opts);
+        self.layout_cache.put(key, computed.clone());
+        self.layout = Some(computed);
     }
 
     /// The scroll offset that centers `line` in the viewport, clamped to the
@@ -338,9 +411,37 @@ impl App {
         self.scroll = 0;
         self.mode = Mode::Reading;
         // A new document invalidates the cached layout; it is rebuilt lazily
-        // on the next draw (or the next mapping lookup) at the current width.
+        // (from L1 if available, else a fresh layout pass) on the next draw
+        // or mapping lookup at the current width — see `ensure_layout`.
         self.layout = None;
+        // Whatever this document is, it isn't the one a still-pending
+        // reload notice was about (that notice is scoped to a specific
+        // (lang, title) — see `PendingReload`); a fresh document view has
+        // no update notice of its own to show.
+        self.pending_reload = None;
         self.clear_find();
+    }
+
+    /// Swaps in the content a background revalidation already wrote to L2
+    /// (PRD FR-OFF-2's "r to reload"), without a second network round trip
+    /// — the whole point of writing the fetched HTML to L2 *before* ever
+    /// showing the notice. A no-op if there's nothing pending, or if the L2
+    /// entry has since been evicted (only reachable with a very tight cache
+    /// cap) — silently doing nothing beats a confusing partial reload.
+    /// `page_source` becomes `Live`: the content just came off the network
+    /// via the revalidation's own fetch, so that's the honest status, even
+    /// though this exact keypress made no request of its own.
+    pub fn reload_from_pending_update(&mut self, cache: &PageCache) {
+        let Some(pending) = self.pending_reload.take() else {
+            return;
+        };
+        self.notice = None;
+        if let Some(page) = cache.get(&pending.lang, &pending.title) {
+            let document = crate::doc::parse_article_html(&pending.title, &page.html);
+            self.current_revid = page.revid;
+            self.page_source = PageSource::Live;
+            self.set_document(document);
+        }
     }
 
     pub fn cycle_citation(&mut self, forward: bool) {
@@ -990,6 +1091,123 @@ mod tests {
             app.layout.as_ref().unwrap().options.ambiguous_wide,
             "option change relaid"
         );
+    }
+
+    /// PRD FR-OFF-1's L1 layer: reopening a previously laid-out article at
+    /// the same identity (lang/title/revid) and width must reuse the L1
+    /// entry instead of relaying out — proven via a counter that only
+    /// increments on an actual `layout::layout_document` call (see
+    /// `layout_computations`'s doc comment for why a counter over
+    /// pointer-identity tricks).
+    #[test]
+    fn reopening_a_previously_laid_out_article_reuses_the_l1_cache_not_a_relayout() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.layout_width = 80;
+
+        app.current_revid = 7;
+        app.set_document(crate::doc::parse_article_html(
+            "Article A",
+            "<html><body><p>hello world</p></body></html>",
+        ));
+        app.ensure_layout();
+        assert_eq!(app.layout_computations, 1);
+
+        app.current_revid = 9;
+        app.set_document(crate::doc::parse_article_html(
+            "Article B",
+            "<html><body><p>a different article entirely</p></body></html>",
+        ));
+        app.ensure_layout();
+        assert_eq!(app.layout_computations, 2);
+
+        // Navigate back to Article A at the identical identity and width:
+        // the L1 cache must serve it without another layout pass.
+        app.current_revid = 7;
+        app.set_document(crate::doc::parse_article_html(
+            "Article A",
+            "<html><body><p>hello world</p></body></html>",
+        ));
+        app.ensure_layout();
+        assert_eq!(app.layout_computations, 2, "L1 cache hit must not relayout");
+    }
+
+    /// A new revid for the same title (PRD FR-OFF-2's post-revalidation
+    /// reload) must miss L1 and relayout — reusing Article A's old layout
+    /// under its new content would be silently wrong.
+    #[test]
+    fn a_new_revid_for_the_same_title_misses_the_l1_cache() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.layout_width = 80;
+
+        app.current_revid = 1;
+        app.set_document(crate::doc::parse_article_html(
+            "Article",
+            "<html><body><p>old content</p></body></html>",
+        ));
+        app.ensure_layout();
+        assert_eq!(app.layout_computations, 1);
+
+        app.current_revid = 2;
+        app.set_document(crate::doc::parse_article_html(
+            "Article",
+            "<html><body><p>new content</p></body></html>",
+        ));
+        app.ensure_layout();
+        assert_eq!(
+            app.layout_computations, 2,
+            "a different revid must not reuse the old revid's layout"
+        );
+    }
+
+    #[test]
+    fn reload_from_pending_update_swaps_in_l2_content_and_marks_it_live() {
+        let dir = std::env::temp_dir().join(format!("wikitui-reload-test-{}", std::process::id()));
+        let cache = crate::cache::PageCache::at(
+            dir.clone(),
+            crate::cache::DEFAULT_MAX_BYTES,
+            crate::cache::FRESH_TTL_SECS,
+            crate::cache::DEFAULT_FORCE_REFETCH_SECS,
+        );
+        cache.put(
+            "en",
+            "Alan Turing",
+            "<html><body><p>updated body</p></body></html>",
+            2,
+            None,
+        );
+
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(crate::doc::parse_article_html(
+            "Alan Turing",
+            "<html><body><p>original body</p></body></html>",
+        ));
+        app.current_revid = 1;
+        app.page_source = PageSource::Cached { age_secs: 100_000 };
+        app.pending_reload = Some(PendingReload {
+            lang: "en".to_string(),
+            title: "Alan Turing".to_string(),
+        });
+        app.notice = Some("updated — r to reload".to_string());
+
+        app.reload_from_pending_update(&cache);
+
+        assert!(app.pending_reload.is_none(), "consumed on reload");
+        assert!(app.notice.is_none(), "reload clears the notice");
+        assert_eq!(app.current_revid, 2);
+        assert_eq!(app.page_source, PageSource::Live);
+        assert!(
+            crate::doc::render_plain(app.doc.as_ref().unwrap()).contains("updated body"),
+            "the new content must actually be what's rendered"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reload_from_pending_update_with_nothing_pending_is_a_no_op() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        let cache = crate::cache::PageCache::disabled();
+        app.reload_from_pending_update(&cache); // must not panic
+        assert!(app.pending_reload.is_none());
     }
 
     /// A citations-bearing fixture, used instead of the plain `doc()`
