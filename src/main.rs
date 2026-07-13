@@ -206,6 +206,7 @@ async fn main() -> Result<()> {
     let theme = Theme::by_name(&resolved.theme.value).unwrap_or_else(Theme::terminal);
     let cite_style = CiteStyle::by_name(&resolved.cite_style.value).unwrap_or(CiteStyle::Apa);
     let no_color = no_color_active();
+    let accessible = accessible_active();
 
     let config_ctx = ConfigContext {
         cli: cli_overrides,
@@ -241,6 +242,7 @@ async fn main() -> Result<()> {
         resolved.lang.value,
         theme,
         no_color,
+        accessible,
         resolved.measure.value,
         resolved.ambiguous_wide.value,
         cite_style,
@@ -270,6 +272,14 @@ fn cli_overrides_from(cli: &Cli) -> config::CliOverrides {
 /// capability report so both agree on what "active" means.
 pub(crate) fn no_color_active() -> bool {
     std::env::var("NO_COLOR").is_ok_and(|v| !v.is_empty())
+}
+
+/// PRD FR-ACS-6: `ACCESSIBLE=1` (any non-empty, non-"0" value) implies
+/// linear-leaning behavior — in this chunk, collapse-to-list tables (the
+/// layout's accessible path) regardless of terminal width. A standard the
+/// PRD honors alongside `NO_COLOR`/`CLICOLOR_FORCE` (§6.7 precedence).
+pub(crate) fn accessible_active() -> bool {
+    std::env::var("ACCESSIBLE").is_ok_and(|v| !v.is_empty() && v != "0")
 }
 
 /// PRD §7 / the v0.5 milestone's "crash-safe terminal restore": whether a
@@ -752,6 +762,7 @@ async fn run(
     lang: String,
     theme: Theme,
     no_color: bool,
+    accessible: bool,
     measure: u16,
     ambiguous_wide: bool,
     cite_style: CiteStyle,
@@ -761,6 +772,7 @@ async fn run(
     reload_flag: Arc<AtomicBool>,
 ) -> Result<()> {
     let mut app = App::new(lang, theme, no_color);
+    app.accessible = accessible;
     app.measure = measure;
     app.ambiguous_wide = ambiguous_wide;
     app.cite_style = cite_style;
@@ -1562,6 +1574,12 @@ async fn handle_key(
                     app.scroll_by(-10)
                 }
                 KeyCode::Char(' ') => app.scroll_by(15),
+                // PRD FR-RD-4's horizontal table scroll: `[`/`]` shift the
+                // shared column window of every wide table in the article
+                // left/right (documented "simplest coherent model" — one
+                // offset for the page, clamped to the widest table).
+                KeyCode::Char(']') => app.scroll_tables(1),
+                KeyCode::Char('[') => app.scroll_tables(-1),
                 KeyCode::Tab => app.cycle_link(true),
                 KeyCode::BackTab => app.cycle_link(false),
                 // PRD FR-NV-1: `f` labels every visible link and follows the

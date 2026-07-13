@@ -12,6 +12,7 @@ REVIDS = {
     "Terminal_Injection_Test": 1004,
     "アラン・チューリング": 1005,
     "計算機科学": 1006,
+    "Rendering_Showcase": 1007,
 }
 
 # Simulates a wiki edit for exactly one fixture, for stale-while-revalidate
@@ -112,6 +113,57 @@ PAGES = {
     </body></html>""",
 
 }
+
+# PRD FR-RD-4/FR-RD-5 / §6.3 pty-verification fixture: one article that
+# exercises every branch of the table + infobox renderer and the size tiers.
+#   - a proper person infobox (name/born/died/fields/known for) -> floats
+#     right of the lead on wide terminals, top block on narrow ones
+#   - a simple 3-column wikitable -> box-drawing grid
+#   - a table with colspan + rowspan -> grid expansion, visible in the grid
+#   - a very wide (12-column) table -> horizontal scroll when it can't fit,
+#     collapse-to-list in accessible mode
+PAGES["Rendering_Showcase"] = """<html><head><title>Rendering Showcase</title></head><body>
+  <table class="infobox"><tbody>
+    <tr><th colspan="2">Ada Lovelace</th></tr>
+    <tr><th>Born</th><td>10 December 1815, London, England</td></tr>
+    <tr><th>Died</th><td>27 November 1852 (aged 36)</td></tr>
+    <tr><th>Fields</th><td>Mathematics, computing</td></tr>
+    <tr><th>Known for</th><td>The first published algorithm intended for a machine</td></tr>
+  </tbody></table>
+  <p>This showcase article exercises the table and infobox renderer described in
+  FR-RD-4 and FR-RD-5. On a wide terminal the infobox to the right is a floated
+  card and this lead paragraph wraps in the column to its left; on a narrow
+  terminal the card becomes a block above the text. The sections below drive the
+  box-drawing grid, rowspan and colspan expansion, and horizontal scrolling.</p>
+  <h2>Simple table</h2>
+  <p>A plain three-column wikitable renders as a box-drawing grid with a header
+  rule under the first row.</p>
+  <table class="wikitable"><tbody>
+    <tr><th>Year</th><th>Event</th><th>Place</th></tr>
+    <tr><td>1815</td><td>Born in London</td><td>England</td></tr>
+    <tr><td>1843</td><td>Published the translation and notes on the Analytical Engine</td><td>England</td></tr>
+    <tr><td>1852</td><td>Died</td><td>England</td></tr>
+  </tbody></table>
+  <h2>Spanned table</h2>
+  <p>This table mixes colspan and rowspan; the grid expansion fills spanned
+  positions with blank cells so columns stay aligned.</p>
+  <table class="wikitable"><tbody>
+    <tr><th colspan="3">Analytical Engine notes</th></tr>
+    <tr><th>Section</th><th>Topic</th><th>Length</th></tr>
+    <tr><td rowspan="2">Note G</td><td>Bernoulli numbers</td><td>long</td></tr>
+    <tr><td>The first algorithm</td><td>long</td></tr>
+    <tr><td>Note A</td><td>General remarks</td><td>short</td></tr>
+  </tbody></table>
+  <h2>Wide table</h2>
+  <p>A table with many columns cannot fit at once; use the bracket keys to
+  scroll its column window horizontally, or read it as a list in accessible
+  mode.</p>
+  <table class="wikitable"><tbody>
+    <tr><th>Col01</th><th>Col02</th><th>Col03</th><th>Col04</th><th>Col05</th><th>Col06</th><th>Col07</th><th>Col08</th><th>Col09</th><th>Col10</th><th>Col11</th><th>Col12</th></tr>
+    <tr><td>alpha</td><td>bravo</td><td>charlie</td><td>delta</td><td>echo</td><td>foxtrot</td><td>golf</td><td>hotel</td><td>india</td><td>juliet</td><td>kilo</td><td>ZEBRA-END</td></tr>
+    <tr><td>a1</td><td>b2</td><td>c3</td><td>d4</td><td>e5</td><td>f6</td><td>g7</td><td>h8</td><td>i9</td><td>j10</td><td>k11</td><td>z12</td></tr>
+  </tbody></table>
+</body></html>"""
 
 # Japanese fixture: long CJK paragraphs that must wrap per-character with
 # kinsoku, a heading structure, and internal links.

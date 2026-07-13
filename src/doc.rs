@@ -43,6 +43,16 @@ const MAX_DOM_DEPTH: usize = 256;
 /// list arbitrarily.
 const MAX_CITATIONS: usize = 5000;
 
+/// PRD SEC-3 (in the spirit of the "10x the largest real article" budget),
+/// applied to table grids: a real table has at most a few dozen columns and
+/// a few thousand rows; a hostile page can otherwise pad `colspan`/`rowspan`
+/// or the row/cell count to force a huge grid. `parse_table` caps the
+/// expanded grid at these dimensions (and clamps each cell's own
+/// colspan/rowspan to them first, so a single `colspan="100000000"` can't
+/// blow up before the grid-level cap even applies), flagging `Table::truncated`.
+const MAX_TABLE_COLS: usize = 100;
+const MAX_TABLE_ROWS: usize = 2000;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum SpanStyle {
     Plain,
@@ -74,12 +84,119 @@ pub enum Block {
     Blockquote(Vec<Span>),
     Code(String),
     Rule,
-    /// A collapsed table: pre-formatted "Label: value" (or cell-joined) lines.
-    Table(Vec<String>),
+    /// A parsed table (PRD FR-RD-4): a rectangular grid of cells with
+    /// rowspan/colspan already resolved by expansion (see [`Table`]). The
+    /// renderer (`layout.rs`) decides per width whether to draw it as a
+    /// box-drawing grid (with per-column sizing, cell wrapping, and
+    /// horizontal scroll for wide tables) or to collapse it to a
+    /// "Header: value" list (accessible mode / too narrow / `--dump`).
+    Table(Table),
     /// A collapsed infobox: ordered (label, value) pairs. An empty label
     /// marks a full-width row (e.g. a section title inside the infobox).
+    /// Rendered as a boxed card — floated right of the lead on wide
+    /// terminals, a top block on narrower ones (PRD FR-RD-5, §6.3 tiers).
     Infobox(Vec<(String, String)>),
     Image(String),
+}
+
+/// One cell of a [`Table`]'s expanded grid (PRD FR-RD-4). Content is
+/// flattened to inline text: nested block elements (including tables nested
+/// in a cell) collapse to their text, and images collapse to their alt text
+/// ("flattening pass for rowspan/colspan and images-in-cells"). `header`
+/// marks a `<th>` so the renderer can style/underline the header row.
+///
+/// A cell produced purely to fill a rowspan/colspan span is *blank* (empty
+/// `text`): the standard TUI expansion is "value in the origin cell, blanks
+/// in the cells it spans over" — see [`Table`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cell {
+    pub text: String,
+    pub header: bool,
+}
+
+impl Cell {
+    fn blank() -> Self {
+        Self {
+            text: String::new(),
+            header: false,
+        }
+    }
+}
+
+/// A table as a **rectangular** grid (PRD FR-RD-4): `rows[r][c]` after
+/// rowspan/colspan expansion, so every row has the same column count and the
+/// renderer never has to reason about spans again. A cell with `colspan=3`
+/// occupies three grid columns — the value in the first, blank [`Cell`]s in
+/// the other two; a cell with `rowspan=2` occupies its column in the next
+/// row too, again with a blank there. `truncated` is set when the source
+/// exceeded [`MAX_TABLE_COLS`]/[`MAX_TABLE_ROWS`] (PRD SEC-3) and the grid
+/// was capped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Table {
+    pub rows: Vec<Vec<Cell>>,
+    pub truncated: bool,
+}
+
+impl Table {
+    /// The grid's column count (every row is padded to this width).
+    pub fn cols(&self) -> usize {
+        self.rows.first().map(Vec::len).unwrap_or(0)
+    }
+
+    /// Whether the first row is a header row (any `<th>` in it) — drives the
+    /// header underline in both the box grid and the collapse-to-list view.
+    pub fn has_header_row(&self) -> bool {
+        self.rows
+            .first()
+            .is_some_and(|r| r.iter().any(|c| c.header))
+    }
+
+    /// PRD FR-RD-4's collapse-to-list ("Header: value") form, shared by the
+    /// accessible/too-narrow layout path and `--dump` (`render_plain`). When
+    /// the first row is a header, each subsequent row renders one
+    /// "Header: value" line per column; otherwise rows render as their cells
+    /// joined by " | ". Blank cells (rowspan/colspan fill) are skipped.
+    pub fn to_list_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if self.rows.is_empty() {
+            return lines;
+        }
+        if self.has_header_row() {
+            let headers: Vec<&str> = self.rows[0].iter().map(|c| c.text.as_str()).collect();
+            for row in &self.rows[1..] {
+                for (i, cell) in row.iter().enumerate() {
+                    if cell.text.is_empty() {
+                        continue;
+                    }
+                    match headers.get(i).copied().filter(|h| !h.is_empty()) {
+                        Some(h) => lines.push(format!("{h}: {}", cell.text)),
+                        None => lines.push(cell.text.clone()),
+                    }
+                }
+                lines.push(String::new());
+            }
+            // Drop the trailing separator blank.
+            if lines.last().is_some_and(String::is_empty) {
+                lines.pop();
+            }
+        } else {
+            for row in &self.rows {
+                let joined = row
+                    .iter()
+                    .filter(|c| !c.text.is_empty())
+                    .map(|c| c.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                if !joined.is_empty() {
+                    lines.push(joined);
+                }
+            }
+        }
+        if self.truncated {
+            lines.push("… (table truncated)".to_string());
+        }
+        lines
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -495,47 +612,176 @@ fn descendant_tags<'a>(
     }
 }
 
-fn collapse_table(node: NodeRef<Node>) -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut rows = Vec::new();
-    descendant_tags(node, "tr", &mut rows, 0);
+/// The flattened inline text of one table cell (PRD FR-RD-4's flattening
+/// pass): text nodes plus `<img>` alt text, with nested block elements
+/// (paragraphs, and even tables nested inside a cell) contributing only
+/// their text. Distinct from `text_content` in exactly one respect — it
+/// substitutes an image's alt text where `text_content` would emit nothing
+/// — so a cell that is just an icon still reads as its label.
+fn cell_text(node: NodeRef<Node>) -> String {
+    let mut out = String::new();
+    collect_cell_text(node, &mut out, 0);
+    normalize_ws(&out)
+}
 
-    let mut headers: Vec<String> = Vec::new();
-    for tr in rows {
-        let mut header_cells = Vec::new();
-        let mut data_cells = Vec::new();
-        for cell in tr.children() {
-            if let Node::Element(el) = cell.value() {
-                let text = normalize_ws(&text_content(cell));
-                if text.is_empty() {
+fn collect_cell_text(node: NodeRef<Node>, out: &mut String, depth: usize) {
+    if depth > MAX_DOM_DEPTH {
+        out.push_str(&flatten_deep_subtree(node));
+        return;
+    }
+    for child in node.children() {
+        match child.value() {
+            Node::Text(t) => out.push_str(&t.text),
+            Node::Element(el) => {
+                if is_skipped_tag(el.name()) || is_noise(el) {
                     continue;
                 }
-                match el.name() {
-                    "th" => header_cells.push(text),
-                    "td" => data_cells.push(text),
-                    _ => {}
+                if el.name() == "img" {
+                    let alt = el.attr("alt").unwrap_or("").trim();
+                    if !alt.is_empty() {
+                        out.push(' ');
+                        out.push_str(alt);
+                        out.push(' ');
+                    }
+                    continue;
                 }
+                collect_cell_text(child, out, depth + 1);
             }
-        }
-        if !header_cells.is_empty() && data_cells.is_empty() {
-            headers = header_cells;
-            if !headers.is_empty() {
-                lines.push(headers.join(" | "));
-                lines
-                    .push("-".repeat(lines.last().map(|l: &String| l.len().min(60)).unwrap_or(20)));
-            }
-        } else if !data_cells.is_empty() {
-            if !headers.is_empty() && headers.len() == data_cells.len() {
-                for (h, v) in headers.iter().zip(data_cells.iter()) {
-                    lines.push(format!("{h}: {v}"));
-                }
-                lines.push(String::new());
-            } else {
-                lines.push(data_cells.join(" | "));
-            }
+            _ => {}
         }
     }
-    lines
+}
+
+/// Reads a `colspan`/`rowspan` attribute, defaulting to 1 and clamping to
+/// `max` (PRD SEC-3): a hostile `colspan="99999999"` must not be able to
+/// allocate a giant row before the grid-level cap in `parse_table` even runs.
+fn span_attr(el: &scraper::node::Element, name: &str, max: usize) -> usize {
+    el.attr(name)
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(1)
+        .clamp(1, max)
+}
+
+/// Parse a `<table>` into a rectangular [`Table`] grid (PRD FR-RD-4),
+/// resolving rowspan/colspan by **expansion**: a cell occupies
+/// `rowspan × colspan` grid positions — the value goes in the origin cell,
+/// and every other position it covers becomes a blank [`Cell`] ("fill first,
+/// blanks after" for colspan; "value on top, blanks below" for rowspan).
+/// This is the standard TUI grid model: after this pass no cell carries a
+/// span, so the renderer only ever sees a plain 2-D array.
+///
+/// PRD SEC-3: the grid is capped at [`MAX_TABLE_COLS`] × [`MAX_TABLE_ROWS`]
+/// (with per-cell spans clamped first, see `span_attr`); anything beyond is
+/// dropped and `Table::truncated` is set so the renderer can note it.
+fn parse_table(node: NodeRef<Node>) -> Table {
+    let mut trs = Vec::new();
+    descendant_tags(node, "tr", &mut trs, 0);
+
+    let mut rows: Vec<Vec<Cell>> = Vec::new();
+    // `carried[col]` = how many more rows a rowspan started above keeps this
+    // column occupied (each such position becomes a blank cell).
+    let mut carried: Vec<usize> = Vec::new();
+    let mut truncated = false;
+
+    for tr in trs {
+        if rows.len() >= MAX_TABLE_ROWS {
+            truncated = true;
+            break;
+        }
+        let cells: Vec<NodeRef<Node>> = tr
+            .children()
+            .filter(|c| {
+                matches!(c.value(), Node::Element(el) if el.name() == "th" || el.name() == "td")
+            })
+            .collect();
+
+        let mut row: Vec<Cell> = Vec::new();
+        let mut col = 0usize;
+        let mut cell_iter = cells.into_iter();
+
+        loop {
+            // Emit blanks for any column a rowspan from above still occupies.
+            while col < carried.len() && carried[col] > 0 {
+                if col >= MAX_TABLE_COLS {
+                    break;
+                }
+                row.push(Cell::blank());
+                carried[col] -= 1;
+                col += 1;
+            }
+            if col >= MAX_TABLE_COLS {
+                truncated = true;
+                break;
+            }
+            let Some(cell_node) = cell_iter.next() else {
+                break;
+            };
+            let Node::Element(el) = cell_node.value() else {
+                continue;
+            };
+            let header = el.name() == "th";
+            let colspan = span_attr(el, "colspan", MAX_TABLE_COLS);
+            let rowspan = span_attr(el, "rowspan", MAX_TABLE_ROWS);
+            let text = cell_text(cell_node);
+
+            for k in 0..colspan {
+                if col >= MAX_TABLE_COLS {
+                    truncated = true;
+                    break;
+                }
+                while carried.len() <= col {
+                    carried.push(0);
+                }
+                let cell = if k == 0 {
+                    Cell {
+                        text: text.clone(),
+                        header,
+                    }
+                } else {
+                    Cell::blank()
+                };
+                row.push(cell);
+                // Reserve this column for the remaining rowspan rows (blanks).
+                if rowspan > 1 {
+                    carried[col] = rowspan - 1;
+                }
+                col += 1;
+            }
+        }
+
+        // Trailing columns still held by a rowspan from above.
+        while col < carried.len() && col < MAX_TABLE_COLS {
+            if carried[col] > 0 {
+                row.push(Cell::blank());
+                carried[col] -= 1;
+            }
+            col += 1;
+        }
+
+        if !row.is_empty() {
+            rows.push(row);
+        }
+    }
+
+    // Rectangularize: pad every row to the widest, capped at MAX_TABLE_COLS.
+    let width = rows
+        .iter()
+        .map(Vec::len)
+        .max()
+        .unwrap_or(0)
+        .min(MAX_TABLE_COLS);
+    for row in &mut rows {
+        if row.len() > width {
+            row.truncate(width);
+        }
+        while row.len() < width {
+            row.push(Cell::blank());
+        }
+    }
+    // Drop rows that ended up entirely blank (a rowspan-only tail row).
+    rows.retain(|r| r.iter().any(|c| !c.text.is_empty()));
+
+    Table { rows, truncated }
 }
 
 fn collapse_infobox(node: NodeRef<Node>) -> Vec<(String, String)> {
@@ -679,9 +925,9 @@ fn walk_blocks(node: NodeRef<Node>, blocks: &mut Vec<Block>, list_depth: u8, dep
                         blocks.push(Block::Infobox(rows));
                     }
                 } else {
-                    let lines = collapse_table(child);
-                    if !lines.is_empty() {
-                        blocks.push(Block::Table(lines));
+                    let table = parse_table(child);
+                    if !table.rows.is_empty() {
+                        blocks.push(Block::Table(table));
                     }
                 }
             }
@@ -934,9 +1180,14 @@ fn sanitize_document(doc: &mut Document) {
             Block::Code(text) => {
                 *text = sanitize::sanitize_and_cap_multiline(text, sanitize::MAX_SPAN_CHARS);
             }
-            Block::Table(lines) => {
-                for line in lines {
-                    *line = sanitize::sanitize_and_cap_single_line(line, sanitize::MAX_SPAN_CHARS);
+            Block::Table(table) => {
+                for row in &mut table.rows {
+                    for cell in row {
+                        cell.text = sanitize::sanitize_and_cap_single_line(
+                            &cell.text,
+                            sanitize::MAX_SPAN_CHARS,
+                        );
+                    }
                 }
             }
             Block::Infobox(rows) => {
@@ -1081,9 +1332,12 @@ pub fn render_plain(doc: &Document) -> String {
                 out.push('\n');
             }
             Block::Rule => out.push_str("----\n\n"),
-            Block::Table(lines) => {
-                for line in lines {
-                    out.push_str(line);
+            Block::Table(table) => {
+                // PRD FR-ACS-1: `--dump` is the screen-reader path, where
+                // tables are collapsed to lists ("Header: value"), not drawn
+                // as a grid — consistent, no cursor addressing, no ANSI.
+                for line in table.to_list_lines() {
+                    out.push_str(&line);
                     out.push('\n');
                 }
                 out.push('\n');
@@ -1196,14 +1450,22 @@ mod tests {
             .blocks
             .iter()
             .filter_map(|b| match b {
-                Block::Table(lines) => Some(lines),
+                Block::Table(table) => Some(table),
                 _ => None,
             })
             .collect();
         // The navbox table must be dropped by the noise filter; only the
         // "wikitable" should survive.
         assert_eq!(data_tables.len(), 1, "navbox table should be filtered out");
-        assert!(data_tables[0].iter().any(|l| l.contains("1950")));
+        assert!(
+            data_tables[0]
+                .rows
+                .iter()
+                .flatten()
+                .any(|c| c.text.contains("1950"))
+        );
+        // The header row must be recognized as such (Year/Event are <th>).
+        assert!(data_tables[0].has_header_row());
 
         let has_image = doc
             .blocks
@@ -1336,6 +1598,169 @@ mod tests {
         assert!(plain.contains("First item"));
         assert!(plain.contains("[infobox]"));
         assert!(plain.contains("[image: A test picture]"));
+    }
+
+    /// Extracts the single `Block::Table` from a one-table fixture.
+    fn only_table(html: &str) -> Table {
+        let doc = parse_article_html("T", html);
+        doc.blocks
+            .into_iter()
+            .find_map(|b| match b {
+                Block::Table(t) => Some(t),
+                _ => None,
+            })
+            .expect("a table block")
+    }
+
+    /// PRD FR-RD-4: a `colspan=2` header over a 2×2 body must expand so the
+    /// header row is `["Pair", <blank>]` (value first, blank in the spanned
+    /// column) and stays rectangular with the body rows.
+    #[test]
+    fn colspan_header_expands_value_then_blank() {
+        let table = only_table(
+            r##"<html><body><table class="wikitable"><tbody>
+            <tr><th colspan="2">Pair</th></tr>
+            <tr><td>a</td><td>b</td></tr>
+            <tr><td>c</td><td>d</td></tr>
+            </tbody></table></body></html>"##,
+        );
+        assert_eq!(table.cols(), 2, "grid is rectangular at 2 columns");
+        assert_eq!(table.rows[0][0].text, "Pair");
+        assert!(table.rows[0][0].header);
+        assert_eq!(
+            table.rows[0][1].text, "",
+            "the spanned-over column is a blank cell (value-first, blanks-after)"
+        );
+        assert_eq!(table.rows[1][0].text, "a");
+        assert_eq!(table.rows[1][1].text, "b");
+        assert_eq!(table.rows[2][1].text, "d");
+    }
+
+    /// PRD FR-RD-4: a `rowspan=2` left cell must fill *downward* — the origin
+    /// cell holds the value on the first row, and the second row gets a blank
+    /// cell in that column so the grid stays rectangular and column-aligned.
+    #[test]
+    fn rowspan_left_cell_fills_downward_with_a_blank() {
+        let table = only_table(
+            r##"<html><body><table class="wikitable"><tbody>
+            <tr><td rowspan="2">L</td><td>r1</td></tr>
+            <tr><td>r2</td></tr>
+            </tbody></table></body></html>"##,
+        );
+        assert_eq!(table.cols(), 2);
+        assert_eq!(table.rows.len(), 2);
+        assert_eq!(table.rows[0][0].text, "L");
+        assert_eq!(table.rows[0][1].text, "r1");
+        assert_eq!(
+            table.rows[1][0].text, "",
+            "the rowspan-covered position on the second row is a blank cell"
+        );
+        assert_eq!(
+            table.rows[1][1].text, "r2",
+            "the second row's real cell lands in the correct column, not shifted left"
+        );
+    }
+
+    /// A pathological nested case: a table inside a cell must flatten to that
+    /// cell's text (FR-RD-4 "tables-in-cells flatten"), never spawn a second
+    /// `Block::Table`, and rowspan+colspan on the same cell must expand
+    /// correctly (a 2×2 span from one origin cell).
+    #[test]
+    fn nested_table_flattens_and_combined_span_expands() {
+        let table = only_table(
+            r##"<html><body><table class="wikitable"><tbody>
+            <tr>
+              <td rowspan="2" colspan="2">Big<table class="wikitable"><tr><td>inner</td></tr></table>Cell</td>
+              <td>x</td>
+            </tr>
+            <tr><td>y</td></tr>
+            </tbody></table></body></html>"##,
+        );
+        // 3 columns wide (2 spanned + 1), 2 rows tall.
+        assert_eq!(table.cols(), 3);
+        assert_eq!(table.rows.len(), 2);
+        // The origin holds the flattened text (inner table folded in), the
+        // three positions it does not cover are blank.
+        assert!(table.rows[0][0].text.contains("Big"));
+        assert!(
+            table.rows[0][0].text.contains("inner"),
+            "the nested table's text flattens into the cell, got {:?}",
+            table.rows[0][0].text
+        );
+        assert!(table.rows[0][0].text.contains("Cell"));
+        assert_eq!(table.rows[0][1].text, "", "colspan fill");
+        assert_eq!(table.rows[0][2].text, "x");
+        assert_eq!(table.rows[1][0].text, "", "rowspan fill");
+        assert_eq!(table.rows[1][1].text, "", "rowspan+colspan fill");
+        assert_eq!(
+            table.rows[1][2].text, "y",
+            "the second row's own cell lands past the 2×2 span"
+        );
+    }
+
+    /// FR-RD-4: an image inside a cell flattens to its alt text, not nothing.
+    #[test]
+    fn image_in_cell_flattens_to_alt_text() {
+        let table = only_table(
+            r##"<html><body><table class="wikitable"><tbody>
+            <tr><td><img src="flag.png" alt="Flag of Nowhere"/></td><td>caption</td></tr>
+            </tbody></table></body></html>"##,
+        );
+        assert_eq!(table.rows[0][0].text, "Flag of Nowhere");
+        assert_eq!(table.rows[0][1].text, "caption");
+    }
+
+    /// PRD SEC-3: a hostile `colspan` far beyond the column cap must not
+    /// allocate a giant row — the grid caps at `MAX_TABLE_COLS` and flags
+    /// truncation, promptly.
+    #[test]
+    fn pathological_colspan_is_capped_and_flagged() {
+        let html = r##"<html><body><table class="wikitable"><tbody>
+            <tr><td colspan="100000000">wide</td></tr>
+            </tbody></table></body></html>"##;
+        let start = std::time::Instant::now();
+        let table = only_table(html);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "a hostile colspan must not stall parsing"
+        );
+        assert!(table.cols() <= MAX_TABLE_COLS);
+        assert!(table.truncated, "capping the grid must set truncated");
+    }
+
+    /// A CJK cell keeps its full text intact through parsing (width handling
+    /// is the layout engine's job — this locks that the model doesn't mangle
+    /// multi-byte content).
+    #[test]
+    fn cjk_cell_text_is_preserved() {
+        let table = only_table(
+            r##"<html><body><table class="wikitable"><tbody>
+            <tr><th>用語</th><th>意味</th></tr>
+            <tr><td>計算機科学</td><td>コンピュータの研究</td></tr>
+            </tbody></table></body></html>"##,
+        );
+        assert_eq!(table.rows[1][0].text, "計算機科学");
+        assert_eq!(table.rows[1][1].text, "コンピュータの研究");
+    }
+
+    /// PRD FR-ACS-1: `--dump` collapses a table to "Header: value" lines,
+    /// carrying its content but no ANSI/box-drawing grid.
+    #[test]
+    fn dump_collapses_a_table_to_a_labeled_list() {
+        let doc = parse_article_html(
+            "T",
+            r##"<html><body><table class="wikitable"><tbody>
+            <tr><th>Year</th><th>Event</th></tr>
+            <tr><td>1950</td><td>Turing test proposed</td></tr>
+            </tbody></table></body></html>"##,
+        );
+        let plain = render_plain(&doc);
+        assert!(plain.contains("Year: 1950"), "got: {plain:?}");
+        assert!(plain.contains("Event: Turing test proposed"));
+        assert!(
+            !plain.contains('\u{1b}') && !plain.contains('│') && !plain.contains('┌'),
+            "the dump must be plain text — no ANSI, no box-drawing grid"
+        );
     }
 
     #[test]
@@ -1781,9 +2206,9 @@ mod tests {
                     }
                 }
                 Block::Code(text) => assert_terminal_safe(text, &format!("{context} (code)")),
-                Block::Table(lines) => {
-                    for line in lines {
-                        assert_terminal_safe(line, &format!("{context} (table)"));
+                Block::Table(table) => {
+                    for cell in table.rows.iter().flatten() {
+                        assert_terminal_safe(&cell.text, &format!("{context} (table cell)"));
                     }
                 }
                 Block::Infobox(rows) => {

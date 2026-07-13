@@ -52,6 +52,10 @@ pub struct Tab {
     pub forward_stack: Vec<HistoryEntry>,
     pub scroll: u16,
     pub max_scroll: u16,
+    /// PRD FR-RD-4's horizontal table scroll offset for this tab: how many
+    /// leading columns every wide table in the article skips. Reset to 0 when
+    /// a new document is installed; adjusted by `App::scroll_tables` (`[`/`]`).
+    pub table_col_offset: u16,
     pub find_input: String,
     pub find_matches: Vec<u16>,
     pub find_occurrences: Vec<layout::Occurrence>,
@@ -104,6 +108,7 @@ impl Tab {
             forward_stack: Vec::new(),
             scroll: 0,
             max_scroll: 0,
+            table_col_offset: 0,
             find_input: String::new(),
             find_matches: Vec::new(),
             find_occurrences: Vec::new(),
@@ -143,6 +148,7 @@ impl Tab {
         self.selected_section = 0;
         self.doc = Some(doc);
         self.scroll = 0;
+        self.table_col_offset = 0;
         self.pending_title = None;
         // A newly installed document is, by definition, not the one a still
         // pending reload notice was about.

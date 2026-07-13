@@ -9,7 +9,9 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::app::{App, Mode};
 use crate::doc::LinkRef;
-use crate::layout::{LaidLine, MatchSpan, SpanKind};
+use crate::layout::{
+    FLOOR_MIN_HEIGHT, FLOOR_MIN_WIDTH, LaidLine, MatchSpan, SizeTier, SpanKind, size_tier,
+};
 use crate::theme::Theme;
 
 /// Every title that should render as "visited" in the active tab (PRD
@@ -317,6 +319,14 @@ pub fn parse_searchmatch(html: &str) -> Vec<(String, bool)> {
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
+    // PRD §6.3 hard floor: below 60×16 there isn't room to read an article at
+    // all, so show a dedicated "terminal too small" screen instead of a
+    // mangled layout. Checked first, before any tab-bar/content split.
+    if size_tier(area.width, area.height) == SizeTier::Floor {
+        draw_too_small(frame, app, area);
+        return;
+    }
+
     // The tab bar (PRD FR-TB-1) is one row above the content, shown only when
     // more than one tab is open — a single tab keeps the current zero-chrome
     // look exactly.
@@ -387,6 +397,35 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.mode == Mode::Help {
         draw_help_overlay(frame, app, area);
     }
+}
+
+/// PRD §6.3's hard-floor screen: the terminal is below 60×16, so instead of
+/// the article we show an honest "too small" message with the required size
+/// and the current one, plus the `--dump` escape hatch (which needs no
+/// minimum size at all — FR-RD-12).
+fn draw_too_small(frame: &mut Frame, app: &App, area: Rect) {
+    frame.render_widget(
+        UiBlock::default().style(base_style(&app.theme, app.no_color)),
+        area,
+    );
+    let text = Text::from(vec![
+        Line::from(RSpan::styled(
+            "Terminal too small",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(format!(
+            "wikitui needs at least {FLOOR_MIN_WIDTH}×{FLOOR_MIN_HEIGHT} (now {}×{}).",
+            area.width, area.height
+        )),
+        Line::from("Resize the window — or run `wikitui --dump <title>`."),
+    ]);
+    frame.render_widget(
+        Paragraph::new(text)
+            .style(base_style(&app.theme, app.no_color))
+            .alignment(ratatui::layout::Alignment::Center),
+        area,
+    );
 }
 
 /// One tab's data for the pure bar/picker builders (kept free of `ratatui`
@@ -1401,6 +1440,7 @@ fn draw_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
         Line::from("gt / gT      next / previous tab"),
         Line::from("bb           tab picker    u  reopen closed tab"),
         Line::from("t            table of contents"),
+        Line::from("[ / ]        scroll wide tables left / right"),
         Line::from("T            cycle color theme"),
         Line::from("y / Y        yank URL / Markdown link"),
         Line::from(":            command (:open, :lang, :theme, :tab, :tabs, :q)"),
@@ -1862,5 +1902,48 @@ mod tests {
     #[test]
     fn breadcrumb_of_empty_trail_is_empty() {
         assert_eq!(build_breadcrumb(&[], 40), "");
+    }
+
+    /// PRD §6.3 hard floor: below 60×16 the whole draw is replaced by the
+    /// "terminal too small" screen, whatever mode the app is in.
+    #[test]
+    fn a_sub_floor_terminal_draws_the_too_small_screen() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        let mut terminal = Terminal::new(TestBackend::new(50, 10)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            rendered.contains("Terminal too small"),
+            "sub-floor terminal must show the too-small screen, got: {rendered:?}"
+        );
+    }
+
+    /// A comfortably-sized terminal draws the normal reading view, not the
+    /// too-small screen.
+    #[test]
+    fn a_normal_terminal_does_not_draw_the_too_small_screen() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(!rendered.contains("Terminal too small"));
     }
 }

@@ -102,6 +102,17 @@ pub struct LayoutOptions {
     /// true, ambiguous-width characters (e.g. `·`, Greek letters) measure 2
     /// cells per the unicode-width CJK tables.
     pub ambiguous_wide: bool,
+    /// PRD FR-ACS-6 (`ACCESSIBLE=1`): collapse tables to "Header: value"
+    /// lists rather than drawing box-drawing grids. Part of `LayoutOptions`
+    /// (and thus the L1 cache key) because it changes the laid-out lines.
+    pub accessible: bool,
+    /// PRD FR-RD-4's horizontal table scroll: how many columns to skip at the
+    /// left of every horizontally-scrollable table in the article (the
+    /// simplest coherent model — one shared offset shifts all wide tables'
+    /// column windows uniformly, `[`/`]` in the reading view). It changes the
+    /// laid-out lines, so it participates in the L1 cache key too: each scroll
+    /// step is a cheap relayout, never a stale reuse.
+    pub table_col_offset: u16,
 }
 
 impl Default for LayoutOptions {
@@ -109,6 +120,8 @@ impl Default for LayoutOptions {
         Self {
             measure: 88,
             ambiguous_wide: false,
+            accessible: false,
+            table_col_offset: 0,
         }
     }
 }
@@ -572,6 +585,606 @@ impl Emitter<'_> {
     fn emit_plain_wrapped(&mut self, content: Vec<Cluster>) {
         self.emit_wrapped(content, Vec::new(), Vec::new());
     }
+
+    /// Emit one document block, pushing exactly one `block_lines` scroll
+    /// anchor for it (so `block_lines` stays index-aligned with `doc.blocks`,
+    /// which section jumps depend on). `link_counter` numbers link
+    /// occurrences in document order — shared across every block so the
+    /// numbering matches `doc::collect_links`. Factored out of the main loop
+    /// so the infobox float can reuse it for the lead blocks it lays out
+    /// beside the card.
+    fn emit_block(
+        &mut self,
+        block: &Block,
+        block_lines: &mut Vec<usize>,
+        link_counter: &mut usize,
+        accessible: bool,
+        table_offset: usize,
+    ) {
+        let aw = self.ambiguous_wide;
+        match block {
+            Block::Heading { level, spans } => {
+                self.blank();
+                let anchor = self.lines.len();
+                let text = flatten_plain(spans);
+                self.emit_plain_wrapped(clusters_from_str(&text, SpanKind::Heading(*level), aw));
+                block_lines.push(anchor);
+            }
+            Block::Paragraph(spans) => {
+                let anchor = self.lines.len();
+                let content = flatten_spans(spans, SpanKind::Plain, link_counter, aw);
+                self.emit_plain_wrapped(content);
+                self.blank();
+                block_lines.push(anchor);
+            }
+            Block::ListItem {
+                ordered,
+                index,
+                depth,
+                spans,
+            } => {
+                let anchor = self.lines.len();
+                let indent = "  ".repeat(*depth as usize);
+                let bullet = if *ordered {
+                    format!("{index}.")
+                } else {
+                    "•".to_string()
+                };
+                let prefix_text = format!("{indent}{bullet} ");
+                let prefix_w = display_width(&prefix_text, aw);
+                let first_prefix = vec![LaidSpan {
+                    text: prefix_text,
+                    kind: SpanKind::Plain,
+                }];
+                let cont_prefix = vec![LaidSpan {
+                    text: " ".repeat(prefix_w),
+                    kind: SpanKind::Plain,
+                }];
+                let content = flatten_spans(spans, SpanKind::Plain, link_counter, aw);
+                self.emit_wrapped(content, first_prefix, cont_prefix);
+                block_lines.push(anchor);
+            }
+            Block::Blockquote(spans) => {
+                let anchor = self.lines.len();
+                let gutter = vec![LaidSpan {
+                    text: "▌ ".to_string(),
+                    kind: SpanKind::Dim,
+                }];
+                let content = flatten_spans(spans, SpanKind::Quote, link_counter, aw);
+                self.emit_wrapped(content, gutter.clone(), gutter);
+                self.blank();
+                block_lines.push(anchor);
+            }
+            Block::Code(text) => {
+                let anchor = self.lines.len();
+                let gutter = "    ";
+                let avail = self.content_width.saturating_sub(4).max(1);
+                for src in text.lines() {
+                    let chunks = chunk_by_width(clusters_from_str(src, SpanKind::Code, aw), avail);
+                    if chunks.is_empty() {
+                        self.push_line(
+                            finalize(
+                                self.pad_width,
+                                &[LaidSpan {
+                                    text: gutter.to_string(),
+                                    kind: SpanKind::Code,
+                                }],
+                                &[],
+                            ),
+                            false,
+                        );
+                    }
+                    for (i, chunk) in chunks.into_iter().enumerate() {
+                        self.push_line(
+                            finalize(
+                                self.pad_width,
+                                &[LaidSpan {
+                                    text: gutter.to_string(),
+                                    kind: SpanKind::Code,
+                                }],
+                                &chunk,
+                            ),
+                            i > 0,
+                        );
+                    }
+                }
+                self.blank();
+                block_lines.push(anchor);
+            }
+            Block::Rule => {
+                let anchor = self.lines.len();
+                let dash_w = display_width("─", aw).max(1);
+                let n = self.content_width.min(40) / dash_w;
+                self.push_line(
+                    finalize(
+                        self.pad_width,
+                        &[LaidSpan {
+                            text: "─".repeat(n),
+                            kind: SpanKind::Dim,
+                        }],
+                        &[],
+                    ),
+                    false,
+                );
+                block_lines.push(anchor);
+            }
+            Block::Table(table) => {
+                let anchor = self.lines.len();
+                self.emit_table(table, accessible, table_offset);
+                self.blank();
+                block_lines.push(anchor);
+            }
+            Block::Infobox(rows) => {
+                let anchor = self.lines.len();
+                self.emit_infobox_topblock(rows);
+                self.blank();
+                block_lines.push(anchor);
+            }
+            Block::Image(alt) => {
+                let anchor = self.lines.len();
+                self.emit_plain_wrapped(clusters_from_str(
+                    &format!("[image: {alt}]"),
+                    SpanKind::Image,
+                    aw,
+                ));
+                self.blank();
+                block_lines.push(anchor);
+            }
+        }
+    }
+
+    /// Emit a table (PRD FR-RD-4): a box-drawing grid (with per-column
+    /// sizing, cell wrapping, and a horizontally-scrollable column window for
+    /// wide tables) or, when accessible/too narrow, its collapse-to-list
+    /// form. See [`plan_table`] for the collapse-vs-scroll rule.
+    fn emit_table(&mut self, table: &crate::doc::Table, accessible: bool, table_offset: usize) {
+        let aw = self.ambiguous_wide;
+        let v = display_width("│", aw).max(1);
+        let natural = natural_col_widths(table, aw);
+        match plan_table(&natural, self.content_width, accessible, table_offset, v) {
+            TablePlan::Collapse => {
+                for line in table.to_list_lines() {
+                    if line.is_empty() {
+                        self.push_line(finalize(self.pad_width, &[], &[]), false);
+                        continue;
+                    }
+                    let clusters = clusters_from_str(&line, SpanKind::Table, aw);
+                    for wl in wrap_content(clusters, self.content_width.max(1)) {
+                        self.push_line(finalize(self.pad_width, &[], &wl), false);
+                    }
+                }
+            }
+            TablePlan::Grid { first_col, widths } => {
+                for line in render_grid_lines(table, first_col, &widths, aw) {
+                    let safe = truncate_to_width(&line, self.content_width, aw);
+                    let clusters = clusters_from_str(&safe, SpanKind::Table, aw);
+                    self.push_line(finalize(self.pad_width, &[], &clusters), false);
+                }
+            }
+        }
+    }
+
+    /// Emit an infobox as a top-block card (PRD FR-RD-5, the compact/minimal
+    /// tiers and the no-float fallback). Capped at [`INFOBOX_CARD_WIDTH`] so
+    /// it reads as a card rather than a full-width banner.
+    fn emit_infobox_topblock(&mut self, rows: &[(String, String)]) {
+        let aw = self.ambiguous_wide;
+        let min_w = 2 * display_width("│", aw).max(1) + 3;
+        let box_w = self.content_width.min(INFOBOX_CARD_WIDTH).max(min_w);
+        for line in infobox_card_lines(rows, box_w, aw) {
+            let safe = truncate_to_width(&line, self.content_width, aw);
+            let clusters = clusters_from_str(&safe, SpanKind::Infobox, aw);
+            self.push_line(finalize(self.pad_width, &[], &clusters), false);
+        }
+    }
+
+    /// Emit a right-floated infobox card (PRD FR-RD-5, the full tier): the
+    /// card is drawn on the right and the lead blocks flow in the remaining
+    /// left column beside it, merged row-by-row. Documented approximations:
+    /// the whole lead is laid at the reduced left width (so the text column
+    /// doesn't re-widen below the card), and merged rows are never glued for
+    /// in-page find (each is searched independently). One `block_lines`
+    /// anchor is pushed for the infobox and one for each lead block, in order.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_infobox_float(
+        &mut self,
+        block_lines: &mut Vec<usize>,
+        link_counter: &mut usize,
+        rows: &[(String, String)],
+        lead_blocks: &[Block],
+        accessible: bool,
+        table_offset: usize,
+    ) {
+        let aw = self.ambiguous_wide;
+        let gap = INFOBOX_FLOAT_GAP;
+        let box_w = INFOBOX_CARD_WIDTH.min(self.content_width.saturating_sub(gap + MIN_LEAD_WIDTH));
+        let left_w = self.content_width.saturating_sub(box_w + gap).max(1);
+        let box_lines = infobox_card_lines(rows, box_w, aw);
+
+        let mut temp_lines: Vec<LaidLine> = Vec::new();
+        let mut temp_cont: Vec<bool> = Vec::new();
+        let mut temp_block_lines: Vec<usize> = Vec::new();
+        {
+            let mut tem = Emitter {
+                lines: &mut temp_lines,
+                continuation: &mut temp_cont,
+                pad_width: 0,
+                content_width: left_w,
+                ambiguous_wide: aw,
+            };
+            for b in lead_blocks {
+                tem.emit_block(
+                    b,
+                    &mut temp_block_lines,
+                    link_counter,
+                    accessible,
+                    table_offset,
+                );
+            }
+        }
+
+        let base = self.lines.len();
+        block_lines.push(base); // the infobox's own anchor = the card's first row
+
+        let rows_total = temp_lines.len().max(box_lines.len());
+        for j in 0..rows_total {
+            let mut spans: Vec<LaidSpan> = Vec::new();
+            if self.pad_width > 0 {
+                spans.push(LaidSpan {
+                    text: " ".repeat(self.pad_width),
+                    kind: SpanKind::Plain,
+                });
+            }
+            let left_used: usize = if let Some(tl) = temp_lines.get(j) {
+                spans.extend(tl.spans.iter().cloned());
+                tl.spans.iter().map(|s| display_width(&s.text, aw)).sum()
+            } else {
+                0
+            };
+            if let Some(bl) = box_lines.get(j) {
+                let fill = left_w.saturating_sub(left_used) + gap;
+                spans.push(LaidSpan {
+                    text: " ".repeat(fill),
+                    kind: SpanKind::Plain,
+                });
+                spans.push(LaidSpan {
+                    text: bl.clone(),
+                    kind: SpanKind::Infobox,
+                });
+            }
+            self.push_line(LaidLine { spans }, false);
+        }
+        for anchor in temp_block_lines {
+            block_lines.push(base + anchor);
+        }
+        self.blank();
+    }
+}
+
+// -- Terminal-size degradation tiers (PRD §6.3) ---------------------------
+
+/// The four terminal-size tiers of PRD §6.3, in a single documented,
+/// table-tested pure function of the terminal's cell dimensions. The reading
+/// UI keys the infobox placement (`Full` floats it beside the lead; the
+/// narrower tiers stack it on top) and the "terminal too small" screen off
+/// this — never off ad-hoc width checks scattered across the draw code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SizeTier {
+    /// Below the terminal floor (PRD §8: any VT100-ish terminal ≥ 60×16):
+    /// the reader shows a dedicated "terminal too small" screen instead of
+    /// the article.
+    Floor,
+    /// `< 80` wide: single column, no infobox float (top block or inline).
+    Minimal,
+    /// `80..=99` wide: compact — infobox as a top block, TOC still available.
+    Compact,
+    /// `>= 100` wide: full layout — the infobox floats to the right of the
+    /// lead section (`FR-RD-5`).
+    Full,
+}
+
+/// PRD §8's terminal floor.
+pub const FLOOR_MIN_WIDTH: u16 = 60;
+pub const FLOOR_MIN_HEIGHT: u16 = 16;
+/// PRD §6.3's tier width boundaries.
+pub const COMPACT_TIER_MIN_WIDTH: u16 = 80;
+pub const FULL_TIER_MIN_WIDTH: u16 = 100;
+
+/// The tier for a terminal `width × height` cells (PRD §6.3), the single
+/// source of truth for size-driven layout decisions. Height only ever
+/// matters at the floor: the `< 60 wide OR < 16 tall` check comes first, so
+/// a wide-but-short terminal is still `Floor` (there isn't room to read).
+pub fn size_tier(width: u16, height: u16) -> SizeTier {
+    if width < FLOOR_MIN_WIDTH || height < FLOOR_MIN_HEIGHT {
+        SizeTier::Floor
+    } else if width < COMPACT_TIER_MIN_WIDTH {
+        SizeTier::Minimal
+    } else if width < FULL_TIER_MIN_WIDTH {
+        SizeTier::Compact
+    } else {
+        SizeTier::Full
+    }
+}
+
+// -- Table rendering (PRD FR-RD-4) ----------------------------------------
+
+/// Minimum readable column width when a table is shrunk or scrolled: if the
+/// available width cannot give even one column this many cells, the table
+/// collapses to a list instead of being drawn as a grid (the documented
+/// collapse-vs-scroll rule — see [`plan_table`]).
+const MIN_COL_WIDTH: usize = 8;
+/// Per-column cap so one enormous cell can't make a column swallow the whole
+/// table; content past this wraps within the column, growing row height.
+const MAX_COL_WIDTH: usize = 40;
+
+/// How a table will be rendered at a given width (PRD FR-RD-4), decided by
+/// [`plan_table`]. `Grid` names the visible column window (`first_col` plus
+/// the width of each visible column, in cells); `Collapse` means fall back
+/// to the "Header: value" list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TablePlan {
+    Collapse,
+    Grid {
+        first_col: usize,
+        widths: Vec<usize>,
+    },
+}
+
+/// The natural (pre-clamp) display width of each column: the widest cell in
+/// it, capped at [`MAX_COL_WIDTH`], and never below 1.
+fn natural_col_widths(table: &crate::doc::Table, aw: bool) -> Vec<usize> {
+    let cols = table.cols();
+    let mut widths = vec![1usize; cols];
+    for row in &table.rows {
+        for (c, cell) in row.iter().enumerate() {
+            if let Some(w) = widths.get_mut(c) {
+                *w = (*w).max(display_width(&cell.text, aw).min(MAX_COL_WIDTH));
+            }
+        }
+    }
+    widths
+}
+
+/// Total grid width in cells for a set of visible column widths, given the
+/// vertical-border glyph width `v` (2 under `ambiguous_wide` for the
+/// East-Asian-Ambiguous box-drawing glyphs). A cell renders as
+/// `│ {content} ` and the row closes with a final `│`, so each column costs
+/// `content + 2 spaces + one border`, plus one leading border.
+fn grid_width(widths: &[usize], v: usize) -> usize {
+    v + widths.iter().map(|w| w + 2 + v).sum::<usize>()
+}
+
+/// PRD FR-RD-4's collapse-vs-scroll decision, as a pure function so the rule
+/// is table-testable. The documented rule:
+///   * **Accessible mode** (FR-ACS-6) always collapses.
+///   * If the width can't fit even one column at [`MIN_COL_WIDTH`] → collapse.
+///   * Else if all columns fit (after shrinking wide ones toward the width) →
+///     a grid showing every column.
+///   * Else → a grid showing a horizontally-scrollable window of columns
+///     starting at `offset` (PRD FR-RD-4's horizontal scroll for wide tables).
+fn plan_table(
+    natural: &[usize],
+    avail: usize,
+    accessible: bool,
+    offset: usize,
+    v: usize,
+) -> TablePlan {
+    let n = natural.len();
+    if n == 0 || accessible {
+        return TablePlan::Collapse;
+    }
+    // Can't fit even one column at the minimum readable width → collapse.
+    if avail < grid_width(&[MIN_COL_WIDTH], v) {
+        return TablePlan::Collapse;
+    }
+    // Fit-all path: is there room for every column, each at least as wide as
+    // min(its natural width, MIN_COL_WIDTH)?
+    let per_col_overhead = 2 + v;
+    let budget = avail.saturating_sub(v + n * per_col_overhead);
+    let min_needed: usize = natural.iter().map(|&x| x.min(MIN_COL_WIDTH)).sum();
+    if min_needed <= budget {
+        return TablePlan::Grid {
+            first_col: 0,
+            widths: shrink_to_budget(natural, budget),
+        };
+    }
+    // Scroll path: a contiguous window of columns from `offset`.
+    let first = offset.min(n - 1);
+    let mut widths = Vec::new();
+    let mut used = v;
+    for &nat in &natural[first..] {
+        let need = nat + per_col_overhead;
+        if used + need <= avail {
+            widths.push(nat);
+            used += need;
+        } else if widths.is_empty() {
+            // Shrink the first (offset) column to fill the row on its own.
+            let w = avail.saturating_sub(2 + 2 * v);
+            if w >= MIN_COL_WIDTH {
+                widths.push(w);
+            }
+            break;
+        } else {
+            break;
+        }
+    }
+    if widths.is_empty() {
+        TablePlan::Collapse
+    } else {
+        TablePlan::Grid {
+            first_col: first,
+            widths,
+        }
+    }
+}
+
+/// Water-fill the columns to fit `budget` total content cells: raise a shared
+/// cap from `MIN_COL_WIDTH` toward `MAX_COL_WIDTH` as far as the budget
+/// allows, so short columns keep their natural width and only genuinely wide
+/// ones get clamped (and then wrap). Precondition (`plan_table` guarantees
+/// it): `Σ min(natural, MIN_COL_WIDTH) ≤ budget`.
+fn shrink_to_budget(natural: &[usize], budget: usize) -> Vec<usize> {
+    let mut cap = MAX_COL_WIDTH;
+    while cap > 1 {
+        let sum: usize = natural.iter().map(|&x| x.min(cap)).sum();
+        if sum <= budget {
+            break;
+        }
+        cap -= 1;
+    }
+    natural.iter().map(|&x| x.min(cap)).collect()
+}
+
+/// Truncate to `w` cells and right-pad with spaces to exactly `w` cells.
+fn pad_to_width(s: &str, w: usize, aw: bool) -> String {
+    let truncated = truncate_to_width(s, w, aw);
+    let used = display_width(&truncated, aw);
+    format!("{truncated}{}", " ".repeat(w.saturating_sub(used)))
+}
+
+/// Wrap `text` to `w` cells using the same word/CJK line-breaker the body
+/// text uses (so a cell that overflows its column wraps and grows the row's
+/// height, never overflows). Returns one string per visual line.
+fn wrap_cell_text(text: &str, w: usize, aw: bool) -> Vec<String> {
+    let clusters = clusters_from_str(text, SpanKind::Table, aw);
+    let wrapped = wrap_content(clusters, w.max(1));
+    let mut out: Vec<String> = wrapped
+        .into_iter()
+        .map(|line| line.iter().map(|c| c.text.as_str()).collect())
+        .collect();
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+/// One horizontal grid border line (`┌─┬─┐`, `├─┼─┤`, or `└─┴─┘`) spanning
+/// the visible columns, cell-accurate under `ambiguous_wide`.
+fn grid_border(widths: &[usize], left: &str, mid: &str, right: &str, aw: bool) -> String {
+    let dash = "─";
+    let dw = display_width(dash, aw).max(1);
+    let mut s = String::from(left);
+    for (i, &w) in widths.iter().enumerate() {
+        if i > 0 {
+            s.push_str(mid);
+        }
+        let cells = w + 2; // the cell's own two padding spaces
+        let d = cells / dw;
+        s.push_str(&dash.repeat(d));
+        let rem = cells - d * dw;
+        if rem > 0 {
+            s.push_str(&" ".repeat(rem));
+        }
+    }
+    s.push_str(right);
+    s
+}
+
+/// Render `table`'s visible column window as box-drawing grid lines
+/// (`┌┬┐├┼┤└┴┘─│`). Each cell is wrapped to its column width, so a grid row
+/// can occupy several screen rows; a header row (any `<th>`) is separated
+/// from the body by a `├┼┤` rule.
+fn render_grid_lines(
+    table: &crate::doc::Table,
+    first_col: usize,
+    widths: &[usize],
+    aw: bool,
+) -> Vec<String> {
+    let cols: Vec<usize> = (first_col..first_col + widths.len()).collect();
+    let mut out = Vec::new();
+    out.push(grid_border(widths, "┌", "┬", "┐", aw));
+    let header = table.has_header_row();
+    for (ri, row) in table.rows.iter().enumerate() {
+        let cell_lines: Vec<Vec<String>> = cols
+            .iter()
+            .enumerate()
+            .map(|(wi, &c)| {
+                let text = row.get(c).map(|cell| cell.text.as_str()).unwrap_or("");
+                wrap_cell_text(text, widths[wi], aw)
+            })
+            .collect();
+        let height = cell_lines.iter().map(Vec::len).max().unwrap_or(1);
+        for h in 0..height {
+            let mut line = String::from("│");
+            for (wi, cl) in cell_lines.iter().enumerate() {
+                let content = cl.get(h).map(String::as_str).unwrap_or("");
+                line.push(' ');
+                line.push_str(&pad_to_width(content, widths[wi], aw));
+                line.push(' ');
+                line.push('│');
+            }
+            out.push(line);
+        }
+        if ri == 0 && header && table.rows.len() > 1 {
+            out.push(grid_border(widths, "├", "┼", "┤", aw));
+        }
+    }
+    out.push(grid_border(widths, "└", "┴", "┘", aw));
+    if table.truncated {
+        out.push("… (table truncated)".to_string());
+    }
+    out
+}
+
+// -- Infobox card rendering (PRD FR-RD-5) ---------------------------------
+
+/// Card width bounds (cells). The float target is `INFOBOX_CARD_WIDTH`; a
+/// top-block card is capped at it too so it reads as a card, not a banner.
+const INFOBOX_CARD_WIDTH: usize = 40;
+/// Minimum lead-text column kept to the left of a floated infobox; below this
+/// the float is abandoned for a top block (documented in `layout_document`).
+const MIN_LEAD_WIDTH: usize = 30;
+/// Gap in cells between the floated infobox and the lead text to its left.
+const INFOBOX_FLOAT_GAP: usize = 2;
+
+/// One bordered content line of an infobox card: `│ {content} │`, the content
+/// truncated/padded so the whole line is exactly `box_w` cells (cell-accurate
+/// under `ambiguous_wide`, where the border glyph is width 2).
+fn card_content_line(content: &str, box_w: usize, aw: bool) -> String {
+    let bar = "│";
+    let bw = display_width(bar, aw).max(1);
+    let inner = box_w.saturating_sub(2 * bw + 2);
+    format!("{bar} {} {bar}", pad_to_width(content, inner, aw))
+}
+
+/// One horizontal card border line (`┌─┐`, `├─┤`, or `└─┘`) exactly `box_w`
+/// cells wide.
+fn card_border_line(left: &str, right: &str, box_w: usize, aw: bool) -> String {
+    let cw = display_width(left, aw).max(1);
+    let dash = "─";
+    let dw = display_width(dash, aw).max(1);
+    let cells = box_w.saturating_sub(2 * cw);
+    let d = cells / dw;
+    let rem = cells - d * dw;
+    format!("{left}{}{}{right}", dash.repeat(d), " ".repeat(rem))
+}
+
+/// Render an infobox's (label, value) rows as a boxed card `box_w` cells wide
+/// (PRD FR-RD-5): a top title border, an optional centered-ish title row (the
+/// leading empty-label row), a `├─┤` rule under it, then `Label: value` rows
+/// with wrapped values, closed by a bottom border. Returns the lines as
+/// strings (all painted in the `Infobox` slot by the caller).
+fn infobox_card_lines(rows: &[(String, String)], box_w: usize, aw: bool) -> Vec<String> {
+    let bar = "│";
+    let bw = display_width(bar, aw).max(1);
+    let inner = box_w.saturating_sub(2 * bw + 2).max(1);
+    let mut out = vec![card_border_line("┌", "┐", box_w, aw)];
+    for (i, (label, value)) in rows.iter().enumerate() {
+        let text = if label.is_empty() {
+            value.clone()
+        } else {
+            format!("{label}: {value}")
+        };
+        for wl in wrap_cell_text(&text, inner, aw) {
+            out.push(card_content_line(&wl, box_w, aw));
+        }
+        // A leading title row (empty label) gets a rule under it.
+        if i == 0 && label.is_empty() && rows.len() > 1 {
+            out.push(card_border_line("├", "┤", box_w, aw));
+        }
+    }
+    out.push(card_border_line("└", "┘", box_w, aw));
+    out
 }
 
 /// Lay `doc` out for a terminal `width` cells wide. See the module docs for
@@ -587,6 +1200,29 @@ pub fn layout_document(doc: &Document, width: u16, options: LayoutOptions) -> La
     let mut block_lines: Vec<usize> = Vec::with_capacity(doc.blocks.len());
     let mut link_counter = 0usize;
 
+    // PRD §6.3/FR-RD-5: on the Full tier (≥ 100 cols) the first infobox
+    // floats to the right of the lead section, if there's room for a readable
+    // card plus a `MIN_LEAD_WIDTH` text column beside it; otherwise it renders
+    // as a top-block card (Compact/Minimal, or a too-narrow content column).
+    let float_infobox =
+        width >= FULL_TIER_MIN_WIDTH && content_width >= 24 + INFOBOX_FLOAT_GAP + MIN_LEAD_WIDTH;
+    let infobox_idx = if float_infobox {
+        doc.blocks
+            .iter()
+            .position(|b| matches!(b, Block::Infobox(_)))
+    } else {
+        None
+    };
+    // The lead section floated beside the card runs from just after the
+    // infobox to the first heading (or the end of the article).
+    let lead_end = infobox_idx.map(|idx| {
+        doc.blocks[idx + 1..]
+            .iter()
+            .position(|b| matches!(b, Block::Heading { .. }))
+            .map(|off| idx + 1 + off)
+            .unwrap_or(doc.blocks.len())
+    });
+
     {
         let mut em = Emitter {
             lines: &mut lines,
@@ -599,191 +1235,31 @@ pub fn layout_document(doc: &Document, width: u16, options: LayoutOptions) -> La
         em.emit_plain_wrapped(clusters_from_str(&doc.title, SpanKind::Title, aw));
         em.blank();
 
-        for block in &doc.blocks {
-            match block {
-                Block::Heading { level, spans } => {
-                    em.blank();
-                    let anchor = em.lines.len();
-                    let text = flatten_plain(spans);
-                    em.emit_plain_wrapped(clusters_from_str(&text, SpanKind::Heading(*level), aw));
-                    block_lines.push(anchor);
-                }
-                Block::Paragraph(spans) => {
-                    let anchor = em.lines.len();
-                    let content = flatten_spans(spans, SpanKind::Plain, &mut link_counter, aw);
-                    em.emit_plain_wrapped(content);
-                    em.blank();
-                    block_lines.push(anchor);
-                }
-                Block::ListItem {
-                    ordered,
-                    index,
-                    depth,
-                    spans,
-                } => {
-                    let anchor = em.lines.len();
-                    let indent = "  ".repeat(*depth as usize);
-                    let bullet = if *ordered {
-                        format!("{index}.")
-                    } else {
-                        "•".to_string()
-                    };
-                    let prefix_text = format!("{indent}{bullet} ");
-                    let prefix_w = display_width(&prefix_text, aw);
-                    let first_prefix = vec![LaidSpan {
-                        text: prefix_text,
-                        kind: SpanKind::Plain,
-                    }];
-                    let cont_prefix = vec![LaidSpan {
-                        text: " ".repeat(prefix_w),
-                        kind: SpanKind::Plain,
-                    }];
-                    let content = flatten_spans(spans, SpanKind::Plain, &mut link_counter, aw);
-                    em.emit_wrapped(content, first_prefix, cont_prefix);
-                    block_lines.push(anchor);
-                }
-                Block::Blockquote(spans) => {
-                    let anchor = em.lines.len();
-                    let gutter = vec![LaidSpan {
-                        text: "▌ ".to_string(),
-                        kind: SpanKind::Dim,
-                    }];
-                    let content = flatten_spans(spans, SpanKind::Quote, &mut link_counter, aw);
-                    em.emit_wrapped(content, gutter.clone(), gutter);
-                    em.blank();
-                    block_lines.push(anchor);
-                }
-                Block::Code(text) => {
-                    let anchor = em.lines.len();
-                    let gutter = "    ";
-                    let avail = content_width.saturating_sub(4).max(1);
-                    for src in text.lines() {
-                        let chunks =
-                            chunk_by_width(clusters_from_str(src, SpanKind::Code, aw), avail);
-                        if chunks.is_empty() {
-                            em.push_line(
-                                finalize(
-                                    pad_width,
-                                    &[LaidSpan {
-                                        text: gutter.to_string(),
-                                        kind: SpanKind::Code,
-                                    }],
-                                    &[],
-                                ),
-                                false,
-                            );
-                        }
-                        // A source line hard-split across several chunks (it
-                        // overflowed `avail`) is one continuous run with no
-                        // separator dropped at the cut — every chunk after
-                        // the first continues the previous one. Different
-                        // source lines never do: that boundary is a real
-                        // `\n`, not a wrap.
-                        for (i, chunk) in chunks.into_iter().enumerate() {
-                            em.push_line(
-                                finalize(
-                                    pad_width,
-                                    &[LaidSpan {
-                                        text: gutter.to_string(),
-                                        kind: SpanKind::Code,
-                                    }],
-                                    &chunk,
-                                ),
-                                i > 0,
-                            );
-                        }
-                    }
-                    em.blank();
-                    block_lines.push(anchor);
-                }
-                Block::Rule => {
-                    let anchor = em.lines.len();
-                    // Box-drawing dashes are East-Asian-Ambiguous, so under
-                    // ambiguous_wide each occupies 2 cells: fill by cells,
-                    // not by character count.
-                    let dash_w = display_width("─", aw).max(1);
-                    let n = content_width.min(40) / dash_w;
-                    em.push_line(
-                        finalize(
-                            pad_width,
-                            &[LaidSpan {
-                                text: "─".repeat(n),
-                                kind: SpanKind::Dim,
-                            }],
-                            &[],
-                        ),
-                        false,
-                    );
-                    block_lines.push(anchor);
-                }
-                Block::Table(rows) => {
-                    let anchor = em.lines.len();
-                    for row in rows {
-                        em.emit_plain_wrapped(clusters_from_str(row, SpanKind::Table, aw));
-                    }
-                    em.blank();
-                    block_lines.push(anchor);
-                }
-                Block::Infobox(rows) => {
-                    let anchor = em.lines.len();
-                    // As with Rule: the border glyphs are ambiguous-width, so
-                    // fills count cells (dash_w per dash), never characters.
-                    let dash_w = display_width("─", aw).max(1);
-                    let top = truncate_to_width("┌─ infobox ", content_width, aw);
-                    let top_fill = content_width.saturating_sub(display_width(&top, aw)) / dash_w;
-                    em.push_line(
-                        finalize(
-                            pad_width,
-                            &[LaidSpan {
-                                text: format!("{top}{}", "─".repeat(top_fill)),
-                                kind: SpanKind::Infobox,
-                            }],
-                            &[],
-                        ),
-                        false,
-                    );
-                    let gutter = vec![LaidSpan {
-                        text: "│ ".to_string(),
-                        kind: SpanKind::Infobox,
-                    }];
-                    for (label, value) in rows {
-                        let text = if label.is_empty() {
-                            value.clone()
-                        } else {
-                            format!("{label}: {value}")
-                        };
-                        em.emit_wrapped(
-                            clusters_from_str(&text, SpanKind::Infobox, aw),
-                            gutter.clone(),
-                            gutter.clone(),
-                        );
-                    }
-                    let bottom_fill = content_width.saturating_sub(display_width("└", aw)) / dash_w;
-                    em.push_line(
-                        finalize(
-                            pad_width,
-                            &[LaidSpan {
-                                text: format!("└{}", "─".repeat(bottom_fill)),
-                                kind: SpanKind::Infobox,
-                            }],
-                            &[],
-                        ),
-                        false,
-                    );
-                    em.blank();
-                    block_lines.push(anchor);
-                }
-                Block::Image(alt) => {
-                    let anchor = em.lines.len();
-                    em.emit_plain_wrapped(clusters_from_str(
-                        &format!("[image: {alt}]"),
-                        SpanKind::Image,
-                        aw,
-                    ));
-                    em.blank();
-                    block_lines.push(anchor);
-                }
+        let mut i = 0;
+        while i < doc.blocks.len() {
+            if Some(i) == infobox_idx
+                && let (Some(idx), Some(end)) = (infobox_idx, lead_end)
+                && let Block::Infobox(rows) = &doc.blocks[idx]
+            {
+                em.emit_infobox_float(
+                    &mut block_lines,
+                    &mut link_counter,
+                    rows,
+                    &doc.blocks[idx + 1..end],
+                    options.accessible,
+                    options.table_col_offset as usize,
+                );
+                i = end;
+                continue;
             }
+            em.emit_block(
+                &doc.blocks[i],
+                &mut block_lines,
+                &mut link_counter,
+                options.accessible,
+                options.table_col_offset as usize,
+            );
+            i += 1;
         }
     }
 
@@ -1004,7 +1480,7 @@ fn occurrence_from_origins(origins: &[Option<(usize, usize)>]) -> Option<Occurre
 /// [`LayoutCacheKey`] (PRD FR-OFF-1's L1 layer) so a stale schema can never
 /// be silently replayed across an upgrade — a version bump makes every
 /// existing L1 entry a guaranteed miss instead.
-pub const LAYOUT_SCHEMA_VERSION: u32 = 1;
+pub const LAYOUT_SCHEMA_VERSION: u32 = 2;
 
 /// PRD §6.8's L1 hit target (< 50 ms) only holds if the cache stays small
 /// enough that a linear scan over it is free — 8 entries covers "the
@@ -1181,6 +1657,7 @@ mod tests {
                         LayoutOptions {
                             measure: 88,
                             ambiguous_wide,
+                            ..LayoutOptions::default()
                         },
                     );
                 }
@@ -1710,5 +2187,402 @@ mod tests {
             "re-inserting the same key must not grow the cache"
         );
         assert!(cache.get(&key).is_some());
+    }
+
+    // -- Terminal-size degradation tiers (PRD §6.3) -------------------------
+
+    #[test]
+    fn size_tier_boundaries_are_exact() {
+        // Width boundaries at a comfortable height.
+        assert_eq!(size_tier(59, 40), SizeTier::Floor);
+        assert_eq!(size_tier(60, 40), SizeTier::Minimal);
+        assert_eq!(size_tier(79, 40), SizeTier::Minimal);
+        assert_eq!(size_tier(80, 40), SizeTier::Compact);
+        assert_eq!(size_tier(99, 40), SizeTier::Compact);
+        assert_eq!(size_tier(100, 40), SizeTier::Full);
+        // Height floor: a wide-but-short terminal is still Floor.
+        assert_eq!(size_tier(120, 15), SizeTier::Floor);
+        assert_eq!(size_tier(120, 16), SizeTier::Full);
+        assert_eq!(size_tier(60, 16), SizeTier::Minimal);
+    }
+
+    // -- Table collapse-vs-scroll decision (pure) ---------------------------
+
+    #[test]
+    fn plan_table_collapses_when_accessible_or_too_narrow() {
+        // Accessible always collapses, no matter how wide.
+        assert_eq!(plan_table(&[10, 10], 200, true, 0, 1), TablePlan::Collapse);
+        // Can't fit even one column at MIN_COL_WIDTH (8): grid_width([8],1)=12.
+        assert_eq!(plan_table(&[20], 11, false, 0, 1), TablePlan::Collapse);
+        assert!(matches!(
+            plan_table(&[20], 12, false, 0, 1),
+            TablePlan::Grid { .. }
+        ));
+    }
+
+    #[test]
+    fn plan_table_fits_all_columns_when_they_reasonably_fit() {
+        // Two columns, natural [4, 18], plenty of room -> grid, all columns,
+        // width within budget.
+        match plan_table(&[4, 18], 40, false, 0, 1) {
+            TablePlan::Grid { first_col, widths } => {
+                assert_eq!(first_col, 0);
+                assert_eq!(widths.len(), 2);
+                assert!(grid_width(&widths, 1) <= 40);
+            }
+            other => panic!("expected a full grid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_table_scrolls_a_window_from_the_offset_when_too_wide() {
+        let natural = vec![18usize; 6]; // 6 wide columns, can't all fit at 60
+        let at0 = plan_table(&natural, 60, false, 0, 1);
+        let at2 = plan_table(&natural, 60, false, 2, 1);
+        let (first0, len0) = match at0 {
+            TablePlan::Grid { first_col, widths } => (first_col, widths.len()),
+            other => panic!("expected a scrolling grid, got {other:?}"),
+        };
+        let first2 = match at2 {
+            TablePlan::Grid { first_col, .. } => first_col,
+            other => panic!("expected a scrolling grid, got {other:?}"),
+        };
+        assert_eq!(first0, 0);
+        assert!(len0 < natural.len(), "not every column fits, so it scrolls");
+        assert_eq!(first2, 2, "the offset shifts the visible column window");
+    }
+
+    // -- Table grid rendering (box-drawing) ---------------------------------
+
+    fn table_at(html: &str, width: u16, opts: LayoutOptions) -> Vec<String> {
+        let doc = parse_article_html("T", html);
+        layout_document(&doc, width, opts)
+            .lines
+            .iter()
+            .map(line_text)
+            .collect()
+    }
+
+    #[test]
+    fn one_by_one_table_has_only_plain_corners() {
+        let lines = table_at(
+            r##"<html><body><table class="wikitable"><tr><td>x</td></tr></table></body></html>"##,
+            60,
+            LayoutOptions::default(),
+        );
+        let joined = lines.join("\n");
+        assert!(joined.contains('┌') && joined.contains('┐'));
+        assert!(joined.contains('└') && joined.contains('┘'));
+        assert!(joined.contains('│'));
+        // A single column has no T-junctions.
+        assert!(!joined.contains('┬') && !joined.contains('┴') && !joined.contains('┼'));
+    }
+
+    #[test]
+    fn header_table_draws_every_box_drawing_glyph() {
+        let lines = table_at(
+            r##"<html><body><table class="wikitable"><tbody>
+            <tr><th>A</th><th>B</th><th>C</th></tr>
+            <tr><td>1</td><td>2</td><td>3</td></tr>
+            </tbody></table></body></html>"##,
+            60,
+            LayoutOptions::default(),
+        );
+        let joined = lines.join("\n");
+        for glyph in ['┌', '┬', '┐', '├', '┼', '┤', '└', '┴', '┘', '─', '│'] {
+            assert!(joined.contains(glyph), "missing {glyph:?} in:\n{joined}");
+        }
+    }
+
+    #[test]
+    fn a_cell_wider_than_its_column_wraps_and_grows_the_row() {
+        // A narrow terminal forces the long cell to wrap onto extra rows, and
+        // no line may exceed the width.
+        let doc = parse_article_html(
+            "T",
+            r##"<html><body><table class="wikitable"><tbody>
+            <tr><th>K</th><th>V</th></tr>
+            <tr><td>x</td><td>one two three four five six seven eight nine ten eleven twelve</td></tr>
+            </tbody></table></body></html>"##,
+        );
+        let layout = layout_document(&doc, 40, LayoutOptions::default());
+        for line in &layout.lines {
+            assert!(
+                line.width(false) <= 40,
+                "grid overflow: {:?}",
+                line_text(line)
+            );
+        }
+        // The long value wrapped: the body occupies more than one content row
+        // between the header rule and the bottom border.
+        let body_rows = layout
+            .lines
+            .iter()
+            .filter(|l| {
+                let t = line_text(l);
+                t.starts_with('│') && t.contains("one")
+                    || (t.starts_with('│') && (t.contains("eleven") || t.contains("twelve")))
+            })
+            .count();
+        assert!(
+            body_rows >= 2,
+            "the overflowing cell must wrap onto extra rows"
+        );
+    }
+
+    #[test]
+    fn scroll_offset_reveals_a_right_column_that_was_hidden() {
+        let mut html = String::from(r##"<html><body><table class="wikitable"><tbody><tr>"##);
+        for c in 0..10 {
+            html.push_str(&format!("<th>Col{c:02}</th>"));
+        }
+        html.push_str("</tr><tr>");
+        for c in 0..10 {
+            html.push_str(&format!("<td>v{c:02}</td>"));
+        }
+        html.push_str("</tr></tbody></table></body></html>");
+
+        let at0 = table_at(&html, 60, LayoutOptions::default()).join("\n");
+        let at5 = table_at(
+            &html,
+            60,
+            LayoutOptions {
+                table_col_offset: 5,
+                ..LayoutOptions::default()
+            },
+        )
+        .join("\n");
+        assert!(at0.contains("Col00"), "offset 0 shows the first column");
+        assert!(
+            !at0.contains("Col09"),
+            "the far-right column is off-screen at offset 0"
+        );
+        assert!(
+            at5.contains("Col09"),
+            "scrolling right brings the far column into view"
+        );
+    }
+
+    #[test]
+    fn accessible_collapses_a_grid_to_a_labeled_list() {
+        let html = r##"<html><body><table class="wikitable"><tbody>
+        <tr><th>Year</th><th>Event</th></tr>
+        <tr><td>1950</td><td>Turing test</td></tr>
+        </tbody></table></body></html>"##;
+        let lines = table_at(
+            html,
+            120,
+            LayoutOptions {
+                accessible: true,
+                ..LayoutOptions::default()
+            },
+        );
+        let joined = lines.join("\n");
+        assert!(
+            !joined.contains('┼') && !joined.contains('┬'),
+            "accessible mode must not draw a grid, even wide"
+        );
+        assert!(joined.contains("Year: 1950"));
+        assert!(joined.contains("Event: Turing test"));
+    }
+
+    #[test]
+    fn cjk_cell_is_sized_by_display_width_not_char_count() {
+        // "計算機" is 3 chars but 6 display cells; the column must be wide
+        // enough that the cell isn't clipped, and nothing overflows.
+        let doc = parse_article_html(
+            "T",
+            r##"<html><body><table class="wikitable"><tbody>
+            <tr><th>用語</th><th>意味</th></tr>
+            <tr><td>計算機</td><td>コンピュータ</td></tr>
+            </tbody></table></body></html>"##,
+        );
+        let layout = layout_document(&doc, 60, LayoutOptions::default());
+        let joined: String = layout.lines.iter().map(line_text).collect();
+        assert!(
+            joined.contains("計算機"),
+            "CJK cell content preserved whole"
+        );
+        for line in &layout.lines {
+            assert!(line.width(false) <= 60);
+        }
+    }
+
+    // -- Infobox card vs top-block by width (PRD FR-RD-5) -------------------
+
+    /// An infobox fixture with a lead paragraph long enough to sit beside a
+    /// floated card, then a heading (which ends the lead region).
+    const INFOBOX_FIXTURE: &str = r##"<html><head><title>Person</title></head><body>
+    <table class="infobox"><tbody>
+    <tr><th colspan="2">Alan Turing</th></tr>
+    <tr><th>Born</th><td>23 June 1912</td></tr>
+    <tr><th>Died</th><td>7 June 1954</td></tr>
+    <tr><th>Fields</th><td>Mathematics, cryptanalysis, computer science</td></tr>
+    </tbody></table>
+    <p>Alan Mathison Turing was an English mathematician and computer scientist,
+    highly influential in the development of theoretical computer science and
+    widely considered the father of artificial intelligence.</p>
+    <h2>Career</h2><p>He worked at Bletchley Park during the war.</p>
+    </body></html>"##;
+
+    /// The display-cell column at which the first `Infobox` span on a line
+    /// begins, or `None` if the line has none.
+    fn infobox_start_col(line: &LaidLine) -> Option<usize> {
+        let mut col = 0;
+        for s in &line.spans {
+            if s.kind == SpanKind::Infobox {
+                return Some(col);
+            }
+            col += display_width(&s.text, false);
+        }
+        None
+    }
+
+    /// Whether a line has real (non-blank) body text to the left of its
+    /// infobox card — the signature of a right-float.
+    fn has_lead_text_beside_infobox(line: &LaidLine) -> bool {
+        let has_infobox = line.spans.iter().any(|s| s.kind == SpanKind::Infobox);
+        let has_body = line
+            .spans
+            .iter()
+            .any(|s| s.kind != SpanKind::Infobox && !s.text.trim().is_empty());
+        has_infobox && has_body
+    }
+
+    #[test]
+    fn infobox_floats_right_with_lead_text_to_its_left_on_wide_terminals() {
+        let doc = parse_article_html("Person", INFOBOX_FIXTURE);
+        let layout = layout_document(&doc, 120, LayoutOptions::default());
+        let float_row = layout
+            .lines
+            .iter()
+            .find(|l| has_lead_text_beside_infobox(l))
+            .expect("a floated row: infobox on the right, lead text on the left");
+        // The card sits in the right portion of the screen.
+        let start = infobox_start_col(float_row).unwrap();
+        assert!(
+            start >= 120 / 2,
+            "infobox border should be in the right half (started at cell {start})"
+        );
+        // No line overflows the terminal.
+        for line in &layout.lines {
+            assert!(line.width(false) <= 120);
+        }
+    }
+
+    #[test]
+    fn infobox_is_a_top_block_not_a_float_on_compact_terminals() {
+        let doc = parse_article_html("Person", INFOBOX_FIXTURE);
+        let layout = layout_document(&doc, 90, LayoutOptions::default());
+        assert!(
+            layout
+                .lines
+                .iter()
+                .all(|l| !has_lead_text_beside_infobox(l)),
+            "no row should have both lead text and the infobox card at 90 cols"
+        );
+        // The card is still drawn (top block).
+        let joined: String = layout.lines.iter().map(line_text).collect();
+        assert!(joined.contains("Alan Turing"));
+        assert!(joined.contains("Born: 23 June 1912"));
+        for line in &layout.lines {
+            assert!(line.width(false) <= 90);
+        }
+    }
+
+    #[test]
+    fn floated_infobox_keeps_block_lines_aligned_for_section_jump() {
+        // The float pushes a block_lines anchor for the infobox and for each
+        // lead block, so section jumps still land on the right heading line.
+        let doc = parse_article_html("Person", INFOBOX_FIXTURE);
+        let sections = section_outline(&doc);
+        let layout = layout_document(&doc, 120, LayoutOptions::default());
+        assert_eq!(
+            layout.block_lines.len(),
+            doc.blocks.len(),
+            "one scroll anchor per block, even across the float"
+        );
+        for section in &sections {
+            let line = layout.block_lines[section.block];
+            assert_eq!(
+                line_text(&layout.lines[line]).trim(),
+                section.title,
+                "the heading's anchor line must render its own text"
+            );
+        }
+    }
+
+    /// The cross-module link-ordering invariant must survive the infobox
+    /// float: a link inside the floated lead paragraph is still numbered and
+    /// located consistently with `doc::collect_links` (which the paint step
+    /// relies on to map focus/hint state to the right span).
+    #[test]
+    fn links_in_a_floated_lead_stay_consistent_with_collect_links() {
+        let html = r##"<html><head><title>P</title></head><body>
+        <table class="infobox"><tbody>
+        <tr><th colspan="2">Name</th></tr>
+        <tr><th>Born</th><td>1900</td></tr>
+        </tbody></table>
+        <p>The lead mentions <a href="./Computer_science">computer science</a> and
+        also <a href="./Enigma_machine">the Enigma machine</a> before the first heading.</p>
+        <h2>More</h2><p>See <a href="./Alan_Turing">Turing</a> too.</p>
+        </body></html>"##;
+        let doc = parse_article_html("P", html);
+        let links = collect_links(&doc);
+        assert_eq!(links.len(), 3, "two lead links plus one after the float");
+        let layout = layout_document(&doc, 120, LayoutOptions::default());
+        assert_eq!(layout.link_lines.len(), links.len());
+        assert_eq!(layout.link_cols.len(), links.len());
+        for (occ, link) in links.iter().enumerate() {
+            let line = &layout.lines[layout.link_lines[occ]];
+            let text: String = line.spans.iter().map(|s| s.text.as_str()).collect();
+            let graphemes: Vec<&str> = text.graphemes(true).collect();
+            let span = layout.link_cols[occ];
+            let sliced: String = graphemes[span.start..span.end].concat();
+            assert_eq!(
+                sliced, link.text,
+                "link {occ} column range must bound its own text"
+            );
+        }
+    }
+
+    #[test]
+    fn table_fixtures_never_overflow_across_widths_and_tiers() {
+        let mut wide = String::from(r##"<html><body><table class="wikitable"><tbody><tr>"##);
+        for c in 0..12 {
+            wide.push_str(&format!("<th>Column {c}</th>"));
+        }
+        wide.push_str("</tr><tr>");
+        for c in 0..12 {
+            wide.push_str(&format!("<td>data cell number {c}</td>"));
+        }
+        wide.push_str("</tr></tbody></table></body></html>");
+        let docs = [
+            parse_article_html("Person", INFOBOX_FIXTURE),
+            parse_article_html("Wide", &wide),
+        ];
+        for doc in &docs {
+            for width in [60u16, 70, 80, 90, 100, 120, 200] {
+                for offset in [0u16, 3, 8] {
+                    for accessible in [false, true] {
+                        let opts = LayoutOptions {
+                            table_col_offset: offset,
+                            accessible,
+                            ..LayoutOptions::default()
+                        };
+                        let layout = layout_document(doc, width, opts);
+                        for line in &layout.lines {
+                            assert!(
+                                line.width(false) <= width as usize,
+                                "overflow at width {width}, offset {offset}, accessible \
+                                 {accessible}: {:?}",
+                                line_text(line)
+                            );
+                        }
+                        assert_eq!(layout.continuation.len(), layout.lines.len() - 1);
+                    }
+                }
+            }
+        }
     }
 }

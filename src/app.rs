@@ -203,6 +203,11 @@ pub struct App {
     /// FR-TH-5): when true, every style still applies but with colors
     /// stripped, regardless of which theme is selected.
     pub no_color: bool,
+    /// PRD FR-ACS-6 (`ACCESSIBLE=1`): drives the layout's collapse-to-list
+    /// table path (and could gate further linear-leaning behavior). Set once
+    /// at startup from the `ACCESSIBLE` environment variable; part of
+    /// `layout_options`, so toggling it invalidates cached layouts.
+    pub accessible: bool,
     /// Research mode's candidate list for the *active tab's* article: element
     /// 0 is always the article's own citation (`research::self_citation`);
     /// the rest are its extracted References entries, in document order.
@@ -389,6 +394,7 @@ impl App {
             pending_g: false,
             theme,
             no_color,
+            accessible: false,
             citations: Vec::new(),
             selected_citation: 0,
             research: ResearchStore::load(),
@@ -630,7 +636,53 @@ impl App {
         LayoutOptions {
             measure: self.measure,
             ambiguous_wide: self.ambiguous_wide,
+            accessible: self.accessible,
+            table_col_offset: self.active_tab().table_col_offset,
         }
+    }
+
+    /// PRD FR-RD-4's horizontal table scroll (`[`/`]` in the reading view):
+    /// shift the shared column window of every wide table in the active
+    /// article, clamped so it can't run past the widest table's columns.
+    /// Changing it invalidates the cached layout (the offset is part of the
+    /// L1 key), so the next draw relayouts with the new window.
+    pub fn scroll_tables(&mut self, delta: i16) {
+        let max = self.max_table_columns().saturating_sub(1) as u16;
+        if max == 0 {
+            self.status = "No wide table to scroll on this page".to_string();
+            return;
+        }
+        let cur = self.active_tab().table_col_offset;
+        let next = if delta < 0 {
+            cur.saturating_sub((-delta) as u16)
+        } else {
+            cur.saturating_add(delta as u16)
+        }
+        .min(max);
+        if next != cur {
+            self.active_tab_mut().table_col_offset = next;
+            self.layout = None;
+        }
+    }
+
+    /// The greatest column count among the active article's tables — the
+    /// bound for how far table scrolling can travel. Zero when the article
+    /// has no tables.
+    fn max_table_columns(&self) -> usize {
+        self.active_tab()
+            .doc
+            .as_ref()
+            .map(|doc| {
+                doc.blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        crate::doc::Block::Table(t) => Some(t.cols()),
+                        _ => None,
+                    })
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0)
     }
 
     /// Ensure `self.layout` is current for `(layout_width, options)`. Three
@@ -2679,6 +2731,52 @@ mod tests {
         let mut app = App::new("en".to_string(), Theme::terminal(), false);
         app.move_suggestion(true);
         assert_eq!(app.selected_suggestion, 0);
+    }
+
+    /// PRD FR-RD-4 horizontal scroll: `[`/`]` (App::scroll_tables) clamps the
+    /// shared column offset to the widest table's column count and floors at 0.
+    #[test]
+    fn table_scroll_offset_clamps_to_the_widest_table() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        let mut html = String::from("<html><body><table class=\"wikitable\"><tbody><tr>");
+        for c in 0..5 {
+            html.push_str(&format!("<td>c{c}</td>"));
+        }
+        html.push_str("</tr></tbody></table></body></html>");
+        app.set_document(crate::doc::parse_article_html("T", &html));
+        assert_eq!(app.max_table_columns(), 5);
+
+        for _ in 0..10 {
+            app.scroll_tables(1);
+        }
+        assert_eq!(
+            app.active_tab().table_col_offset,
+            4,
+            "offset clamps to columns - 1"
+        );
+        app.scroll_tables(-100);
+        assert_eq!(app.active_tab().table_col_offset, 0, "floors at 0");
+    }
+
+    #[test]
+    fn table_scroll_is_a_no_op_without_tables() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(crate::doc::parse_article_html(
+            "T",
+            "<html><body><p>no tables here</p></body></html>",
+        ));
+        app.scroll_tables(1);
+        assert_eq!(app.active_tab().table_col_offset, 0);
+    }
+
+    #[test]
+    fn layout_options_carry_accessible_and_the_tabs_table_offset() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.accessible = true;
+        app.active_tab_mut().table_col_offset = 3;
+        let opts = app.layout_options();
+        assert!(opts.accessible);
+        assert_eq!(opts.table_col_offset, 3);
     }
 
     /// FR-NV-6b: highlighting now covers every literal occurrence, not just
