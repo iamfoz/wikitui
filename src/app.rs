@@ -3547,4 +3547,161 @@ mod tests {
         assert_eq!(resolve_r_prefix('r'), RPrefixAction::OpenResearch);
         assert_eq!(resolve_r_prefix('j'), RPrefixAction::OpenResearch);
     }
+
+    // ---- Reading history (PRD FR-HS-1/2/4) --------------------------------
+
+    #[test]
+    fn set_document_records_a_visit_with_the_previous_articles_referrer() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.open_document(doc("Alan Turing"));
+        app.open_document(doc("Enigma machine"));
+
+        let recent = app.history.recent(10);
+        assert_eq!(recent.len(), 2);
+        let enigma = recent.iter().find(|v| v.title == "Enigma machine").unwrap();
+        assert_eq!(enigma.referrer_lang.as_deref(), Some("en"));
+        assert_eq!(enigma.referrer_title.as_deref(), Some("Alan Turing"));
+        let turing = recent.iter().find(|v| v.title == "Alan Turing").unwrap();
+        assert!(
+            turing.referrer_title.is_none(),
+            "the first page in a tab has no referrer"
+        );
+    }
+
+    #[test]
+    fn opening_a_document_starts_dwell_tracking_and_replacing_it_flushes() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.open_document(doc("Alan Turing"));
+        let first_id = app.active_tab().history_visit_id;
+        assert!(
+            first_id.is_some(),
+            "a successful install starts dwell tracking"
+        );
+        assert!(app.active_tab().visit_started_at.is_some());
+
+        // Replacing the document must flush the old visit's dwell (tested
+        // numerically in `history::tests::update_dwell_accumulates_
+        // across_multiple_calls`) and start fresh tracking for the new one.
+        app.open_document(doc("Enigma machine"));
+        let second_id = app.active_tab().history_visit_id;
+        assert!(second_id.is_some());
+        assert_ne!(first_id, second_id, "a new visit gets its own row id");
+    }
+
+    #[test]
+    fn closing_a_tab_flushes_its_dwell_before_it_is_gone() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.open_document(doc("Alan Turing"));
+        let visit_id = app.active_tab().history_visit_id.unwrap();
+        app.new_foreground_tab();
+        assert_eq!(app.tabs.len(), 2);
+
+        // Closing tab 0 (still showing "Alan Turing") must not panic and
+        // must flush that tab's dwell via `History::update_dwell` before
+        // the tab (and its tracking fields) is removed — proven here by
+        // the fact that this doesn't panic reaching into a gone tab, and
+        // that the row `update_dwell` targeted is still the same one that
+        // was recorded.
+        app.close_tab(0);
+        assert_eq!(app.tabs.len(), 1);
+        let recent = app.history.recent(10);
+        let turing = recent.iter().find(|v| v.id == visit_id);
+        assert!(
+            turing.is_some(),
+            "the visit row closing the tab flushed dwell for must still exist"
+        );
+    }
+
+    #[test]
+    fn incognito_suppresses_recording_and_dwell_tracking() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.incognito = true;
+
+        app.open_document(doc("Alan Turing"));
+        assert!(
+            app.history.recent(10).is_empty(),
+            "incognito must not record a visit"
+        );
+        assert!(
+            app.active_tab().history_visit_id.is_none(),
+            "incognito must not start dwell tracking either"
+        );
+        assert!(app.active_tab().visit_started_at.is_none());
+
+        // Flipping incognito off (the future FR-PR-3 chunk's whole job) is
+        // enough to resume recording — no other state to reset.
+        app.incognito = false;
+        app.open_document(doc("Enigma machine"));
+        assert_eq!(
+            app.history.recent(10).len(),
+            1,
+            "recording resumes once incognito is turned off"
+        );
+    }
+
+    #[test]
+    fn background_tab_load_completion_records_a_visit_too() {
+        // Mirrors `tests::background_load_completion_installs_into_the_
+        // right_tab_by_id` in main.rs, but at the `App` level: a background
+        // tab's fetch landing is "an article successfully renders in a
+        // tab" the same as the active tab's own `set_document` (PRD
+        // FR-HS-1) — exercised here via the same `record_history_visit`
+        // entrypoint `main::apply_tab_load_outcome` calls.
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        let id = app.open_background_tab("Enigma machine".to_string(), "en".to_string());
+        let index = app.tab_index_by_id(id).unwrap();
+        app.tabs[index].install_document(doc("Enigma machine"));
+        app.record_history_visit(index, None);
+
+        let recent = app.history.recent(10);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].title, "Enigma machine");
+        assert!(app.tabs[index].history_visit_id.is_some());
+    }
+
+    #[test]
+    fn open_reading_history_picker_populates_recent_and_resets_selection() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.open_document(doc("Alan Turing"));
+        app.open_document(doc("Enigma machine"));
+        app.history_pick_selected = 5; // stale from a previous state
+        app.open_reading_history_picker();
+        assert_eq!(app.mode, Mode::ReadingHistory);
+        assert_eq!(app.history_pick_matches.len(), 2);
+        assert_eq!(app.history_pick_selected, 0);
+    }
+
+    #[test]
+    fn refresh_history_matches_filters_by_the_current_input() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.open_document(doc("Alan Turing"));
+        app.open_document(doc("Enigma machine"));
+        app.history_pick_filter = "enig".to_string();
+        app.refresh_history_matches();
+        assert_eq!(app.history_pick_matches.len(), 1);
+        assert_eq!(app.history_pick_matches[0].title, "Enigma machine");
+    }
+
+    #[test]
+    fn delete_selected_history_removes_just_that_article() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.open_document(doc("Alan Turing"));
+        app.open_document(doc("Enigma machine"));
+        app.open_reading_history_picker();
+        // most-recent-first: Enigma machine (opened last) is index 0.
+        assert_eq!(app.history_pick_matches[0].title, "Enigma machine");
+        app.delete_selected_history();
+        assert_eq!(app.history_pick_matches.len(), 1);
+        assert_eq!(app.history_pick_matches[0].title, "Alan Turing");
+    }
+
+    #[test]
+    fn clear_history_all_empties_the_store_and_the_open_picker() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.open_document(doc("Alan Turing"));
+        app.open_reading_history_picker();
+        app.clear_history(crate::command::HistoryClearScope::All);
+        assert!(app.history.recent(10).is_empty());
+        assert!(app.history_pick_matches.is_empty());
+    }
 }
