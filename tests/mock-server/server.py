@@ -293,6 +293,24 @@ SEARCH_PAGES = [
     },
 ]
 
+# PRD Appendix A "Summary" fixtures (FR-OFF-4 T2 link-peek): a plain-text
+# extract per title, served at /api/rest_v1/page/summary/{title}. A title with
+# no explicit entry falls back to a synthesized one-liner so any internal link
+# still resolves offline.
+SUMMARIES = {
+    "Computer_science": "Computer science is the study of computation, information, and automation.",
+    "Enigma_machine": "The Enigma machine was a cipher device used in the early to mid-20th century.",
+    "Alan_Turing": "Alan Turing was an English mathematician and computer scientist.",
+}
+
+# PRD FR-OFF-5 bulk-save-by-category fixtures: category name (without the
+# Category: prefix, matched case-insensitively) -> member article titles
+# (namespace 0). Served via the Action API list=categorymembers shape.
+CATEGORIES = {
+    "physics": ["Alan Turing", "Computer science", "Enigma machine"],
+    "computing": ["Computer science", "Alan Turing"],
+}
+
 # Did-you-mean corrections (FR-SR-4 / §7's zero-results row) for queries
 # that hit no SEARCH_PAGES text at all. Keyed lowercase; see
 # `api::SearchOutcome`'s doc comment for why this rides the REST
@@ -326,10 +344,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         parts = parsed.path.split('/')
         params = urllib.parse.parse_qs(parsed.query)
 
-        if '/page/' in parsed.path and parsed.path.endswith('/html'):
+        if '/page/summary/' in parsed.path:
+            self._serve_summary(parts)
+        elif '/page/' in parsed.path and parsed.path.endswith('/html'):
             self._serve_article(parts)
         elif '/page/' in parsed.path and parsed.path.endswith('/bare'):
             self._serve_bare(parts)
+        elif parsed.path.endswith('/api.php'):
+            self._serve_action_api(params)
         elif parsed.path.endswith('/search/title'):
             self._serve_search_title(params)
         elif parsed.path.endswith('/search/page'):
@@ -341,6 +363,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
         else:
             self.send_response(404)
             self.end_headers()
+
+    def _serve_summary(self, parts):
+        # PRD Appendix A "Summary" (FR-OFF-4 T2): plain-text extract for a
+        # link target. A title without an explicit SUMMARIES entry gets a
+        # synthesized one-liner so link-peek still resolves offline.
+        title = urllib.parse.unquote(parts[-1])
+        extract = SUMMARIES.get(title, f"{title.replace('_', ' ')} is a topic on Wikipedia.")
+        self._send_json({"title": title.replace('_', ' '), "extract": extract})
+
+    def _serve_action_api(self, params):
+        # PRD FR-OFF-5 bulk-save-by-category: list=categorymembers, depth 1.
+        action = params.get('action', [''])[0]
+        listing = params.get('list', [''])[0]
+        if action == 'query' and listing == 'categorymembers':
+            cmtitle = params.get('cmtitle', [''])[0]
+            name = cmtitle.split(':', 1)[-1].strip().lower()
+            members = CATEGORIES.get(name, [])
+            self._send_json({
+                "query": {"categorymembers": [{"title": t} for t in members]}
+            })
+            return
+        self.send_response(404)
+        self.end_headers()
 
     def _serve_media(self):
         # PRD FR-RD-8: serve the real tiny PNG, counting the hit so tests can

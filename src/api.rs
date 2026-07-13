@@ -139,6 +139,31 @@ struct BareLatest {
     id: u64,
 }
 
+/// The subset of `/api/rest_v1/page/summary/{title}` this client consumes
+/// (PRD Appendix A): just the plain-text extract that powers T2 link-peek.
+#[derive(Debug, Deserialize)]
+struct SummaryResponse {
+    #[serde(default)]
+    extract: String,
+}
+
+/// The subset of `list=categorymembers` (formatversion=2) this client reads.
+#[derive(Debug, Deserialize)]
+struct CategoryMembersResponse {
+    query: CategoryMembersQuery,
+}
+
+#[derive(Debug, Deserialize)]
+struct CategoryMembersQuery {
+    #[serde(default)]
+    categorymembers: Vec<CategoryMember>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CategoryMember {
+    title: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct BareResponse {
     latest: BareLatest,
@@ -281,6 +306,77 @@ impl WikiClient {
         read_capped(resp, MAX_IMAGE_BYTES)
             .await
             .context("reading image body")
+    }
+
+    /// A link-target summary/extract (PRD Appendix A's "Summary" row: `GET
+    /// /api/rest_v1/page/summary/{title}`), for T2 saved pages (FR-OFF-4) so
+    /// link-peek resolves offline. Returns the plain-text extract, sanitized
+    /// (SEC-1) since it becomes stored, displayable text. Batching the
+    /// extracts (`action=query&prop=extracts`, `exlimit≤20`) is Appendix A's
+    /// documented optimization and a future seam; this per-title call keeps
+    /// the T2 path simple.
+    pub async fn fetch_summary(&self, lang: &str, title: &str) -> Result<String> {
+        let url = format!(
+            "{}/api/rest_v1/page/summary/{}",
+            self.host(lang),
+            Self::title_path(title)
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("requesting summary for {title:?}"))?
+            .error_for_status()
+            .context("summary request failed")?;
+        let bytes = read_capped(resp, MAX_SEARCH_RESPONSE_BYTES)
+            .await
+            .context("reading summary response body")?;
+        let parsed: SummaryResponse =
+            serde_json::from_slice(&bytes).context("parsing summary response")?;
+        Ok(crate::sanitize::sanitize_single_line(&parsed.extract).into_owned())
+    }
+
+    /// The members of a category (PRD FR-OFF-5's bulk-save-by-category:
+    /// Appendix A's `list=categorymembers`, depth 1). Namespace-0 article
+    /// titles only, capped at `limit`. `cat` may be given with or without the
+    /// `Category:` prefix.
+    pub async fn fetch_category_members(
+        &self,
+        lang: &str,
+        cat: &str,
+        limit: u32,
+    ) -> Result<Vec<String>> {
+        let cmtitle = if cat.to_ascii_lowercase().starts_with("category:") {
+            cat.to_string()
+        } else {
+            format!("Category:{cat}")
+        };
+        let url = format!(
+            "{}/w/api.php?action=query&list=categorymembers&cmtitle={}&cmtype=page&cmlimit={}&format=json&formatversion=2",
+            self.host(lang),
+            urlencoding::encode(&cmtitle),
+            limit
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("requesting category members for {cat:?}"))?
+            .error_for_status()
+            .context("categorymembers request failed")?;
+        let bytes = read_capped(resp, MAX_SEARCH_RESPONSE_BYTES)
+            .await
+            .context("reading categorymembers response body")?;
+        let parsed: CategoryMembersResponse =
+            serde_json::from_slice(&bytes).context("parsing categorymembers response")?;
+        Ok(parsed
+            .query
+            .categorymembers
+            .into_iter()
+            .map(|m| crate::sanitize::sanitize_single_line(&m.title).into_owned())
+            .collect())
     }
 
     /// The cheap revalidation call (PRD FR-OFF-2 / Appendix A's "Page
@@ -474,6 +570,39 @@ mod tests {
             parsed.pages[0].timestamp.as_deref(),
             Some("2026-06-30T10:15:00Z")
         );
+    }
+
+    /// PRD Appendix A "Summary" (FR-OFF-4 T2): the extract field powers
+    /// offline link-peek; a response missing it degrades to empty, not error.
+    #[test]
+    fn summary_response_parses_the_extract() {
+        let json = r#"{"title": "Alan Turing", "extract": "A mathematician."}"#;
+        let parsed: SummaryResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.extract, "A mathematician.");
+        let missing = r#"{"title": "X"}"#;
+        let parsed: SummaryResponse = serde_json::from_str(missing).unwrap();
+        assert_eq!(parsed.extract, "");
+    }
+
+    /// PRD FR-OFF-5's `list=categorymembers`: member titles are extracted, and
+    /// an empty/absent list is not an error.
+    #[test]
+    fn categorymembers_response_parses_member_titles() {
+        let json = r#"{"query": {"categorymembers": [
+            {"title": "Alan Turing"}, {"title": "Computer science"}
+        ]}}"#;
+        let parsed: CategoryMembersResponse = serde_json::from_str(json).unwrap();
+        let titles: Vec<_> = parsed
+            .query
+            .categorymembers
+            .iter()
+            .map(|m| m.title.as_str())
+            .collect();
+        assert_eq!(titles, vec!["Alan Turing", "Computer science"]);
+
+        let empty = r#"{"query": {}}"#;
+        let parsed: CategoryMembersResponse = serde_json::from_str(empty).unwrap();
+        assert!(parsed.query.categorymembers.is_empty());
     }
 
     /// The typeahead schema: title + optional Wikidata-style description.

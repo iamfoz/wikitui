@@ -427,9 +427,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Mode::ReadingHistory | Mode::ReadingHistoryFilter => {
             draw_reading_history_picker(frame, app, content_area)
         }
+        Mode::SavedPicker => draw_saved_picker(frame, app, content_area),
+        // The offline card overlays the reading view (drawn after the status
+        // bar below, like the help overlay).
+        Mode::OfflineCard => draw_reading(frame, app, content_area),
     }
 
     draw_status_bar(frame, app, status_area);
+
+    if app.mode == Mode::OfflineCard {
+        draw_offline_card(frame, app, area);
+    }
 
     // The typeahead dropdown floats over the reading view, anchored just
     // above the prompt it belongs to (PRD FR-SR-1) — drawn after the status
@@ -1337,6 +1345,106 @@ fn draw_reading_history_picker(frame: &mut Frame, app: &App, area: Rect) {
     render_selectable_list(frame, list, area, app.history_pick_selected);
 }
 
+/// The `:saved` saved-pages browser (PRD §5.7 / FR-OFF-4): title, tier, size,
+/// saved date, and the integrity verdict (ok/corrupt — the sha256 check). The
+/// pinned store is visually distinct from the read-later/history pickers by
+/// carrying its own size + integrity columns, matching the "quota-visible,
+/// integrity-checked" contract §5.7 draws around saved pages.
+fn draw_saved_picker(frame: &mut Frame, app: &App, area: Rect) {
+    let integrity = app.saved.verify_all();
+    let items: Vec<ListItem> = app
+        .saved
+        .list()
+        .iter()
+        .enumerate()
+        .map(|(i, rec)| {
+            let ok = integrity
+                .get(i)
+                .map(|(_, _, v)| *v == crate::saved::Integrity::Ok)
+                .unwrap_or(true);
+            let integrity_note = if ok { "ok" } else { "CORRUPT" };
+            let detail = format!(
+                "   [{}] {}   {}   saved {}   integrity: {integrity_note}",
+                rec.lang,
+                rec.tier.label(),
+                human_size(rec.size_total),
+                crate::bookmarks::display_date(&rec.saved_at),
+            );
+            let line = Line::from(vec![
+                RSpan::styled(
+                    rec.title.clone(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                RSpan::styled(detail, colored(app.no_color, app.theme.dim)),
+            ]);
+            let style = if i == app.selected_saved {
+                colored_bg(app.no_color, app.theme.selected_fg, app.theme.selected_bg)
+            } else {
+                Style::default()
+            };
+            ListItem::new(line).style(style)
+        })
+        .collect();
+
+    let title = format!(
+        "Saved pages ({}, {}) — Enter: open  d: remove  Esc: close",
+        app.saved.list().len(),
+        human_size(app.saved.total_bytes()),
+    );
+    let list = List::new(items)
+        .style(base_style(&app.theme, app.no_color))
+        .block(UiBlock::default().borders(Borders::ALL).title(title));
+    render_selectable_list(frame, list, area, app.selected_saved);
+}
+
+/// A compact byte-size for the saved browser ("30 KB" / "1.4 MB").
+fn human_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{} KB", bytes / 1024)
+    } else {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+/// §7's "Offline, uncached link" card: a centered overlay offering the two
+/// documented choices (queue for fetch when online / search saved pages).
+fn draw_offline_card(frame: &mut Frame, app: &App, area: Rect) {
+    let width = 54.min(area.width.saturating_sub(4)).max(20);
+    let height = 8.min(area.height.saturating_sub(2)).max(6);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    let title = app
+        .offline_card_target
+        .as_ref()
+        .map(|(_, t)| t.clone())
+        .unwrap_or_default();
+    let body = Text::from(vec![
+        Line::from(RSpan::styled(
+            "Not available offline",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(format!("\"{title}\" isn't cached or saved.")),
+        Line::from(""),
+        Line::from("f  queue for fetch when online"),
+        Line::from("s  search saved pages"),
+        Line::from("Esc  dismiss"),
+    ]);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(body)
+            .style(base_style(&app.theme, app.no_color))
+            .block(UiBlock::default().borders(Borders::ALL).title("Offline")),
+        popup,
+    );
+}
+
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let tab = app.active_tab();
     let text = match app.mode {
@@ -1388,6 +1496,10 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         }
         Mode::BookmarkPicker => app.status.clone(),
         Mode::ReadLaterPicker => app.status.clone(),
+        Mode::SavedPicker => app.status.clone(),
+        Mode::OfflineCard => {
+            "f: queue for fetch when online   s: search saved pages   Esc: dismiss".to_string()
+        }
         Mode::ReadingHistory => app.status.clone(),
         Mode::ReadingHistoryFilter => {
             format!("filter: {}   Esc: apply", app.history_pick_filter)

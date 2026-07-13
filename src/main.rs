@@ -1,5 +1,6 @@
 mod api;
 mod app;
+mod attribution;
 mod bookmark_export;
 mod bookmarks;
 mod cache;
@@ -10,6 +11,7 @@ mod config;
 mod crashguard;
 mod doc;
 mod doctor;
+mod fetch_queue;
 mod fuzzy;
 mod graphics;
 mod hints;
@@ -19,6 +21,8 @@ mod jsonl;
 mod layout;
 mod research;
 mod sanitize;
+mod saved;
+mod saved_export;
 mod tab;
 mod target;
 mod theme;
@@ -36,13 +40,14 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 use api::{TitleSuggestion, WikiClient};
-use app::{App, Mode, PageSource, PendingReload};
+use app::{App, BulkSaveRequest, Mode, PageSource, PendingReload};
 use bookmarks::ReadLaterEntry;
 use cache::{PageCache, RevalidateAction, SwrDecision};
 use cite::CiteStyle;
 use cli::{Cli, Commands, ConfigAction};
 use config::ConfigContext;
 use crashguard::{SuspendedTerminal, TerminalGuard};
+use saved::{LinkSummary, Tier};
 use tab::{HistoryEntry, TabId};
 use theme::Theme;
 
@@ -107,6 +112,31 @@ struct TabLoadOutcome {
 struct ImageOutcome {
     src: String,
     decoded: Option<crate::image::DecodedImage>,
+}
+
+/// One completed (or failed) saved-page fetch (PRD FR-OFF-4..5), delivered
+/// off the event loop like every other background fetch. The main loop applies
+/// it via `apply_save_outcome`, which owns `App::saved`.
+struct SaveOutcome {
+    /// `Err(message)` on any network/parse failure fetching this target — the
+    /// save of *this* page fails, but a bulk run continues with the rest.
+    result: std::result::Result<SaveFetched, String>,
+    title: String,
+}
+
+/// Everything fetched for one saved page, ready for `SavedPages::save` to pin
+/// on the main thread (the store is not `Send`-shared).
+struct SaveFetched {
+    lang: String,
+    title: String,
+    revid: u64,
+    tier: Tier,
+    html: String,
+    /// `(src, bytes)` pairs for T1+ thumbnails (empty for T0).
+    thumbs: Vec<(String, Vec<u8>)>,
+    /// Link-target summaries for T2 (empty otherwise).
+    summaries: Vec<LinkSummary>,
+    source_note: String,
 }
 
 enum RevalidationResult {
@@ -766,6 +796,271 @@ async fn ensure_cached(client: &WikiClient, cache: &PageCache, lang: &str, title
     }
 }
 
+// -- Saved pages (PRD FR-OFF-4..7) ----------------------------------------
+
+/// PRD FR-OFF-4 T1 thumbnail byte cap (per image is already bounded by
+/// `api::fetch_image`'s own read cap) — the count is bounded by
+/// `saved::MAX_T1_THUMBS`.
+const MAX_SAVE_THUMB_BYTES: usize = 2 * 1024 * 1024;
+
+/// `S` / `:save [t0|t1|t2]`: pin the article on screen at `tier`. A single
+/// page needs no cost preview (that is for bulk saves, FR-OFF-5) — it fires
+/// straight onto the background save queue.
+fn start_current_save(
+    client: &WikiClient,
+    cache: &PageCache,
+    app: &mut App,
+    tier: Tier,
+    save_tx: &UnboundedSender<SaveOutcome>,
+) {
+    let Some(doc) = app.active_tab().doc.as_ref() else {
+        app.notice = Some("Open an article first".to_string());
+        return;
+    };
+    let title = doc.title.clone();
+    let lang = app.active_tab().lang.clone();
+    fire_save_job(
+        client,
+        cache,
+        app,
+        vec![(lang, title)],
+        tier,
+        "S save".to_string(),
+        save_tx,
+    );
+}
+
+/// Resolve a bulk save's targets into a cost preview + y/n confirmation (PRD
+/// FR-OFF-5): nothing is fetched until the reader confirms. An empty target
+/// set reports so instead of arming a pointless confirm.
+fn request_bulk_save(app: &mut App, label: String, tier: Tier, targets: Vec<(String, String)>) {
+    if targets.is_empty() {
+        app.notice = Some(format!("Nothing to save for {label}"));
+        return;
+    }
+    app.notice = Some(app::bulk_cost_preview(&label, targets.len(), tier));
+    app.pending_bulk_save = Some(BulkSaveRequest {
+        label,
+        tier,
+        targets,
+    });
+}
+
+/// Spawn the serial, non-blocking background save (PRD FR-OFF-5's "background
+/// queue"): one task walks `targets` in order, fetching each and posting a
+/// `SaveOutcome`, so a big save never blocks the reader and the store is only
+/// touched on the main thread (`apply_save_outcome`). `pending_saves` keeps
+/// the loop polling until every outcome has landed.
+fn fire_save_job(
+    client: &WikiClient,
+    cache: &PageCache,
+    app: &mut App,
+    targets: Vec<(String, String)>,
+    tier: Tier,
+    source_note: String,
+    save_tx: &UnboundedSender<SaveOutcome>,
+) {
+    let count = targets.len();
+    app.pending_saves += count as u32;
+    app.notice = Some(format!("Saving {count} page(s) ({})…", tier.label()));
+    let client = client.clone();
+    let cache = cache.clone();
+    let tx = save_tx.clone();
+    let include_nonfree = app.include_nonfree;
+    tokio::spawn(async move {
+        for (lang, title) in targets {
+            let result = fetch_for_save(
+                &client,
+                &cache,
+                &lang,
+                &title,
+                tier,
+                include_nonfree,
+                &source_note,
+            )
+            .await
+            .map_err(|e| e.to_string());
+            let _ = tx.send(SaveOutcome {
+                result,
+                title: title.clone(),
+            });
+        }
+    });
+}
+
+/// Fetch everything one saved page needs at `tier`: the HTML (cache-first, so
+/// re-saving the article on screen doesn't re-hit the network), plus — per
+/// tier — thumbnails (T1+) and link-target summaries (T2). Thumbnail bytes are
+/// the same sanitized image sources shown transiently in the reading view; the
+/// non-free *export* exclusion (§10) is enforced at export time, not here (see
+/// `saved.rs`'s module doc).
+async fn fetch_for_save(
+    client: &WikiClient,
+    cache: &PageCache,
+    lang: &str,
+    title: &str,
+    tier: Tier,
+    _include_nonfree: bool,
+    source_note: &str,
+) -> Result<SaveFetched> {
+    // HTML: prefer the cache (the article on screen is already there) and fall
+    // back to a fresh fetch for a target that has never been opened.
+    let (html, revid) = match cache.get(lang, title) {
+        Some(page) => (page.html, page.revid),
+        None => {
+            let fetched = client.fetch_article_html(lang, title).await?;
+            cache.put(
+                lang,
+                title,
+                &fetched.html,
+                fetched.revid,
+                fetched.etag.as_deref(),
+            );
+            (fetched.html, fetched.revid)
+        }
+    };
+
+    let mut thumbs = Vec::new();
+    let mut summaries = Vec::new();
+
+    if matches!(tier, Tier::T1 | Tier::T2) {
+        let document = doc::parse_article_html(title, &html);
+        let mut srcs: Vec<String> = Vec::new();
+        for block in &document.blocks {
+            if let doc::Block::Image { src: Some(src), .. } = block
+                && !srcs.contains(src)
+            {
+                srcs.push(src.clone());
+            }
+        }
+        for src in srcs.into_iter().take(saved::MAX_T1_THUMBS) {
+            if let Ok(bytes) = client.fetch_image(&src).await
+                && bytes.len() <= MAX_SAVE_THUMB_BYTES
+            {
+                thumbs.push((src, bytes));
+            }
+        }
+    }
+
+    if matches!(tier, Tier::T2) {
+        let document = doc::parse_article_html(title, &html);
+        let mut seen: Vec<String> = Vec::new();
+        for link in doc::collect_links(&document) {
+            if let Some(target) = link.internal_title
+                && !seen.contains(&target)
+            {
+                seen.push(target);
+            }
+        }
+        for target in seen.into_iter().take(saved::MAX_T2_SUMMARIES) {
+            if let Ok(extract) = client.fetch_summary(lang, &target).await {
+                summaries.push(LinkSummary {
+                    title: target,
+                    extract,
+                });
+            }
+        }
+    }
+
+    Ok(SaveFetched {
+        lang: lang.to_string(),
+        title: title.to_string(),
+        revid,
+        tier,
+        html,
+        thumbs,
+        summaries,
+        source_note: source_note.to_string(),
+    })
+}
+
+/// Apply one completed save on the main thread (PRD FR-OFF-4): pin it into the
+/// store (index + content), or report the failure. Decrements `pending_saves`
+/// so the loop can stop polling once a run finishes.
+fn apply_save_outcome(app: &mut App, outcome: SaveOutcome) {
+    app.pending_saves = app.pending_saves.saturating_sub(1);
+    match outcome.result {
+        Ok(f) => match app.saved.save(
+            &f.lang,
+            &f.title,
+            f.revid,
+            f.tier,
+            &f.html,
+            &f.thumbs,
+            f.summaries,
+            &f.source_note,
+        ) {
+            Ok(record) => {
+                app.notice = Some(format!(
+                    "Saved \"{}\" ({}, {})",
+                    record.title,
+                    record.tier.label(),
+                    human_bytes(record.size_total)
+                ));
+            }
+            Err(e) => app.notice = Some(format!("Save failed for \"{}\": {e}", f.title)),
+        },
+        Err(e) => app.notice = Some(format!("Save failed for \"{}\": {e}", outcome.title)),
+    }
+}
+
+/// A compact byte-size string for save notices ("30 KB", "1.4 MB").
+fn human_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{} KB", bytes / 1024)
+    } else {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+/// Serve a pinned saved page for reading (PRD §5.7): decompress from the saved
+/// store and install it with the ▣ Saved indicator, no network involved. The
+/// `:saved` browser's Enter and the offline fallback both route here.
+fn open_saved(app: &mut App, lang: &str, title: &str) {
+    match app.saved.get(lang, title) {
+        Some(content) => {
+            let document = doc::parse_article_html(title, &content.html);
+            {
+                let tab = app.active_tab_mut();
+                tab.page_source = PageSource::Saved {
+                    age_secs: content.age_secs,
+                };
+                tab.current_revid = content.revid;
+            }
+            app.open_document(document);
+        }
+        None => {
+            app.notice = Some(format!("Saved page \"{title}\" is unavailable or corrupt"));
+            app.mode = Mode::Reading;
+        }
+    }
+}
+
+/// `:fetch-queue` (PRD FR-OFF-6): drain the offline fetch queue now — fetch
+/// every queued title into the cache, dropping the ones that land. Runs
+/// synchronously on the trigger (a deliberate, explicit action; the mock makes
+/// it instant). Auto-drain the moment connectivity returns is a documented
+/// seam — it needs a connectivity signal wikitui doesn't yet have.
+async fn drain_fetch_queue(client: &WikiClient, cache: &PageCache, app: &mut App) {
+    let queued = app.fetch_queue.snapshot();
+    if queued.is_empty() {
+        app.notice = Some("Fetch queue is empty".to_string());
+        return;
+    }
+    let (mut ok, mut fail) = (0u32, 0u32);
+    for q in queued {
+        if ensure_cached(client, cache, &q.lang, &q.title).await {
+            app.fetch_queue.remove(&q.lang, &q.title);
+            ok += 1;
+        } else {
+            fail += 1;
+        }
+    }
+    app.notice = Some(format!("Fetch queue: {ok} fetched, {fail} still pending"));
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
@@ -820,6 +1115,8 @@ async fn run(
     let (open_tx, mut open_rx) = mpsc::unbounded_channel::<TabLoadOutcome>();
     // PRD FR-RD-8: inline-image fetch+decode results (lazy, never blocking).
     let (image_tx, mut image_rx) = mpsc::unbounded_channel::<ImageOutcome>();
+    // PRD FR-OFF-4..5: background saved-page fetch results (serial, non-blocking).
+    let (save_tx, mut save_rx) = mpsc::unbounded_channel::<SaveOutcome>();
 
     if let Some(query) = cli.search {
         app.search_input = query;
@@ -869,6 +1166,7 @@ async fn run(
             || app.pending_revalidations > 0
             || app.any_tab_loading()
             || app.image_store.any_loading()
+            || app.pending_saves > 0
         {
             let poll_interval = if app.mode == Mode::Search {
                 TYPEAHEAD_POLL
@@ -887,6 +1185,7 @@ async fn run(
                     key.modifiers,
                     &revalidate_tx,
                     &open_tx,
+                    &save_tx,
                     terminal,
                 )
                 .await;
@@ -921,6 +1220,11 @@ async fn run(
             while let Ok(outcome) = image_rx.try_recv() {
                 app.deliver_image(outcome.src, outcome.decoded);
             }
+            // PRD FR-OFF-4..5: pin completed saved-page fetches on the main
+            // thread (the store isn't shared with the spawned task).
+            while let Ok(outcome) = save_rx.try_recv() {
+                apply_save_outcome(&mut app, outcome);
+            }
         } else if let Event::Key(key) = event::read()? {
             // Block until an event arrives instead of redrawing on a timer —
             // an idle reader shouldn't spin the CPU or spam hide-cursor codes.
@@ -933,6 +1237,7 @@ async fn run(
                     key.modifiers,
                     &revalidate_tx,
                     &open_tx,
+                    &save_tx,
                     terminal,
                 )
                 .await;
@@ -1064,6 +1369,16 @@ async fn open_title(
     let lang = app.lang.clone();
     match fetch_page(client, cache, &lang, title).await {
         Ok(outcome) => {
+            // PRD §5.7: a pinned saved copy is the intended offline artifact,
+            // so it takes precedence over a stale cache serve — but never over
+            // a live/fresh copy, which is genuinely newer.
+            if matches!(outcome.source, PageSource::Offline { .. })
+                && app.saved.is_saved(&lang, title)
+            {
+                app.loading = false;
+                open_saved(app, &lang, title);
+                return;
+            }
             let document = doc::parse_article_html(title, &outcome.html);
             {
                 let tab = app.active_tab_mut();
@@ -1085,8 +1400,17 @@ async fn open_title(
             }
         }
         Err(e) => {
-            app.status = format!("Error: {e}");
-            app.mode = Mode::Reading;
+            // §7's "Offline, uncached link": the network failed and nothing is
+            // cached. If the page is pinned, serve that (▣); otherwise offer
+            // the queue-for-fetch / search-saved card (FR-OFF-6).
+            app.loading = false;
+            if app.saved.is_saved(&lang, title) {
+                open_saved(app, &lang, title);
+            } else {
+                app.status = format!("Error: {e}");
+                app.show_offline_card(lang, title.to_string());
+            }
+            return;
         }
     }
     app.loading = false;
@@ -1148,6 +1472,7 @@ async fn handle_key(
     modifiers: KeyModifiers,
     revalidate_tx: &UnboundedSender<RevalidationOutcome>,
     open_tx: &UnboundedSender<TabLoadOutcome>,
+    save_tx: &UnboundedSender<SaveOutcome>,
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
 ) {
     // `Q`'s one-keypress quit confirmation (PRD Appendix B) is intercepted
@@ -1159,6 +1484,29 @@ async fn handle_key(
         match code {
             KeyCode::Char('y') | KeyCode::Char('Y') => app.should_quit = true,
             _ => app.status = "Quit cancelled".to_string(),
+        }
+        return;
+    }
+
+    // PRD FR-OFF-5's bulk-save cost-preview confirmation, intercepted the same
+    // way: `y` proceeds with the resolved target list on the background save
+    // queue, anything else cancels. Nothing was fetched until this point.
+    if let Some(request) = app.pending_bulk_save.take() {
+        app.notice = None;
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let source_note = format!("bulk: {}", request.label);
+                fire_save_job(
+                    client,
+                    cache,
+                    app,
+                    request.targets,
+                    request.tier,
+                    source_note,
+                    save_tx,
+                );
+            }
+            _ => app.notice = Some("Bulk save cancelled".to_string()),
         }
         return;
     }
@@ -1224,7 +1572,9 @@ async fn handle_key(
                 app.command_input.clear();
                 app.mode = Mode::Reading;
                 match command::parse(&input) {
-                    Ok(cmd) => execute_command(client, cache, app, cmd, revalidate_tx).await,
+                    Ok(cmd) => {
+                        execute_command(client, cache, app, cmd, revalidate_tx, save_tx).await
+                    }
                     Err(message) => app.notice = Some(message),
                 }
             }
@@ -1538,6 +1888,39 @@ async fn handle_key(
             }
             _ => {}
         },
+        // PRD §5.7 / FR-OFF-4's saved-pages browser: Enter offline-serves the
+        // pinned copy (▣), `d` un-pins, Esc closes.
+        Mode::SavedPicker => match code {
+            KeyCode::Esc => app.close_saved_picker(),
+            KeyCode::Char('j') | KeyCode::Down => app.cycle_saved(true),
+            KeyCode::Char('k') | KeyCode::Up => app.cycle_saved(false),
+            KeyCode::Char('d') => app.delete_selected_saved(),
+            KeyCode::Enter => {
+                if let Some((lang, title)) = app.selected_saved_target() {
+                    app.lang = lang.clone();
+                    app.mode = Mode::Reading;
+                    open_saved(app, &lang, &title);
+                }
+            }
+            KeyCode::Char('?') => {
+                app.prior_mode = app.mode;
+                app.mode = Mode::Help;
+            }
+            _ => {}
+        },
+        // §7's "Offline, uncached link" card: `f` queues the target for
+        // fetch-when-online, `s` opens the saved-pages browser, Esc dismisses.
+        Mode::OfflineCard => match code {
+            KeyCode::Char('f') => {
+                app.queue_offline_target();
+            }
+            KeyCode::Char('s') => {
+                app.close_offline_card();
+                app.open_saved_picker();
+            }
+            KeyCode::Esc => app.close_offline_card(),
+            _ => {}
+        },
         Mode::Reading => {
             // g-prefix chords (PRD Appendix B): the g-latch's second key.
             // `gg` top, `gt`/`gT` next/prev tab (FR-TB-1), `gb` back-stack
@@ -1747,6 +2130,10 @@ async fn handle_key(
                     }
                 }
                 KeyCode::Char('T') => app.cycle_theme(),
+                // PRD FR-OFF-4 / Appendix B ("S save offline"): pin the
+                // current article at the default depth (T0). `:save t1|t2`
+                // pins deeper; `:saved` browses the store.
+                KeyCode::Char('S') => start_current_save(client, cache, app, Tier::T0, save_tx),
                 KeyCode::Char(':') => {
                     app.mode = Mode::Command;
                     app.command_input.clear();
@@ -1850,8 +2237,9 @@ async fn execute_command(
     app: &mut App,
     cmd: command::Command,
     revalidate_tx: &UnboundedSender<RevalidationOutcome>,
+    save_tx: &UnboundedSender<SaveOutcome>,
 ) {
-    use command::Command;
+    use command::{Command, SaveSpec};
     match cmd {
         Command::Open(raw) => {
             // Same grammar as the CLI TITLE argument: URLs and
@@ -1947,6 +2335,49 @@ async fn execute_command(
         Command::ReadLater => app.open_readlater_picker(),
         Command::History => app.open_reading_history_picker(),
         Command::HistoryClear(scope) => app.clear_history(scope),
+        // PRD FR-OFF-4..7's `:save …`.
+        Command::Save(spec) => match spec {
+            SaveSpec::Current(tier) => start_current_save(client, cache, app, tier, save_tx),
+            SaveSpec::Tag(tag) => {
+                let targets: Vec<(String, String)> = app
+                    .bookmarks
+                    .bookmarks
+                    .iter()
+                    .filter(|b| b.tags.iter().any(|t| t.eq_ignore_ascii_case(&tag)))
+                    .map(|b| (b.lang.clone(), b.title.clone()))
+                    .collect();
+                request_bulk_save(app, format!("tag #{tag}"), Tier::T0, targets);
+            }
+            SaveSpec::Tabs => {
+                let targets: Vec<(String, String)> = app
+                    .tabs
+                    .iter()
+                    .filter_map(|t| t.doc.as_ref().map(|d| (t.lang.clone(), d.title.clone())))
+                    .collect();
+                let label = format!("{} open tabs", targets.len());
+                request_bulk_save(app, label, Tier::T0, targets);
+            }
+            SaveSpec::Category(cat) => {
+                let lang = app.lang.clone();
+                match client.fetch_category_members(&lang, &cat, 500).await {
+                    Ok(members) => {
+                        let targets: Vec<(String, String)> =
+                            members.into_iter().map(|t| (lang.clone(), t)).collect();
+                        let name = cat
+                            .trim_start_matches("Category:")
+                            .trim_start_matches("category:");
+                        request_bulk_save(app, format!("Category:{name}"), Tier::T0, targets);
+                    }
+                    Err(e) => app.notice = Some(format!("Couldn't list category members: {e}")),
+                }
+            }
+            SaveSpec::Export { format, path } => {
+                let path = path.map(std::path::PathBuf::from);
+                app.export_saved_page(&format, path.as_deref());
+            }
+        },
+        Command::Saved => app.open_saved_picker(),
+        Command::FetchQueue => drain_fetch_queue(client, cache, app).await,
         Command::Quit => app.should_quit = true,
     }
 }

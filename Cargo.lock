@@ -3456,6 +3456,7 @@ dependencies = [
  "scraper",
  "serde",
  "serde_json",
+ "sha2",
  "textwrap",
  "tokio",
  "toml",

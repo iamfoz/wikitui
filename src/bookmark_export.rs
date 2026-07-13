@@ -83,21 +83,13 @@ fn group_by_tag(bookmarks: &[Bookmark]) -> (Vec<(String, Vec<&Bookmark>)>, Vec<&
     (by_tag.into_iter().collect(), untagged)
 }
 
-/// PRD §10's export attribution footer, shared by every format here:
-/// Wikipedia's content license, that a revision permalink (where known)
-/// carries the author attribution Wikimedia's reuse terms require, the
-/// export date, and — critically — that a bookmark's own note/tags are the
-/// reader's annotation, not part of the licensed article text (ShareAlike
-/// governs the article, not what a reader wrote about it).
+/// PRD §10's export attribution footer, shared by every format here — and,
+/// via `crate::attribution`, with the saved-page export (PRD FR-OFF-7) so the
+/// wording lives in exactly one place. `include_annotation_note = true`: a
+/// bookmark carries the reader's own note/tags, which ShareAlike does not
+/// govern (they annotate the article, they aren't it), so the footer says so.
 fn attribution_note() -> String {
-    format!(
-        "Wikipedia article content is licensed CC BY-SA 4.0 (some articles GFDL); \
-         each entry's revision permalink, where present, carries the author attribution \
-         Wikimedia's reuse terms require. Exported {} by wikitui, an unofficial client \
-         (not endorsed by the Wikimedia Foundation). Notes and tags above are the \
-         reader's own annotations, not Wikipedia article text.",
-        crate::research::today()
-    )
+    crate::attribution::export_footer(&crate::research::today(), true)
 }
 
 /// The revision permalink for a bookmark, when its revid is known — unlike

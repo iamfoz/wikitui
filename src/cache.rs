@@ -436,8 +436,10 @@ fn now_unix() -> u64 {
 
 /// Percent-encoding keeps names readable and filesystem-safe (no '/', no
 /// ':'); very long titles could exceed the common 255-byte filename limit
-/// once encoded, so those fall back to a stable hash.
-fn safe_name(s: &str) -> String {
+/// once encoded, so those fall back to a stable hash. `pub(crate)` so the
+/// pinned saved-pages store (`saved.rs`) derives on-disk names the same way,
+/// rather than a second copy of this rule.
+pub(crate) fn safe_name(s: &str) -> String {
     let encoded = urlencoding::encode(s).into_owned();
     if encoded.len() > 200 {
         format!("h{:016x}", fnv1a(s.as_bytes()))
@@ -448,7 +450,9 @@ fn safe_name(s: &str) -> String {
 
 /// FNV-1a: tiny, dependency-free, and stable across runs and Rust
 /// versions (unlike `DefaultHasher`), which cache filenames require.
-fn fnv1a(bytes: &[u8]) -> u64 {
+/// `pub(crate)` so `saved.rs` shares the exact hash the cache's `safe_name`
+/// long-title fallback uses.
+pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in bytes {
         hash ^= u64::from(*byte);

@@ -4,6 +4,7 @@
 //! commands produce an error message listing what's available.
 
 use crate::cite::CiteStyle;
+use crate::saved::Tier;
 use crate::theme::Theme;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +63,14 @@ pub enum Command {
     /// Clearing a single article stays picker-only (`d`), not an
     /// ex-command argument.
     HistoryClear(HistoryClearScope),
+    /// `:save …` (PRD FR-OFF-4..7): pin the current article at a tier, run a
+    /// bulk save, or export a saved/current page. See [`SaveSpec`].
+    Save(SaveSpec),
+    /// `:saved` — open the saved-pages browser (PRD §5.7 / FR-OFF-4).
+    Saved,
+    /// `:fetch-queue` — drain the offline "queue for fetch when online" list
+    /// (PRD FR-OFF-6): fetch every queued title into the cache now.
+    FetchQueue,
     /// `:set <key>=<value>` — runtime render override. Today handles
     /// `images=on|off` (PRD FR-TH-7); this is the seed for FR-PC-4's broader
     /// per-tab `:set` (width/justify/images), which will extend the accepted
@@ -82,7 +91,32 @@ pub enum HistoryClearScope {
     All,
 }
 
-pub const USAGE: &str = "commands: open <title>, lang <code>, theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], set images=on|off, config reload, help, quit";
+/// What `:save` was asked to do (PRD FR-OFF-4..7). Kept as parsed data so
+/// `main.rs` performs the network/storage work with the handles it has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SaveSpec {
+    /// `:save` / `:save t0|t1|t2` (and the `S` key) — pin the current article
+    /// at the given depth. `S` and a bare `:save` default to `Tier::T0`.
+    Current(Tier),
+    /// `:save tag <name>` — bulk-save every bookmark carrying `<name>`.
+    Tag(String),
+    /// `:save category <Cat>` — bulk-save a category's members (depth 1).
+    Category(String),
+    /// `:save tabs` — bulk-save every open tab's article.
+    Tabs,
+    /// `:save export md|txt|html [path]` — export a saved (or the current)
+    /// page with the §10 attribution footer.
+    Export {
+        format: String,
+        path: Option<String>,
+    },
+}
+
+/// The saved-page export formats (`saved_export::FORMATS`), duplicated as a
+/// parse-time constant so `command` doesn't depend on the render module.
+const SAVE_EXPORT_FORMATS: [&str; 3] = ["md", "txt", "html"];
+
+pub const USAGE: &str = "commands: open <title>, lang <code>, theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, set images=on|off, config reload, help, quit";
 
 pub fn parse(input: &str) -> Result<Command, String> {
     let input = input.trim();
@@ -219,6 +253,63 @@ pub fn parse(input: &str) -> Result<Command, String> {
                 )),
             }
         }
+        // `:save` (PRD FR-OFF-4..7). Bare / `t0`/`t1`/`t2` pin the current
+        // article; `tag`/`category`/`tabs` bulk-save; `export` writes a file.
+        "save" => {
+            let (sub, rest) = match arg.split_once(char::is_whitespace) {
+                Some((s, r)) => (s, r.trim()),
+                None => (arg, ""),
+            };
+            match sub {
+                "" => Ok(Command::Save(SaveSpec::Current(Tier::T0))),
+                "t0" | "t1" | "t2" => {
+                    // A tier alone is the whole argument; reject trailing junk.
+                    if !rest.is_empty() {
+                        return Err(format!("usage: :save {sub}"));
+                    }
+                    Ok(Command::Save(SaveSpec::Current(Tier::parse(sub).unwrap())))
+                }
+                "tag" => {
+                    if rest.is_empty() {
+                        Err("usage: :save tag <tagname>".to_string())
+                    } else {
+                        Ok(Command::Save(SaveSpec::Tag(rest.to_string())))
+                    }
+                }
+                "category" | "cat" => {
+                    if rest.is_empty() {
+                        Err("usage: :save category <Category>".to_string())
+                    } else {
+                        Ok(Command::Save(SaveSpec::Category(rest.to_string())))
+                    }
+                }
+                "tabs" => Ok(Command::Save(SaveSpec::Tabs)),
+                "export" => {
+                    let (format, path) = match rest.split_once(char::is_whitespace) {
+                        Some((f, p)) => (f, Some(p.trim()).filter(|p| !p.is_empty())),
+                        None => (rest, None),
+                    };
+                    if format.is_empty() {
+                        return Err("usage: :save export md|txt|html [path]".to_string());
+                    }
+                    if !SAVE_EXPORT_FORMATS.contains(&format) {
+                        return Err(format!(
+                            "unknown export format {format:?} — one of: {}",
+                            SAVE_EXPORT_FORMATS.join(", ")
+                        ));
+                    }
+                    Ok(Command::Save(SaveSpec::Export {
+                        format: format.to_string(),
+                        path: path.map(str::to_string),
+                    }))
+                }
+                other => Err(format!(
+                    "unknown save subcommand {other:?} — try: save [t0|t1|t2], save tag <t>, save category <c>, save tabs, save export md|txt|html [path]"
+                )),
+            }
+        }
+        "saved" => Ok(Command::Saved),
+        "fetch-queue" | "fetchqueue" => Ok(Command::FetchQueue),
         "library" | "lib" => Ok(Command::Library),
         "research" => Ok(Command::Research),
         "toc" => Ok(Command::Toc),
@@ -444,5 +535,79 @@ mod tests {
         assert!(parse("history clear").is_err());
         assert!(parse("history clear yesterday").is_err());
         assert!(parse("history frobnicate").is_err());
+    }
+
+    #[test]
+    fn save_bare_and_tiers_parse() {
+        assert_eq!(
+            parse("save"),
+            Ok(Command::Save(SaveSpec::Current(Tier::T0)))
+        );
+        assert_eq!(
+            parse("save t0"),
+            Ok(Command::Save(SaveSpec::Current(Tier::T0)))
+        );
+        assert_eq!(
+            parse("save t1"),
+            Ok(Command::Save(SaveSpec::Current(Tier::T1)))
+        );
+        assert_eq!(
+            parse("save t2"),
+            Ok(Command::Save(SaveSpec::Current(Tier::T2)))
+        );
+        assert!(parse("save t3").is_err());
+        assert!(parse("save t1 extra").is_err(), "a tier takes no argument");
+    }
+
+    #[test]
+    fn save_bulk_forms_parse() {
+        assert_eq!(
+            parse("save tag crypto"),
+            Ok(Command::Save(SaveSpec::Tag("crypto".to_string())))
+        );
+        assert_eq!(
+            parse("save category Physics"),
+            Ok(Command::Save(SaveSpec::Category("Physics".to_string())))
+        );
+        assert_eq!(
+            parse("save cat Category:Physics"),
+            Ok(Command::Save(SaveSpec::Category(
+                "Category:Physics".to_string()
+            )))
+        );
+        assert_eq!(parse("save tabs"), Ok(Command::Save(SaveSpec::Tabs)));
+        assert!(parse("save tag").is_err());
+        assert!(parse("save category").is_err());
+        assert!(parse("save frobnicate").is_err());
+    }
+
+    #[test]
+    fn save_export_parses_format_and_optional_path() {
+        assert_eq!(
+            parse("save export md"),
+            Ok(Command::Save(SaveSpec::Export {
+                format: "md".to_string(),
+                path: None
+            }))
+        );
+        assert_eq!(
+            parse("save export html /tmp/out.html"),
+            Ok(Command::Save(SaveSpec::Export {
+                format: "html".to_string(),
+                path: Some("/tmp/out.html".to_string())
+            }))
+        );
+        for format in ["md", "txt", "html"] {
+            assert!(parse(&format!("save export {format}")).is_ok());
+        }
+        assert!(parse("save export").is_err());
+        assert!(parse("save export pdf").is_err());
+    }
+
+    #[test]
+    fn saved_and_fetch_queue_parse() {
+        assert_eq!(parse("saved"), Ok(Command::Saved));
+        assert_eq!(parse("fetch-queue"), Ok(Command::FetchQueue));
+        assert_eq!(parse("fetchqueue"), Ok(Command::FetchQueue));
     }
 }

@@ -8,9 +8,11 @@ use crate::cache::PageCache;
 use crate::cite::CiteStyle;
 use crate::config::ConfigContext;
 use crate::doc::{Citation, Document};
+use crate::fetch_queue::FetchQueue;
 use crate::hints::{self, HintTarget};
 use crate::layout::{self, Layout, LayoutCache, LayoutOptions};
 use crate::research::{ResearchStore, SavedCitation};
+use crate::saved::{SavedPages, Tier};
 use crate::tab::{HistoryEntry, Tab, TabId};
 use crate::theme::Theme;
 
@@ -81,17 +83,38 @@ pub enum Mode {
     /// Enter/Esc both return to [`Mode::ReadingHistory`] with the filter
     /// still applied.
     ReadingHistoryFilter,
+    /// `:saved` (PRD §5.7 / FR-OFF-4): the saved-pages browser — a selectable
+    /// list of pinned pages showing tier, size, saved date, and integrity
+    /// (ok/corrupt). Enter offline-serves the page from the saved store, `d`
+    /// un-pins it, Esc closes.
+    SavedPicker,
+    /// §7's "Offline, uncached link" card: shown when the network is down and
+    /// a followed link is neither cached nor saved. `f` queues it for fetch
+    /// when online, `s` opens the saved-pages browser, Esc dismisses.
+    OfflineCard,
 }
 
 /// Where the currently open article's content came from (PRD FR-OFF-6's
-/// offline-indicator states): ● fresh from the network, ◐ served from
-/// cache, ○ network failed and a (possibly stale) cached copy stood in.
+/// offline-indicator states): ● fresh from the network, ◐ served from the
+/// evictable cache, ○ network failed and a (possibly stale) cached copy stood
+/// in, ▣ served from the *pinned* saved-pages store. The ▣ glyph is
+/// deliberately distinct from ◐/○ so a pinned saved page (integrity-checked,
+/// never evicted — PRD §5.7) reads as different from a best-effort cache hit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageSource {
     None,
     Live,
-    Cached { age_secs: u64 },
-    Offline { age_secs: u64 },
+    Cached {
+        age_secs: u64,
+    },
+    Offline {
+        age_secs: u64,
+    },
+    /// Served from the pinned saved-pages store (`saved.rs`). `age_secs` is
+    /// time since it was saved.
+    Saved {
+        age_secs: u64,
+    },
 }
 
 /// A background revalidation (PRD FR-OFF-2) found a newer revid and wrote
@@ -134,6 +157,9 @@ impl PageSource {
                 "○ offline — cached {} ago · ",
                 crate::cache::age_human(*age_secs)
             ),
+            Self::Saved { age_secs } => {
+                format!("▣ saved {} ago · ", crate::cache::age_human(*age_secs))
+            }
         }
     }
 }
@@ -385,6 +411,40 @@ pub struct App {
     /// The mode `open_reading_history_picker` was entered from, restored on
     /// Esc (mirrors `bookmark_prior_mode`).
     pub history_pick_prior_mode: Mode,
+
+    // -- Saved pages, bulk save, offline card (PRD §5.7, FR-OFF-4..7) -------
+    /// The pinned saved-pages store (PRD FR-OFF-4). Distinct from the
+    /// evictable `PageCache` in `main` — see `saved.rs`.
+    pub saved: SavedPages,
+    /// Selection cursor for the `:saved` browser.
+    pub selected_saved: usize,
+    /// The mode `open_saved_picker` was entered from, restored on Esc.
+    pub saved_prior_mode: Mode,
+    /// The offline fetch queue (PRD FR-OFF-6). Populated by the offline-card's
+    /// `f`, drained by `:fetch-queue`.
+    pub fetch_queue: FetchQueue,
+    /// The `(lang, title)` the offline card is currently offering to queue or
+    /// find in saved pages — `Some` exactly while `mode == Mode::OfflineCard`.
+    pub offline_card_target: Option<(String, String)>,
+    /// A bulk save awaiting the reader's y/n confirmation (PRD FR-OFF-5's cost
+    /// preview): the resolved target list and tier, held until `y` proceeds.
+    pub pending_bulk_save: Option<BulkSaveRequest>,
+    /// How many save fetches are in flight (single or bulk). Keeps the event
+    /// loop on its scoped-poll path (like `pending_revalidations`) so save
+    /// completions land without a keypress; decremented per applied outcome.
+    pub pending_saves: u32,
+    /// Export-overwrite confirmation for `:save export`, mirroring
+    /// `pending_bookmark_export_overwrite`.
+    pub pending_saved_export_overwrite: Option<std::path::PathBuf>,
+}
+
+/// A confirmed-and-resolved bulk save (PRD FR-OFF-5): the human label for the
+/// cost preview, the tier to pin at, and the concrete `(lang, title)` targets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BulkSaveRequest {
+    pub label: String,
+    pub tier: Tier,
+    pub targets: Vec<(String, String)>,
 }
 
 impl App {
@@ -461,6 +521,14 @@ impl App {
             history_pick_selected: 0,
             history_pick_filter: String::new(),
             history_pick_prior_mode: Mode::Reading,
+            saved: SavedPages::load(),
+            selected_saved: 0,
+            saved_prior_mode: Mode::Reading,
+            fetch_queue: FetchQueue::load(),
+            offline_card_target: None,
+            pending_bulk_save: None,
+            pending_saves: 0,
+            pending_saved_export_overwrite: None,
         }
     }
 
@@ -1931,6 +1999,180 @@ impl App {
             Err(e) => format!("Export failed: {e}"),
         });
     }
+
+    // -- Saved pages browser (PRD §5.7, FR-OFF-4) --------------------------
+
+    /// `:saved` — open the saved-pages browser.
+    pub fn open_saved_picker(&mut self) {
+        self.saved_prior_mode = self.mode;
+        self.mode = Mode::SavedPicker;
+        self.selected_saved = self
+            .selected_saved
+            .min(self.saved.list().len().saturating_sub(1));
+        self.status = "Enter: open offline   d: remove   Esc: close   j/k: move".to_string();
+    }
+
+    pub fn close_saved_picker(&mut self) {
+        self.mode = self.saved_prior_mode;
+        self.status = match &self.active_tab().doc {
+            Some(doc) => doc.title.clone(),
+            None => "Press / to search, ? for help, q to quit".to_string(),
+        };
+    }
+
+    pub fn cycle_saved(&mut self, forward: bool) {
+        let len = self.saved.list().len();
+        if len == 0 {
+            self.selected_saved = 0;
+            return;
+        }
+        self.selected_saved = if forward {
+            (self.selected_saved + 1) % len
+        } else {
+            (self.selected_saved + len - 1) % len
+        };
+    }
+
+    /// The `(lang, title)` the saved-browser selection refers to, or `None`
+    /// when the store is empty.
+    pub fn selected_saved_target(&self) -> Option<(String, String)> {
+        self.saved
+            .list()
+            .get(self.selected_saved)
+            .map(|r| (r.lang.clone(), r.title.clone()))
+    }
+
+    /// `d` in the saved browser: un-pin the selection, keeping the cursor in
+    /// range over whatever remains.
+    pub fn delete_selected_saved(&mut self) {
+        let Some((lang, title)) = self.selected_saved_target() else {
+            return;
+        };
+        if let Some((removed, persisted)) = self.saved.remove(&lang, &title) {
+            let len = self.saved.list().len();
+            self.selected_saved = if len == 0 {
+                0
+            } else {
+                self.selected_saved.min(len - 1)
+            };
+            self.status = match persisted {
+                Ok(()) => format!("Removed saved page \"{}\"", removed.title),
+                Err(e) => format!(
+                    "Un-pinned \"{}\" this session, but updating the index failed: {e}",
+                    removed.title
+                ),
+            };
+        }
+    }
+
+    // -- Offline uncached-link card (PRD FR-OFF-6, §7) ---------------------
+
+    /// Show §7's "Offline, uncached link" card for `(lang, title)` — the
+    /// followed link is neither cached nor saved and the network is down.
+    pub fn show_offline_card(&mut self, lang: String, title: String) {
+        self.offline_card_target = Some((lang, title));
+        self.mode = Mode::OfflineCard;
+    }
+
+    pub fn close_offline_card(&mut self) {
+        self.offline_card_target = None;
+        self.mode = Mode::Reading;
+    }
+
+    /// The offline card's `f`: enqueue the pending target for fetch-when-online
+    /// (PRD FR-OFF-6) and dismiss the card. Returns whether something new was
+    /// queued (a duplicate is reported, not re-added).
+    pub fn queue_offline_target(&mut self) -> bool {
+        let Some((lang, title)) = self.offline_card_target.clone() else {
+            return false;
+        };
+        let added = self.fetch_queue.enqueue(&lang, &title);
+        self.close_offline_card();
+        self.notice = Some(if added {
+            format!("Queued \"{title}\" to fetch when online")
+        } else {
+            format!("\"{title}\" is already in the fetch queue")
+        });
+        added
+    }
+
+    // -- Saved-page export (PRD FR-OFF-7) ----------------------------------
+
+    /// `:save export md|txt|html [path]`: export the article on screen (which,
+    /// for a page opened from the `:saved` browser, is the pinned copy) with
+    /// the §10 attribution footer. When the page is saved with T1+ thumbnails
+    /// *and* the reader opted into non-free content, the HTML export embeds the
+    /// pinned images; otherwise images are alt text only (see `saved_export`).
+    pub fn export_saved_page(&mut self, format: &str, path: Option<&std::path::Path>) {
+        let Some(doc) = self.active_tab().doc.clone() else {
+            self.notice = Some("Open an article first".to_string());
+            return;
+        };
+        let lang = self.active_tab().lang.clone();
+        let title = doc.title.clone();
+
+        let stored_thumbs = self
+            .saved
+            .find(&lang, &title)
+            .map(|r| r.thumbs.clone())
+            .unwrap_or_default();
+        let thumbs = crate::saved_export::embeddable_from(&stored_thumbs, |src| {
+            self.saved.thumb_bytes(&lang, &title, src)
+        });
+
+        let Some(content) =
+            crate::saved_export::render(&doc, &lang, format, self.include_nonfree, &thumbs)
+        else {
+            self.notice = Some(format!(
+                "unknown export format {format:?} — one of: {}",
+                crate::saved_export::FORMATS.join(", ")
+            ));
+            return;
+        };
+
+        let target = match path {
+            Some(p) => p.to_path_buf(),
+            None => match crate::saved_export::default_export_path(&title, format) {
+                Some(p) => p,
+                None => {
+                    self.notice = Some(format!("unknown export format {format:?}"));
+                    return;
+                }
+            },
+        };
+
+        if target.exists()
+            && self.pending_saved_export_overwrite.as_deref() != Some(target.as_path())
+        {
+            self.pending_saved_export_overwrite = Some(target.clone());
+            self.notice = Some(format!(
+                "{} already exists — run the export again to overwrite",
+                target.display()
+            ));
+            return;
+        }
+        self.pending_saved_export_overwrite = None;
+        if let Some(parent) = target.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        self.notice = Some(match std::fs::write(&target, content) {
+            Ok(()) => format!("Exported \"{title}\" to {}", target.display()),
+            Err(e) => format!("Export failed: {e}"),
+        });
+    }
+}
+
+/// PRD FR-OFF-5's bulk cost preview, matching §7's wording ("Category:Physics
+/// → 412 articles, est. 14 MB. Proceed?"). A pure function of the count and
+/// tier so the estimate math is table-testable without any store or network:
+/// per-article bytes come from `Tier::estimate_bytes` (FR-OFF-9's figures).
+pub fn bulk_cost_preview(label: &str, count: usize, tier: Tier) -> String {
+    let bytes = count as u64 * tier.estimate_bytes();
+    let mb = bytes as f64 / (1024.0 * 1024.0);
+    format!(
+        "{label} → {count} articles, est. {mb:.1} MB ({}). Proceed? (y/n)",
+        tier.label()
+    )
 }
 
 /// Pure debounce-elapsed check (PRD FR-SR-1), isolated from the real clock
@@ -4034,5 +4276,93 @@ mod tests {
         app.clear_history(crate::command::HistoryClearScope::All);
         assert!(app.history.recent(10).is_empty());
         assert!(app.history_pick_matches.is_empty());
+    }
+
+    // ---- Saved pages, offline card, bulk cost preview (PRD FR-OFF-4..7) ---
+
+    /// PRD FR-OFF-6's ▣ Saved glyph must be distinct from ◐ cached and ○
+    /// offline, so a pinned page reads differently from a cache hit.
+    #[test]
+    fn saved_page_source_glyph_is_distinct_from_cached_and_offline() {
+        let saved = PageSource::Saved { age_secs: 120 }.prefix();
+        assert!(saved.starts_with('▣'), "saved uses ▣: {saved:?}");
+        assert!(saved.contains("saved"));
+        let cached = PageSource::Cached { age_secs: 120 }.prefix();
+        let offline = PageSource::Offline { age_secs: 120 }.prefix();
+        assert!(cached.starts_with('◐'));
+        assert!(offline.starts_with('○'));
+        assert_ne!(saved, cached);
+        assert_ne!(saved, offline);
+    }
+
+    /// PRD FR-OFF-5's cost preview: the estimate is count × the tier's
+    /// per-article figure (FR-OFF-9), and the wording matches §7's row.
+    #[test]
+    fn bulk_cost_preview_estimates_and_matches_prd_wording() {
+        // 412 T0 articles at ~30 KB each ≈ 12.1 MB.
+        let preview = bulk_cost_preview("Category:Physics", 412, Tier::T0);
+        assert!(preview.starts_with("Category:Physics → 412 articles, est. "));
+        assert!(preview.contains("MB"));
+        assert!(preview.ends_with("Proceed? (y/n)"));
+        // T1's per-article estimate is larger than T0's for the same count.
+        let t0 = bulk_cost_preview("x", 100, Tier::T0);
+        let t1 = bulk_cost_preview("x", 100, Tier::T1);
+        assert_ne!(t0, t1);
+    }
+
+    #[test]
+    fn offline_card_show_and_dismiss_routing() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.show_offline_card("en".to_string(), "Nonexistent".to_string());
+        assert_eq!(app.mode, Mode::OfflineCard);
+        assert_eq!(
+            app.offline_card_target,
+            Some(("en".to_string(), "Nonexistent".to_string()))
+        );
+        app.close_offline_card();
+        assert_eq!(app.mode, Mode::Reading);
+        assert!(app.offline_card_target.is_none());
+    }
+
+    #[test]
+    fn offline_card_f_enqueues_the_target_and_dedups() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.fetch_queue = crate::fetch_queue::FetchQueue::in_memory();
+        app.show_offline_card("en".to_string(), "Deep Learning".to_string());
+        assert!(app.queue_offline_target(), "first queue is new");
+        assert!(app.fetch_queue.contains("en", "Deep Learning"));
+        assert_eq!(app.mode, Mode::Reading, "card dismisses after queueing");
+
+        // Queuing the same target again is rejected as a duplicate.
+        app.show_offline_card("en".to_string(), "Deep Learning".to_string());
+        assert!(!app.queue_offline_target(), "duplicate rejected");
+    }
+
+    #[test]
+    fn saved_picker_cycles_and_deletes() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.saved = crate::saved::SavedPages::in_memory();
+        app.saved
+            .save("en", "A", 1, Tier::T0, "<p>a</p>", &[], vec![], "")
+            .unwrap();
+        app.saved
+            .save("en", "B", 1, Tier::T0, "<p>b</p>", &[], vec![], "")
+            .unwrap();
+        app.open_saved_picker();
+        assert_eq!(app.mode, Mode::SavedPicker);
+        assert_eq!(app.selected_saved_target(), Some(("en".into(), "A".into())));
+        app.cycle_saved(true);
+        assert_eq!(app.selected_saved_target(), Some(("en".into(), "B".into())));
+        app.cycle_saved(true);
+        assert_eq!(
+            app.selected_saved_target(),
+            Some(("en".into(), "A".into())),
+            "wraps"
+        );
+
+        app.delete_selected_saved();
+        assert_eq!(app.saved.list().len(), 1);
+        // Selection stays in range over what remains.
+        assert!(app.selected_saved_target().is_some());
     }
 }
