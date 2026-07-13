@@ -11,6 +11,7 @@ mod doctor;
 mod layout;
 mod research;
 mod sanitize;
+mod tab;
 mod target;
 mod theme;
 mod ui;
@@ -33,6 +34,7 @@ use cite::CiteStyle;
 use cli::{Cli, Commands, ConfigAction};
 use config::ConfigContext;
 use crashguard::TerminalGuard;
+use tab::{HistoryEntry, TabId};
 use theme::Theme;
 
 /// How often the loop wakes up while the Search prompt is open, purely so
@@ -64,9 +66,12 @@ struct TypeaheadOutcome {
 }
 
 /// One completed (or failed) background revalidation (PRD FR-OFF-2),
-/// tagged with the (lang, title) it's for so the receiver can tell whether
-/// it still applies to whatever's on screen.
+/// tagged with the originating tab's id (FR-TB-3) plus the (lang, title) it's
+/// for, so the receiver can route it to the exact tab that requested it —
+/// dropping it gracefully if that tab has since closed — and confirm the tab
+/// still shows that article before arming a reload notice.
 struct RevalidationOutcome {
+    tab_id: TabId,
     lang: String,
     title: String,
     /// `None` on any network failure along the way (bare-metadata call or
@@ -74,6 +79,16 @@ struct RevalidationOutcome {
     /// the cached copy already on screen simply stands, nothing is logged
     /// or shown.
     result: Option<RevalidationResult>,
+}
+
+/// One completed (or failed) background-tab fetch (PRD FR-TB-3): the `Ctrl-Enter`
+/// "open in background tab" path fetches off the event loop and delivers the
+/// result here, keyed to the tab it belongs to.
+struct TabLoadOutcome {
+    tab_id: TabId,
+    lang: String,
+    title: String,
+    result: std::result::Result<FetchOutcome, String>,
 }
 
 enum RevalidationResult {
@@ -379,6 +394,7 @@ async fn fetch_page(
 /// stale-cache-hit fetch that requested it.
 fn fire_revalidation(
     client: &WikiClient,
+    tab_id: TabId,
     lang: String,
     title: String,
     cached_revid: u64,
@@ -389,6 +405,36 @@ fn fire_revalidation(
     tokio::spawn(async move {
         let result = revalidate(&client, &lang, &title, cached_revid).await;
         let _ = tx.send(RevalidationOutcome {
+            tab_id,
+            lang,
+            title,
+            result,
+        });
+    });
+}
+
+/// Spawns the fetch for a background tab (PRD FR-TB-3): runs the full
+/// cache-aware `fetch_page` off the event loop so opening a link into a
+/// background tab never blocks the reader, and reports the outcome tagged
+/// with the tab's id. The cache is cheap to clone (a directory path plus a
+/// few counters).
+fn fire_background_load(
+    client: &WikiClient,
+    cache: &PageCache,
+    tab_id: TabId,
+    lang: String,
+    title: String,
+    tx: &UnboundedSender<TabLoadOutcome>,
+) {
+    let client = client.clone();
+    let cache = cache.clone();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let result = fetch_page(&client, &cache, &lang, &title)
+            .await
+            .map_err(|e| e.to_string());
+        let _ = tx.send(TabLoadOutcome {
+            tab_id,
             lang,
             title,
             result,
@@ -419,13 +465,16 @@ async fn revalidate(
     }
 }
 
-/// Applies a completed revalidation (PRD FR-OFF-2): writes any changed
-/// content into L2 (or silently touches `fetched_at` for an unchanged
-/// revid) regardless of what's currently on screen, then — only if the
-/// reader is still looking at that exact (lang, title) — arms the "updated
-/// — r to reload" notice. A stale result for an article the reader has
-/// since navigated away from still updates the cache (so it's ready
-/// whenever they come back) but never disturbs the current view.
+/// Applies a completed revalidation (PRD FR-OFF-2, FR-TB-3): writes any
+/// changed content into L2 (or silently touches `fetched_at` for an unchanged
+/// revid) regardless of what's on screen, then routes the "updated" signal to
+/// the *originating tab* by id. If that tab has closed, the completion is
+/// dropped gracefully (the cache write still happened, so a future open is
+/// fresh). The tab must still show that (lang, title) — otherwise it navigated
+/// on within its own view and the notice would be wrong. The notice text is
+/// shown only when the affected tab is the active one; a background tab arms
+/// its own `pending_reload`, which is re-surfaced when the reader switches to
+/// it (`App::sync_active_tab`).
 fn apply_revalidation_outcome(app: &mut App, cache: &PageCache, outcome: RevalidationOutcome) {
     app.pending_revalidations = app.pending_revalidations.saturating_sub(1);
     let Some(result) = outcome.result else {
@@ -437,15 +486,73 @@ fn apply_revalidation_outcome(app: &mut App, cache: &PageCache, outcome: Revalid
         }
         RevalidationResult::Changed { html, revid, etag } => {
             cache.put(&outcome.lang, &outcome.title, &html, revid, etag.as_deref());
-            let still_open = app.lang == outcome.lang
-                && app.doc.as_ref().is_some_and(|d| d.title == outcome.title);
+            let Some(index) = app.tab_index_by_id(outcome.tab_id) else {
+                return; // the tab closed — nothing to notify.
+            };
+            let tab = &mut app.tabs[index];
+            let still_open = tab.lang == outcome.lang
+                && tab.doc.as_ref().is_some_and(|d| d.title == outcome.title);
             if still_open {
-                app.pending_reload = Some(PendingReload {
+                tab.pending_reload = Some(PendingReload {
                     lang: outcome.lang,
                     title: outcome.title,
                 });
-                app.notice = Some("updated — r to reload".to_string());
+                // Only surface the notice text when this tab is on screen; a
+                // background tab's reload re-arms when it becomes active.
+                if index == app.active {
+                    app.notice = Some("updated — r to reload".to_string());
+                }
             }
+        }
+    }
+}
+
+/// Applies a completed background-tab fetch (PRD FR-TB-3): installs the
+/// document into the tab it was fetched for (by id), or drops it if that tab
+/// has closed. On a network error the tab keeps a "(failed)" placeholder title
+/// so the reader can see which background open didn't land. A stale-cache-hit
+/// result also kicks off a revalidation keyed to that tab.
+fn apply_tab_load_outcome(
+    client: &WikiClient,
+    app: &mut App,
+    outcome: TabLoadOutcome,
+    revalidate_tx: &UnboundedSender<RevalidationOutcome>,
+) {
+    let Some(index) = app.tab_index_by_id(outcome.tab_id) else {
+        return; // the background tab was closed before its fetch landed.
+    };
+    match outcome.result {
+        Ok(fetch) => {
+            let document = doc::parse_article_html(&outcome.title, &fetch.html);
+            {
+                let tab = &mut app.tabs[index];
+                tab.loading = false;
+                tab.lang = outcome.lang.clone();
+                tab.page_source = fetch.source;
+                tab.current_revid = fetch.revid;
+                tab.install_document(document);
+            }
+            // If this tab happens to be the active one (the reader switched to
+            // it while it loaded), refresh the app-global view state.
+            if index == app.active {
+                app.layout = None;
+            }
+            if let Some(cached_revid) = fetch.revalidate {
+                fire_revalidation(
+                    client,
+                    outcome.tab_id,
+                    outcome.lang,
+                    outcome.title,
+                    cached_revid,
+                    revalidate_tx,
+                );
+                app.pending_revalidations += 1;
+            }
+        }
+        Err(_) => {
+            let tab = &mut app.tabs[index];
+            tab.loading = false;
+            tab.pending_title = Some(format!("{} (failed)", outcome.title));
         }
     }
 }
@@ -496,11 +603,13 @@ async fn run(
     app.cite_style = cite_style;
     app.config_ctx = config_ctx;
 
-    // Delivers typeahead responses and background revalidation outcomes
-    // back to the loop (PRD FR-SR-1 / FR-OFF-2): both run on spawned tasks,
-    // never inline, so neither can stall redraws or keystrokes.
+    // Delivers typeahead responses, background revalidation outcomes, and
+    // background-tab fetch results back to the loop (PRD FR-SR-1 / FR-OFF-2 /
+    // FR-TB-3): all run on spawned tasks, never inline, so none can stall
+    // redraws or keystrokes.
     let (typeahead_tx, mut typeahead_rx) = mpsc::unbounded_channel::<TypeaheadOutcome>();
     let (revalidate_tx, mut revalidate_rx) = mpsc::unbounded_channel::<RevalidationOutcome>();
+    let (open_tx, mut open_rx) = mpsc::unbounded_channel::<TabLoadOutcome>();
 
     if let Some(query) = cli.search {
         app.search_input = query;
@@ -533,13 +642,14 @@ async fn run(
             );
         }
 
-        // Search mode's typeahead debounce and an in-flight background
-        // revalidation (PRD FR-OFF-2) are the only two reasons to wake on a
-        // timer instead of blocking forever in `event::read()`. Everywhere
-        // else — plain Reading mode with nothing revalidating — keeps the
-        // original block-until-input behavior (PRD FR-ACS-2: no gratuitous
-        // redraws/CPU use idle; verified 0% over several seconds).
-        if app.mode == Mode::Search || app.pending_revalidations > 0 {
+        // Three things wake the loop on a timer instead of blocking forever
+        // in `event::read()`: Search mode's typeahead debounce (FR-SR-1), an
+        // in-flight background revalidation (FR-OFF-2), and a background tab
+        // still loading (FR-TB-3) — so its "…"→title transition and the
+        // revalidation/reload notices land without a keypress. Everywhere else
+        // — plain Reading mode, nothing in flight — keeps the block-until-input
+        // behavior (PRD FR-ACS-2: no gratuitous redraws/CPU use while idle).
+        if app.mode == Mode::Search || app.pending_revalidations > 0 || app.any_tab_loading() {
             let poll_interval = if app.mode == Mode::Search {
                 TYPEAHEAD_POLL
             } else {
@@ -556,6 +666,7 @@ async fn run(
                     key.code,
                     key.modifiers,
                     &revalidate_tx,
+                    &open_tx,
                 )
                 .await;
             }
@@ -581,6 +692,9 @@ async fn run(
             while let Ok(outcome) = revalidate_rx.try_recv() {
                 apply_revalidation_outcome(&mut app, cache, outcome);
             }
+            while let Ok(outcome) = open_rx.try_recv() {
+                apply_tab_load_outcome(client, &mut app, outcome, &revalidate_tx);
+            }
         } else if let Event::Key(key) = event::read()? {
             // Block until an event arrives instead of redrawing on a timer —
             // an idle reader shouldn't spin the CPU or spam hide-cursor codes.
@@ -592,6 +706,7 @@ async fn run(
                     key.code,
                     key.modifiers,
                     &revalidate_tx,
+                    &open_tx,
                 )
                 .await;
             }
@@ -668,16 +783,22 @@ async fn open_title(
     revalidate_tx: &UnboundedSender<RevalidationOutcome>,
 ) {
     app.loading = true;
-    match fetch_page(client, cache, &app.lang, title).await {
+    let lang = app.lang.clone();
+    match fetch_page(client, cache, &lang, title).await {
         Ok(outcome) => {
             let document = doc::parse_article_html(title, &outcome.html);
-            app.page_source = outcome.source;
-            app.current_revid = outcome.revid;
+            {
+                let tab = app.active_tab_mut();
+                tab.page_source = outcome.source;
+                tab.current_revid = outcome.revid;
+            }
             app.open_document(document);
             if let Some(cached_revid) = outcome.revalidate {
+                let tab_id = app.active_tab().id;
                 fire_revalidation(
                     client,
-                    app.lang.clone(),
+                    tab_id,
+                    lang,
                     title.to_string(),
                     cached_revid,
                     revalidate_tx,
@@ -693,29 +814,40 @@ async fn open_title(
     app.loading = false;
 }
 
-/// Fetch and install `title` without touching the back/forward stacks —
-/// used for `H`/`L` navigation, which already adjusted the stacks via
-/// `App::navigate_back_target`/`navigate_forward_target`. Same background
-/// revalidation behavior as `open_title`.
-async fn open_title_from_history(
+/// Fetch and install a back/forward (or `gb`-jump) history entry into the
+/// active tab without touching its stacks — `App::navigate_*`/
+/// `jump_to_back_entry` already adjusted them — and restore the entry's saved
+/// scroll position (PRD FR-TB-2 v1.0: "preserving scroll state"). Fetches in
+/// the entry's own language so cross-language history restores correctly.
+async fn open_history_entry(
     client: &WikiClient,
     cache: &PageCache,
     app: &mut App,
-    title: &str,
+    entry: HistoryEntry,
     revalidate_tx: &UnboundedSender<RevalidationOutcome>,
 ) {
     app.loading = true;
-    match fetch_page(client, cache, &app.lang, title).await {
+    app.lang = entry.lang.clone();
+    match fetch_page(client, cache, &entry.lang, &entry.title).await {
         Ok(outcome) => {
-            let document = doc::parse_article_html(title, &outcome.html);
-            app.page_source = outcome.source;
-            app.current_revid = outcome.revid;
+            let document = doc::parse_article_html(&entry.title, &outcome.html);
+            {
+                let tab = app.active_tab_mut();
+                tab.page_source = outcome.source;
+                tab.current_revid = outcome.revid;
+            }
             app.set_document(document);
+            // Restore the scroll position we left this page at (set_document
+            // reset it to the top); the draw clamps it to the article's real
+            // extent, which is unchanged since it's the same article.
+            app.active_tab_mut().scroll = entry.scroll;
             if let Some(cached_revid) = outcome.revalidate {
+                let tab_id = app.active_tab().id;
                 fire_revalidation(
                     client,
-                    app.lang.clone(),
-                    title.to_string(),
+                    tab_id,
+                    entry.lang,
+                    entry.title,
                     cached_revid,
                     revalidate_tx,
                 );
@@ -729,6 +861,7 @@ async fn open_title_from_history(
     app.loading = false;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_key(
     client: &WikiClient,
     cache: &PageCache,
@@ -736,7 +869,21 @@ async fn handle_key(
     code: KeyCode,
     modifiers: KeyModifiers,
     revalidate_tx: &UnboundedSender<RevalidationOutcome>,
+    open_tx: &UnboundedSender<TabLoadOutcome>,
 ) {
+    // `Q`'s one-keypress quit confirmation (PRD Appendix B) is intercepted
+    // before any mode dispatch so no other binding can leak through: `y`
+    // confirms the quit, anything else cancels it.
+    if app.pending_quit_confirm {
+        app.pending_quit_confirm = false;
+        app.notice = None;
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => app.should_quit = true,
+            _ => app.status = "Quit cancelled".to_string(),
+        }
+        return;
+    }
+
     match app.mode {
         Mode::Help => {
             // Any key closes the help overlay.
@@ -817,11 +964,11 @@ async fn handle_key(
             }
             KeyCode::Enter => app.mode = Mode::Reading,
             KeyCode::Backspace => {
-                app.find_input.pop();
+                app.active_tab_mut().find_input.pop();
                 app.update_find();
             }
             KeyCode::Char(c) => {
-                app.find_input.push(c);
+                app.active_tab_mut().find_input.push(c);
                 app.update_find();
             }
             _ => {}
@@ -883,14 +1030,74 @@ async fn handle_key(
         Mode::Toc => match code {
             KeyCode::Esc => app.mode = Mode::Reading,
             KeyCode::Char('j') | KeyCode::Down => {
-                if !app.sections.is_empty() {
-                    app.selected_section = (app.selected_section + 1).min(app.sections.len() - 1);
+                let len = app.active_tab().sections.len();
+                if len > 0 {
+                    let next = (app.active_tab().selected_section + 1).min(len - 1);
+                    app.active_tab_mut().selected_section = next;
                 }
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                app.selected_section = app.selected_section.saturating_sub(1);
+                let prev = app.active_tab().selected_section.saturating_sub(1);
+                app.active_tab_mut().selected_section = prev;
             }
-            KeyCode::Enter => app.jump_to_section(app.selected_section),
+            KeyCode::Enter => app.jump_to_section(app.active_tab().selected_section),
+            KeyCode::Char('?') => {
+                app.prior_mode = app.mode;
+                app.mode = Mode::Help;
+            }
+            _ => {}
+        },
+        // PRD FR-TB-1's `bb` tab picker: a selectable list of open tabs.
+        // Enter switches, `d` closes the highlighted tab, Esc cancels.
+        Mode::TabPicker => match code {
+            KeyCode::Esc => app.mode = Mode::Reading,
+            KeyCode::Char('j') | KeyCode::Down => {
+                if !app.tabs.is_empty() {
+                    app.selected_tab_pick = (app.selected_tab_pick + 1).min(app.tabs.len() - 1);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                app.selected_tab_pick = app.selected_tab_pick.saturating_sub(1);
+            }
+            KeyCode::Enter => {
+                let index = app.selected_tab_pick;
+                app.switch_to_tab(index); // sync_active_tab lands us in Reading
+            }
+            KeyCode::Char('d') => {
+                // Closing the last tab quits (same invariant as `q`).
+                if app.close_tab(app.selected_tab_pick) {
+                    app.should_quit = true;
+                } else {
+                    // Stay in the picker so several tabs can be closed in a row.
+                    app.mode = Mode::TabPicker;
+                }
+            }
+            KeyCode::Char('?') => {
+                app.prior_mode = app.mode;
+                app.mode = Mode::Help;
+            }
+            _ => {}
+        },
+        // PRD FR-NV-7's `gb` back-stack picker: the active tab's history
+        // trail. Enter jumps to that entry (browser-style), Esc cancels.
+        Mode::HistoryPicker => match code {
+            KeyCode::Esc => app.mode = Mode::Reading,
+            KeyCode::Char('j') | KeyCode::Down => {
+                let len = app.active_tab().back_stack.len();
+                if len > 0 {
+                    app.selected_history = (app.selected_history + 1).min(len - 1);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                app.selected_history = app.selected_history.saturating_sub(1);
+            }
+            KeyCode::Enter => {
+                let index = app.selected_history;
+                app.mode = Mode::Reading;
+                if let Some(entry) = app.jump_to_back_entry(index) {
+                    open_history_entry(client, cache, app, entry, revalidate_tx).await;
+                }
+            }
             KeyCode::Char('?') => {
                 app.prior_mode = app.mode;
                 app.mode = Mode::Help;
@@ -898,14 +1105,67 @@ async fn handle_key(
             _ => {}
         },
         Mode::Reading => {
+            // g-prefix chords (PRD Appendix B): the g-latch's second key.
+            // `gg` top, `gt`/`gT` next/prev tab (FR-TB-1), `gb` back-stack
+            // picker (FR-NV-7). An unrecognized second key falls through to
+            // its normal binding (matching how `gj` still scrolls).
+            if app.pending_g {
+                app.pending_g = false;
+                match code {
+                    KeyCode::Char('g') => {
+                        app.scroll_to_top();
+                        return;
+                    }
+                    KeyCode::Char('t') => {
+                        app.next_tab();
+                        return;
+                    }
+                    KeyCode::Char('T') => {
+                        app.prev_tab();
+                        return;
+                    }
+                    KeyCode::Char('b') => {
+                        if app.active_tab().back_stack.is_empty() {
+                            app.status = "No history to show in this tab".to_string();
+                        } else {
+                            app.selected_history = app.active_tab().back_stack.len() - 1;
+                            app.mode = Mode::HistoryPicker;
+                        }
+                        return;
+                    }
+                    _ => {} // dead prefix — handle this key normally below.
+                }
+            }
+            // b-prefix chord: `bb` opens the tab picker (FR-TB-1). Any other
+            // second key cancels the latch and is handled normally.
+            if app.pending_b {
+                app.pending_b = false;
+                if let KeyCode::Char('b') = code {
+                    app.selected_tab_pick = app.active;
+                    app.mode = Mode::TabPicker;
+                    return;
+                }
+            }
+
             // Captured before `app.notice` is cleared below: PRD FR-OFF-2's
             // "updated — r to reload" notice means this keypress, if it's
             // `r`, reloads instead of opening Research mode — see the `r`
             // arm's own comment for why the two share a key.
-            let had_pending_reload = app.pending_reload.is_some();
+            let had_pending_reload = app.active_tab().pending_reload.is_some();
             app.notice = None;
             match code {
-                KeyCode::Char('q') => app.should_quit = true,
+                // PRD Appendix B: `q` closes the current tab (quitting if it
+                // was the last); `Q` quits outright behind a one-keypress
+                // y/n confirm (armed here, resolved at the top of handle_key).
+                KeyCode::Char('q') => {
+                    if app.close_active_tab() {
+                        app.should_quit = true;
+                    }
+                }
+                KeyCode::Char('Q') => {
+                    app.pending_quit_confirm = true;
+                    app.notice = Some("really quit? (y/n)".to_string());
+                }
                 KeyCode::Char('/') => {
                     app.mode = Mode::Search;
                     app.search_input.clear();
@@ -928,8 +1188,36 @@ async fn handle_key(
                 KeyCode::Char(' ') => app.scroll_by(15),
                 KeyCode::Tab => app.cycle_link(true),
                 KeyCode::BackTab => app.cycle_link(false),
+                // PRD FR-TB-3: Ctrl-Enter opens the focused internal link in a
+                // BACKGROUND tab — the fetch fires immediately via the tab-load
+                // channel and focus does NOT move. (Budget-aware prefetch
+                // scheduling for these is a later chunk; for now it fetches
+                // eagerly.) Checked before the plain-Enter arm below.
+                KeyCode::Enter if modifiers.contains(KeyModifiers::CONTROL) => {
+                    let link = app
+                        .active_tab()
+                        .focused_link
+                        .and_then(|i| app.active_tab().links.get(i))
+                        .cloned();
+                    match link.and_then(|l| l.internal_title) {
+                        Some(title) => {
+                            let lang = app.lang.clone();
+                            let id = app.open_background_tab(title.clone(), lang.clone());
+                            fire_background_load(client, cache, id, lang, title, open_tx);
+                            app.status = "Opening in a background tab…".to_string();
+                        }
+                        None => {
+                            app.status = "No internal link focused to open in a tab".to_string();
+                        }
+                    }
+                }
                 KeyCode::Enter => {
-                    if let Some(link) = app.focused_link.and_then(|i| app.links.get(i)).cloned() {
+                    let link = app
+                        .active_tab()
+                        .focused_link
+                        .and_then(|i| app.active_tab().links.get(i))
+                        .cloned();
+                    if let Some(link) = link {
                         match link.internal_title {
                             Some(title) => {
                                 open_title(client, cache, app, &title, revalidate_tx).await
@@ -939,21 +1227,28 @@ async fn handle_key(
                     }
                 }
                 KeyCode::Char('H') => {
-                    if let Some(title) = app.navigate_back_target() {
-                        open_title_from_history(client, cache, app, &title, revalidate_tx).await;
+                    if let Some(entry) = app.navigate_back_target() {
+                        open_history_entry(client, cache, app, entry, revalidate_tx).await;
                     } else {
                         app.status = "No earlier page in history".to_string();
                     }
                 }
                 KeyCode::Char('L') => {
-                    if let Some(title) = app.navigate_forward_target() {
-                        open_title_from_history(client, cache, app, &title, revalidate_tx).await;
+                    if let Some(entry) = app.navigate_forward_target() {
+                        open_history_entry(client, cache, app, entry, revalidate_tx).await;
                     } else {
                         app.status = "No later page in history".to_string();
                     }
                 }
+                // `u` reopens the last closed tab (PRD FR-TB-1). Distinct from
+                // Ctrl-u (half-page up), which is a guarded arm above.
+                KeyCode::Char('u') => {
+                    if !app.reopen_closed_tab() {
+                        app.status = "No recently closed tabs to reopen".to_string();
+                    }
+                }
                 KeyCode::Char('t') => {
-                    if app.sections.is_empty() {
+                    if app.active_tab().sections.is_empty() {
                         app.status = "No sections on this page".to_string();
                     } else {
                         app.mode = Mode::Toc;
@@ -988,15 +1283,12 @@ async fn handle_key(
                 // entrypoint share a key: when a background revalidation
                 // just posted an update notice, `r` reloads the article
                 // (the notice already told the reader what `r` means right
-                // now); otherwise it opens Research mode as always. The
-                // notice text is the only affordance for this, matching how
-                // `g`/`gg` and find's `n`/`N` are already context-sensitive
-                // in this same match.
+                // now); otherwise it opens Research mode as always.
                 KeyCode::Char('r') if had_pending_reload => {
                     app.reload_from_pending_update(cache);
                 }
                 KeyCode::Char('r') => {
-                    if app.doc.is_some() {
+                    if app.active_tab().doc.is_some() {
                         app.mode = Mode::Research;
                     } else {
                         app.status = "Open an article first".to_string();
@@ -1008,30 +1300,27 @@ async fn handle_key(
                     app.clear_find();
                 }
                 KeyCode::Char('n') => {
-                    if app.find_matches.is_empty() {
+                    if app.active_tab().find_matches.is_empty() {
                         app.status = "No active search — Ctrl-f to find in this page".to_string();
                     } else {
                         app.find_next();
                     }
                 }
                 KeyCode::Char('N') => {
-                    if app.find_matches.is_empty() {
+                    if app.active_tab().find_matches.is_empty() {
                         app.status = "No active search — Ctrl-f to find in this page".to_string();
                     } else {
                         app.find_prev();
                     }
                 }
-                KeyCode::Char('g') => {
-                    if app.pending_g {
-                        app.scroll_to_top();
-                        app.pending_g = false;
-                    } else {
-                        app.pending_g = true;
-                    }
-                }
+                // Arm the g-/b-prefix latches (their second key is consumed at
+                // the top of this arm on the next keypress).
+                KeyCode::Char('g') => app.pending_g = true,
+                KeyCode::Char('b') => app.pending_b = true,
                 KeyCode::Char('G') => app.scroll_to_bottom(),
                 KeyCode::Esc => {
                     app.pending_g = false;
+                    app.pending_b = false;
                     app.clear_find();
                 }
                 _ => {}
@@ -1041,6 +1330,9 @@ async fn handle_key(
 
     if !matches!(code, KeyCode::Char('g')) {
         app.pending_g = false;
+    }
+    if !matches!(code, KeyCode::Char('b')) {
+        app.pending_b = false;
     }
 }
 
@@ -1086,14 +1378,14 @@ async fn execute_command(
         }
         Command::Library => app.open_library(),
         Command::Research => {
-            if app.doc.is_some() {
+            if app.active_tab().doc.is_some() {
                 app.mode = Mode::Research;
             } else {
                 app.notice = Some("Open an article first".to_string());
             }
         }
         Command::Toc => {
-            if app.sections.is_empty() {
+            if app.active_tab().sections.is_empty() {
                 app.notice = Some("No sections on this page".to_string());
             } else {
                 app.mode = Mode::Toc;
@@ -1110,6 +1402,28 @@ async fn execute_command(
             app.mode = Mode::Help;
         }
         Command::ConfigReload => apply_config_reload(app),
+        // PRD FR-TB-1's tab ex-commands.
+        Command::TabClose => {
+            if app.close_active_tab() {
+                app.should_quit = true;
+            }
+        }
+        Command::TabNew(title) => {
+            app.new_foreground_tab();
+            if let Some(raw) = title {
+                let target = target::parse(&raw);
+                if let Some(lang) = target.lang {
+                    app.lang = lang;
+                }
+                open_title(client, cache, app, &target.title, revalidate_tx).await;
+            } else {
+                app.notice = Some("New tab".to_string());
+            }
+        }
+        Command::Tabs => {
+            app.selected_tab_pick = app.active;
+            app.mode = Mode::TabPicker;
+        }
         Command::Quit => app.should_quit = true,
     }
 }
@@ -1187,5 +1501,126 @@ mod tests {
             .decode(payload)
             .unwrap();
         assert_eq!(decoded, b"Alan Turing");
+    }
+
+    // ---- Background completion routing by tab id (PRD FR-TB-3, FR-OFF-2) --
+
+    fn test_client() -> WikiClient {
+        // A never-contacted client: the routing tests set `revalidate: None`
+        // so no request is ever made through it.
+        WikiClient::new("http://127.0.0.1:1/{lang}".to_string()).unwrap()
+    }
+
+    #[test]
+    fn background_load_completion_installs_into_the_right_tab_by_id() {
+        let client = test_client();
+        let (revalidate_tx, _rx) = mpsc::unbounded_channel::<RevalidationOutcome>();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        let id = app.open_background_tab("Enigma machine".to_string(), "en".to_string());
+        assert!(app.tabs.iter().find(|t| t.id == id).unwrap().loading);
+
+        apply_tab_load_outcome(
+            &client,
+            &mut app,
+            TabLoadOutcome {
+                tab_id: id,
+                lang: "en".to_string(),
+                title: "Enigma machine".to_string(),
+                result: Ok(FetchOutcome {
+                    html: "<html><body><p>rotor cipher</p></body></html>".to_string(),
+                    source: PageSource::Live,
+                    revid: 42,
+                    revalidate: None,
+                }),
+            },
+            &revalidate_tx,
+        );
+
+        let tab = app.tabs.iter().find(|t| t.id == id).unwrap();
+        assert!(!tab.loading, "the background tab is no longer loading");
+        assert_eq!(tab.current_revid, 42);
+        assert_eq!(tab.doc.as_ref().unwrap().title, "Enigma machine");
+    }
+
+    #[test]
+    fn background_completion_for_a_closed_tab_is_dropped() {
+        let client = test_client();
+        let (revalidate_tx, _rx) = mpsc::unbounded_channel::<RevalidationOutcome>();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        let id = app.open_background_tab("Enigma machine".to_string(), "en".to_string());
+        // Close the background tab before its fetch lands.
+        let index = app.tab_index_by_id(id).unwrap();
+        app.close_tab(index);
+        assert!(app.tab_index_by_id(id).is_none());
+
+        // Applying the now-stale completion must not panic or resurrect it.
+        apply_tab_load_outcome(
+            &client,
+            &mut app,
+            TabLoadOutcome {
+                tab_id: id,
+                lang: "en".to_string(),
+                title: "Enigma machine".to_string(),
+                result: Ok(FetchOutcome {
+                    html: "<html><body><p>x</p></body></html>".to_string(),
+                    source: PageSource::Live,
+                    revid: 1,
+                    revalidate: None,
+                }),
+            },
+            &revalidate_tx,
+        );
+        assert_eq!(app.tabs.len(), 1, "no tab was resurrected");
+    }
+
+    #[test]
+    fn revalidation_notice_shows_only_for_the_active_tab_and_rearms_on_switch() {
+        let cache = PageCache::disabled();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        // Tab 0 (active) holds "A"; tab 1 (background) holds "B".
+        app.active_tab_mut().current_revid = 1;
+        app.set_document(doc::parse_article_html(
+            "A",
+            "<html><body><p>a</p></body></html>",
+        ));
+        let tab0 = app.active_tab().id;
+        app.new_foreground_tab();
+        app.set_document(doc::parse_article_html(
+            "B",
+            "<html><body><p>b</p></body></html>",
+        ));
+        let tab1 = app.active_tab().id;
+        // Back to tab 0.
+        app.switch_to_tab(app.tab_index_by_id(tab0).unwrap());
+
+        // A revalidation for the BACKGROUND tab 1 must update its state but not
+        // pop a notice on the active tab 0.
+        apply_revalidation_outcome(
+            &mut app,
+            &cache,
+            RevalidationOutcome {
+                tab_id: tab1,
+                lang: "en".to_string(),
+                title: "B".to_string(),
+                result: Some(RevalidationResult::Changed {
+                    html: "<html><body><p>b2</p></body></html>".to_string(),
+                    revid: 2,
+                    etag: None,
+                }),
+            },
+        );
+        assert!(
+            app.notice.is_none(),
+            "a background tab's update must not notify the active tab"
+        );
+        let bg = app.tab_index_by_id(tab1).unwrap();
+        assert!(
+            app.tabs[bg].pending_reload.is_some(),
+            "the background tab still records the pending reload"
+        );
+
+        // Switching to tab 1 re-arms the notice.
+        app.switch_to_tab(bg);
+        assert_eq!(app.notice.as_deref(), Some("updated — r to reload"));
     }
 }

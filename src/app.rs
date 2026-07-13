@@ -4,10 +4,19 @@ use crate::api::{SearchResult, TitleSuggestion};
 use crate::cache::PageCache;
 use crate::cite::CiteStyle;
 use crate::config::ConfigContext;
-use crate::doc::{Citation, Document, LinkRef, SectionRef, collect_links, section_outline};
+use crate::doc::{Citation, Document};
 use crate::layout::{self, Layout, LayoutCache, LayoutOptions};
 use crate::research::{ResearchStore, SavedCitation};
+use crate::tab::{HistoryEntry, Tab, TabId};
 use crate::theme::Theme;
+
+/// How many closed tabs the undo stack (`u` to reopen — PRD FR-TB-1) keeps.
+/// A hard cap so a long session's closed-tab snapshots — which hold whole
+/// `Document`s — don't accumulate unboundedly: closing beyond this drops the
+/// oldest snapshot, so its `Document` is freed (§6.8's 10-tabs-< 150 MB
+/// memory target). The tradeoff is deliberate: `u` walks back this many
+/// closes, not to the dawn of the session.
+pub const CLOSED_TABS_CAP: usize = 10;
 
 /// PRD FR-SR-1's typeahead debounce window (spec calls for 150-250ms; 200ms
 /// splits the difference). Reset on every keystroke while the Search prompt
@@ -25,6 +34,12 @@ pub enum Mode {
     Library,
     Command,
     Help,
+    /// The `bb` fuzzy tab picker (PRD FR-TB-1): a selectable list of open
+    /// tabs — Enter switches, `d` closes, Esc cancels.
+    TabPicker,
+    /// The `gb` back-stack picker (PRD FR-NV-7): the active tab's history
+    /// trail — Enter jumps to that entry (browser-style), Esc cancels.
+    HistoryPicker,
 }
 
 /// Where the currently open article's content came from (PRD FR-OFF-6's
@@ -70,15 +85,28 @@ impl PageSource {
 pub struct App {
     pub mode: Mode,
     pub prior_mode: Mode,
-    pub doc: Option<Document>,
-    pub links: Vec<LinkRef>,
-    pub focused_link: Option<usize>,
-    pub sections: Vec<SectionRef>,
-    pub selected_section: usize,
-    pub back_stack: Vec<String>,
-    pub forward_stack: Vec<String>,
-    pub scroll: u16,
-    pub max_scroll: u16,
+    /// Every open tab (PRD FR-TB-1, §2.2 tabs-as-buffers). Always non-empty
+    /// while the app runs: closing the last tab quits. Per-view state (the
+    /// document, links, scroll, per-tab history, find state) lives on each
+    /// [`Tab`], not here — see `src/tab.rs`.
+    pub tabs: Vec<Tab>,
+    /// Index into `tabs` of the tab currently on screen.
+    pub active: usize,
+    /// Snapshots of closed tabs for `u` (reopen — PRD FR-TB-1), most-recent
+    /// last. Capped at [`CLOSED_TABS_CAP`] so retained `Document`s drop.
+    pub closed_tabs: Vec<Tab>,
+    /// The next tab id to hand out (PRD FR-TB-3): stable across closes so a
+    /// background completion routes to the right tab even after indices shift.
+    pub next_tab_id: TabId,
+    /// Selection cursor for the `bb` tab picker.
+    pub selected_tab_pick: usize,
+    /// Selection cursor for the `gb` back-stack picker.
+    pub selected_history: usize,
+    /// The `bb` chord's pending-key latch (mirrors `pending_g` for `gg`).
+    pub pending_b: bool,
+    /// `Q`'s one-keypress quit confirmation (PRD Appendix B): armed by `Q`,
+    /// resolved by the next key (`y` quits, anything else cancels).
+    pub pending_quit_confirm: bool,
     pub status: String,
     pub search_input: String,
     pub results: Vec<SearchResult>,
@@ -100,7 +128,15 @@ pub struct App {
     /// results or hasn't run yet.
     pub search_suggestion: Option<String>,
     pub should_quit: bool,
+    /// The app-global "current" language for new searches and opens (PRD
+    /// FR-ML-1/2, MVP slice). Kept in sync with the active tab's `lang` when
+    /// switching tabs; each tab additionally records the language its own
+    /// article was fetched in (for history restore and background routing).
     pub lang: String,
+    /// A foreground blocking operation (search, initial open) is in progress.
+    /// Distinct from a [`Tab`]'s own `loading` flag, which tracks a
+    /// *background* tab's in-flight fetch and drives the tab bar's "…"
+    /// indicator (PRD FR-TB-3).
     pub loading: bool,
     pub pending_g: bool,
     pub theme: Theme,
@@ -108,27 +144,11 @@ pub struct App {
     /// FR-TH-5): when true, every style still applies but with colors
     /// stripped, regardless of which theme is selected.
     pub no_color: bool,
-    /// In-page find (PRD FR-NV-6): what the reader typed into `Ctrl-f`.
-    pub find_input: String,
-    /// The laid-out line each occurrence of `find_input` starts on, in
-    /// reading (top-to-bottom, left-to-right) order — one entry per
-    /// individual occurrence now (char-level, FR-NV-6b), not one per
-    /// matching block as before. `find_matches[i]` is always
-    /// `find_occurrences[i].pieces[0].0`; kept as its own field because
-    /// scrolling and the "N/M" counter only ever need the line.
-    pub find_matches: Vec<u16>,
-    /// Every occurrence of `find_input`, same order as `find_matches` — the
-    /// data `ui::paint_document` needs to highlight every match (each of an
-    /// occurrence's pieces, plural only when it straddled a line wrap) and
-    /// emphasize the current one, at char precision, with every piece of it
-    /// getting the emphasis rather than just the first.
-    pub find_occurrences: Vec<layout::Occurrence>,
-    /// Which entry in `find_matches`/`find_occurrences` `n`/`N` last jumped
-    /// to.
-    pub find_index: usize,
-    /// Research mode's candidate list for the open article: element 0 is
-    /// always the article's own citation (`research::self_citation`);
+    /// Research mode's candidate list for the *active tab's* article: element
+    /// 0 is always the article's own citation (`research::self_citation`);
     /// the rest are its extracted References entries, in document order.
+    /// Rebuilt whenever the active document changes (open, reload, tab
+    /// switch), so Research mode always reflects the tab on screen.
     pub citations: Vec<Citation>,
     pub selected_citation: usize,
     /// The running bibliography, persisted to disk (PRD §6.4 plain files).
@@ -143,9 +163,6 @@ pub struct App {
     /// Export-overwrite confirmation: the filename the user was just
     /// warned about; a second `e` for the same filename proceeds.
     pub pending_export_overwrite: Option<String>,
-    /// Where the open article's content came from — set by the fetch path
-    /// before `set_document`, which folds it into the status line.
-    pub page_source: PageSource,
     /// The `:` command line's in-progress input (PRD FR-CS-2).
     pub command_input: String,
     /// Transient feedback from the last `:` command (":lang de" →
@@ -173,17 +190,6 @@ pub struct App {
     /// instrumentation point: proving an L1 hit skips relayout this way is
     /// far simpler than rigging up pointer-identity checks through a clone.
     pub layout_computations: u32,
-    /// The revid of the currently open document, when known (PRD FR-OFF-1),
-    /// `0` in degraded mode. Set by the fetch path (`main::open_title`/
-    /// `open_title_from_history`) right before installing the document;
-    /// participates in the L1 cache key so a background-revalidated
-    /// article (new revid, same title) never replays a layout computed for
-    /// its predecessor.
-    pub current_revid: u64,
-    /// Set when a background revalidation (PRD FR-OFF-2) wrote newer
-    /// content for the article currently on screen into L2; `r` reloads
-    /// from it (see `reload_from_pending_update`). `None` most of the time.
-    pub pending_reload: Option<PendingReload>,
     /// How many background revalidations are currently in flight (PRD
     /// FR-OFF-2). The main loop scopes its `event::poll` timeout to this
     /// being nonzero (mirroring Search mode's debounce-driven poll) so a
@@ -215,18 +221,20 @@ pub struct App {
 
 impl App {
     pub fn new(lang: String, theme: Theme, no_color: bool) -> Self {
+        // Every session starts with exactly one (empty) tab; the invariant
+        // "`tabs` is never empty while running" holds from here.
+        let first_tab = Tab::new(0, lang.clone());
         Self {
             mode: Mode::Reading,
             prior_mode: Mode::Reading,
-            doc: None,
-            links: Vec::new(),
-            focused_link: None,
-            sections: Vec::new(),
-            selected_section: 0,
-            back_stack: Vec::new(),
-            forward_stack: Vec::new(),
-            scroll: 0,
-            max_scroll: 0,
+            tabs: vec![first_tab],
+            active: 0,
+            closed_tabs: Vec::new(),
+            next_tab_id: 1,
+            selected_tab_pick: 0,
+            selected_history: 0,
+            pending_b: false,
+            pending_quit_confirm: false,
             status: "Press / to search, ? for help, q to quit".to_string(),
             search_input: String::new(),
             results: Vec::new(),
@@ -241,10 +249,6 @@ impl App {
             pending_g: false,
             theme,
             no_color,
-            find_input: String::new(),
-            find_matches: Vec::new(),
-            find_occurrences: Vec::new(),
-            find_index: 0,
             citations: Vec::new(),
             selected_citation: 0,
             research: ResearchStore::load(),
@@ -252,14 +256,11 @@ impl App {
             cite_style: CiteStyle::Apa,
             library_prior_mode: Mode::Reading,
             pending_export_overwrite: None,
-            page_source: PageSource::None,
             command_input: String::new(),
             notice: None,
             layout: None,
             layout_cache: LayoutCache::new(layout::DEFAULT_L1_CAPACITY),
             layout_computations: 0,
-            current_revid: 0,
-            pending_reload: None,
             pending_revalidations: 0,
             layout_width: 80,
             viewport_height: 0,
@@ -267,6 +268,198 @@ impl App {
             ambiguous_wide: false,
             config_ctx: ConfigContext::default(),
         }
+    }
+
+    /// The tab currently on screen. `tabs` is never empty while the app runs
+    /// (closing the last tab quits), so indexing is safe.
+    pub fn active_tab(&self) -> &Tab {
+        &self.tabs[self.active]
+    }
+
+    pub fn active_tab_mut(&mut self) -> &mut Tab {
+        &mut self.tabs[self.active]
+    }
+
+    /// Index of the tab with the given stable id, if it is still open (PRD
+    /// FR-TB-3): a background completion whose tab has since closed resolves
+    /// to `None` and is dropped gracefully.
+    pub fn tab_index_by_id(&self, id: TabId) -> Option<usize> {
+        self.tabs.iter().position(|t| t.id == id)
+    }
+
+    fn allocate_tab_id(&mut self) -> TabId {
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        id
+    }
+
+    /// PRD FR-TB-3: open `title` in a new, *unfocused* background tab and
+    /// return its id so the caller can spawn the keyed fetch. Focus does not
+    /// move; the tab shows its target title + "…" in the bar until the fetch
+    /// lands (budget-aware prefetch scheduling arrives with a later chunk —
+    /// for now the fetch fires immediately via the existing channel pattern).
+    pub fn open_background_tab(&mut self, title: String, lang: String) -> TabId {
+        let id = self.allocate_tab_id();
+        let mut tab = Tab::new(id, lang);
+        tab.loading = true;
+        tab.pending_title = Some(title);
+        self.tabs.push(tab);
+        id
+    }
+
+    /// `:tab new` — create a fresh tab and switch to it. The caller fetches
+    /// into the now-active tab via the normal foreground path (or leaves it
+    /// empty on the welcome screen).
+    pub fn new_foreground_tab(&mut self) {
+        let id = self.allocate_tab_id();
+        let lang = self.lang.clone();
+        self.tabs.push(Tab::new(id, lang));
+        self.active = self.tabs.len() - 1;
+        self.sync_active_tab();
+    }
+
+    /// Close the tab at `index`, snapshotting it onto the close-undo stack
+    /// and fixing the active index browser-style (focus moves to the tab that
+    /// slides into place, or the new last tab). Returns `true` iff that was
+    /// the last tab — the caller quits, since there is always ≥ 1 tab while
+    /// running.
+    pub fn close_tab(&mut self, index: usize) -> bool {
+        if index >= self.tabs.len() {
+            return false;
+        }
+        let tab = self.tabs.remove(index);
+        self.push_closed(tab);
+        if self.tabs.is_empty() {
+            return true;
+        }
+        if index < self.active {
+            self.active -= 1;
+        } else if index == self.active {
+            self.active = self.active.min(self.tabs.len() - 1);
+        }
+        self.selected_tab_pick = self.selected_tab_pick.min(self.tabs.len() - 1);
+        self.sync_active_tab();
+        false
+    }
+
+    /// `q` / `:tab close` — close the active tab (quitting if it was the
+    /// last). See [`Self::close_tab`].
+    pub fn close_active_tab(&mut self) -> bool {
+        self.close_tab(self.active)
+    }
+
+    fn push_closed(&mut self, tab: Tab) {
+        self.closed_tabs.push(tab);
+        // §6.8 memory note: cap the undo stack so closed tabs' `Document`s
+        // actually drop — dropping the oldest snapshot is the deliberate
+        // tradeoff for a bounded footprint (10 tabs < 150 MB).
+        if self.closed_tabs.len() > CLOSED_TABS_CAP {
+            self.closed_tabs.remove(0);
+        }
+    }
+
+    /// `u` — reopen the most-recently-closed tab, restoring its whole
+    /// snapshot (document, history stacks, scroll) and focusing it (PRD
+    /// FR-TB-1). Returns `false` if there was nothing to reopen.
+    pub fn reopen_closed_tab(&mut self) -> bool {
+        match self.closed_tabs.pop() {
+            Some(tab) => {
+                self.tabs.push(tab);
+                self.active = self.tabs.len() - 1;
+                self.sync_active_tab();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `gt` — focus the next tab, wrapping (PRD FR-TB-1).
+    pub fn next_tab(&mut self) {
+        if self.tabs.len() < 2 {
+            return;
+        }
+        self.active = (self.active + 1) % self.tabs.len();
+        self.sync_active_tab();
+    }
+
+    /// `gT` — focus the previous tab, wrapping.
+    pub fn prev_tab(&mut self) {
+        if self.tabs.len() < 2 {
+            return;
+        }
+        self.active = (self.active + self.tabs.len() - 1) % self.tabs.len();
+        self.sync_active_tab();
+    }
+
+    /// Tab-picker Enter — focus a tab by index.
+    pub fn switch_to_tab(&mut self, index: usize) {
+        if index < self.tabs.len() {
+            self.active = index;
+            self.sync_active_tab();
+        }
+    }
+
+    /// After any change of which tab is active: adopt the tab's language for
+    /// new searches/opens, rebuild the app-global citation list from its
+    /// document, drop the cached layout so the next draw rebuilds for this
+    /// tab (an L1 hit, not a relayout), re-arm the SWR "updated — r to
+    /// reload" notice iff this tab has one pending, land in Reading mode, and
+    /// refresh the status line.
+    fn sync_active_tab(&mut self) {
+        self.lang = self.active_tab().lang.clone();
+        self.rebuild_citations();
+        self.layout = None;
+        self.pending_g = false;
+        self.pending_b = false;
+        self.mode = Mode::Reading;
+        self.notice = self
+            .active_tab()
+            .pending_reload
+            .as_ref()
+            .map(|_| "updated — r to reload".to_string());
+        self.refresh_reading_status();
+    }
+
+    /// Rebuild [`Self::citations`] from the active tab's document (or clear
+    /// it when the tab is empty).
+    fn rebuild_citations(&mut self) {
+        let lang = self.lang.clone();
+        let built = self.active_tab().doc.as_ref().map(|doc| {
+            let mut c = vec![crate::research::self_citation(&doc.title, &lang)];
+            c.extend(doc.citations.iter().cloned());
+            c
+        });
+        self.citations = built.unwrap_or_default();
+        self.selected_citation = 0;
+    }
+
+    /// Recompute the Reading-mode status line from the active tab.
+    fn refresh_reading_status(&mut self) {
+        let ncites = self.citations.len();
+        let status = {
+            let tab = self.active_tab();
+            tab.doc.as_ref().map(|doc| {
+                format!(
+                    "{}{} — {} blocks, {} links, {} sections, {} citations",
+                    tab.page_source.prefix(),
+                    doc.title,
+                    doc.blocks.len(),
+                    tab.links.len(),
+                    tab.sections.len(),
+                    ncites
+                )
+            })
+        };
+        if let Some(status) = status {
+            self.status = status;
+        }
+    }
+
+    /// Whether any open tab has a background fetch in flight (PRD FR-TB-3):
+    /// the event loop stays on its scoped-poll path while this holds, so a
+    /// background tab's "…"→title transition happens without a keypress.
+    pub fn any_tab_loading(&self) -> bool {
+        self.tabs.iter().any(|t| t.loading)
     }
 
     /// The layout options derived from the current reading preferences.
@@ -295,34 +488,48 @@ impl App {
         if !stale {
             return;
         }
-        let Some(doc) = self.doc.as_ref() else {
+        // The L1 cache key is keyed on the *active tab's* article identity
+        // (lang/title/revid), which the shared `layout_cache` disambiguates
+        // across tabs — so a single cache serves every tab and a tab switch
+        // is an L1 hit, not a relayout (§6.8).
+        let key = {
+            let tab = self.active_tab();
+            tab.doc.as_ref().map(|doc| layout::LayoutCacheKey {
+                lang: tab.lang.clone(),
+                title: doc.title.clone(),
+                revid: tab.current_revid,
+                width,
+                options: opts,
+                schema_version: layout::LAYOUT_SCHEMA_VERSION,
+            })
+        };
+        let Some(key) = key else {
             self.layout = None;
             return;
-        };
-        let key = layout::LayoutCacheKey {
-            lang: self.lang.clone(),
-            title: doc.title.clone(),
-            revid: self.current_revid,
-            width,
-            options: opts,
-            schema_version: layout::LAYOUT_SCHEMA_VERSION,
         };
         if let Some(cached) = self.layout_cache.get(&key) {
             self.layout = Some(cached);
             return;
         }
         self.layout_computations += 1;
-        let computed = layout::layout_document(doc, width, opts);
+        let computed = {
+            let doc = self
+                .active_tab()
+                .doc
+                .as_ref()
+                .expect("keyed above, so a document is present");
+            layout::layout_document(doc, width, opts)
+        };
         self.layout_cache.put(key, computed.clone());
         self.layout = Some(computed);
     }
 
     /// The scroll offset that centers `line` in the viewport, clamped to the
-    /// scrollable range. Before the first draw `viewport_height` is 0, which
-    /// degrades gracefully to top-aligning the line.
+    /// active tab's scrollable range. Before the first draw `viewport_height`
+    /// is 0, which degrades gracefully to top-aligning the line.
     fn center_scroll(&self, line: u16) -> u16 {
         line.saturating_sub(self.viewport_height / 2)
-            .min(self.max_scroll)
+            .min(self.active_tab().max_scroll)
     }
 
     pub fn cycle_theme(&mut self) {
@@ -330,96 +537,110 @@ impl App {
         self.status = format!("Theme: {}", self.theme.name);
     }
 
-    /// The open article's canonical URL — the `y` yank payload (FR-NV-10).
+    /// The active tab's canonical article URL — the `y` yank payload
+    /// (FR-NV-10).
     pub fn yank_url(&self) -> Option<String> {
-        self.doc
+        let tab = self.active_tab();
+        tab.doc
             .as_ref()
-            .map(|d| crate::research::article_url(&d.title, &self.lang))
+            .map(|d| crate::research::article_url(&d.title, &tab.lang))
     }
 
-    /// A Markdown link to the open article — the `Y` yank payload; terminal
-    /// users paste these into notes constantly (PRD FR-NV-10's rationale).
+    /// A Markdown link to the active tab's article — the `Y` yank payload;
+    /// terminal users paste these into notes constantly (PRD FR-NV-10).
     pub fn yank_markdown(&self) -> Option<String> {
-        self.doc.as_ref().map(|d| {
+        let tab = self.active_tab();
+        tab.doc.as_ref().map(|d| {
             format!(
                 "[{}]({})",
                 d.title,
-                crate::research::article_url(&d.title, &self.lang)
+                crate::research::article_url(&d.title, &tab.lang)
             )
         })
     }
 
     /// Open a document reached by a fresh navigation (search result, CLI
-    /// title, or following a link): the article we were reading, if any,
-    /// becomes the back-stack top, and any forward history is discarded —
-    /// standard browser back/forward semantics (PRD FR-TB-2).
+    /// title, or following a link) *in the active tab*: the article it was
+    /// showing, if any, becomes its back-stack top (with its scroll captured
+    /// for restoration), and its forward history is discarded — standard
+    /// browser semantics, now per-tab (PRD FR-TB-2 v1.0).
     pub fn open_document(&mut self, doc: Document) {
-        if let Some(current) = &self.doc {
-            self.back_stack.push(current.title.clone());
+        if let Some(entry) = self.active_tab().current_entry() {
+            self.active_tab_mut().back_stack.push(entry);
         }
-        self.forward_stack.clear();
+        self.active_tab_mut().forward_stack.clear();
         self.set_document(doc);
     }
 
-    /// Returns the title to fetch for "go back", already adjusting the
-    /// back/forward stacks — the caller fetches it and finishes the
-    /// navigation with `set_document`, which must NOT touch the stacks
-    /// again (this method already did).
-    pub fn navigate_back_target(&mut self) -> Option<String> {
-        let target = self.back_stack.pop()?;
-        if let Some(current) = &self.doc {
-            self.forward_stack.push(current.title.clone());
+    /// Returns the history entry to fetch for "go back" — `(lang, title,
+    /// scroll)` — already adjusting the active tab's back/forward stacks. The
+    /// caller fetches it and finishes with `set_document` (which must NOT
+    /// touch the stacks again) then restores `entry.scroll`.
+    pub fn navigate_back_target(&mut self) -> Option<HistoryEntry> {
+        let target = self.active_tab_mut().back_stack.pop()?;
+        if let Some(entry) = self.active_tab().current_entry() {
+            self.active_tab_mut().forward_stack.push(entry);
         }
         Some(target)
     }
 
     /// The forward-history counterpart of `navigate_back_target`.
-    pub fn navigate_forward_target(&mut self) -> Option<String> {
-        let target = self.forward_stack.pop()?;
-        if let Some(current) = &self.doc {
-            self.back_stack.push(current.title.clone());
+    pub fn navigate_forward_target(&mut self) -> Option<HistoryEntry> {
+        let target = self.active_tab_mut().forward_stack.pop()?;
+        if let Some(entry) = self.active_tab().current_entry() {
+            self.active_tab_mut().back_stack.push(entry);
         }
         Some(target)
     }
 
-    /// Install a document without touching the back/forward stacks (used
-    /// after `navigate_back_target`/`navigate_forward_target`, which
-    /// already adjusted them).
+    /// Jump the active tab's history straight to `back_stack[index]`
+    /// (browser-style, PRD FR-NV-7's `gb`): the current page and every
+    /// back-stack entry newer than the target move onto the forward stack —
+    /// newest first — so Forward walks back the way you came. Returns the
+    /// entry to fetch, or `None` if the index is out of range.
+    pub fn jump_to_back_entry(&mut self, index: usize) -> Option<HistoryEntry> {
+        let current = self.active_tab().current_entry();
+        let tab = self.active_tab_mut();
+        if index >= tab.back_stack.len() {
+            return None;
+        }
+        if let Some(cur) = current {
+            tab.forward_stack.push(cur);
+        }
+        while tab.back_stack.len() > index + 1 {
+            if let Some(entry) = tab.back_stack.pop() {
+                tab.forward_stack.push(entry);
+            }
+        }
+        tab.back_stack.pop()
+    }
+
+    /// Install a document into the active tab without touching its
+    /// back/forward stacks (used after `navigate_*`/`jump_to_back_entry`,
+    /// which already adjusted them). The caller sets the tab's
+    /// `page_source`/`current_revid` first; this installs the document,
+    /// rebuilds the app-global citation list, and refreshes the status line.
     pub fn set_document(&mut self, doc: Document) {
-        self.links = collect_links(&doc);
-        self.focused_link = if self.links.is_empty() { None } else { Some(0) };
-        self.sections = section_outline(&doc);
-        self.selected_section = 0;
+        let lang = self.lang.clone();
 
         // Element 0 is always this article's own citation; the rest are
         // whatever it cites (Research mode, PRD-adjacent feature request).
-        let mut citations = vec![crate::research::self_citation(&doc.title, &self.lang)];
+        let mut citations = vec![crate::research::self_citation(&doc.title, &lang)];
         citations.extend(doc.citations.iter().cloned());
         self.citations = citations;
         self.selected_citation = 0;
 
-        self.status = format!(
-            "{}{} — {} blocks, {} links, {} sections, {} citations",
-            self.page_source.prefix(),
-            doc.title,
-            doc.blocks.len(),
-            self.links.len(),
-            self.sections.len(),
-            self.citations.len()
-        );
-        self.doc = Some(doc);
-        self.scroll = 0;
+        {
+            let tab = self.active_tab_mut();
+            tab.lang = lang;
+            tab.install_document(doc);
+        }
         self.mode = Mode::Reading;
         // A new document invalidates the cached layout; it is rebuilt lazily
         // (from L1 if available, else a fresh layout pass) on the next draw
         // or mapping lookup at the current width — see `ensure_layout`.
         self.layout = None;
-        // Whatever this document is, it isn't the one a still-pending
-        // reload notice was about (that notice is scoped to a specific
-        // (lang, title) — see `PendingReload`); a fresh document view has
-        // no update notice of its own to show.
-        self.pending_reload = None;
-        self.clear_find();
+        self.refresh_reading_status();
     }
 
     /// Swaps in the content a background revalidation already wrote to L2
@@ -432,14 +653,17 @@ impl App {
     /// via the revalidation's own fetch, so that's the honest status, even
     /// though this exact keypress made no request of its own.
     pub fn reload_from_pending_update(&mut self, cache: &PageCache) {
-        let Some(pending) = self.pending_reload.take() else {
+        let Some(pending) = self.active_tab_mut().pending_reload.take() else {
             return;
         };
         self.notice = None;
         if let Some(page) = cache.get(&pending.lang, &pending.title) {
             let document = crate::doc::parse_article_html(&pending.title, &page.html);
-            self.current_revid = page.revid;
-            self.page_source = PageSource::Live;
+            {
+                let tab = self.active_tab_mut();
+                tab.current_revid = page.revid;
+                tab.page_source = PageSource::Live;
+            }
             self.set_document(document);
         }
     }
@@ -463,6 +687,7 @@ impl App {
             return;
         };
         let source_article = self
+            .active_tab()
             .doc
             .as_ref()
             .map(|d| d.title.clone())
@@ -477,7 +702,7 @@ impl App {
         };
         self.research.add(SavedCitation {
             source_article,
-            source_lang: self.lang.clone(),
+            source_lang: self.active_tab().lang.clone(),
             text: citation.text,
             url: citation.url,
             saved_at: crate::research::today(),
@@ -522,7 +747,7 @@ impl App {
     /// don't linger on the reading status bar.
     pub fn close_library(&mut self) {
         self.mode = self.library_prior_mode;
-        self.status = match &self.doc {
+        self.status = match &self.active_tab().doc {
             Some(doc) => doc.title.clone(),
             None => "Press / to search, ? for help, q to quit".to_string(),
         };
@@ -600,18 +825,15 @@ impl App {
         };
     }
 
-    /// Clears any in-page find state — a fresh article's matches would be
-    /// meaningless leftovers from whatever was open before.
+    /// Clears the active tab's in-page find state — a fresh article's matches
+    /// would be meaningless leftovers from whatever was open before.
     pub fn clear_find(&mut self) {
-        self.find_input.clear();
-        self.find_matches.clear();
-        self.find_occurrences.clear();
-        self.find_index = 0;
+        self.active_tab_mut().clear_find();
     }
 
-    /// Recomputes every occurrence of `find_input` in the open document and
-    /// jumps to the first hit, if any (PRD FR-NV-6). Char-level, via
-    /// `layout::find_matches` on the cached layout — smart-case and
+    /// Recomputes every occurrence of the active tab's `find_input` in its
+    /// document and jumps to the first hit, if any (PRD FR-NV-6). Char-level,
+    /// via `layout::find_matches` on the cached layout — smart-case and
     /// highlight-all fall out of that function, one `Occurrence` per hit
     /// (never split back into one entry per line-piece: that would
     /// double-count a match that straddles a wrap). `find_matches` mirrors
@@ -619,71 +841,99 @@ impl App {
     /// that only ever needed a line to jump to.
     pub fn update_find(&mut self) {
         self.ensure_layout();
-        self.find_occurrences = match &self.layout {
+        let occurrences = match &self.layout {
             Some(layout) => {
-                layout::find_matches(&layout.lines, &layout.continuation, &self.find_input)
+                let input = self.active_tab().find_input.clone();
+                layout::find_matches(&layout.lines, &layout.continuation, &input)
             }
             None => Vec::new(),
         };
-        self.find_matches = self
-            .find_occurrences
+        let matches: Vec<u16> = occurrences
             .iter()
             .filter_map(|occ| occ.pieces.first().map(|&(line, _)| line as u16))
             .collect();
-        self.find_index = 0;
-        if let Some(&line) = self.find_matches.first() {
-            self.scroll = self.center_scroll(line);
+        let first = matches.first().copied();
+        {
+            let tab = self.active_tab_mut();
+            tab.find_occurrences = occurrences;
+            tab.find_matches = matches;
+            tab.find_index = 0;
+        }
+        if let Some(line) = first {
+            let scroll = self.center_scroll(line);
+            self.active_tab_mut().scroll = scroll;
         }
     }
 
     pub fn find_next(&mut self) {
-        if self.find_matches.is_empty() {
+        let (len, index) = {
+            let tab = self.active_tab();
+            (tab.find_matches.len(), tab.find_index)
+        };
+        if len == 0 {
             return;
         }
-        self.find_index = (self.find_index + 1) % self.find_matches.len();
-        self.scroll = self.center_scroll(self.find_matches[self.find_index]);
+        let new_index = (index + 1) % len;
+        let line = self.active_tab().find_matches[new_index];
+        let scroll = self.center_scroll(line);
+        let tab = self.active_tab_mut();
+        tab.find_index = new_index;
+        tab.scroll = scroll;
     }
 
     pub fn find_prev(&mut self) {
-        if self.find_matches.is_empty() {
+        let (len, index) = {
+            let tab = self.active_tab();
+            (tab.find_matches.len(), tab.find_index)
+        };
+        if len == 0 {
             return;
         }
-        self.find_index = (self.find_index + self.find_matches.len() - 1) % self.find_matches.len();
-        self.scroll = self.center_scroll(self.find_matches[self.find_index]);
+        let new_index = (index + len - 1) % len;
+        let line = self.active_tab().find_matches[new_index];
+        let scroll = self.center_scroll(line);
+        let tab = self.active_tab_mut();
+        tab.find_index = new_index;
+        tab.scroll = scroll;
     }
 
-    /// Scroll to the given section's heading line, clamped to what's
-    /// actually scrollable (a section near the end of a short article may
-    /// not have `max_scroll` lines below it). The heading's line is resolved
-    /// from the layout's block→line map.
+    /// Scroll the active tab to the given section's heading line, clamped to
+    /// what's actually scrollable (a section near the end of a short article
+    /// may not have `max_scroll` lines below it). The heading's line is
+    /// resolved from the layout's block→line map.
     pub fn jump_to_section(&mut self, index: usize) {
         self.ensure_layout();
-        let line = self.sections.get(index).and_then(|section| {
-            self.layout
-                .as_ref()
-                .and_then(|l| l.block_lines.get(section.block).copied())
-        });
+        let line = {
+            let tab = self.active_tab();
+            tab.sections.get(index).and_then(|section| {
+                self.layout
+                    .as_ref()
+                    .and_then(|l| l.block_lines.get(section.block).copied())
+            })
+        };
         if let Some(line) = line {
-            self.scroll = (line as u16).min(self.max_scroll);
+            let max = self.active_tab().max_scroll;
+            self.active_tab_mut().scroll = (line as u16).min(max);
         }
         self.mode = Mode::Reading;
     }
 
     pub fn cycle_link(&mut self, forward: bool) {
-        if self.links.is_empty() {
+        let len = self.active_tab().links.len();
+        if len == 0 {
             self.status = "No links on this page".to_string();
             return;
         }
-        let len = self.links.len();
-        self.focused_link = Some(match self.focused_link {
+        let next = Some(match self.active_tab().focused_link {
             None => 0,
             Some(i) if forward => (i + 1) % len,
             Some(i) => (i + len - 1) % len,
         });
+        self.active_tab_mut().focused_link = next;
         self.scroll_focused_link_into_view();
     }
 
-    /// Scroll so the currently focused link's first line is visible, if it
+    /// Scroll so the active tab's focused link's first line is visible, if it
     /// isn't already — links cycled past the bottom of a long page would
     /// otherwise be highlighted off-screen. A no-op before the first draw
     /// (no viewport height) or when the layout has no line for the link.
@@ -691,7 +941,7 @@ impl App {
         if self.viewport_height == 0 {
             return;
         }
-        let Some(occ) = self.focused_link else {
+        let Some(occ) = self.active_tab().focused_link else {
             return;
         };
         self.ensure_layout();
@@ -703,27 +953,56 @@ impl App {
             return;
         };
         let line = line as u16;
-        let bottom = self.scroll.saturating_add(self.viewport_height);
-        if line < self.scroll {
-            self.scroll = line.min(self.max_scroll);
+        let (scroll, max) = {
+            let tab = self.active_tab();
+            (tab.scroll, tab.max_scroll)
+        };
+        let vh = self.viewport_height;
+        let bottom = scroll.saturating_add(vh);
+        let new = if line < scroll {
+            line.min(max)
         } else if line >= bottom {
-            self.scroll = line
-                .saturating_sub(self.viewport_height.saturating_sub(1))
-                .min(self.max_scroll);
-        }
+            line.saturating_sub(vh.saturating_sub(1)).min(max)
+        } else {
+            scroll
+        };
+        self.active_tab_mut().scroll = new;
     }
 
     pub fn scroll_by(&mut self, delta: i32) {
-        let new = (self.scroll as i32 + delta).clamp(0, self.max_scroll as i32);
-        self.scroll = new as u16;
+        let tab = self.active_tab_mut();
+        let new = (tab.scroll as i32 + delta).clamp(0, tab.max_scroll as i32);
+        tab.scroll = new as u16;
     }
 
     pub fn scroll_to_top(&mut self) {
-        self.scroll = 0;
+        self.active_tab_mut().scroll = 0;
     }
 
     pub fn scroll_to_bottom(&mut self) {
-        self.scroll = self.max_scroll;
+        let max = self.active_tab().max_scroll;
+        self.active_tab_mut().scroll = max;
+    }
+
+    /// Build the active tab's breadcrumb trail (PRD FR-NV-7): the last few
+    /// back-stack titles plus the current article title, in navigation order.
+    /// The status bar renders and middle-truncates it. Empty when the tab has
+    /// no document.
+    pub fn breadcrumb_titles(&self) -> Vec<String> {
+        let tab = self.active_tab();
+        let Some(doc) = tab.doc.as_ref() else {
+            return Vec::new();
+        };
+        let mut trail: Vec<String> = tab
+            .back_stack
+            .iter()
+            .rev()
+            .take(3)
+            .rev()
+            .map(|e| e.title.clone())
+            .collect();
+        trail.push(doc.title.clone());
+        trail
     }
 
     /// Arms (or disarms) the typeahead debounce timer on every Search-mode
@@ -785,6 +1064,7 @@ pub fn zero_results_message(query: &str, suggestion: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::doc::LinkRef;
 
     fn doc(title: &str) -> Document {
         Document {
@@ -795,6 +1075,25 @@ mod tests {
         }
     }
 
+    /// The titles on the active tab's back stack, for asserting history
+    /// contents now that entries are `(lang, title, scroll)` rather than bare
+    /// strings.
+    fn back_titles(app: &App) -> Vec<String> {
+        app.active_tab()
+            .back_stack
+            .iter()
+            .map(|e| e.title.clone())
+            .collect()
+    }
+
+    fn forward_titles(app: &App) -> Vec<String> {
+        app.active_tab()
+            .forward_stack
+            .iter()
+            .map(|e| e.title.clone())
+            .collect()
+    }
+
     #[test]
     fn back_and_forward_mirror_browser_semantics() {
         let mut app = App::new("en".to_string(), Theme::terminal(), false);
@@ -802,22 +1101,22 @@ mod tests {
         app.open_document(doc("A"));
         app.open_document(doc("B"));
         app.open_document(doc("C"));
-        assert_eq!(app.back_stack, vec!["A", "B"]);
-        assert!(app.forward_stack.is_empty());
-        assert_eq!(app.doc.as_ref().unwrap().title, "C");
+        assert_eq!(back_titles(&app), vec!["A", "B"]);
+        assert!(app.active_tab().forward_stack.is_empty());
+        assert_eq!(app.active_tab().doc.as_ref().unwrap().title, "C");
 
         let target = app.navigate_back_target().unwrap();
-        assert_eq!(target, "B");
-        assert_eq!(app.back_stack, vec!["A"]);
-        assert_eq!(app.forward_stack, vec!["C"]);
+        assert_eq!(target.title, "B");
+        assert_eq!(back_titles(&app), vec!["A"]);
+        assert_eq!(forward_titles(&app), vec!["C"]);
         // navigate_back_target only adjusts the stacks; the caller installs
         // the fetched document via set_document.
         app.set_document(doc("B"));
 
         let target = app.navigate_forward_target().unwrap();
-        assert_eq!(target, "C");
-        assert_eq!(app.back_stack, vec!["A", "B"]);
-        assert!(app.forward_stack.is_empty());
+        assert_eq!(target.title, "C");
+        assert_eq!(back_titles(&app), vec!["A", "B"]);
+        assert!(app.active_tab().forward_stack.is_empty());
     }
 
     #[test]
@@ -827,15 +1126,15 @@ mod tests {
         app.open_document(doc("B"));
 
         let target = app.navigate_back_target().unwrap();
-        assert_eq!(target, "A");
+        assert_eq!(target.title, "A");
         app.set_document(doc("A"));
-        assert_eq!(app.forward_stack, vec!["B"]);
+        assert_eq!(forward_titles(&app), vec!["B"]);
 
         // Reading A and following a different link (fresh navigation) should
         // drop the "forward to B" branch, exactly like a browser.
         app.open_document(doc("Z"));
-        assert!(app.forward_stack.is_empty());
-        assert_eq!(app.back_stack, vec!["A"]);
+        assert!(app.active_tab().forward_stack.is_empty());
+        assert_eq!(back_titles(&app), vec!["A"]);
     }
 
     #[test]
@@ -848,7 +1147,7 @@ mod tests {
     #[test]
     fn cycle_link_wraps_in_both_directions() {
         let mut app = App::new("en".to_string(), Theme::terminal(), false);
-        app.links = vec![
+        app.active_tab_mut().links = vec![
             LinkRef {
                 href: "./A".into(),
                 text: "A".into(),
@@ -865,24 +1164,24 @@ mod tests {
                 internal_title: Some("C".into()),
             },
         ];
-        app.focused_link = None;
+        app.active_tab_mut().focused_link = None;
 
         app.cycle_link(true);
-        assert_eq!(app.focused_link, Some(0));
+        assert_eq!(app.active_tab().focused_link, Some(0));
         app.cycle_link(true);
         app.cycle_link(true);
-        assert_eq!(app.focused_link, Some(2));
+        assert_eq!(app.active_tab().focused_link, Some(2));
         app.cycle_link(true); // wraps forward past the end
-        assert_eq!(app.focused_link, Some(0));
+        assert_eq!(app.active_tab().focused_link, Some(0));
         app.cycle_link(false); // wraps backward past the start
-        assert_eq!(app.focused_link, Some(2));
+        assert_eq!(app.active_tab().focused_link, Some(2));
     }
 
     #[test]
     fn cycle_link_on_linkless_page_leaves_focus_unset() {
         let mut app = App::new("en".to_string(), Theme::terminal(), false);
         app.cycle_link(true);
-        assert_eq!(app.focused_link, None);
+        assert_eq!(app.active_tab().focused_link, None);
     }
 
     #[test]
@@ -897,12 +1196,12 @@ mod tests {
         html.push_str("<h2>Late Section</h2><p>tail</p></body></html>");
         app.set_document(crate::doc::parse_article_html("T", &html));
         app.layout_width = 80;
-        app.max_scroll = 30; // a short viewport: the heading's line is past the end
+        app.active_tab_mut().max_scroll = 30; // a short viewport: the heading's line is past the end
         app.mode = Mode::Toc;
 
-        assert_eq!(app.sections.len(), 1);
+        assert_eq!(app.active_tab().sections.len(), 1);
         app.jump_to_section(0);
-        assert_eq!(app.scroll, 30);
+        assert_eq!(app.active_tab().scroll, 30);
         assert_eq!(app.mode, Mode::Reading);
     }
 
@@ -934,14 +1233,19 @@ mod tests {
         let mut app = App::new("en".to_string(), Theme::terminal(), false);
         let html = "<html><body><p>alpha</p><p>bravo alpha</p><p>charlie</p></body></html>";
         app.set_document(crate::doc::parse_article_html("Test", html));
-        app.max_scroll = 100; // pretend a long article so clamping never kicks in
+        app.active_tab_mut().max_scroll = 100; // pretend a long article so clamping never kicks in
 
-        app.find_input = "alpha".to_string();
+        app.active_tab_mut().find_input = "alpha".to_string();
         app.update_find();
 
-        assert_eq!(app.find_matches.len(), 2, "two paragraphs mention alpha");
         assert_eq!(
-            app.scroll, app.find_matches[0],
+            app.active_tab().find_matches.len(),
+            2,
+            "two paragraphs mention alpha"
+        );
+        assert_eq!(
+            app.active_tab().scroll,
+            app.active_tab().find_matches[0],
             "should jump straight to the first match"
         );
     }
@@ -951,20 +1255,20 @@ mod tests {
         let mut app = App::new("en".to_string(), Theme::terminal(), false);
         let html = "<html><body><p>alpha</p><p>alpha</p><p>alpha</p></body></html>";
         app.set_document(crate::doc::parse_article_html("Test", html));
-        app.max_scroll = 100;
-        app.find_input = "alpha".to_string();
+        app.active_tab_mut().max_scroll = 100;
+        app.active_tab_mut().find_input = "alpha".to_string();
         app.update_find();
-        assert_eq!(app.find_matches.len(), 3);
+        assert_eq!(app.active_tab().find_matches.len(), 3);
 
-        assert_eq!(app.find_index, 0);
+        assert_eq!(app.active_tab().find_index, 0);
         app.find_next();
-        assert_eq!(app.find_index, 1);
+        assert_eq!(app.active_tab().find_index, 1);
         app.find_next();
-        assert_eq!(app.find_index, 2);
+        assert_eq!(app.active_tab().find_index, 2);
         app.find_next(); // wraps forward past the last match
-        assert_eq!(app.find_index, 0);
+        assert_eq!(app.active_tab().find_index, 0);
         app.find_prev(); // wraps backward past the first match
-        assert_eq!(app.find_index, 2);
+        assert_eq!(app.active_tab().find_index, 2);
     }
 
     #[test]
@@ -974,20 +1278,20 @@ mod tests {
             "First",
             "<html><body><p>alpha</p></body></html>",
         ));
-        app.max_scroll = 100;
-        app.find_input = "alpha".to_string();
+        app.active_tab_mut().max_scroll = 100;
+        app.active_tab_mut().find_input = "alpha".to_string();
         app.update_find();
-        assert_eq!(app.find_matches.len(), 1);
+        assert_eq!(app.active_tab().find_matches.len(), 1);
 
         app.set_document(crate::doc::parse_article_html(
             "Second",
             "<html><body><p>bravo</p></body></html>",
         ));
         assert!(
-            app.find_input.is_empty(),
+            app.active_tab().find_input.is_empty(),
             "a new article's matches must not carry over from the old one"
         );
-        assert!(app.find_matches.is_empty());
+        assert!(app.active_tab().find_matches.is_empty());
     }
 
     #[test]
@@ -995,7 +1299,7 @@ mod tests {
         let mut app = App::new("en".to_string(), Theme::terminal(), false);
         app.find_next();
         app.find_prev();
-        assert_eq!(app.find_index, 0);
+        assert_eq!(app.active_tab().find_index, 0);
     }
 
     /// A document whose paragraphs wrap: find matches must land on
@@ -1009,12 +1313,12 @@ mod tests {
         let html = format!("<html><body><p>{long}</p><p>needle paragraph</p></body></html>");
         app.set_document(crate::doc::parse_article_html("Test", &html));
         app.layout_width = 40;
-        app.max_scroll = 100;
+        app.active_tab_mut().max_scroll = 100;
 
-        app.find_input = "needle".to_string();
+        app.active_tab_mut().find_input = "needle".to_string();
         app.update_find();
 
-        assert_eq!(app.find_matches.len(), 1);
+        assert_eq!(app.active_tab().find_matches.len(), 1);
         let layout = app.layout.as_ref().expect("layout built by update_find");
         let wrapped_first_para = layout.block_lines[1] - layout.block_lines[0];
         assert!(
@@ -1022,7 +1326,8 @@ mod tests {
             "the first paragraph must actually wrap for this test to bite"
         );
         assert_eq!(
-            app.find_matches[0] as usize, layout.block_lines[1],
+            app.active_tab().find_matches[0] as usize,
+            layout.block_lines[1],
             "the match must be the needle block's laid-out line"
         );
     }
@@ -1040,25 +1345,26 @@ mod tests {
         app.layout_width = 80;
         app.viewport_height = 10;
         app.ensure_layout();
-        app.max_scroll = (app.layout.as_ref().unwrap().lines.len() as u16).saturating_sub(10);
+        app.active_tab_mut().max_scroll =
+            (app.layout.as_ref().unwrap().lines.len() as u16).saturating_sub(10);
 
-        assert_eq!(app.focused_link, Some(0));
-        assert_eq!(app.scroll, 0);
+        assert_eq!(app.active_tab().focused_link, Some(0));
+        assert_eq!(app.active_tab().scroll, 0);
         app.cycle_link(true); // second link, far below the 10-row viewport
         let link_line = app.layout.as_ref().unwrap().link_lines[1] as u16;
         assert!(link_line > 10, "second link must start off-screen");
         assert!(
-            app.scroll <= link_line && link_line < app.scroll + 10,
+            app.active_tab().scroll <= link_line && link_line < app.active_tab().scroll + 10,
             "focused link line {link_line} must be inside viewport starting at {}",
-            app.scroll
+            app.active_tab().scroll
         );
 
         app.cycle_link(true); // wraps to the first link back at the top
         let first_line = app.layout.as_ref().unwrap().link_lines[0] as u16;
         assert!(
-            app.scroll <= first_line && first_line < app.scroll + 10,
+            app.active_tab().scroll <= first_line && first_line < app.active_tab().scroll + 10,
             "wrapping back to the top link must scroll it into view (scroll {}, line {first_line})",
-            app.scroll
+            app.active_tab().scroll
         );
     }
 
@@ -1104,7 +1410,7 @@ mod tests {
         let mut app = App::new("en".to_string(), Theme::terminal(), false);
         app.layout_width = 80;
 
-        app.current_revid = 7;
+        app.active_tab_mut().current_revid = 7;
         app.set_document(crate::doc::parse_article_html(
             "Article A",
             "<html><body><p>hello world</p></body></html>",
@@ -1112,7 +1418,7 @@ mod tests {
         app.ensure_layout();
         assert_eq!(app.layout_computations, 1);
 
-        app.current_revid = 9;
+        app.active_tab_mut().current_revid = 9;
         app.set_document(crate::doc::parse_article_html(
             "Article B",
             "<html><body><p>a different article entirely</p></body></html>",
@@ -1122,7 +1428,7 @@ mod tests {
 
         // Navigate back to Article A at the identical identity and width:
         // the L1 cache must serve it without another layout pass.
-        app.current_revid = 7;
+        app.active_tab_mut().current_revid = 7;
         app.set_document(crate::doc::parse_article_html(
             "Article A",
             "<html><body><p>hello world</p></body></html>",
@@ -1139,7 +1445,7 @@ mod tests {
         let mut app = App::new("en".to_string(), Theme::terminal(), false);
         app.layout_width = 80;
 
-        app.current_revid = 1;
+        app.active_tab_mut().current_revid = 1;
         app.set_document(crate::doc::parse_article_html(
             "Article",
             "<html><body><p>old content</p></body></html>",
@@ -1147,7 +1453,7 @@ mod tests {
         app.ensure_layout();
         assert_eq!(app.layout_computations, 1);
 
-        app.current_revid = 2;
+        app.active_tab_mut().current_revid = 2;
         app.set_document(crate::doc::parse_article_html(
             "Article",
             "<html><body><p>new content</p></body></html>",
@@ -1181,9 +1487,9 @@ mod tests {
             "Alan Turing",
             "<html><body><p>original body</p></body></html>",
         ));
-        app.current_revid = 1;
-        app.page_source = PageSource::Cached { age_secs: 100_000 };
-        app.pending_reload = Some(PendingReload {
+        app.active_tab_mut().current_revid = 1;
+        app.active_tab_mut().page_source = PageSource::Cached { age_secs: 100_000 };
+        app.active_tab_mut().pending_reload = Some(PendingReload {
             lang: "en".to_string(),
             title: "Alan Turing".to_string(),
         });
@@ -1191,12 +1497,16 @@ mod tests {
 
         app.reload_from_pending_update(&cache);
 
-        assert!(app.pending_reload.is_none(), "consumed on reload");
-        assert!(app.notice.is_none(), "reload clears the notice");
-        assert_eq!(app.current_revid, 2);
-        assert_eq!(app.page_source, PageSource::Live);
         assert!(
-            crate::doc::render_plain(app.doc.as_ref().unwrap()).contains("updated body"),
+            app.active_tab().pending_reload.is_none(),
+            "consumed on reload"
+        );
+        assert!(app.notice.is_none(), "reload clears the notice");
+        assert_eq!(app.active_tab().current_revid, 2);
+        assert_eq!(app.active_tab().page_source, PageSource::Live);
+        assert!(
+            crate::doc::render_plain(app.active_tab().doc.as_ref().unwrap())
+                .contains("updated body"),
             "the new content must actually be what's rendered"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1207,7 +1517,7 @@ mod tests {
         let mut app = App::new("en".to_string(), Theme::terminal(), false);
         let cache = crate::cache::PageCache::disabled();
         app.reload_from_pending_update(&cache); // must not panic
-        assert!(app.pending_reload.is_none());
+        assert!(app.active_tab().pending_reload.is_none());
     }
 
     /// A citations-bearing fixture, used instead of the plain `doc()`
@@ -1604,19 +1914,20 @@ mod tests {
             "Test",
             "<html><body><p>turing turing turing</p></body></html>",
         ));
-        app.max_scroll = 100;
-        app.find_input = "turing".to_string();
+        app.active_tab_mut().max_scroll = 100;
+        app.active_tab_mut().find_input = "turing".to_string();
         app.update_find();
 
         assert_eq!(
-            app.find_matches.len(),
+            app.active_tab().find_matches.len(),
             3,
             "one match per occurrence, all on the same block/line"
         );
-        assert_eq!(app.find_occurrences.len(), 3);
+        assert_eq!(app.active_tab().find_occurrences.len(), 3);
         // All three occurrences land on the same line (the block didn't
         // wrap), each a single piece, at increasing column ranges.
         let cols: Vec<usize> = app
+            .active_tab()
             .find_occurrences
             .iter()
             .map(|occ| {
@@ -1667,22 +1978,22 @@ mod tests {
             continuation: vec![true],
         });
         app.layout_width = 20; // matches the hand-built Layout's `width`, so `ensure_layout` (which `update_find` calls) sees it as fresh and doesn't discard it
-        app.max_scroll = 100;
+        app.active_tab_mut().max_scroll = 100;
 
-        app.find_input = "computer science".to_string();
+        app.active_tab_mut().find_input = "computer science".to_string();
         app.update_find();
 
         assert_eq!(
-            app.find_occurrences.len(),
+            app.active_tab().find_occurrences.len(),
             1,
             "one query occurrence must stay one entry even though a wrap splits it"
         );
         assert_eq!(
-            app.find_occurrences[0].pieces.len(),
+            app.active_tab().find_occurrences[0].pieces.len(),
             2,
             "split across both lines"
         );
-        assert_eq!(app.find_matches.len(), 1);
+        assert_eq!(app.active_tab().find_matches.len(), 1);
     }
 
     /// Smart-case (FR-NV-6a) reaches all the way through `App::update_find`,
@@ -1694,25 +2005,276 @@ mod tests {
             "Test",
             "<html><body><p>Alan Turing was here</p></body></html>",
         ));
-        app.max_scroll = 100;
+        app.active_tab_mut().max_scroll = 100;
 
-        app.find_input = "turing".to_string();
+        app.active_tab_mut().find_input = "turing".to_string();
         app.update_find();
         assert_eq!(
-            app.find_matches.len(),
+            app.active_tab().find_matches.len(),
             1,
             "lowercase query is case-insensitive"
         );
 
-        app.find_input = "Turing".to_string();
+        app.active_tab_mut().find_input = "Turing".to_string();
         app.update_find();
-        assert_eq!(app.find_matches.len(), 1, "matching case still matches");
+        assert_eq!(
+            app.active_tab().find_matches.len(),
+            1,
+            "matching case still matches"
+        );
 
-        app.find_input = "TURING".to_string();
+        app.active_tab_mut().find_input = "TURING".to_string();
         app.update_find();
         assert!(
-            app.find_matches.is_empty(),
+            app.active_tab().find_matches.is_empty(),
             "wrong-case query with an uppercase letter must not match"
+        );
+    }
+
+    // ---- Tab system (PRD FR-TB-1..3) ------------------------------------
+
+    /// An `App` with `n` article tabs (titles "T0".."T{n-1}"), tab `i`
+    /// focused. Each tab holds a distinct one-paragraph document.
+    fn app_with_tabs(n: usize, focus: usize) -> App {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        // The first tab already exists; fill it, then open the rest.
+        for i in 0..n {
+            if i > 0 {
+                app.new_foreground_tab();
+            }
+            app.set_document(doc(&format!("T{i}")));
+        }
+        app.active = focus;
+        app.sync_via_public_switch(focus);
+        app
+    }
+
+    impl App {
+        /// Test helper: switch to a tab index through the public path so the
+        /// active-tab bookkeeping (citations, lang) is consistent.
+        fn sync_via_public_switch(&mut self, index: usize) {
+            self.switch_to_tab(index);
+        }
+    }
+
+    #[test]
+    fn closing_a_tab_left_of_active_shifts_the_active_index() {
+        let mut app = app_with_tabs(4, 2); // active = T2
+        assert_eq!(app.active_tab().doc.as_ref().unwrap().title, "T2");
+        let quit = app.close_tab(0); // close T0, left of active
+        assert!(!quit);
+        assert_eq!(app.tabs.len(), 3);
+        assert_eq!(
+            app.active_tab().doc.as_ref().unwrap().title,
+            "T2",
+            "focus must stay on the same article after a left-of-active close"
+        );
+    }
+
+    #[test]
+    fn closing_the_active_tab_focuses_its_right_neighbor() {
+        let mut app = app_with_tabs(4, 1); // active = T1
+        app.close_tab(1); // close active
+        assert_eq!(app.tabs.len(), 3);
+        assert_eq!(
+            app.active_tab().doc.as_ref().unwrap().title,
+            "T2",
+            "closing the active tab focuses the tab that slid into its slot"
+        );
+    }
+
+    #[test]
+    fn closing_the_last_index_active_tab_focuses_the_new_last() {
+        let mut app = app_with_tabs(3, 2); // active = last (T2)
+        app.close_tab(2);
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(
+            app.active, 1,
+            "closing the last tab moves focus to the new last"
+        );
+        assert_eq!(app.active_tab().doc.as_ref().unwrap().title, "T1");
+    }
+
+    #[test]
+    fn closing_the_final_remaining_tab_signals_quit() {
+        let mut app = app_with_tabs(1, 0);
+        let quit = app.close_active_tab();
+        assert!(quit, "closing the last remaining tab must signal a quit");
+        assert!(app.tabs.is_empty());
+    }
+
+    #[test]
+    fn per_tab_back_stacks_are_isolated() {
+        let mut app = app_with_tabs(2, 0);
+        // Navigate within tab 0 (open_document pushes the current article).
+        app.open_document(doc("T0-child"));
+        assert_eq!(back_titles(&app), vec!["T0"]);
+
+        // Tab 1's history is untouched by tab 0's navigation.
+        app.switch_to_tab(1);
+        assert!(
+            app.active_tab().back_stack.is_empty(),
+            "a fresh tab's back stack is independent of another tab's"
+        );
+        app.open_document(doc("T1-child"));
+        assert_eq!(back_titles(&app), vec!["T1"]);
+
+        // Back in tab 0, its own stack is still exactly what we left it.
+        app.switch_to_tab(0);
+        assert_eq!(back_titles(&app), vec!["T0"]);
+    }
+
+    #[test]
+    fn navigating_captures_scroll_and_back_restores_it() {
+        let mut app = app_with_tabs(1, 0);
+        // Read partway down T0, then follow a link to a child article.
+        app.active_tab_mut().scroll = 42;
+        app.open_document(doc("Child"));
+        assert_eq!(app.active_tab().scroll, 0, "the child opens at the top");
+
+        // Going back returns the entry carrying T0's captured scroll.
+        let entry = app.navigate_back_target().unwrap();
+        assert_eq!(entry.title, "T0");
+        assert_eq!(
+            entry.scroll, 42,
+            "the back entry restores the scroll position we left at"
+        );
+    }
+
+    #[test]
+    fn close_undo_restores_document_stacks_and_scroll() {
+        let mut app = app_with_tabs(2, 0);
+        // Build some history + a scroll position in tab 0.
+        app.open_document(doc("T0-child"));
+        app.active_tab_mut().scroll = 17;
+        let before_back = back_titles(&app);
+        assert_eq!(before_back, vec!["T0"]);
+
+        // Close tab 0, then reopen it.
+        app.close_tab(0);
+        assert_eq!(app.tabs.len(), 1);
+        assert!(app.reopen_closed_tab());
+        assert_eq!(app.tabs.len(), 2);
+
+        let restored = app.active_tab();
+        assert_eq!(restored.doc.as_ref().unwrap().title, "T0-child");
+        assert_eq!(restored.scroll, 17, "scroll restored from the snapshot");
+        assert_eq!(
+            restored
+                .back_stack
+                .iter()
+                .map(|e| e.title.clone())
+                .collect::<Vec<_>>(),
+            vec!["T0"],
+            "the back stack survives close/undo intact"
+        );
+    }
+
+    #[test]
+    fn reopen_with_empty_undo_stack_is_a_noop() {
+        let mut app = app_with_tabs(1, 0);
+        assert!(!app.reopen_closed_tab());
+        assert_eq!(app.tabs.len(), 1);
+    }
+
+    #[test]
+    fn close_undo_stack_is_capped_and_drops_oldest() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        // Open and close far more tabs than the cap.
+        for i in 0..(CLOSED_TABS_CAP + 5) {
+            app.new_foreground_tab();
+            app.set_document(doc(&format!("C{i}")));
+            app.close_active_tab();
+        }
+        assert_eq!(
+            app.closed_tabs.len(),
+            CLOSED_TABS_CAP,
+            "the undo stack never grows past its cap, so old Documents drop"
+        );
+        // The most-recently-closed is on top; the oldest few are gone.
+        let newest = app.closed_tabs.last().unwrap();
+        assert_eq!(
+            newest.doc.as_ref().unwrap().title,
+            format!("C{}", CLOSED_TABS_CAP + 4)
+        );
+    }
+
+    #[test]
+    fn next_and_prev_tab_wrap() {
+        let mut app = app_with_tabs(3, 0);
+        app.next_tab();
+        assert_eq!(app.active, 1);
+        app.next_tab();
+        app.next_tab(); // wraps 2 -> 0
+        assert_eq!(app.active, 0);
+        app.prev_tab(); // wraps 0 -> 2
+        assert_eq!(app.active, 2);
+    }
+
+    #[test]
+    fn opening_a_background_tab_does_not_move_focus() {
+        let mut app = app_with_tabs(1, 0);
+        let active_before = app.active;
+        let id = app.open_background_tab("Enigma machine".to_string(), "en".to_string());
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.active, active_before, "focus must not move");
+        let bg = app.tab_index_by_id(id).unwrap();
+        assert!(app.tabs[bg].loading, "the background tab starts loading");
+        assert_eq!(
+            app.tabs[bg].display_title(),
+            "Enigma machine",
+            "it shows its target title while loading"
+        );
+    }
+
+    #[test]
+    fn jump_to_back_entry_moves_intermediate_history_to_forward() {
+        let mut app = app_with_tabs(1, 0);
+        // Walk A(=T0) -> B -> C -> D within the tab.
+        app.open_document(doc("B"));
+        app.open_document(doc("C"));
+        app.open_document(doc("D"));
+        assert_eq!(back_titles(&app), vec!["T0", "B", "C"]);
+
+        // Jump straight back to the oldest entry (index 0 == "T0").
+        let target = app.jump_to_back_entry(0).unwrap();
+        assert_eq!(target.title, "T0");
+        assert!(app.active_tab().back_stack.is_empty());
+        // Current (D) and the skipped-over entries become forward history,
+        // ordered so Forward replays D last.
+        assert_eq!(forward_titles(&app), vec!["D", "C", "B"]);
+    }
+
+    #[test]
+    fn breadcrumb_titles_are_the_last_few_plus_current() {
+        let mut app = app_with_tabs(1, 0);
+        for t in ["B", "C", "D", "E"] {
+            app.open_document(doc(t));
+        }
+        // back_stack = [T0, B, C, D], current = E; trail keeps the last 3
+        // back entries plus the current article.
+        assert_eq!(
+            app.breadcrumb_titles(),
+            vec!["B", "C", "D", "E"],
+            "breadcrumb trims to the most recent hops"
+        );
+    }
+
+    #[test]
+    fn switching_tabs_rearms_a_pending_reload_notice() {
+        let mut app = app_with_tabs(2, 0);
+        // Simulate a background revalidation that armed tab 1's reload while
+        // tab 0 was on screen.
+        app.tabs[1].pending_reload = Some(PendingReload {
+            lang: "en".to_string(),
+            title: "T1".to_string(),
+        });
+        assert!(app.notice.is_none());
+        app.switch_to_tab(1);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("updated — r to reload"),
+            "switching to a tab with a pending reload re-arms the notice"
         );
     }
 }

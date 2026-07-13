@@ -34,11 +34,19 @@ pub enum Command {
     /// are documented as restart-only, so this deliberately leaves them
     /// alone; the same reload also fires on SIGHUP.
     ConfigReload,
+    /// `:tab close` — close the active tab (PRD FR-TB-1). Closing the last
+    /// tab quits.
+    TabClose,
+    /// `:tab new [title]` — open a fresh tab, switching to it; loads `title`
+    /// if given, else the welcome screen.
+    TabNew(Option<String>),
+    /// `:tabs` — open the fuzzy tab picker (same view as `bb`).
+    Tabs,
     /// `:q` / `:quit` — exit.
     Quit,
 }
 
-pub const USAGE: &str = "commands: open <title>, lang <code>, theme <name>, style <name>, library, research, toc, export [style], config reload, help, quit";
+pub const USAGE: &str = "commands: open <title>, lang <code>, theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, config reload, help, quit";
 
 pub fn parse(input: &str) -> Result<Command, String> {
     let input = input.trim();
@@ -96,6 +104,27 @@ pub fn parse(input: &str) -> Result<Command, String> {
                 "unknown config subcommand {other:?} — try: config reload"
             )),
         },
+        // `:tab close` / `:tab new [title]` (PRD FR-TB-1). `close!` is
+        // accepted as an alias for `close` — the exclamation-force idiom from
+        // Appendix B / FR-CS-2, harmless here since a tab close needs no
+        // confirmation.
+        "tab" => {
+            let (sub, rest) = match arg.split_once(char::is_whitespace) {
+                Some((s, r)) => (s, r.trim()),
+                None => (arg, ""),
+            };
+            match sub {
+                "close" | "close!" => Ok(Command::TabClose),
+                "new" => Ok(Command::TabNew(
+                    (!rest.is_empty()).then(|| rest.to_string()),
+                )),
+                "" => Err("usage: :tab close | :tab new [title]".to_string()),
+                other => Err(format!(
+                    "unknown tab subcommand {other:?} — try: tab close, tab new [title]"
+                )),
+            }
+        }
+        "tabs" => Ok(Command::Tabs),
         "library" | "lib" => Ok(Command::Library),
         "research" => Ok(Command::Research),
         "toc" => Ok(Command::Toc),
@@ -180,6 +209,20 @@ mod tests {
         assert_eq!(parse("config reload"), Ok(Command::ConfigReload));
         assert!(parse("config").is_err());
         assert!(parse("config bogus").is_err());
+    }
+
+    #[test]
+    fn tab_subcommands_parse() {
+        assert_eq!(parse("tab close"), Ok(Command::TabClose));
+        assert_eq!(parse("tab close!"), Ok(Command::TabClose));
+        assert_eq!(parse("tab new"), Ok(Command::TabNew(None)));
+        assert_eq!(
+            parse("tab new Alan Turing"),
+            Ok(Command::TabNew(Some("Alan Turing".to_string())))
+        );
+        assert_eq!(parse("tabs"), Ok(Command::Tabs));
+        assert!(parse("tab").is_err());
+        assert!(parse("tab frobnicate").is_err());
     }
 
     #[test]

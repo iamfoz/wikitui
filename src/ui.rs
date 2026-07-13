@@ -12,13 +12,14 @@ use crate::doc::LinkRef;
 use crate::layout::{LaidLine, Layout, MatchSpan, SpanKind};
 use crate::theme::Theme;
 
-/// Every article title opened this session — back-stack, forward-stack, and
-/// the one currently on screen — used to style already-read links
-/// differently from unread ones (PRD FR-HS-2).
+/// Every article title in the active tab's history — its back-stack,
+/// forward-stack, and the one currently on screen — used to style
+/// already-read links differently from unread ones (PRD FR-HS-2).
 fn visited_titles(app: &App) -> HashSet<&str> {
-    let mut set: HashSet<&str> = app.back_stack.iter().map(String::as_str).collect();
-    set.extend(app.forward_stack.iter().map(String::as_str));
-    if let Some(doc) = &app.doc {
+    let tab = app.active_tab();
+    let mut set: HashSet<&str> = tab.back_stack.iter().map(|e| e.title.as_str()).collect();
+    set.extend(tab.forward_stack.iter().map(|e| e.title.as_str()));
+    if let Some(doc) = &tab.doc {
         set.insert(doc.title.as_str());
     }
     set
@@ -293,10 +294,31 @@ pub fn parse_searchmatch(html: &str) -> Vec<(String, bool)> {
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
-    let chunks = UiLayout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(area);
+
+    // The tab bar (PRD FR-TB-1) is one row above the content, shown only when
+    // more than one tab is open — a single tab keeps the current zero-chrome
+    // look exactly.
+    let show_tab_bar = app.tabs.len() > 1;
+    let chunks = if show_tab_bar {
+        UiLayout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(area)
+    } else {
+        UiLayout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(area)
+    };
+    let (tab_bar_area, content_area, status_area) = if show_tab_bar {
+        (Some(chunks[0]), chunks[1], chunks[2])
+    } else {
+        (None, chunks[0], chunks[1])
+    };
 
     // Paint the whole frame in the theme's background/foreground first so
     // areas a widget doesn't explicitly style (e.g. the empty tail of a
@@ -306,23 +328,29 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         area,
     );
 
-    match app.mode {
-        Mode::Reading | Mode::Help | Mode::Search | Mode::Find | Mode::Command => {
-            draw_reading(frame, app, chunks[0])
-        }
-        Mode::Results => draw_results(frame, app, chunks[0]),
-        Mode::Toc => draw_toc(frame, app, chunks[0]),
-        Mode::Research => draw_research(frame, app, chunks[0]),
-        Mode::Library => draw_library(frame, app, chunks[0]),
+    if let Some(bar) = tab_bar_area {
+        draw_tab_bar(frame, app, bar);
     }
 
-    draw_status_bar(frame, app, chunks[1]);
+    match app.mode {
+        Mode::Reading | Mode::Help | Mode::Search | Mode::Find | Mode::Command => {
+            draw_reading(frame, app, content_area)
+        }
+        Mode::Results => draw_results(frame, app, content_area),
+        Mode::Toc => draw_toc(frame, app, content_area),
+        Mode::Research => draw_research(frame, app, content_area),
+        Mode::Library => draw_library(frame, app, content_area),
+        Mode::TabPicker => draw_tab_picker(frame, app, content_area),
+        Mode::HistoryPicker => draw_history_picker(frame, app, content_area),
+    }
+
+    draw_status_bar(frame, app, status_area);
 
     // The typeahead dropdown floats over the reading view, anchored just
     // above the prompt it belongs to (PRD FR-SR-1) — drawn after the status
     // bar so it layers on top, same ordering as the help overlay below.
     if app.mode == Mode::Search && !app.typeahead.is_empty() {
-        draw_search_suggestions(frame, app, chunks[0]);
+        draw_search_suggestions(frame, app, content_area);
     }
 
     if app.mode == Mode::Help {
@@ -330,8 +358,233 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 }
 
+/// One tab's data for the pure bar/picker builders (kept free of `ratatui`
+/// types so the overflow logic is table-testable).
+pub struct TabLabel {
+    /// 1-based display index.
+    pub number: usize,
+    pub title: String,
+    pub loading: bool,
+    pub active: bool,
+}
+
+/// One painted run of the tab bar: its text and whether it is the active tab
+/// (which the painter highlights with the theme's selected slots).
+#[derive(Debug, PartialEq, Eq)]
+pub struct TabBarSegment {
+    pub text: String,
+    pub active: bool,
+}
+
+fn tab_labels(app: &App) -> Vec<TabLabel> {
+    app.tabs
+        .iter()
+        .enumerate()
+        .map(|(i, t)| TabLabel {
+            number: i + 1,
+            title: t.display_title(),
+            loading: t.loading,
+            active: i == app.active,
+        })
+        .collect()
+}
+
+/// Display width of a string, EAW-narrow (the tab bar and breadcrumb are
+/// chrome, not article body, so the article's ambiguous-width setting doesn't
+/// apply here).
+fn display_width(s: &str) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    UnicodeWidthStr::width(s)
+}
+
+fn take_width_prefix(s: &str, budget: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let mut out = String::new();
+    let mut w = 0;
+    for g in s.graphemes(true) {
+        let gw = UnicodeWidthStr::width(g);
+        if w + gw > budget {
+            break;
+        }
+        out.push_str(g);
+        w += gw;
+    }
+    out
+}
+
+fn take_width_suffix(s: &str, budget: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let mut out = String::new();
+    let mut w = 0;
+    for g in s.graphemes(true).collect::<Vec<_>>().into_iter().rev() {
+        let gw = UnicodeWidthStr::width(g);
+        if w + gw > budget {
+            break;
+        }
+        out.insert_str(0, g);
+        w += gw;
+    }
+    out
+}
+
+/// Middle-truncate `s` to at most `max` display columns, inserting an ellipsis
+/// (PRD FR-TB-1 "middle-truncated titles"). Grapheme- and width-aware so CJK
+/// titles never split a cell.
+pub fn middle_truncate(s: &str, max: usize) -> String {
+    if display_width(s) <= max {
+        return s.to_string();
+    }
+    if max <= 1 {
+        return "…".to_string();
+    }
+    let budget = max - 1; // room for the ellipsis
+    let head_budget = budget.div_ceil(2);
+    let tail_budget = budget - head_budget;
+    format!(
+        "{}…{}",
+        take_width_prefix(s, head_budget),
+        take_width_suffix(s, tail_budget)
+    )
+}
+
+fn render_tab_segment(label: &TabLabel, max_title: usize) -> String {
+    let title = middle_truncate(&label.title, max_title);
+    // Loading tabs get a static "…" (PRD FR-ACS-2/FR-ACS-4: no animation).
+    if label.loading {
+        format!(" {}:{} … ", label.number, title)
+    } else {
+        format!(" {}:{} ", label.number, title)
+    }
+}
+
+/// Build the tab-bar segments (PRD FR-TB-1). When every numbered title fits in
+/// `width`, all are rendered. On overflow the active tab collapses to the
+/// compact `[3/17] Alan Turing` indicator and as many neighbors as fit are
+/// added outward from it, then everything is ordered left-to-right by index.
+pub fn build_tab_bar(labels: &[TabLabel], width: usize) -> Vec<TabBarSegment> {
+    if labels.is_empty() {
+        return Vec::new();
+    }
+    let full: Vec<String> = labels.iter().map(|l| render_tab_segment(l, 24)).collect();
+    let total: usize = full.iter().map(|s| display_width(s)).sum();
+    if total <= width {
+        return labels
+            .iter()
+            .zip(full)
+            .map(|(l, text)| TabBarSegment {
+                text,
+                active: l.active,
+            })
+            .collect();
+    }
+
+    let n = labels.len();
+    let active_idx = labels.iter().position(|l| l.active).unwrap_or(0);
+    let active = &labels[active_idx];
+    let compact = {
+        // The compact indicator must itself fit the bar, so its title budget
+        // is bounded by the width left after the `[a/n]` chrome, not a fixed
+        // cap — otherwise a very long active title would overflow a narrow bar.
+        let head = format!(" [{}/{}] ", active_idx + 1, n);
+        let marker = if active.loading { " …" } else { "" };
+        let chrome = display_width(&head) + display_width(marker) + 1;
+        let title_budget = width.saturating_sub(chrome).clamp(1, 24);
+        let title = middle_truncate(&active.title, title_budget);
+        format!("{head}{title}{marker} ")
+    };
+    let mut used = display_width(&compact);
+    let mut chosen: Vec<(usize, TabBarSegment)> = vec![(
+        active_idx,
+        TabBarSegment {
+            text: compact,
+            active: true,
+        },
+    )];
+
+    // Grow outward, right then left, adding a neighbor only if it still fits.
+    let mut next_right = (active_idx + 1 < n).then_some(active_idx + 1);
+    let mut next_left = active_idx.checked_sub(1);
+    loop {
+        let mut added = false;
+        if let Some(r) = next_right {
+            let seg = render_tab_segment(&labels[r], 16);
+            if used + display_width(&seg) <= width {
+                used += display_width(&seg);
+                chosen.push((
+                    r,
+                    TabBarSegment {
+                        text: seg,
+                        active: false,
+                    },
+                ));
+                next_right = (r + 1 < n).then_some(r + 1);
+                added = true;
+            } else {
+                next_right = None;
+            }
+        }
+        if let Some(l) = next_left {
+            let seg = render_tab_segment(&labels[l], 16);
+            if used + display_width(&seg) <= width {
+                used += display_width(&seg);
+                chosen.push((
+                    l,
+                    TabBarSegment {
+                        text: seg,
+                        active: false,
+                    },
+                ));
+                next_left = l.checked_sub(1);
+                added = true;
+            } else {
+                next_left = None;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+
+    chosen.sort_by_key(|(i, _)| *i);
+    chosen.into_iter().map(|(_, seg)| seg).collect()
+}
+
+/// Build the active tab's breadcrumb string (PRD FR-NV-7): the trail titles
+/// joined with " → ", middle-truncated to `width`.
+pub fn build_breadcrumb(titles: &[String], width: usize) -> String {
+    if titles.is_empty() {
+        return String::new();
+    }
+    middle_truncate(&titles.join(" → "), width)
+}
+
+fn draw_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
+    let labels = tab_labels(app);
+    let segments = build_tab_bar(&labels, area.width as usize);
+    let spans: Vec<RSpan<'static>> = segments
+        .into_iter()
+        .map(|seg| {
+            let style = if seg.active {
+                colored_bg(app.no_color, app.theme.selected_fg, app.theme.selected_bg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                colored_bg(app.no_color, app.theme.status_fg, app.theme.status_bg)
+            };
+            RSpan::styled(seg.text, style)
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(colored_bg(
+            app.no_color,
+            app.theme.status_fg,
+            app.theme.status_bg,
+        )),
+        area,
+    );
+}
+
 fn draw_reading(frame: &mut Frame, app: &mut App, area: Rect) {
-    if app.doc.is_some() {
+    if app.active_tab().doc.is_some() {
         let visible_height = area.height.max(1);
         // Build (or reuse) the width-aware layout for this width, so scroll
         // offset is measured in the same laid-out lines the app's mappings
@@ -345,21 +598,26 @@ fn draw_reading(frame: &mut Frame, app: &mut App, area: Rect) {
             .as_ref()
             .map(|l| l.lines.len() as u16)
             .unwrap_or(0);
-        app.max_scroll = total_lines.saturating_sub(visible_height);
-        app.scroll = app.scroll.min(app.max_scroll);
-        let scroll = app.scroll;
+        let max_scroll = total_lines.saturating_sub(visible_height);
+        {
+            let tab = app.active_tab_mut();
+            tab.max_scroll = max_scroll;
+            tab.scroll = tab.scroll.min(max_scroll);
+        }
+        let scroll = app.active_tab().scroll;
 
         let visited = visited_titles(app);
         if let Some(layout) = app.layout.as_ref() {
+            let tab = app.active_tab();
             let text = paint_document(
                 layout,
-                app.focused_link,
-                &app.links,
+                tab.focused_link,
+                &tab.links,
                 &visited,
                 &app.theme,
                 app.no_color,
-                &app.find_occurrences,
-                app.find_index,
+                &tab.find_occurrences,
+                tab.find_index,
             );
             let paragraph = Paragraph::new(text)
                 .style(base_style(&app.theme, app.no_color))
@@ -568,7 +826,8 @@ fn draw_search_suggestions(frame: &mut Frame, app: &App, content_area: Rect) {
 }
 
 fn draw_toc(frame: &mut Frame, app: &App, area: Rect) {
-    let items: Vec<ListItem> = app
+    let tab = app.active_tab();
+    let items: Vec<ListItem> = tab
         .sections
         .iter()
         .enumerate()
@@ -576,7 +835,7 @@ fn draw_toc(frame: &mut Frame, app: &App, area: Rect) {
             // Level 2 is the top-level "== Heading ==" tier; deeper levels
             // get progressively indented.
             let indent = "  ".repeat(section.level.saturating_sub(2) as usize);
-            let style = if i == app.selected_section {
+            let style = if i == tab.selected_section {
                 colored_bg(app.no_color, app.theme.selected_fg, app.theme.selected_bg)
             } else {
                 Style::default()
@@ -585,11 +844,90 @@ fn draw_toc(frame: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
-    let title = format!("Table of contents ({} sections)", app.sections.len());
+    let title = format!("Table of contents ({} sections)", tab.sections.len());
     let list = List::new(items)
         .style(base_style(&app.theme, app.no_color))
         .block(UiBlock::default().borders(Borders::ALL).title(title));
-    render_selectable_list(frame, list, area, app.selected_section);
+    render_selectable_list(frame, list, area, tab.selected_section);
+}
+
+/// The `bb` / `:tabs` tab picker (PRD FR-TB-1): index, title, language, and a
+/// loading marker per tab. Follows the same selectable-list pattern as the
+/// TOC and library views.
+fn draw_tab_picker(frame: &mut Frame, app: &App, area: Rect) {
+    let items: Vec<ListItem> = app
+        .tabs
+        .iter()
+        .enumerate()
+        .map(|(i, tab)| {
+            let marker = if tab.loading { "  … loading" } else { "" };
+            let line = Line::from(vec![
+                RSpan::styled(
+                    format!("{}: {}", i + 1, tab.display_title()),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                RSpan::styled(
+                    format!("   [{}]{}", tab.lang, marker),
+                    colored(app.no_color, app.theme.dim),
+                ),
+            ]);
+            let style = if i == app.selected_tab_pick {
+                colored_bg(app.no_color, app.theme.selected_fg, app.theme.selected_bg)
+            } else {
+                Style::default()
+            };
+            ListItem::new(line).style(style)
+        })
+        .collect();
+
+    let title = format!(
+        "Tabs ({}) — Enter: switch  d: close  Esc: cancel",
+        app.tabs.len()
+    );
+    let list = List::new(items)
+        .style(base_style(&app.theme, app.no_color))
+        .block(UiBlock::default().borders(Borders::ALL).title(title));
+    render_selectable_list(frame, list, area, app.selected_tab_pick);
+}
+
+/// The `gb` back-stack picker (PRD FR-NV-7): the active tab's history trail,
+/// oldest at the top. Enter jumps to the highlighted entry (browser-style).
+fn draw_history_picker(frame: &mut Frame, app: &App, area: Rect) {
+    let tab = app.active_tab();
+    let items: Vec<ListItem> = tab
+        .back_stack
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let line = Line::from(vec![
+                RSpan::styled(
+                    entry.title.clone(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                RSpan::styled(
+                    format!("   [{}]", entry.lang),
+                    colored(app.no_color, app.theme.dim),
+                ),
+            ]);
+            let style = if i == app.selected_history {
+                colored_bg(app.no_color, app.theme.selected_fg, app.theme.selected_bg)
+            } else {
+                Style::default()
+            };
+            ListItem::new(line).style(style)
+        })
+        .collect();
+
+    let current = tab
+        .doc
+        .as_ref()
+        .map(|d| d.title.as_str())
+        .unwrap_or("(none)");
+    let title = format!("History → {current} — Enter: jump  Esc: cancel");
+    let list = List::new(items)
+        .style(base_style(&app.theme, app.no_color))
+        .block(UiBlock::default().borders(Borders::ALL).title(title));
+    render_selectable_list(frame, list, area, app.selected_history);
 }
 
 fn draw_research(frame: &mut Frame, app: &App, area: Rect) {
@@ -689,6 +1027,7 @@ fn draw_library(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
+    let tab = app.active_tab();
     let text = match app.mode {
         Mode::Search if app.typeahead.is_empty() => format!(
             "/{}   Tab: full-text search   Esc: cancel",
@@ -699,23 +1038,25 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             app.search_input
         ),
         Mode::Command => format!(":{}", app.command_input),
-        Mode::Find if app.find_matches.is_empty() && !app.find_input.is_empty() => {
-            format!("find: {} (no matches)", app.find_input)
+        Mode::Find if tab.find_matches.is_empty() && !tab.find_input.is_empty() => {
+            format!("find: {} (no matches)", tab.find_input)
         }
-        Mode::Find if !app.find_matches.is_empty() => {
+        Mode::Find if !tab.find_matches.is_empty() => {
             format!(
                 "find: {} ({}/{})",
-                app.find_input,
-                app.find_index + 1,
-                app.find_matches.len()
+                tab.find_input,
+                tab.find_index + 1,
+                tab.find_matches.len()
             )
         }
-        Mode::Find => format!("find: {}", app.find_input),
+        Mode::Find => format!("find: {}", tab.find_input),
         Mode::Results if app.results.is_empty() && app.search_suggestion.is_some() => {
             "Enter: search the suggestion   Esc: cancel".to_string()
         }
         Mode::Results => "Enter: open   Esc: cancel   j/k: move".to_string(),
         Mode::Toc => "Enter: jump to section   Esc: cancel   j/k: move".to_string(),
+        Mode::TabPicker => "Enter: switch tab   d: close   Esc: cancel   j/k: move".to_string(),
+        Mode::HistoryPicker => "Enter: jump   Esc: cancel   j/k: move".to_string(),
         Mode::Research => "Enter/s: save citation   R: library   Esc: done   j/k: move".to_string(),
         // The library's status line carries transient action feedback
         // (delete/export/style outcomes overwrite it) — see open_library.
@@ -725,34 +1066,46 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         // Command feedback outranks the focused-link line until the next
         // keypress clears it (see App::notice).
         Mode::Reading if app.notice.is_some() => app.notice.clone().unwrap_or_default(),
-        Mode::Reading if !app.find_matches.is_empty() => {
+        Mode::Reading if !tab.find_matches.is_empty() => {
             format!(
                 "match {}/{} for \"{}\"   n/N: cycle   Esc: clear",
-                app.find_index + 1,
-                app.find_matches.len(),
-                app.find_input
+                tab.find_index + 1,
+                tab.find_matches.len(),
+                tab.find_input
             )
         }
         // The focused-link line takes over the status bar on any page with
         // links (nearly all of them), so the page-source indicator must
         // prefix it too or ◐/○ would never actually be seen (app.status
         // already carries the prefix via set_document).
-        Mode::Reading => match app.focused_link.and_then(|i| app.links.get(i)) {
+        Mode::Reading => match tab.focused_link.and_then(|i| tab.links.get(i)) {
             Some(link) if link.internal_title.is_some() => {
                 format!(
                     "{}→ {} ({}/{})   Tab/S-Tab: cycle   Enter: open   H: back   L: forward",
-                    app.page_source.prefix(),
+                    tab.page_source.prefix(),
                     link.text,
-                    app.focused_link.unwrap() + 1,
-                    app.links.len()
+                    tab.focused_link.unwrap() + 1,
+                    tab.links.len()
                 )
             }
             Some(link) => format!(
                 "{}→ {} (external, not yet followable)",
-                app.page_source.prefix(),
+                tab.page_source.prefix(),
                 link.text
             ),
-            None => app.status.clone(),
+            // FR-NV-7: with no notice, find, or focused link to show, the
+            // default segment is the active tab's breadcrumb trail; falls
+            // back to the plain status line before any history has built up.
+            None => {
+                let titles = app.breadcrumb_titles();
+                if titles.len() > 1 {
+                    let prefix = tab.page_source.prefix();
+                    let budget = (area.width as usize).saturating_sub(display_width(&prefix));
+                    format!("{prefix}{}", build_breadcrumb(&titles, budget))
+                } else {
+                    app.status.clone()
+                }
+            }
         },
     };
     let style = if matches!(app.mode, Mode::Search | Mode::Find | Mode::Command) {
@@ -764,8 +1117,8 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
-    let width = 60.min(area.width.saturating_sub(4)).max(20);
-    let height = 21.min(area.height.saturating_sub(4)).max(8);
+    let width = 62.min(area.width.saturating_sub(4)).max(20);
+    let height = 25.min(area.height.saturating_sub(4)).max(8);
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
         y: area.y + (area.height.saturating_sub(height)) / 2,
@@ -784,18 +1137,23 @@ fn draw_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
         Line::from("gg / G       top / bottom"),
         Line::from("Tab/S-Tab    cycle links"),
         Line::from("Enter        follow link / open selected result"),
-        Line::from("H / L        back / forward"),
+        Line::from("Ctrl-Enter   open focused link in a background tab"),
+        Line::from("H / L        back / forward (per tab, restores scroll)"),
+        Line::from("gb           back-stack picker (breadcrumb trail)"),
+        Line::from("gt / gT      next / previous tab"),
+        Line::from("bb           tab picker    u  reopen closed tab"),
         Line::from("t            table of contents"),
         Line::from("T            cycle color theme"),
         Line::from("y / Y        yank URL / Markdown link"),
-        Line::from(":            command line (:open, :lang, :theme, :export, :q)"),
+        Line::from(":            command (:open, :lang, :theme, :tab, :tabs, :q)"),
         Line::from("r            research mode: cite this page & its sources"),
         Line::from("R            library: browse/export saved bibliography"),
         Line::from("/            search: type for suggestions, Enter opens, Tab full-text"),
         Line::from("Ctrl-f       find in this page (smart-case), n/N: cycle matches"),
         Line::from("Esc          cancel / close"),
         Line::from("?            toggle this help"),
-        Line::from("q            quit"),
+        Line::from("q            close current tab (quits on the last)"),
+        Line::from("Q            quit (with y/n confirm)"),
     ]);
 
     frame.render_widget(Clear, popup);
@@ -1102,5 +1460,134 @@ mod tests {
             reversed_on(1, "science"),
             "the second piece of the SAME wrapped current match must be emphasized too"
         );
+    }
+
+    // ---- Tab bar & breadcrumb builders (PRD FR-TB-1, FR-NV-7) -----------
+
+    fn label(number: usize, title: &str, loading: bool, active: bool) -> TabLabel {
+        TabLabel {
+            number,
+            title: title.to_string(),
+            loading,
+            active,
+        }
+    }
+
+    #[test]
+    fn tab_bar_renders_every_tab_when_they_fit() {
+        let labels = vec![
+            label(1, "Alan Turing", false, true),
+            label(2, "Enigma", false, false),
+        ];
+        let segments = build_tab_bar(&labels, 80);
+        assert_eq!(segments.len(), 2, "both tabs shown when they fit");
+        let joined: String = segments.iter().map(|s| s.text.as_str()).collect();
+        assert!(joined.contains("1:Alan Turing"));
+        assert!(joined.contains("2:Enigma"));
+        assert_eq!(
+            segments.iter().filter(|s| s.active).count(),
+            1,
+            "exactly one active segment"
+        );
+        assert!(segments[0].active, "tab 1 is the active one");
+    }
+
+    #[test]
+    fn tab_bar_collapses_to_compact_indicator_on_overflow() {
+        // 17 tabs with long titles, active = tab 3 (number 3), narrow bar.
+        let mut labels: Vec<TabLabel> = (1..=17)
+            .map(|n| label(n, "Article With A Fairly Long Title", false, false))
+            .collect();
+        labels[2].active = true; // the 3rd tab
+        let width = 30;
+        let segments = build_tab_bar(&labels, width);
+
+        let joined: String = segments.iter().map(|s| s.text.as_str()).collect();
+        assert!(
+            joined.contains("[3/17]"),
+            "overflow shows the [active/total] indicator: {joined:?}"
+        );
+        assert_eq!(
+            segments.iter().filter(|s| s.active).count(),
+            1,
+            "still exactly one active segment on overflow"
+        );
+        assert!(
+            display_width(&joined) <= width,
+            "the compact bar must fit the width ({}<={width}): {joined:?}",
+            display_width(&joined)
+        );
+    }
+
+    #[test]
+    fn tab_bar_marks_a_loading_tab_with_a_static_ellipsis() {
+        let labels = vec![
+            label(1, "Alan Turing", false, true),
+            label(2, "Enigma", true, false), // loading
+        ];
+        let segments = build_tab_bar(&labels, 80);
+        let loading_seg = &segments[1];
+        assert!(
+            loading_seg.text.contains('…'),
+            "a loading tab shows a static ellipsis: {:?}",
+            loading_seg.text
+        );
+    }
+
+    #[test]
+    fn middle_truncate_keeps_head_and_tail_within_budget() {
+        let s = "A Very Long Article Title That Will Not Fit";
+        let out = middle_truncate(s, 20);
+        assert!(out.contains('…'), "truncation inserts an ellipsis: {out:?}");
+        assert!(
+            display_width(&out) <= 20,
+            "truncated width {} must fit budget",
+            display_width(&out)
+        );
+        assert!(out.starts_with('A'), "keeps the head: {out:?}");
+        assert!(out.ends_with('t'), "keeps the tail: {out:?}");
+    }
+
+    #[test]
+    fn middle_truncate_is_a_noop_when_it_fits() {
+        assert_eq!(middle_truncate("Short", 20), "Short");
+    }
+
+    #[test]
+    fn middle_truncate_is_width_aware_for_cjk() {
+        // Each CJK glyph is 2 cells wide; truncation must not split a cell.
+        let s = "アラン・チューリング計算機科学";
+        let out = middle_truncate(s, 10);
+        assert!(display_width(&out) <= 10, "CJK width respected: {out:?}");
+        assert!(out.contains('…'));
+    }
+
+    #[test]
+    fn breadcrumb_joins_the_trail_with_arrows() {
+        let trail = vec![
+            "Turing".to_string(),
+            "Enigma".to_string(),
+            "Bletchley Park".to_string(),
+        ];
+        let out = build_breadcrumb(&trail, 80);
+        assert_eq!(out, "Turing → Enigma → Bletchley Park");
+    }
+
+    #[test]
+    fn breadcrumb_middle_truncates_a_long_trail() {
+        let trail = vec![
+            "Alan Turing".to_string(),
+            "Enigma machine".to_string(),
+            "Bletchley Park".to_string(),
+            "Government Code and Cypher School".to_string(),
+        ];
+        let out = build_breadcrumb(&trail, 30);
+        assert!(display_width(&out) <= 30, "breadcrumb fits: {out:?}");
+        assert!(out.contains('…'), "long trail is truncated: {out:?}");
+    }
+
+    #[test]
+    fn breadcrumb_of_empty_trail_is_empty() {
+        assert_eq!(build_breadcrumb(&[], 40), "");
     }
 }

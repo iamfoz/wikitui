@@ -75,6 +75,7 @@ pub const DEFAULT_FORCE_REFETCH_SECS: u64 = 30 * 24 * 60 * 60;
 /// density).
 const ZSTD_LEVEL: i32 = 3;
 
+#[derive(Clone)]
 pub struct PageCache {
     /// `None` when no cache directory could be determined — every lookup
     /// misses and every store is a no-op, but reading still works.
