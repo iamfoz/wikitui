@@ -8,6 +8,7 @@ mod config;
 mod crashguard;
 mod doc;
 mod doctor;
+mod hints;
 mod layout;
 mod research;
 mod sanitize;
@@ -973,6 +974,41 @@ async fn handle_key(
             }
             _ => {}
         },
+        // PRD FR-NV-1's link hints: Esc cancels, backspace un-narrows, and
+        // any other character either narrows the visible set or (once it
+        // completes exactly one label) resolves and follows it. The actual
+        // fetch/background-tab-open happens here, not in `App`, because it
+        // needs the network/channel handles `handle_key` already has —
+        // `App::resolve_hint_action` decides WHAT to do (testable without
+        // touching either), this just carries it out.
+        Mode::Hint => match code {
+            KeyCode::Esc => app.exit_hint_mode(),
+            KeyCode::Backspace => {
+                app.hint_input.pop();
+            }
+            KeyCode::Char(c) => {
+                if let hints::HintOutcome::Resolved(link_idx) = app.narrow_hint_input(c) {
+                    let action = app.resolve_hint_action(link_idx);
+                    app.exit_hint_mode();
+                    match action {
+                        Some(app::HintFollowAction::Foreground(title)) => {
+                            open_title(client, cache, app, &title, revalidate_tx).await;
+                        }
+                        Some(app::HintFollowAction::Background(title)) => {
+                            let lang = app.lang.clone();
+                            let id = app.open_background_tab(title.clone(), lang.clone());
+                            fire_background_load(client, cache, id, lang, title, open_tx);
+                            app.status = "Opening in a background tab…".to_string();
+                        }
+                        Some(app::HintFollowAction::External(href)) => {
+                            app.status = format!("External link: {href}");
+                        }
+                        None => {}
+                    }
+                }
+            }
+            _ => {}
+        },
         Mode::Research => match code {
             KeyCode::Esc => app.mode = Mode::Reading,
             KeyCode::Char('j') | KeyCode::Down => app.cycle_citation(true),
@@ -1188,6 +1224,17 @@ async fn handle_key(
                 KeyCode::Char(' ') => app.scroll_by(15),
                 KeyCode::Tab => app.cycle_link(true),
                 KeyCode::BackTab => app.cycle_link(false),
+                // PRD FR-NV-1: `f` labels every visible link and follows the
+                // typed one in this tab; `F` does the same but resolves into
+                // a background tab (see `Mode::Hint`'s own arm below for the
+                // typing/resolution side). Guarded against Ctrl so it doesn't
+                // shadow Ctrl-f's own (later, unrelated) arm below — matching
+                // this match's existing convention of checking the more
+                // specific/guarded binding first (see Ctrl-Enter vs Enter).
+                KeyCode::Char('f') if !modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.enter_hint_mode(false)
+                }
+                KeyCode::Char('F') => app.enter_hint_mode(true),
                 // PRD FR-TB-3: Ctrl-Enter opens the focused internal link in a
                 // BACKGROUND tab — the fetch fires immediately via the tab-load
                 // channel and focus does NOT move. (Budget-aware prefetch

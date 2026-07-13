@@ -55,6 +55,13 @@ pub enum SpanKind {
     /// the paint step can look up focus/visited state by the same index the
     /// app cycles through.
     Link(usize),
+    /// A link-hint label (PRD FR-NV-1), spliced over the leading cells of a
+    /// link's own span at paint time (`hints::overlay_hint_labels`) — never
+    /// produced by `layout_document` itself, and never stored on a cached
+    /// `Layout`: hint state is as transient as focus/visited state, which
+    /// also never becomes a `SpanKind` variant of its own (see this enum's
+    /// doc comment).
+    Hint,
 }
 
 /// One styled run of text within a laid-out line.
@@ -124,6 +131,16 @@ pub struct Layout {
     /// `doc::collect_links`, so cycling links can scroll the focused link
     /// into view.
     pub link_lines: Vec<usize>,
+    /// The grapheme-column range `[start, end)` of each link occurrence's own
+    /// text on its `link_lines` line — same units as [`MatchSpan`] (grapheme
+    /// clusters from the line's own start, never display cells or bytes) and
+    /// indexed identically to `link_lines`/`doc::collect_links`. A link that
+    /// wraps across lines is only recorded here for its first line, matching
+    /// `link_lines`. This is link-hint painting's (PRD FR-NV-1) only geometry
+    /// dependency on the layout: it locates a link's own span within its line
+    /// so a hint label can be spliced in without re-deriving column offsets
+    /// from `lines` at paint time.
+    pub link_cols: Vec<MatchSpan>,
     /// `continuation[i]` is true when `lines[i]` is a soft-wrapped
     /// continuation of the very same content run as `lines[i + 1]` — no
     /// block boundary (paragraph break, list-item edge, table row, ...)
@@ -770,20 +787,29 @@ pub fn layout_document(doc: &Document, width: u16, options: LayoutOptions) -> La
         }
     }
 
-    // Map each link occurrence to the first line it appears on. Occurrence
+    // Map each link occurrence to the first line it appears on, and the
+    // grapheme-column range its own span occupies on that line. Occurrence
     // indices were assigned in document order (== collect_links order) during
     // flattening, so this fills every slot.
     let mut link_lines = vec![0usize; link_counter];
+    let mut link_cols = vec![MatchSpan { start: 0, end: 0 }; link_counter];
     let mut seen = vec![false; link_counter];
     for (i, line) in lines.iter().enumerate() {
+        let mut col = 0usize;
         for span in &line.spans {
+            let span_graphemes = span.text.graphemes(true).count();
             if let SpanKind::Link(occ) = span.kind
                 && occ < link_counter
                 && !seen[occ]
             {
                 seen[occ] = true;
                 link_lines[occ] = i;
+                link_cols[occ] = MatchSpan {
+                    start: col,
+                    end: col + span_graphemes,
+                };
             }
+            col += span_graphemes;
         }
     }
 
@@ -793,6 +819,7 @@ pub fn layout_document(doc: &Document, width: u16, options: LayoutOptions) -> La
         lines,
         block_lines,
         link_lines,
+        link_cols,
         continuation,
     }
 }
@@ -1323,6 +1350,29 @@ mod tests {
         // Link lines are non-decreasing in document order.
         for w in layout.link_lines.windows(2) {
             assert!(w[0] <= w[1], "link occurrences must be in document order");
+        }
+    }
+
+    /// `link_cols` must slice out exactly the link's own rendered text on its
+    /// `link_lines` line — the property link-hint painting (PRD FR-NV-1)
+    /// depends on to splice a label over the right cells without re-deriving
+    /// column offsets itself.
+    #[test]
+    fn link_cols_slice_out_the_links_own_rendered_text() {
+        let doc = parse_article_html("アラン・チューリング", JA_FIXTURE);
+        let links = collect_links(&doc);
+        let layout = layout_document(&doc, 40, LayoutOptions::default());
+        assert_eq!(layout.link_cols.len(), links.len());
+        for (occ, link) in links.iter().enumerate() {
+            let line = &layout.lines[layout.link_lines[occ]];
+            let text = line_text(line);
+            let graphemes: Vec<&str> = text.graphemes(true).collect();
+            let span = layout.link_cols[occ];
+            let sliced: String = graphemes[span.start..span.end].concat();
+            assert_eq!(
+                sliced, link.text,
+                "link_cols[{occ}] must bound exactly the link's own text"
+            );
         }
     }
 

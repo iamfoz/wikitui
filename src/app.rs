@@ -5,6 +5,7 @@ use crate::cache::PageCache;
 use crate::cite::CiteStyle;
 use crate::config::ConfigContext;
 use crate::doc::{Citation, Document};
+use crate::hints::{self, HintTarget};
 use crate::layout::{self, Layout, LayoutCache, LayoutOptions};
 use crate::research::{ResearchStore, SavedCitation};
 use crate::tab::{HistoryEntry, Tab, TabId};
@@ -40,6 +41,11 @@ pub enum Mode {
     /// The `gb` back-stack picker (PRD FR-NV-7): the active tab's history
     /// trail — Enter jumps to that entry (browser-style), Esc cancels.
     HistoryPicker,
+    /// Vimium-style link hints (PRD FR-NV-1): every link visible in the
+    /// viewport is labeled; typing narrows to one and follows it. Entered by
+    /// `f` (follow in this tab) or `F` (open in a background tab — see
+    /// `App::hint_background`); Esc cancels back to Reading.
+    Hint,
 }
 
 /// Where the currently open article's content came from (PRD FR-OFF-6's
@@ -63,6 +69,21 @@ pub enum PageSource {
 pub struct PendingReload {
     pub lang: String,
     pub title: String,
+}
+
+/// What a resolved link hint should do (PRD FR-NV-1), returned by
+/// `App::resolve_hint_action` — see its doc comment for why this is decided
+/// as plain data rather than performed inline (testability without the
+/// network).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HintFollowAction {
+    /// Follow this internal link in the current tab (`f`).
+    Foreground(String),
+    /// Open this internal link in a new background tab (`F`).
+    Background(String),
+    /// The resolved link has no internal target — same "not yet followable"
+    /// notice Enter already shows for a focused external link.
+    External(String),
 }
 
 impl PageSource {
@@ -211,6 +232,19 @@ pub struct App {
     /// East-Asian-Ambiguous width toggle (FR-RD-10, default false); a config
     /// file will wire this later.
     pub ambiguous_wide: bool,
+    /// The active tab's currently-labeled link hints (PRD FR-NV-1), valid
+    /// only while `mode == Mode::Hint`. Recomputed from scratch by
+    /// `refresh_hint_targets` on entry and on every draw — never patched
+    /// incrementally — so a resize mid-hint-mode can't leave a stale
+    /// line/column behind (see that method's doc comment).
+    pub hint_targets: Vec<HintTarget>,
+    /// What's been typed so far in hint mode, narrowing `hint_targets` down
+    /// to the labels that still start with it.
+    pub hint_input: String,
+    /// Which key opened hint mode: `false` for `f` (follow in this tab),
+    /// `true` for `F` (open in a background tab, FR-TB-3 integration — see
+    /// `resolve_hint_action`).
+    pub hint_background: bool,
     /// The CLI/env overrides and config file path resolved at startup
     /// (PRD §6.7), kept so `:config reload` and SIGHUP can re-run
     /// resolution against the exact same precedence layers. Defaulted by
@@ -266,6 +300,9 @@ impl App {
             viewport_height: 0,
             measure: 88,
             ambiguous_wide: false,
+            hint_targets: Vec::new(),
+            hint_input: String::new(),
+            hint_background: false,
             config_ctx: ConfigContext::default(),
         }
     }
@@ -967,6 +1004,106 @@ impl App {
             scroll
         };
         self.active_tab_mut().scroll = new;
+    }
+
+    // -- Link hints (PRD FR-NV-1) --------------------------------------
+
+    /// Enters hint mode: every link visible in the current viewport gets a
+    /// home-row label (`hints::visible_link_hints`) painted over its first
+    /// cells. `background` distinguishes `f` (follow in this tab) from `F`
+    /// (open in a background tab, FR-TB-3 integration — vimium semantics:
+    /// `F` follows once and exits hint mode immediately; looping to open
+    /// several without leaving hint mode is a v1.x nicety, not this one). A
+    /// no-op (with a status message, not a mode change) when nothing is
+    /// visible to hint.
+    pub fn enter_hint_mode(&mut self, background: bool) {
+        self.hint_background = background;
+        self.hint_input.clear();
+        self.mode = Mode::Hint;
+        self.ensure_layout();
+        self.refresh_hint_targets();
+        if self.hint_targets.is_empty() {
+            self.mode = Mode::Reading;
+            self.status = "No links visible to hint".to_string();
+        }
+    }
+
+    /// Leaves hint mode back to Reading, discarding the transient hint
+    /// state. Called on Esc and once a hint resolves — hint mode is only
+    /// ever entered from Reading, so there is no "prior mode" to restore
+    /// (unlike Help/Library).
+    pub fn exit_hint_mode(&mut self) {
+        self.mode = Mode::Reading;
+        self.hint_targets.clear();
+        self.hint_input.clear();
+    }
+
+    /// Recomputes the visible hint set from the CURRENT layout, scroll, and
+    /// viewport height (PRD FR-NV-1: "hints survive reflow"). Called once on
+    /// entry and again on every draw while `Mode::Hint` is active
+    /// (`ui::draw_reading`) — deliberately not just once — so a resize
+    /// mid-hint-mode re-labels from the layout just rebuilt for the new
+    /// width instead of replaying line/column positions computed for the
+    /// old one. Hint assignment has no state of its own beyond what
+    /// `(layout, scroll, viewport_height)` already determines, so recomputing
+    /// unconditionally is simpler than tracking "did anything actually
+    /// change" and is cheap enough to not matter (a handful of links, no
+    /// relayout). A no-op outside Hint mode.
+    pub fn refresh_hint_targets(&mut self) {
+        if self.mode != Mode::Hint {
+            return;
+        }
+        self.hint_targets = match &self.layout {
+            Some(layout) => {
+                hints::visible_link_hints(layout, self.active_tab().scroll, self.viewport_height)
+            }
+            None => Vec::new(),
+        };
+        // A resize can change which links are visible entirely. If the
+        // already-typed prefix no longer matches any label in the new set,
+        // drop it rather than leaving the reader stuck typing into a prefix
+        // that can never resolve again.
+        if !self
+            .hint_targets
+            .iter()
+            .any(|t| t.label.starts_with(&self.hint_input))
+        {
+            self.hint_input.clear();
+        }
+    }
+
+    /// Types one more character into the hint-mode prefix (PRD FR-NV-1): a
+    /// keystroke that leaves at least one hint label still matching is
+    /// committed, narrowing the visible set; one that would eliminate every
+    /// remaining hint is silently ignored (the prefix stays what it was) —
+    /// deliberately not exiting hint mode outright (the brief's other
+    /// documented option), so a single mistyped key doesn't throw the reader
+    /// back to Reading mid-hint. Esc and backspace remain the explicit ways
+    /// out/back.
+    pub fn narrow_hint_input(&mut self, c: char) -> hints::HintOutcome {
+        let mut candidate = self.hint_input.clone();
+        candidate.push(c);
+        let outcome = hints::resolve(&self.hint_targets, &candidate);
+        if !matches!(outcome, hints::HintOutcome::Ignored) {
+            self.hint_input = candidate;
+        }
+        outcome
+    }
+
+    /// What following the resolved hint at `link_idx` should do (PRD FR-NV-1
+    /// `f`/`F`), decided purely from App state — the link's `internal_title`
+    /// and whether hint mode was entered via `F` (`hint_background`) — so
+    /// it's testable without touching the network. `handle_key` is the only
+    /// caller that turns this into an actual fetch (`Foreground` via
+    /// `open_title`, `Background` via `open_background_tab`/
+    /// `fire_background_load`, mirroring the existing Ctrl-Enter path).
+    pub fn resolve_hint_action(&self, link_idx: usize) -> Option<HintFollowAction> {
+        let link = self.active_tab().links.get(link_idx)?;
+        Some(match &link.internal_title {
+            Some(title) if self.hint_background => HintFollowAction::Background(title.clone()),
+            Some(title) => HintFollowAction::Foreground(title.clone()),
+            None => HintFollowAction::External(link.href.clone()),
+        })
     }
 
     pub fn scroll_by(&mut self, delta: i32) {
@@ -1975,6 +2112,7 @@ mod tests {
             ],
             block_lines: vec![0],
             link_lines: vec![],
+            link_cols: vec![],
             continuation: vec![true],
         });
         app.layout_width = 20; // matches the hand-built Layout's `width`, so `ensure_layout` (which `update_find` calls) sees it as fresh and doesn't discard it
@@ -2275,6 +2413,176 @@ mod tests {
             app.notice.as_deref(),
             Some("updated — r to reload"),
             "switching to a tab with a pending reload re-arms the notice"
+        );
+    }
+
+    // -- Link hints (PRD FR-NV-1) ----------------------------------------
+
+    fn app_with_html(html: &str) -> App {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(crate::doc::parse_article_html("T", html));
+        app.layout_width = 80;
+        app.viewport_height = 24;
+        app
+    }
+
+    #[test]
+    fn hint_mode_with_no_visible_links_stays_in_reading() {
+        let mut app = app_with_html("<html><body><p>no links here</p></body></html>");
+        app.enter_hint_mode(false);
+        assert_eq!(
+            app.mode,
+            Mode::Reading,
+            "nothing to hint, so hint mode never actually opens"
+        );
+        assert!(app.hint_targets.is_empty());
+    }
+
+    #[test]
+    fn enter_hint_mode_labels_every_visible_link_in_reading_order() {
+        let html = r##"<html><body><p>See <a href="./A">Alpha</a> and
+            <a href="./B">Bravo</a> and <a href="./C">Charlie</a>.</p></body></html>"##;
+        let mut app = app_with_html(html);
+
+        app.enter_hint_mode(false);
+        assert_eq!(app.mode, Mode::Hint);
+        assert!(!app.hint_background, "`f` follows in the current tab");
+        assert_eq!(app.hint_targets.len(), 3);
+        assert_eq!(
+            app.hint_targets.iter().map(|t| t.link).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+
+        app.exit_hint_mode();
+        assert_eq!(app.mode, Mode::Reading);
+        assert!(app.hint_targets.is_empty());
+        assert!(app.hint_input.is_empty());
+    }
+
+    #[test]
+    fn entering_hint_mode_with_the_background_flag_records_it() {
+        let html = r##"<html><body><p>See <a href="./A">Alpha</a>.</p></body></html>"##;
+        let mut app = app_with_html(html);
+        app.enter_hint_mode(true);
+        assert!(app.hint_background, "`F` opens into a background tab");
+    }
+
+    #[test]
+    fn narrow_hint_input_ignores_unmatched_chars_and_resolves_a_completed_label() {
+        let html = r##"<html><body><p>See <a href="./A">Alpha</a> and
+            <a href="./B">Bravo</a>.</p></body></html>"##;
+        let mut app = app_with_html(html);
+        app.enter_hint_mode(false);
+
+        // Two visible links get the first two HINT_ALPHABET labels, "a" and "s".
+        assert_eq!(app.hint_targets[0].label, "a");
+        assert_eq!(app.hint_targets[1].label, "s");
+
+        // A character that's the prefix of no label is ignored outright —
+        // the typed-so-far input is left exactly as it was.
+        let outcome = app.narrow_hint_input('z');
+        assert_eq!(outcome, hints::HintOutcome::Ignored);
+        assert!(app.hint_input.is_empty());
+
+        // Typing the second link's label resolves to ITS link index, not
+        // the first's.
+        let outcome = app.narrow_hint_input('s');
+        assert_eq!(outcome, hints::HintOutcome::Resolved(1));
+    }
+
+    #[test]
+    fn resolve_hint_action_routes_by_the_background_flag_and_internal_vs_external() {
+        let html = r##"<html><body><p>See <a href="./Internal_Target">Alpha</a> and
+            <a href="https://example.com/">External</a>.</p></body></html>"##;
+        let mut app = app_with_html(html);
+
+        app.enter_hint_mode(false);
+        assert_eq!(
+            app.resolve_hint_action(0),
+            Some(HintFollowAction::Foreground("Internal Target".to_string())),
+            "`f` on an internal link follows it in this tab"
+        );
+        assert!(
+            matches!(
+                app.resolve_hint_action(1),
+                Some(HintFollowAction::External(_))
+            ),
+            "an external link's hint resolves to the same notice Enter shows today"
+        );
+
+        // The identical link resolves to `Background` once hint mode was
+        // entered via `F` instead — `handle_key` is what turns this into an
+        // actual `open_background_tab` call (PRD FR-TB-3); this only proves
+        // the ROUTING DECISION, no network involved.
+        app.enter_hint_mode(true);
+        assert_eq!(
+            app.resolve_hint_action(0),
+            Some(HintFollowAction::Background("Internal Target".to_string()))
+        );
+
+        assert_eq!(
+            app.resolve_hint_action(99),
+            None,
+            "an out-of-range link index resolves to nothing, not a panic"
+        );
+    }
+
+    /// PRD's "hints survive reflow": a resize mid-hint-mode must re-derive
+    /// the visible set from the NEW layout, not keep serving the line/column
+    /// positions computed for the old width. Built so a long filler
+    /// paragraph wraps to a different number of lines at the two widths,
+    /// pushing the one link below a viewport that used to include it —
+    /// computed from the real layouts directly, not hand-guessed, so the
+    /// test fails loudly (rather than passing vacuously) if the premise
+    /// ever stops holding.
+    #[test]
+    fn hint_targets_recompute_from_the_new_layout_after_a_resize() {
+        let mut html = String::from("<html><body><p>");
+        for _ in 0..15 {
+            html.push_str("filler word run that wraps differently at each width ");
+        }
+        html.push_str("</p><p>See <a href=\"./Target\">Target</a> here.</p></body></html>");
+        let document = crate::doc::parse_article_html("T", &html);
+
+        let wide = layout::layout_document(&document, 88, LayoutOptions::default());
+        let narrow = layout::layout_document(&document, 30, LayoutOptions::default());
+        assert_ne!(
+            wide.link_lines[0], narrow.link_lines[0],
+            "the filler must wrap to a different line count at these widths, \
+             or this test doesn't actually exercise a reflow"
+        );
+
+        let viewport_height = (wide.link_lines[0] + 1) as u16;
+        assert!(
+            narrow.link_lines[0] as u16 >= viewport_height,
+            "the narrower layout must push the link below this viewport, \
+             or this test doesn't actually exercise a reflow"
+        );
+
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(document);
+        app.viewport_height = viewport_height;
+        app.layout_width = 88;
+
+        app.enter_hint_mode(false);
+        assert_eq!(
+            app.hint_targets.len(),
+            1,
+            "the link is visible at the wide width"
+        );
+        assert_eq!(app.hint_targets[0].line, wide.link_lines[0]);
+
+        // Simulate the resize exactly as `ui::draw_reading` would notice it:
+        // a new width, then the same `ensure_layout` + `refresh_hint_targets`
+        // sequence it runs on every draw.
+        app.layout_width = 30;
+        app.ensure_layout();
+        app.refresh_hint_targets();
+        assert!(
+            app.hint_targets.is_empty(),
+            "the link scrolled below the viewport at the new width and must \
+             no longer be hinted — a stale hint here would follow the wrong \
+             thing if the reader typed its old label"
         );
     }
 }

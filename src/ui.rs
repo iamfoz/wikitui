@@ -9,7 +9,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::app::{App, Mode};
 use crate::doc::LinkRef;
-use crate::layout::{LaidLine, Layout, MatchSpan, SpanKind};
+use crate::layout::{LaidLine, MatchSpan, SpanKind};
 use crate::theme::Theme;
 
 /// Every article title in the active tab's history — its back-stack,
@@ -108,6 +108,13 @@ fn kind_style(
                 colored(no_color, color).add_modifier(Modifier::UNDERLINED)
             }
         }
+        // PRD FR-NV-1: the focus colors, swapped, so a hint label reads as
+        // visually distinct from the Tab-cycled focused-link highlight
+        // (`colored_bg(no_color, theme.focus_fg, theme.focus_bg)` above) even
+        // on the same link.
+        SpanKind::Hint => {
+            colored_bg(no_color, theme.focus_bg, theme.focus_fg).add_modifier(Modifier::BOLD)
+        }
     }
 }
 
@@ -182,8 +189,12 @@ fn paint_line(
     Line::from(spans)
 }
 
-/// Paint a laid-out document into styled text — one laid line per row, no
-/// runtime wrapping (the layout already broke lines to width).
+/// Paint laid-out lines into styled text — one laid line per row, no
+/// runtime wrapping (the layout already broke lines to width). Takes the
+/// line slice directly, rather than a whole `Layout`, so hint mode (PRD
+/// FR-NV-1) can feed it a hint-overlaid copy of `Layout::lines`
+/// (`hints::overlay_hint_labels`) without this function needing to know
+/// hints exist at all.
 ///
 /// `find_occurrences` is `App::find_occurrences` verbatim — one entry per
 /// query occurrence, in document order, each carrying one or more `(line,
@@ -194,7 +205,7 @@ fn paint_line(
 /// (PRD FR-NV-6b); every other occurrence gets just the plain highlight.
 #[allow(clippy::too_many_arguments)]
 fn paint_document(
-    layout: &Layout,
+    lines: &[LaidLine],
     focused_link: Option<usize>,
     links: &[LinkRef],
     visited: &HashSet<&str>,
@@ -203,7 +214,7 @@ fn paint_document(
     find_occurrences: &[crate::layout::Occurrence],
     find_index: usize,
 ) -> Text<'static> {
-    let mut per_line: Vec<Vec<MatchSpan>> = vec![Vec::new(); layout.lines.len()];
+    let mut per_line: Vec<Vec<MatchSpan>> = vec![Vec::new(); lines.len()];
     for occurrence in find_occurrences {
         for &(line, range) in &occurrence.pieces {
             if let Some(slot) = per_line.get_mut(line) {
@@ -217,8 +228,7 @@ fn paint_document(
         .unwrap_or(&[]);
 
     Text::from(
-        layout
-            .lines
+        lines
             .iter()
             .enumerate()
             .map(|(i, l)| {
@@ -333,7 +343,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     match app.mode {
-        Mode::Reading | Mode::Help | Mode::Search | Mode::Find | Mode::Command => {
+        Mode::Reading | Mode::Help | Mode::Search | Mode::Find | Mode::Command | Mode::Hint => {
             draw_reading(frame, app, content_area)
         }
         Mode::Results => draw_results(frame, app, content_area),
@@ -592,6 +602,12 @@ fn draw_reading(frame: &mut Frame, app: &mut App, area: Rect) {
         app.layout_width = area.width;
         app.viewport_height = visible_height;
         app.ensure_layout();
+        // PRD FR-NV-1's "hints survive reflow": recomputed every draw (not
+        // just once on entry) so a resize while hinting re-labels from the
+        // layout just rebuilt above instead of replaying stale positions —
+        // see `App::refresh_hint_targets`'s doc comment. A no-op outside hint
+        // mode.
+        app.refresh_hint_targets();
 
         let total_lines = app
             .layout
@@ -609,8 +625,22 @@ fn draw_reading(frame: &mut Frame, app: &mut App, area: Rect) {
         let visited = visited_titles(app);
         if let Some(layout) = app.layout.as_ref() {
             let tab = app.active_tab();
+            // In hint mode, paint a hint-overlaid COPY of the layout's lines
+            // (PRD FR-NV-1) rather than the cached lines themselves — hints
+            // are transient interactive state, never written back into the
+            // cacheable `Layout` (see `layout::SpanKind::Hint`'s doc comment).
+            let lines: std::borrow::Cow<[LaidLine]> = if app.mode == Mode::Hint {
+                std::borrow::Cow::Owned(crate::hints::overlay_hint_labels(
+                    &layout.lines,
+                    &app.hint_targets,
+                    &app.hint_input,
+                    app.ambiguous_wide,
+                ))
+            } else {
+                std::borrow::Cow::Borrowed(layout.lines.as_slice())
+            };
             let text = paint_document(
-                layout,
+                &lines,
                 tab.focused_link,
                 &tab.links,
                 &visited,
@@ -1038,6 +1068,11 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             app.search_input
         ),
         Mode::Command => format!(":{}", app.command_input),
+        // PRD FR-NV-1's hint-mode status line, ahead of everything Reading
+        // shows (notice, find, focused link, breadcrumb) by being its own
+        // `Mode` arm here — the same priority mechanism `Find`/`Command`
+        // already use, not a special case bolted onto `Mode::Reading`.
+        Mode::Hint => format!("hint: {}   Esc: cancel", app.hint_input),
         Mode::Find if tab.find_matches.is_empty() && !tab.find_input.is_empty() => {
             format!("find: {} (no matches)", tab.find_input)
         }
@@ -1108,7 +1143,10 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             }
         },
     };
-    let style = if matches!(app.mode, Mode::Search | Mode::Find | Mode::Command) {
+    let style = if matches!(
+        app.mode,
+        Mode::Search | Mode::Find | Mode::Command | Mode::Hint
+    ) {
         colored_bg(app.no_color, app.theme.focus_fg, app.theme.focus_bg)
     } else {
         colored_bg(app.no_color, app.theme.status_fg, app.theme.status_bg)
@@ -1136,6 +1174,8 @@ fn draw_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
         Line::from("Ctrl-d/u     half page down/up"),
         Line::from("gg / G       top / bottom"),
         Line::from("Tab/S-Tab    cycle links"),
+        Line::from("f            link hints: type the label to follow"),
+        Line::from("F            link hints: open the label in a background tab"),
         Line::from("Enter        follow link / open selected result"),
         Line::from("Ctrl-Enter   open focused link in a background tab"),
         Line::from("H / L        back / forward (per tab, restores scroll)"),
@@ -1195,7 +1235,16 @@ mod tests {
 
         let layout = layout_document(&doc, 80, LayoutOptions::default());
         let theme = Theme::terminal();
-        let text = paint_document(&layout, None, &[], &HashSet::new(), &theme, false, &[], 0);
+        let text = paint_document(
+            &layout.lines,
+            None,
+            &[],
+            &HashSet::new(),
+            &theme,
+            false,
+            &[],
+            0,
+        );
 
         for section in &sections {
             let line = layout.block_lines[section.block];
@@ -1257,7 +1306,7 @@ mod tests {
 
         let theme = Theme::full();
         let layout = layout_document(&doc, 80, LayoutOptions::default());
-        let text = paint_document(&layout, None, &links, &visited, &theme, false, &[], 0);
+        let text = paint_document(&layout.lines, None, &links, &visited, &theme, false, &[], 0);
 
         let paragraph_line = text
             .lines
@@ -1370,7 +1419,7 @@ mod tests {
         assert_eq!(occurrences.len(), 2, "one hit per paragraph");
 
         let text = paint_document(
-            &layout,
+            &layout.lines,
             None,
             &[],
             &HashSet::new(),
@@ -1437,7 +1486,7 @@ mod tests {
         };
         let theme = Theme::full();
         let text = paint_document(
-            &layout,
+            &layout.lines,
             None,
             &[],
             &HashSet::new(),
