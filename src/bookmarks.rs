@@ -353,16 +353,11 @@ pub fn parse_filter(input: &str) -> BookmarkFilter {
 /// of `query` must appear in `text`, in that order, case-insensitively —
 /// not necessarily contiguous. An empty query matches anything, which is
 /// what makes an all-tags, no-text filter (`#crypto`) match by tag alone.
+/// Delegates to `crate::fuzzy`, shared with the history picker's `/` filter
+/// and ranked search (PRD FR-HS-1) — kept as a thin wrapper here so this
+/// module's existing call sites and tests don't need to change.
 pub fn fuzzy_matches(text: &str, query: &str) -> bool {
-    if query.is_empty() {
-        return true;
-    }
-    let haystack = text.to_lowercase();
-    let mut chars = haystack.chars();
-    query
-        .to_lowercase()
-        .chars()
-        .all(|qc| chars.any(|tc| tc == qc))
+    crate::fuzzy::fuzzy_matches(text, query)
 }
 
 /// Whether `bookmark` satisfies `filter`: every named tag present (AND),

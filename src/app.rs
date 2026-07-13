@@ -67,6 +67,20 @@ pub enum Mode {
     /// Enter opens and (per `readlater_auto_dequeue`) removes the entry;
     /// `d` removes without opening; Esc closes.
     ReadLaterPicker,
+    /// `Ctrl-h` / `:history` (PRD FR-HS-1): the *persistent*, cross-session
+    /// reading-history picker backed by `history::History` — distinct from
+    /// [`Mode::HistoryPicker`] above, which is the active tab's own
+    /// back-stack trail and never survives a restart. Recency-weighted,
+    /// fuzzy-filterable via `/` ([`Mode::ReadingHistoryFilter`]); `d`
+    /// deletes that article's history, Enter reopens into the current tab,
+    /// Esc closes.
+    ReadingHistory,
+    /// The reading-history picker's `/` live filter — mirrors
+    /// [`Mode::BookmarkFilter`]'s split: every keystroke narrows
+    /// `App::history_pick_filter` and rebuilds `App::history_pick_matches`;
+    /// Enter/Esc both return to [`Mode::ReadingHistory`] with the filter
+    /// still applied.
+    ReadingHistoryFilter,
 }
 
 /// Where the currently open article's content came from (PRD FR-OFF-6's
@@ -311,6 +325,38 @@ pub struct App {
     /// `pending_export_overwrite` — the exact target path just warned
     /// about; running the same export again for that same path proceeds.
     pub pending_bookmark_export_overwrite: Option<std::path::PathBuf>,
+
+    // -- Reading history (PRD §5.5, FR-HS-1/2/4) ---------------------------
+    /// The persistent, SQLite-backed reading history (`history::History`).
+    /// Defaults to an in-memory store (see `History::in_memory`'s doc
+    /// comment) — `main::run` swaps in the real on-disk store right after
+    /// construction, exactly like `readlater_auto_dequeue`/`config_ctx`
+    /// below. This is deliberate, not an oversight: `set_document` (this
+    /// module) records a visit on every successful document install, and
+    /// dozens of existing tests build an `App` via `App::new` and call
+    /// `set_document`/`open_document` directly — defaulting to an on-disk
+    /// store would make `cargo test` write real rows into the developer's
+    /// actual state directory on every run.
+    pub history: crate::history::History,
+    /// PRD FR-PR-3's incognito gate (that chunk is not built yet — this one
+    /// only adds the flag and routes every write in this module through it,
+    /// per the PRD's "architectural requirement, do early"): when `true`,
+    /// `record_history_visit` and dwell tracking (`flush_tab_dwell`) become
+    /// no-ops. The future incognito chunk just has to flip this — from
+    /// `--incognito` (`cli::Cli::incognito`, wired in `main::run`) today,
+    /// and presumably a runtime keybind once FR-PR-3 lands.
+    pub incognito: bool,
+    /// The reading-history picker's live list (PRD FR-HS-1), rebuilt by
+    /// `refresh_history_matches` whenever `history_pick_filter` changes or
+    /// the picker (re)opens: recency-weighted, optionally fuzzy-filtered.
+    pub history_pick_matches: Vec<crate::history::Visit>,
+    /// Selection cursor into `history_pick_matches`.
+    pub history_pick_selected: usize,
+    /// The reading-history picker's `/` filter input.
+    pub history_pick_filter: String,
+    /// The mode `open_reading_history_picker` was entered from, restored on
+    /// Esc (mirrors `bookmark_prior_mode`).
+    pub history_pick_prior_mode: Mode,
 }
 
 impl App {
@@ -375,6 +421,12 @@ impl App {
             readlater_prior_mode: Mode::Reading,
             readlater_auto_dequeue: true,
             pending_bookmark_export_overwrite: None,
+            history: crate::history::History::in_memory(),
+            incognito: false,
+            history_pick_matches: Vec::new(),
+            history_pick_selected: 0,
+            history_pick_filter: String::new(),
+            history_pick_prior_mode: Mode::Reading,
         }
     }
 
@@ -435,6 +487,9 @@ impl App {
         if index >= self.tabs.len() {
             return false;
         }
+        // PRD FR-HS-1's dwell time stops accumulating the moment a tab
+        // closes; flush before the tab (and its tracking fields) are gone.
+        self.flush_tab_dwell(index);
         let tab = self.tabs.remove(index);
         self.push_closed(tab);
         if self.tabs.is_empty() {
@@ -727,9 +782,32 @@ impl App {
     /// back/forward stacks (used after `navigate_*`/`jump_to_back_entry`,
     /// which already adjusted them). The caller sets the tab's
     /// `page_source`/`current_revid` first; this installs the document,
-    /// rebuilds the app-global citation list, and refreshes the status line.
+    /// rebuilds the app-global citation list, refreshes the status line,
+    /// and — PRD FR-HS-1 — is the one place a reading-history visit gets
+    /// recorded: this is "an article successfully renders in a tab," the
+    /// installation point every navigation path (`open_document`, back/
+    /// forward, bookmark/read-later/history-picker reopen, the SWR "r to
+    /// reload") funnels through.
     pub fn set_document(&mut self, doc: Document) {
         let lang = self.lang.clone();
+        let index = self.active;
+
+        // Whatever the active tab was showing before this moment stops
+        // accumulating dwell time now (PRD FR-HS-1) — must happen before
+        // `install_document` clears the tracking fields below.
+        self.flush_tab_dwell(index);
+        // The referrer (PRD FR-HS-1's "referrer article") is the top of the
+        // back stack at this exact moment: for a fresh navigation
+        // (`open_document`) that is precisely the article just pushed off
+        // screen by this move; for back/forward navigation it reflects an
+        // earlier point in the tab's own trail rather than "pressed back" —
+        // a documented simplification, not a distinct code path per
+        // navigation kind.
+        let referrer = self
+            .active_tab()
+            .back_stack
+            .last()
+            .map(|e| (e.lang.clone(), e.title.clone()));
 
         // Element 0 is always this article's own citation; the rest are
         // whatever it cites (Research mode, PRD-adjacent feature request).
@@ -743,12 +821,168 @@ impl App {
             tab.lang = lang;
             tab.install_document(doc);
         }
+        self.record_history_visit(index, referrer);
         self.mode = Mode::Reading;
         // A new document invalidates the cached layout; it is rebuilt lazily
         // (from L1 if available, else a fresh layout pass) on the next draw
         // or mapping lookup at the current width — see `ensure_layout`.
         self.layout = None;
         self.refresh_reading_status();
+    }
+
+    // -- Reading history (PRD FR-HS-1/2/4) ---------------------------------
+
+    /// Records a visit to whatever document is now installed at
+    /// `tabs[index]` (PRD FR-HS-1), unless `self.incognito` — the one gate
+    /// every write in this module routes through (PRD FR-PR-3, not built
+    /// yet). Starts that tab's dwell clock running from now. Called by
+    /// `set_document` for the active tab and by `main::apply_tab_load_outcome`
+    /// for a background tab's fetch completion — the only two places a
+    /// document is ever installed. A no-op if the tab index is gone or has
+    /// no document (nothing to record).
+    pub(crate) fn record_history_visit(
+        &mut self,
+        index: usize,
+        referrer: Option<(String, String)>,
+    ) {
+        if self.incognito {
+            return;
+        }
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let Some(title) = tab.doc.as_ref().map(|d| d.title.clone()) else {
+            return;
+        };
+        let lang = tab.lang.clone();
+        let referrer_ref = referrer.as_ref().map(|(l, t)| (l.as_str(), t.as_str()));
+        let id = self.history.record_visit(&lang, &title, referrer_ref);
+        let tab = &mut self.tabs[index];
+        tab.history_visit_id = id;
+        tab.visit_started_at = Some(std::time::Instant::now());
+    }
+
+    /// Flushes accumulated dwell time for `tabs[index]`'s current visit
+    /// (PRD FR-HS-1): called right before that tab's document is replaced
+    /// (`set_document`), the tab closes (`close_tab`), or the app exits
+    /// (`flush_all_tab_dwell`). A no-op if nothing is being tracked there
+    /// (no document, incognito — in which case `history_visit_id` was
+    /// never set — or a write already failed and produced no id).
+    fn flush_tab_dwell(&mut self, index: usize) {
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return;
+        };
+        let id = tab.history_visit_id.take();
+        let started = tab.visit_started_at.take();
+        if let (Some(id), Some(started)) = (id, started) {
+            self.history.update_dwell(id, started.elapsed().as_secs());
+        }
+    }
+
+    /// Flushes dwell time for every open tab (PRD FR-HS-1): called once,
+    /// right before the app exits — "the tab closes or the app exits" from
+    /// the requirement's dwell-tracking wording. Closing an individual tab
+    /// mid-session goes through `close_tab`, which flushes just that one.
+    pub fn flush_all_tab_dwell(&mut self) {
+        for index in 0..self.tabs.len() {
+            self.flush_tab_dwell(index);
+        }
+    }
+
+    /// `Ctrl-h` / `:history` (PRD FR-HS-1): opens the persistent
+    /// reading-history picker over the most recent visit to each article,
+    /// most-recent-first.
+    pub fn open_reading_history_picker(&mut self) {
+        self.history_pick_prior_mode = self.mode;
+        self.mode = Mode::ReadingHistory;
+        self.history_pick_filter.clear();
+        self.refresh_history_matches();
+        self.status = "j/k: move   /: filter   d: delete   Enter: open   Esc: close".to_string();
+    }
+
+    pub fn close_reading_history_picker(&mut self) {
+        self.mode = self.history_pick_prior_mode;
+        self.status = match &self.active_tab().doc {
+            Some(doc) => doc.title.clone(),
+            None => "Press / to search, ? for help, q to quit".to_string(),
+        };
+    }
+
+    /// How many rows the picker asks for — generous enough that "recent
+    /// history" and "fuzzy search over history" both feel unbounded in
+    /// practice without ever loading the entire table into the picker.
+    const HISTORY_PICKER_LIMIT: usize = 200;
+
+    /// Rebuilds `history_pick_matches` from `history_pick_filter` (PRD
+    /// FR-HS-1): an empty filter is plain recency (`History::recent`); a
+    /// non-empty one is `History::search`'s fuzzy, recency-weighted
+    /// ranking (see that method's doc comment for exactly how the two
+    /// combine). Resets the selection — a narrower or wider list makes the
+    /// old cursor position meaningless.
+    pub fn refresh_history_matches(&mut self) {
+        self.history_pick_matches = if self.history_pick_filter.trim().is_empty() {
+            self.history.recent(Self::HISTORY_PICKER_LIMIT)
+        } else {
+            self.history
+                .search(&self.history_pick_filter, Self::HISTORY_PICKER_LIMIT)
+        };
+        self.history_pick_selected = 0;
+    }
+
+    /// Moves the picker's selection, wrapping — a no-op with nothing shown.
+    pub fn cycle_history_pick(&mut self, forward: bool) {
+        let len = self.history_pick_matches.len();
+        if len == 0 {
+            return;
+        }
+        self.history_pick_selected = if forward {
+            (self.history_pick_selected + 1) % len
+        } else {
+            (self.history_pick_selected + len - 1) % len
+        };
+    }
+
+    /// `d` in the picker (PRD FR-HS-4): deletes every visit to the selected
+    /// article, then refreshes the list so it disappears immediately.
+    pub fn delete_selected_history(&mut self) {
+        let Some(visit) = self
+            .history_pick_matches
+            .get(self.history_pick_selected)
+            .cloned()
+        else {
+            return;
+        };
+        self.status = match self.history.clear(crate::history::ClearRange::Article {
+            lang: visit.lang.clone(),
+            title: visit.title.clone(),
+        }) {
+            Ok(_) => format!("Removed \"{}\" from history", visit.title),
+            Err(e) => format!("Removed from this session, but the database update failed: {e}"),
+        };
+        self.refresh_history_matches();
+    }
+
+    /// `:history clear today|all` (PRD FR-HS-4). "today" clears visits
+    /// opened since *local* midnight (`history::today_start_unix`) — the
+    /// reader's own calendar day, not UTC's (same reasoning as `research::
+    /// today`). Refreshes the picker's list too, in case it's open.
+    pub fn clear_history(&mut self, scope: crate::command::HistoryClearScope) {
+        let range = match scope {
+            crate::command::HistoryClearScope::All => crate::history::ClearRange::All,
+            crate::command::HistoryClearScope::Today => {
+                crate::history::ClearRange::Since(crate::history::today_start_unix())
+            }
+        };
+        self.notice = Some(match self.history.clear(range) {
+            Ok(n) => format!(
+                "Cleared {n} history entr{}",
+                if n == 1 { "y" } else { "ies" }
+            ),
+            Err(e) => format!("Clearing history failed: {e}"),
+        });
+        if self.mode == Mode::ReadingHistory {
+            self.refresh_history_matches();
+        }
     }
 
     /// Swaps in the content a background revalidation already wrote to L2

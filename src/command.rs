@@ -53,11 +53,31 @@ pub enum Command {
     },
     /// `:readlater` — open the read-later queue view.
     ReadLater,
+    /// `:history` (PRD FR-HS-1) — bare form opens the fuzzy reading-history
+    /// picker (same view as Ctrl-h), mirroring `:bookmarks`' "bare opens the
+    /// picker" convention.
+    History,
+    /// `:history clear today|all` (PRD FR-HS-4): `today` removes visits
+    /// opened since local midnight, `all` empties the whole history.
+    /// Clearing a single article stays picker-only (`d`), not an
+    /// ex-command argument.
+    HistoryClear(HistoryClearScope),
     /// `:q` / `:quit` — exit.
     Quit,
 }
 
-pub const USAGE: &str = "commands: open <title>, lang <code>, theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, config reload, help, quit";
+/// `:history clear`'s two documented scopes (PRD FR-HS-4). Kept separate
+/// from `history::ClearRange` — that type's `Since`/`Before` cutoffs are
+/// unix timestamps, which parsing has no business computing; resolving
+/// `Today` into an actual cutoff happens at execution time
+/// (`App::clear_history`), not here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryClearScope {
+    Today,
+    All,
+}
+
+pub const USAGE: &str = "commands: open <title>, lang <code>, theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], config reload, help, quit";
 
 pub fn parse(input: &str) -> Result<Command, String> {
     let input = input.trim();
@@ -172,6 +192,28 @@ pub fn parse(input: &str) -> Result<Command, String> {
             }
         }
         "readlater" => Ok(Command::ReadLater),
+        // `:history` alone opens the picker; `:history clear today|all`
+        // clears it (PRD FR-HS-1/4).
+        "history" => {
+            let (sub, rest) = match arg.split_once(char::is_whitespace) {
+                Some((s, r)) => (s, r.trim()),
+                None => (arg, ""),
+            };
+            match sub {
+                "" => Ok(Command::History),
+                "clear" => match rest {
+                    "all" => Ok(Command::HistoryClear(HistoryClearScope::All)),
+                    "today" => Ok(Command::HistoryClear(HistoryClearScope::Today)),
+                    "" => Err("usage: :history clear today|all".to_string()),
+                    other => Err(format!(
+                        "unknown history clear scope {other:?} — one of: today, all"
+                    )),
+                },
+                other => Err(format!(
+                    "unknown history subcommand {other:?} — try: history, history clear today|all"
+                )),
+            }
+        }
         "library" | "lib" => Ok(Command::Library),
         "research" => Ok(Command::Research),
         "toc" => Ok(Command::Toc),
@@ -321,5 +363,29 @@ mod tests {
         assert!(parse("bookmarks export").is_err());
         assert!(parse("bookmarks export carrier-pigeon").is_err());
         assert!(parse("bookmarks frobnicate").is_err());
+    }
+
+    #[test]
+    fn history_bare_opens_the_picker() {
+        assert_eq!(parse("history"), Ok(Command::History));
+    }
+
+    #[test]
+    fn history_clear_parses_both_scopes() {
+        assert_eq!(
+            parse("history clear all"),
+            Ok(Command::HistoryClear(HistoryClearScope::All))
+        );
+        assert_eq!(
+            parse("history clear today"),
+            Ok(Command::HistoryClear(HistoryClearScope::Today))
+        );
+    }
+
+    #[test]
+    fn history_clear_rejects_bad_input() {
+        assert!(parse("history clear").is_err());
+        assert!(parse("history clear yesterday").is_err());
+        assert!(parse("history frobnicate").is_err());
     }
 }

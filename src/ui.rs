@@ -12,15 +12,27 @@ use crate::doc::LinkRef;
 use crate::layout::{LaidLine, MatchSpan, SpanKind};
 use crate::theme::Theme;
 
-/// Every article title in the active tab's history — its back-stack,
-/// forward-stack, and the one currently on screen — used to style
-/// already-read links differently from unread ones (PRD FR-HS-2).
+/// Every title that should render as "visited" in the active tab (PRD
+/// FR-HS-2): this session's own back-stack, forward-stack, and the article
+/// currently on screen — so a page opened this session but not yet
+/// committed to the persistent history (or opened while incognito) still
+/// shows visited — **plus** every `(lang, title)` the persistent,
+/// cross-session `history::History` store has ever recorded for this tab's
+/// language, so a link stays visited across restarts too. The persistent
+/// half is a single `HashMap` lookup (`History::visited_titles_for_lang`),
+/// not a query — see that method's doc comment for why: this runs once per
+/// draw, but the caller checks membership once per visible link, and a
+/// disk hit per link per frame is exactly what the in-memory cache exists
+/// to avoid.
 fn visited_titles(app: &App) -> HashSet<&str> {
     let tab = app.active_tab();
     let mut set: HashSet<&str> = tab.back_stack.iter().map(|e| e.title.as_str()).collect();
     set.extend(tab.forward_stack.iter().map(|e| e.title.as_str()));
     if let Some(doc) = &tab.doc {
         set.insert(doc.title.as_str());
+    }
+    if let Some(titles) = app.history.visited_titles_for_lang(&tab.lang) {
+        set.extend(titles.iter().map(String::as_str));
     }
     set
 }
@@ -358,6 +370,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             draw_bookmark_picker(frame, app, content_area)
         }
         Mode::ReadLaterPicker => draw_readlater_picker(frame, app, content_area),
+        Mode::ReadingHistory | Mode::ReadingHistoryFilter => {
+            draw_reading_history_picker(frame, app, content_area)
+        }
     }
 
     draw_status_bar(frame, app, status_area);
@@ -1181,6 +1196,63 @@ fn reading_time_estimate(_entry: &crate::bookmarks::ReadLaterEntry) -> &'static 
     "—"
 }
 
+/// `Ctrl-h` / `:history`'s persistent reading-history picker (PRD FR-HS-1):
+/// title, language (only when it differs from the app-global default —
+/// most installs read one language, so a `[en]` tag on every row would be
+/// noise), relative visit time, and dwell when it's long enough to be worth
+/// mentioning. Reads from `app.history_pick_matches`
+/// (`App::refresh_history_matches`'s output), not a live query — this is a
+/// paint function, not a place to hit SQLite from.
+fn draw_reading_history_picker(frame: &mut Frame, app: &App, area: Rect) {
+    let items: Vec<ListItem> = app
+        .history_pick_matches
+        .iter()
+        .enumerate()
+        .map(|(i, visit)| {
+            let mut detail = format!(
+                "   {}",
+                crate::history::relative_time(crate::history::now_unix() - visit.opened_at)
+            );
+            if visit.lang != app.lang {
+                detail = format!("   [{}]{detail}", visit.lang);
+            }
+            if visit.dwell_secs >= 30 {
+                detail.push_str(&format!(
+                    "   ~{}",
+                    crate::cache::age_human(visit.dwell_secs as u64)
+                ));
+            }
+            let line = Line::from(vec![
+                RSpan::styled(
+                    visit.title.clone(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                RSpan::styled(detail, colored(app.no_color, app.theme.dim)),
+            ]);
+            let style = if i == app.history_pick_selected {
+                colored_bg(app.no_color, app.theme.selected_fg, app.theme.selected_bg)
+            } else {
+                Style::default()
+            };
+            ListItem::new(line).style(style)
+        })
+        .collect();
+
+    let filter_note = if app.history_pick_filter.is_empty() {
+        String::new()
+    } else {
+        format!(" (filter: {})", app.history_pick_filter)
+    };
+    let title = format!(
+        "History ({}){filter_note} — Enter: open  /: filter  d: delete  Esc: close",
+        app.history_pick_matches.len()
+    );
+    let list = List::new(items)
+        .style(base_style(&app.theme, app.no_color))
+        .block(UiBlock::default().borders(Borders::ALL).title(title));
+    render_selectable_list(frame, list, area, app.history_pick_selected);
+}
+
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let tab = app.active_tab();
     let text = match app.mode {
@@ -1232,6 +1304,10 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         }
         Mode::BookmarkPicker => app.status.clone(),
         Mode::ReadLaterPicker => app.status.clone(),
+        Mode::ReadingHistory => app.status.clone(),
+        Mode::ReadingHistoryFilter => {
+            format!("filter: {}   Esc: apply", app.history_pick_filter)
+        }
         Mode::Help => "Press any key to close help".to_string(),
         Mode::Reading if app.loading => "Loading…".to_string(),
         // Command feedback outranks the focused-link line until the next
@@ -1321,6 +1397,7 @@ fn draw_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
         Line::from("Ctrl-Enter   open focused link in a background tab"),
         Line::from("H / L        back / forward (per tab, restores scroll)"),
         Line::from("gb           back-stack picker (breadcrumb trail)"),
+        Line::from("Ctrl-h       reading history (persistent)   :history clear today|all"),
         Line::from("gt / gT      next / previous tab"),
         Line::from("bb           tab picker    u  reopen closed tab"),
         Line::from("t            table of contents"),

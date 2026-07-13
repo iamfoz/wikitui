@@ -175,6 +175,9 @@ pub struct ResolvedConfig {
     /// PRD FR-BM-3's "(config)" read-later behavior: whether opening a
     /// queued entry removes it. Defaults to `true`.
     pub readlater_auto_dequeue: Valued<bool>,
+    /// PRD FR-HS-4's retention window: `history::History::retention_prune`
+    /// runs with this at startup. `0` (the default) means "keep forever."
+    pub history_retention_days: Valued<u64>,
     /// Parse errors, unknown keys, and rejected values — never fatal, but
     /// `doctor` reports them and exits 1 if any is `IssueLevel::Error`.
     pub issues: Vec<Issue>,
@@ -242,6 +245,7 @@ pub fn resolve(
         "active_wiki",
         "wiki",
         "readlater_auto_dequeue",
+        "history",
     ]
     .into_iter()
     .collect();
@@ -304,6 +308,7 @@ pub fn resolve(
         resolve_cache(&table, &mut issues);
     let (active_wiki, base_url_template) = resolve_wiki(env, &table, &mut issues);
     let readlater_auto_dequeue = resolve_readlater_auto_dequeue(env, &table, &mut issues);
+    let history_retention_days = resolve_history(&table, &mut issues);
 
     ResolvedConfig {
         config_version: Valued {
@@ -326,6 +331,7 @@ pub fn resolve(
         active_wiki,
         base_url_template,
         readlater_auto_dequeue,
+        history_retention_days,
         migration_summary: config_version.1,
         issues,
         config_path: config_path.map(Path::to_path_buf),
@@ -739,6 +745,54 @@ fn resolve_readlater_auto_dequeue(
             }
         },
         None => default,
+    }
+}
+
+/// PRD FR-HS-4's `[history] retention_days`: file-only, like `cache.*` —
+/// a preference set once in `config.toml`, not worth a CLI flag or env var
+/// for a single run. `0` (default) means "keep forever"; the resolver
+/// deliberately accepts `0` as a valid, meaningful file value (unlike
+/// `resolve_positive_int`, which would reject it) since it's the
+/// documented "don't prune" setting, not a mistake.
+fn resolve_history(table: &toml::Table, issues: &mut Vec<Issue>) -> Valued<u64> {
+    const DEFAULT_RETENTION_DAYS: u64 = 0;
+    let default = Valued {
+        value: DEFAULT_RETENTION_DAYS,
+        source: Source::Default,
+    };
+
+    let Some(history_table) = table.get("history").and_then(toml::Value::as_table) else {
+        if table.contains_key("history") {
+            issues.push(Issue::warning(
+                "history must be a table (use [history] with retention_days); ignoring",
+            ));
+        }
+        return default;
+    };
+
+    let known: BTreeSet<&str> = ["retention_days"].into_iter().collect();
+    for key in history_table.keys() {
+        if !known.contains(key.as_str()) {
+            issues.push(Issue::warning(format!(
+                "unknown config key 'history.{key}' — ignored"
+            )));
+        }
+    }
+
+    match history_table.get("retention_days") {
+        None => default,
+        Some(v) => match v.as_integer().filter(|n| *n >= 0) {
+            Some(n) => Valued {
+                value: n as u64,
+                source: Source::File,
+            },
+            None => {
+                issues.push(Issue::warning(
+                    "history.retention_days must be a non-negative integer; using default 0 (keep forever)",
+                ));
+                default
+            }
+        },
     }
 }
 
@@ -1218,6 +1272,92 @@ mod tests {
             i.message
                 .contains("readlater_auto_dequeue must be a boolean")
         }));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn history_retention_days_defaults_to_zero_keep_forever() {
+        let default = resolve(&CliOverrides::default(), &EnvOverrides::default(), None);
+        assert_eq!(default.history_retention_days.value, 0);
+        assert_eq!(default.history_retention_days.source, Source::Default);
+    }
+
+    #[test]
+    fn history_retention_days_honors_the_file() {
+        let path = temp_config("[history]\nretention_days = 90\n");
+        let resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(resolved.history_retention_days.value, 90);
+        assert_eq!(resolved.history_retention_days.source, Source::File);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn history_retention_days_accepts_zero_as_a_real_file_value() {
+        // 0 is the meaningful "keep forever" setting, not an error — unlike
+        // `resolve_positive_int`'s fields, it must round-trip from the file.
+        let path = temp_config("[history]\nretention_days = 0\n");
+        let resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(resolved.history_retention_days.value, 0);
+        assert_eq!(resolved.history_retention_days.source, Source::File);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn history_retention_days_rejects_negative_and_non_integer_values() {
+        let path = temp_config("[history]\nretention_days = -5\n");
+        let resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(resolved.history_retention_days.value, 0);
+        assert_eq!(resolved.history_retention_days.source, Source::Default);
+        assert!(
+            resolved
+                .issues
+                .iter()
+                .any(|i| i.message.contains("history.retention_days"))
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn history_unknown_keys_and_non_table_shape_warn() {
+        let path = temp_config("[history]\nretention_days = 30\nbogus = 1\n");
+        let resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert!(
+            resolved
+                .issues
+                .iter()
+                .any(|i| i.message.contains("history.bogus"))
+        );
+        cleanup(&path);
+
+        let path = temp_config("history = 5\n");
+        let resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(resolved.history_retention_days.value, 0);
+        assert!(
+            resolved
+                .issues
+                .iter()
+                .any(|i| i.message.contains("history must be a table"))
+        );
         cleanup(&path);
     }
 

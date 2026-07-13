@@ -60,6 +60,13 @@ pub struct Cli {
     /// directory and `WIKITUI_CONFIG` (PRD §6.7).
     #[arg(long, value_name = "PATH")]
     pub config: Option<PathBuf>,
+
+    /// Incognito mode (FR-CS-6, FR-PR-3): no reading-history writes for
+    /// this run — see `App.incognito`'s doc comment for the full gate
+    /// (stats/interest-model/prefetch suppression arrive with the rest of
+    /// FR-PR-3, not built yet).
+    #[arg(long)]
+    pub incognito: bool,
 }
 
 #[derive(Subcommand, Debug)]

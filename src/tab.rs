@@ -73,6 +73,20 @@ pub struct Tab {
     /// only shows while this tab is active; switching to a tab that has this
     /// armed re-shows the notice (per the tab-routing requirement).
     pub pending_reload: Option<PendingReload>,
+    /// The row id `history::History::record_visit` returned for the
+    /// currently-installed document (PRD FR-HS-1), or `None` when nothing
+    /// is being tracked (empty tab, incognito, or the write failed). Paired
+    /// with `visit_started_at`; both are cleared together by
+    /// `App::flush_tab_dwell` and by `install_document` resetting them for
+    /// a fresh document.
+    pub history_visit_id: Option<i64>,
+    /// When the currently-installed document became "the one on screen" in
+    /// this tab, for dwell-time accounting (PRD FR-HS-1). `std::time::
+    /// Instant`, not a `chrono` timestamp: this measures *elapsed* wall
+    /// time, the same monotonic-clock job `app.rs`'s typeahead debounce
+    /// already uses `Instant` for — not a second, independent clock
+    /// convention.
+    pub visit_started_at: Option<std::time::Instant>,
 }
 
 impl Tab {
@@ -99,6 +113,8 @@ impl Tab {
             loading: false,
             pending_title: None,
             pending_reload: None,
+            history_visit_id: None,
+            visit_started_at: None,
         }
     }
 
@@ -131,6 +147,16 @@ impl Tab {
         // A newly installed document is, by definition, not the one a still
         // pending reload notice was about.
         self.pending_reload = None;
+        // Whatever history-visit/dwell tracking belonged to the previous
+        // document is stale now; `App::set_document` (the only caller with
+        // access to `history::History`) is responsible for flushing that
+        // dwell *before* calling this and for recording the new visit
+        // *after* — see its doc comment. Resetting unconditionally here
+        // keeps that invariant true even for a background tab's first-ever
+        // install (`main::apply_tab_load_outcome`), which had nothing to
+        // flush in the first place.
+        self.history_visit_id = None;
+        self.visit_started_at = None;
         self.clear_find();
     }
 

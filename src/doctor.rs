@@ -90,6 +90,16 @@ fn print_resolved_config(resolved: &ResolvedConfig) {
         "  readlater_auto_dequeue = {} ({})",
         resolved.readlater_auto_dequeue.value, resolved.readlater_auto_dequeue.source
     );
+    println!(
+        "  history.retention_days = {} ({}){}",
+        resolved.history_retention_days.value,
+        resolved.history_retention_days.source,
+        if resolved.history_retention_days.value == 0 {
+            " -- keep forever"
+        } else {
+            ""
+        }
+    );
 }
 
 fn print_problems(resolved: &ResolvedConfig) {

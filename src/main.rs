@@ -10,7 +10,9 @@ mod config;
 mod crashguard;
 mod doc;
 mod doctor;
+mod fuzzy;
 mod hints;
+mod history;
 mod jsonl;
 mod layout;
 mod research;
@@ -243,6 +245,7 @@ async fn main() -> Result<()> {
         resolved.ambiguous_wide.value,
         cite_style,
         resolved.readlater_auto_dequeue.value,
+        resolved.history_retention_days.value,
         config_ctx,
         reload_flag,
     )
@@ -538,6 +541,13 @@ fn apply_tab_load_outcome(
                 tab.current_revid = fetch.revid;
                 tab.install_document(document);
             }
+            // PRD FR-HS-1: a background tab's fetch landing is "an article
+            // successfully renders in a tab" too, same as the active tab's
+            // own `App::set_document` — no referrer is captured for a
+            // background open today (the tab that spawned it isn't
+            // threaded through `TabLoadOutcome`), a documented limitation
+            // rather than a missing feature.
+            app.record_history_visit(index, None);
             // If this tab happens to be the active one (the reader switched to
             // it while it loaded), refresh the app-global view state.
             if index == app.active {
@@ -746,6 +756,7 @@ async fn run(
     ambiguous_wide: bool,
     cite_style: CiteStyle,
     readlater_auto_dequeue: bool,
+    history_retention_days: u64,
     config_ctx: ConfigContext,
     reload_flag: Arc<AtomicBool>,
 ) -> Result<()> {
@@ -755,6 +766,14 @@ async fn run(
     app.cite_style = cite_style;
     app.readlater_auto_dequeue = readlater_auto_dequeue;
     app.config_ctx = config_ctx;
+    app.incognito = cli.incognito;
+    // The real, on-disk reading history (PRD §6.4) — `App::new` defaults to
+    // an in-memory store precisely so this line, not construction, is the
+    // one place the real state directory gets touched (see `App.history`'s
+    // doc comment). `retention_prune` runs once here, at startup, per PRD
+    // FR-HS-4.
+    app.history = history::History::open();
+    app.history.retention_prune(history_retention_days);
 
     // Delivers typeahead responses, background revalidation outcomes, and
     // background-tab fetch results back to the loop (PRD FR-SR-1 / FR-OFF-2 /
@@ -871,6 +890,10 @@ async fn run(
             break;
         }
     }
+
+    // PRD FR-HS-1's dwell time: whatever every open tab is still showing
+    // stops accumulating dwell the moment the app exits.
+    app.flush_all_tab_dwell();
 
     Ok(())
 }
@@ -1371,6 +1394,51 @@ async fn handle_key(
             }
             _ => {}
         },
+        // `Ctrl-h` / `:history`'s persistent reading-history picker (PRD
+        // FR-HS-1): `/` enters the live filter (`Mode::ReadingHistoryFilter`),
+        // `d` deletes that article's whole history, Enter opens in this tab
+        // (consistent with every other picker — no new-tab surprise).
+        Mode::ReadingHistory => match code {
+            KeyCode::Esc => app.close_reading_history_picker(),
+            KeyCode::Char('j') | KeyCode::Down => app.cycle_history_pick(true),
+            KeyCode::Char('k') | KeyCode::Up => app.cycle_history_pick(false),
+            KeyCode::Char('/') => app.mode = Mode::ReadingHistoryFilter,
+            KeyCode::Char('d') => app.delete_selected_history(),
+            KeyCode::Enter => {
+                if let Some(visit) = app
+                    .history_pick_matches
+                    .get(app.history_pick_selected)
+                    .cloned()
+                {
+                    app.lang = visit.lang.clone();
+                    open_title(client, cache, app, &visit.title, revalidate_tx).await;
+                }
+            }
+            KeyCode::Char('?') => {
+                app.prior_mode = app.mode;
+                app.mode = Mode::Help;
+            }
+            _ => {}
+        },
+        // The reading-history picker's `/` filter: every keystroke narrows
+        // `history_pick_filter` and rebuilds `history_pick_matches` right
+        // away (unlike the bookmark filter's on-the-fly `visible_bookmarks`,
+        // this list is a materialized, recency/fuzzy-ranked query result —
+        // rebuilding it on every draw instead of every keystroke would mean
+        // re-querying at 60 Hz for no reason). Enter/Esc both return to
+        // `Mode::ReadingHistory` with the filter still applied.
+        Mode::ReadingHistoryFilter => match code {
+            KeyCode::Esc | KeyCode::Enter => app.mode = Mode::ReadingHistory,
+            KeyCode::Backspace => {
+                app.history_pick_filter.pop();
+                app.refresh_history_matches();
+            }
+            KeyCode::Char(c) => {
+                app.history_pick_filter.push(c);
+                app.refresh_history_matches();
+            }
+            _ => {}
+        },
         Mode::Reading => {
             // g-prefix chords (PRD Appendix B): the g-latch's second key.
             // `gg` top, `gt`/`gT` next/prev tab (FR-TB-1), `gb` back-stack
@@ -1618,6 +1686,11 @@ async fn handle_key(
                 KeyCode::Char('m') => app.toggle_bookmark(),
                 KeyCode::Char('B') => app.open_bookmark_picker(),
                 KeyCode::Char('R') => app.open_library(),
+                // PRD FR-HS-1: Ctrl-h opens the persistent reading-history
+                // picker (distinct from `gb`'s per-tab back-stack picker).
+                KeyCode::Char('h') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.open_reading_history_picker();
+                }
                 KeyCode::Char('f') if modifiers.contains(KeyModifiers::CONTROL) => {
                     app.mode = Mode::Find;
                     app.clear_find();
@@ -1757,6 +1830,8 @@ async fn execute_command(
             app.export_bookmarks(&format, path.as_deref());
         }
         Command::ReadLater => app.open_readlater_picker(),
+        Command::History => app.open_reading_history_picker(),
+        Command::HistoryClear(scope) => app.clear_history(scope),
         Command::Quit => app.should_quit = true,
     }
 }
