@@ -295,6 +295,29 @@ pub struct App {
     /// tests never touch it (there's no file to reload from `::default()`).
     pub config_ctx: ConfigContext,
 
+    // -- Inline images (PRD FR-RD-8, FR-TH-7) -----------------------------
+    /// Decoded inline-image pixels for the session, keyed by source URL,
+    /// populated by async fetch/decode (never blocking the UI). Read by
+    /// `ensure_layout` (to reserve boxes) and paint (to fill them).
+    pub image_store: crate::image::ImageStore,
+    /// Bumped whenever inline-image state changes (a decode lands, `:set
+    /// images` flips, a theme change flips `images`). Feeds `LayoutOptions`
+    /// so a change forces exactly one relayout and no pre-decode cached
+    /// layout is replayed with a stale image box (PRD FR-RD-8, FR-OFF-1).
+    pub image_epoch: u64,
+    /// Runtime override of the theme's `images` default (PRD FR-TH-7 `:set
+    /// images=on|off`, and the config `images` key at startup). `None` means
+    /// "follow the active theme".
+    pub images_override: Option<bool>,
+    /// PRD §10 licensing policy: whether non-free/fair-use images may be
+    /// used. Default false. Today a policy flag with a documented seam — the
+    /// saved-page image persistence that must honor it isn't built yet.
+    pub include_nonfree: bool,
+    /// The terminal graphics capability snapshot (`$TERM`/`$TERM_PROGRAM`/…),
+    /// captured once at startup; `App::graphics_protocol` layers the live
+    /// `no_color`/`images_enabled` decision on top (PRD FR-RD-8 §6.3).
+    pub graphics_env: crate::graphics::GraphicsEnv,
+
     // -- Bookmarks, annotations, read-later (PRD §5.6) --------------------
     /// The saved-bookmarks store (PRD FR-BM-1/7), persisted to disk.
     pub bookmarks: BookmarkStore,
@@ -416,6 +439,11 @@ impl App {
             hint_input: String::new(),
             hint_background: false,
             config_ctx: ConfigContext::default(),
+            image_store: crate::image::ImageStore::new(),
+            image_epoch: 0,
+            images_override: None,
+            include_nonfree: false,
+            graphics_env: crate::graphics::GraphicsEnv::default(),
             bookmarks: BookmarkStore::load(),
             readlater: ReadLaterStore::load(),
             pending_r: false,
@@ -638,6 +666,7 @@ impl App {
             ambiguous_wide: self.ambiguous_wide,
             accessible: self.accessible,
             table_col_offset: self.active_tab().table_col_offset,
+            image_epoch: self.image_epoch,
         }
     }
 
@@ -726,6 +755,10 @@ impl App {
             self.layout = Some(cached);
             return;
         }
+        // Reserve boxes for any decoded inline images (empty when images are
+        // off / no graphics protocol / below the size tier). Computed before
+        // the mutable borrows below so it can read the store immutably.
+        let img_map = self.image_box_map();
         self.layout_computations += 1;
         let computed = {
             let doc = self
@@ -733,10 +766,90 @@ impl App {
                 .doc
                 .as_ref()
                 .expect("keyed above, so a document is present");
-            layout::layout_document(doc, width, opts)
+            layout::layout_document_with_images(doc, width, opts, &img_map)
         };
         self.layout_cache.put(key, computed.clone());
         self.layout = Some(computed);
+    }
+
+    /// PRD FR-TH-7 / FR-RD-8: whether inline images render right now — the
+    /// runtime `:set images` (or config) override, else the active theme's
+    /// default.
+    pub fn images_enabled(&self) -> bool {
+        self.images_override.unwrap_or(self.theme.images)
+    }
+
+    /// The graphics protocol wikitui would use for images right now (PRD
+    /// FR-RD-8 §6.3): the startup terminal snapshot plus the live
+    /// `no_color`/`images_enabled` decision. `None` means alt text.
+    pub fn graphics_protocol(&self) -> crate::graphics::GraphicsProtocol {
+        let env = crate::graphics::GraphicsEnv {
+            no_color: self.no_color,
+            images_enabled: self.images_enabled(),
+            ..self.graphics_env.clone()
+        };
+        crate::graphics::detect_protocol(&env)
+    }
+
+    /// The reserved image boxes for the active document at the current width
+    /// (PRD FR-RD-8). Empty when images are disabled, the terminal has no
+    /// graphics protocol, or the content column is below [`layout::
+    /// IMAGE_MIN_COLS`] — every image then falls back to its placeholder.
+    fn image_box_map(&self) -> std::collections::HashMap<String, (u16, u16)> {
+        let mut map = std::collections::HashMap::new();
+        if matches!(
+            self.graphics_protocol(),
+            crate::graphics::GraphicsProtocol::None
+        ) {
+            return map;
+        }
+        let content_width = (self.layout_width as usize).min(self.measure as usize);
+        let max_cols = content_width.min(layout::IMAGE_MAX_COLS as usize) as u16;
+        if max_cols < layout::IMAGE_MIN_COLS {
+            return map;
+        }
+        if let Some(doc) = self.active_tab().doc.as_ref() {
+            for block in &doc.blocks {
+                if let crate::doc::Block::Image { src: Some(src), .. } = block
+                    && let Some(b) = self
+                        .image_store
+                        .box_for(src, max_cols, layout::IMAGE_MAX_ROWS)
+                {
+                    map.insert(src.clone(), b);
+                }
+            }
+        }
+        map
+    }
+
+    /// PRD FR-TH-7: flip inline-image rendering at runtime (`:set
+    /// images=on|off`). Off falls straight back to alt-text placeholders; on
+    /// makes the next frame lazily fetch. Either way one relayout is forced.
+    pub fn set_images(&mut self, on: bool) {
+        self.images_override = Some(on);
+        self.note_image_state_change();
+        self.status = format!("Images: {}", if on { "on" } else { "off" });
+    }
+
+    /// Bump the image epoch and drop the cached layout so the next
+    /// `ensure_layout` rebuilds with the new inline-image state (PRD FR-RD-8):
+    /// a decode landing, an images toggle, or a theme change that flips the
+    /// theme's `images` default.
+    pub fn note_image_state_change(&mut self) {
+        self.image_epoch = self.image_epoch.wrapping_add(1);
+        self.layout = None;
+    }
+
+    /// Switch the color theme, relayouting only if the change flips whether
+    /// images render (PRD FR-TH-7): image boxes depend on the theme's
+    /// `images` default, so a text↔image theme swap must rebuild the layout,
+    /// while any other theme swap stays O(paint) as before.
+    pub fn set_theme(&mut self, theme: Theme) {
+        let before = self.images_enabled();
+        self.theme = theme;
+        if self.images_enabled() != before {
+            self.note_image_state_change();
+        }
     }
 
     /// The scroll offset that centers `line` in the viewport, clamped to the
@@ -748,8 +861,20 @@ impl App {
     }
 
     pub fn cycle_theme(&mut self) {
-        self.theme = self.theme.next();
+        self.set_theme(self.theme.next());
         self.status = format!("Theme: {}", self.theme.name);
+    }
+
+    /// Install a decoded (or failed) inline image delivered by the async
+    /// loader (PRD FR-RD-8). A successful decode makes the box appear on the
+    /// next relayout; a failure keeps the placeholder. Either way the image
+    /// state changed, so the layout is invalidated.
+    pub fn deliver_image(&mut self, src: String, decoded: Option<crate::image::DecodedImage>) {
+        match decoded {
+            Some(img) => self.image_store.set_ready(src, img),
+            None => self.image_store.set_failed(src),
+        }
+        self.note_image_state_change();
     }
 
     /// The active tab's canonical article URL — the `y` yank payload
@@ -1921,6 +2046,114 @@ mod tests {
             .iter()
             .map(|e| e.title.clone())
             .collect()
+    }
+
+    /// A truecolor tty snapshot, so `graphics_protocol` resolves to
+    /// `HalfBlock` for an image-capable theme.
+    fn truecolor_env() -> crate::graphics::GraphicsEnv {
+        crate::graphics::GraphicsEnv {
+            colorterm: "truecolor".to_string(),
+            is_tty: true,
+            ..Default::default()
+        }
+    }
+
+    fn doc_with_image(src: &str) -> Document {
+        let mut d = doc("Pic");
+        d.blocks.push(crate::doc::Block::Image {
+            src: Some(src.to_string()),
+            alt: "alt".to_string(),
+            caption: None,
+        });
+        d
+    }
+
+    fn tiny_image() -> crate::image::DecodedImage {
+        crate::image::DecodedImage {
+            width: 2,
+            height: 2,
+            rgba: vec![
+                255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
+            ],
+        }
+    }
+
+    #[test]
+    fn text_theme_never_enables_images_or_reserves_boxes() {
+        // A text theme (homebrew, images=false) resolves to no protocol even
+        // on a kitty terminal, and reserves no image boxes — the property the
+        // "text theme never fetches" pty check leans on (request_visible_images
+        // returns early when the protocol is None).
+        let mut app = App::new("en".to_string(), Theme::homebrew(), false);
+        app.graphics_env = crate::graphics::GraphicsEnv {
+            term: "xterm-kitty".to_string(),
+            is_tty: true,
+            ..Default::default()
+        };
+        app.open_document(doc_with_image("u"));
+        app.image_store.set_ready("u".to_string(), tiny_image());
+        assert!(!app.images_enabled());
+        assert_eq!(
+            app.graphics_protocol(),
+            crate::graphics::GraphicsProtocol::None
+        );
+        assert!(
+            app.image_box_map().is_empty(),
+            "no boxes reserved for a text theme"
+        );
+    }
+
+    #[test]
+    fn full_theme_on_truecolor_reserves_a_box_for_a_decoded_image() {
+        let mut app = App::new("en".to_string(), Theme::full(), false);
+        app.graphics_env = truecolor_env();
+        app.open_document(doc_with_image("u"));
+        assert!(app.images_enabled());
+        assert_eq!(
+            app.graphics_protocol(),
+            crate::graphics::GraphicsProtocol::HalfBlock
+        );
+        // Nothing decoded yet -> no box.
+        assert!(app.image_box_map().is_empty());
+        app.image_store.set_ready("u".to_string(), tiny_image());
+        let map = app.image_box_map();
+        assert!(map.contains_key("u"), "decoded image reserves a box");
+    }
+
+    #[test]
+    fn set_images_toggle_flips_enablement_and_forces_relayout() {
+        let mut app = App::new("en".to_string(), Theme::full(), false);
+        app.graphics_env = truecolor_env();
+        app.open_document(doc_with_image("u"));
+        app.image_store.set_ready("u".to_string(), tiny_image());
+        app.ensure_layout();
+        let epoch_before = app.image_epoch;
+
+        app.set_images(false);
+        assert!(!app.images_enabled());
+        assert!(app.image_epoch > epoch_before, "epoch bumped");
+        assert!(app.layout.is_none(), "layout invalidated on toggle");
+        assert_eq!(
+            app.graphics_protocol(),
+            crate::graphics::GraphicsProtocol::None
+        );
+        assert!(app.image_box_map().is_empty(), "images off -> no boxes");
+
+        app.set_images(true);
+        assert!(app.images_enabled());
+        assert!(app.image_box_map().contains_key("u"));
+    }
+
+    #[test]
+    fn switching_between_image_and_text_theme_invalidates_layout() {
+        let mut app = App::new("en".to_string(), Theme::full(), false);
+        app.graphics_env = truecolor_env();
+        app.open_document(doc_with_image("u"));
+        app.ensure_layout();
+        assert!(app.layout.is_some());
+        // full (images) -> homebrew (text) flips images_enabled, so relayout.
+        app.set_theme(Theme::homebrew());
+        assert!(app.layout.is_none(), "text/image theme swap relayouts");
     }
 
     #[test]

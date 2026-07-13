@@ -119,6 +119,8 @@ pub struct EnvOverrides {
     pub base_url: Option<String>,
     /// PRD FR-BM-3's "(config)" `readlater_auto_dequeue`.
     pub readlater_auto_dequeue: Option<String>,
+    /// PRD FR-TH-7's `images` override of the theme default (`WIKITUI_IMAGES`).
+    pub images: Option<String>,
 }
 
 impl EnvOverrides {
@@ -136,6 +138,7 @@ impl EnvOverrides {
             cite_style: get("WIKITUI_CITE_STYLE"),
             base_url: get("WIKITUI_BASE_URL"),
             readlater_auto_dequeue: get("WIKITUI_READLATER_AUTO_DEQUEUE"),
+            images: get("WIKITUI_IMAGES"),
         }
     }
 }
@@ -178,6 +181,14 @@ pub struct ResolvedConfig {
     /// PRD FR-HS-4's retention window: `history::History::retention_prune`
     /// runs with this at startup. `0` (the default) means "keep forever."
     pub history_retention_days: Valued<u64>,
+    /// PRD FR-TH-7's `images` key: overrides the active theme's `images`
+    /// default when set (`Some(true)`/`Some(false)`); `None` (the default)
+    /// means "follow the theme." Wired into `App::images_override`.
+    pub images: Valued<Option<bool>>,
+    /// PRD §10 licensing: whether non-free/fair-use images may be used.
+    /// Default false. Today a policy flag with a documented seam (saved-page
+    /// image persistence, which must exclude non-free, isn't built yet).
+    pub include_nonfree: Valued<bool>,
     /// Parse errors, unknown keys, and rejected values — never fatal, but
     /// `doctor` reports them and exits 1 if any is `IssueLevel::Error`.
     pub issues: Vec<Issue>,
@@ -246,6 +257,8 @@ pub fn resolve(
         "wiki",
         "readlater_auto_dequeue",
         "history",
+        "images",
+        "include_nonfree",
     ]
     .into_iter()
     .collect();
@@ -309,6 +322,8 @@ pub fn resolve(
     let (active_wiki, base_url_template) = resolve_wiki(env, &table, &mut issues);
     let readlater_auto_dequeue = resolve_readlater_auto_dequeue(env, &table, &mut issues);
     let history_retention_days = resolve_history(&table, &mut issues);
+    let images = resolve_images(env, &table, &mut issues);
+    let include_nonfree = resolve_include_nonfree(&table, &mut issues);
 
     ResolvedConfig {
         config_version: Valued {
@@ -332,6 +347,8 @@ pub fn resolve(
         base_url_template,
         readlater_auto_dequeue,
         history_retention_days,
+        images,
+        include_nonfree,
         migration_summary: config_version.1,
         issues,
         config_path: config_path.map(Path::to_path_buf),
@@ -740,6 +757,76 @@ fn resolve_readlater_auto_dequeue(
             None => {
                 issues.push(Issue::warning(format!(
                     "readlater_auto_dequeue must be a boolean; using default {DEFAULT}"
+                )));
+                default
+            }
+        },
+        None => default,
+    }
+}
+
+/// PRD FR-TH-7's `images` override of the active theme's default: env
+/// (`WIKITUI_IMAGES`) then file. `None` (the default) means "follow the
+/// theme"; `on`/`off`/`true`/`false` force it. Wired into
+/// `App::images_override`.
+fn resolve_images(
+    env: &EnvOverrides,
+    table: &toml::Table,
+    issues: &mut Vec<Issue>,
+) -> Valued<Option<bool>> {
+    let default = Valued {
+        value: None,
+        source: Source::Default,
+    };
+    if let Some(raw) = &env.images {
+        return match parse_bool_ish(raw) {
+            Some(value) => Valued {
+                value: Some(value),
+                source: Source::Env,
+            },
+            None => {
+                issues.push(Issue::warning(format!(
+                    "images: {raw:?} (from environment) is not a boolean; following the theme"
+                )));
+                default
+            }
+        };
+    }
+    match table.get("images") {
+        Some(v) => match v.as_bool() {
+            Some(value) => Valued {
+                value: Some(value),
+                source: Source::File,
+            },
+            None => {
+                issues.push(Issue::warning(
+                    "images must be a boolean; following the theme".to_string(),
+                ));
+                default
+            }
+        },
+        None => default,
+    }
+}
+
+/// PRD §10 licensing: `include_nonfree` (file-only, default false). A policy
+/// flag today — the saved-page image persistence that must honor it is a
+/// later chunk (documented seam).
+fn resolve_include_nonfree(table: &toml::Table, issues: &mut Vec<Issue>) -> Valued<bool> {
+    const DEFAULT: bool = false;
+    let default = Valued {
+        value: DEFAULT,
+        source: Source::Default,
+    };
+    match table.get("include_nonfree") {
+        Some(v) => match v.as_bool() {
+            Some(value) => Valued {
+                value,
+                source: Source::File,
+            },
+            None => {
+                issues.push(Issue::warning(format!(
+                    "include_nonfree must be a boolean; using default {DEFAULT}"
                 )));
                 default
             }
@@ -1253,6 +1340,48 @@ mod tests {
         let from_env = resolve(&CliOverrides::default(), &env, None);
         assert!(!from_env.readlater_auto_dequeue.value);
         assert_eq!(from_env.readlater_auto_dequeue.source, Source::Env);
+    }
+
+    #[test]
+    fn images_defaults_to_follow_theme_and_honors_file_and_env() {
+        let default = resolve(&CliOverrides::default(), &EnvOverrides::default(), None);
+        assert_eq!(default.images.value, None, "default follows the theme");
+        assert_eq!(default.images.source, Source::Default);
+
+        let path = temp_config("images = false\n");
+        let from_file = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(from_file.images.value, Some(false));
+        assert_eq!(from_file.images.source, Source::File);
+        cleanup(&path);
+
+        let env = EnvOverrides {
+            images: Some("on".to_string()),
+            ..Default::default()
+        };
+        let from_env = resolve(&CliOverrides::default(), &env, None);
+        assert_eq!(from_env.images.value, Some(true));
+        assert_eq!(from_env.images.source, Source::Env);
+    }
+
+    #[test]
+    fn include_nonfree_defaults_false_and_honors_file() {
+        let default = resolve(&CliOverrides::default(), &EnvOverrides::default(), None);
+        assert!(!default.include_nonfree.value);
+        assert_eq!(default.include_nonfree.source, Source::Default);
+
+        let path = temp_config("include_nonfree = true\n");
+        let from_file = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert!(from_file.include_nonfree.value);
+        assert_eq!(from_file.include_nonfree.source, Source::File);
+        cleanup(&path);
     }
 
     #[test]

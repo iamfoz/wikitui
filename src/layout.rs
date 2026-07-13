@@ -28,7 +28,7 @@
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::doc::{Block, Document, SpanStyle};
+use crate::doc::{Block, Document, GalleryItem, SpanStyle};
 
 /// The semantic style of a laid-out span. Deliberately theme-independent:
 /// the paint step in `ui.rs` maps each variant to concrete `ratatui` styles
@@ -51,6 +51,23 @@ pub enum SpanKind {
     Table,
     Infobox,
     Image,
+    /// A caption line under an image or gallery (PRD FR-RD-8): dim italics.
+    Caption,
+    /// One reserved row of an inline image's half-block box (PRD FR-RD-8).
+    /// The layout reserves `rows` of these stacked vertically, each the box's
+    /// full width (its `LaidSpan.text` is that many spaces, so width math and
+    /// find highlighting treat the row as blank). At paint time `ui.rs` looks
+    /// the decoded image up by `src` in the [`crate::image::ImageStore`] and
+    /// replaces this one span with a run of `▀` half-block cells whose fg/bg
+    /// come from the image's pixels — so the layout stays theme-independent
+    /// (only box geometry, never a color, lives here). Emitted only when the
+    /// image is decoded *and* images are enabled; otherwise the layout emits a
+    /// plain `[image: alt]` placeholder instead.
+    ImageRow {
+        src: String,
+        row: u16,
+        rows: u16,
+    },
     /// A link occurrence. The index matches `doc::collect_links` ordering, so
     /// the paint step can look up focus/visited state by the same index the
     /// app cycles through.
@@ -113,6 +130,15 @@ pub struct LayoutOptions {
     /// laid-out lines, so it participates in the L1 cache key too: each scroll
     /// step is a cheap relayout, never a stale reuse.
     pub table_col_offset: u16,
+    /// Not a typography knob but a layout **input**: bumped by `App` whenever
+    /// inline-image state changes (a thumbnail finishes decoding, `:set
+    /// images` flips, a theme change flips `images`). Because it lives in the
+    /// L1 cache key (`LayoutCacheKey`) and the `ensure_layout` staleness check
+    /// (`l.options != opts`), a newly-decoded image forces one relayout and no
+    /// pre-decode cached layout is ever replayed with a stale image box (PRD
+    /// FR-RD-8, FR-OFF-1). The reserved box sizes themselves come from an
+    /// [`ImageResolver`] passed alongside, not from this field.
+    pub image_epoch: u64,
 }
 
 impl Default for LayoutOptions {
@@ -122,9 +148,55 @@ impl Default for LayoutOptions {
             ambiguous_wide: false,
             accessible: false,
             table_col_offset: 0,
+            image_epoch: 0,
         }
     }
 }
+
+/// Resolves an image source URL to the cell box (`cols`, `rows`) the layout
+/// should reserve for it, or `None` to fall back to the `[image: alt]`
+/// placeholder (image not decoded yet, images disabled, or below the size
+/// tier). Keeps `layout_document` decoupled from the `App`'s image store: the
+/// caller precomputes the boxes and hands them in.
+pub trait ImageResolver {
+    fn image_box(&self, src: &str) -> Option<(u16, u16)>;
+}
+
+/// The no-image resolver: every image renders as its alt-text placeholder.
+/// Test-only — the reading view always builds a real (possibly empty) box map
+/// and calls [`layout_document_with_images`]; `NoImages` backs the
+/// image-unaware [`layout_document`] convenience the tests use.
+#[cfg(test)]
+pub struct NoImages;
+
+#[cfg(test)]
+impl ImageResolver for NoImages {
+    fn image_box(&self, _src: &str) -> Option<(u16, u16)> {
+        None
+    }
+}
+
+impl ImageResolver for std::collections::HashMap<String, (u16, u16)> {
+    fn image_box(&self, src: &str) -> Option<(u16, u16)> {
+        self.get(src).copied()
+    }
+}
+
+/// PRD FR-RD-8 / §6.3 box caps: a single image never occupies more than this
+/// many columns or rows, so a huge thumbnail can't eat the screen. Width is
+/// additionally clamped to the content column at layout time.
+pub const IMAGE_MAX_COLS: u16 = 60;
+pub const IMAGE_MAX_ROWS: u16 = 24;
+/// PRD §6.3 degradation: below this content width, inline images are not
+/// rendered as half-blocks at all (the box would be too small to read) — the
+/// alt-text placeholder shows instead. A documented, acceptable tier floor.
+pub const IMAGE_MIN_COLS: u16 = 16;
+/// Below this content width a gallery renders as a vertical list rather than
+/// a horizontal captioned strip (PRD FR-RD-8 "captioned strips or lists").
+/// Chosen above the `measure` floor (40) so a narrow reading column
+/// (`:set`/config `measure = 40`, or a sub-60 column) reaches the list form,
+/// while the default 88-cell column gets the strip.
+const GALLERY_STRIP_MIN_WIDTH: usize = 60;
 
 /// A fully laid-out document plus the line mappings the app needs. All
 /// mappings are computed *from* the emitted lines, so there is one source of
@@ -531,6 +603,9 @@ struct Emitter<'a> {
     pad_width: usize,
     content_width: usize,
     ambiguous_wide: bool,
+    /// Reserves inline-image boxes (PRD FR-RD-8); `&NoImages` when images are
+    /// off, so every image emits its alt-text placeholder instead.
+    images: &'a dyn ImageResolver,
 }
 
 impl Emitter<'_> {
@@ -720,15 +795,93 @@ impl Emitter<'_> {
                 self.blank();
                 block_lines.push(anchor);
             }
-            Block::Image(alt) => {
+            Block::Image { src, alt, caption } => {
                 let anchor = self.lines.len();
+                self.emit_image(src.as_deref(), alt);
+                if let Some(caption) = caption {
+                    self.emit_caption(caption);
+                }
+                self.blank();
+                block_lines.push(anchor);
+            }
+            Block::Gallery(items) => {
+                let anchor = self.lines.len();
+                self.emit_gallery(items);
+                self.blank();
+                block_lines.push(anchor);
+            }
+        }
+    }
+
+    /// Emit one inline image (PRD FR-RD-8): the reserved half-block box when
+    /// the resolver hands back a decoded box (and the content column clears
+    /// the [`IMAGE_MIN_COLS`] tier floor), else the `[image: alt]` placeholder
+    /// on a single line. The box is `rows` [`SpanKind::ImageRow`] lines, each
+    /// `cols` cells wide (its text is that many spaces); `ui.rs` fills the
+    /// cells with the image's pixels at paint time.
+    fn emit_image(&mut self, src: Option<&str>, alt: &str) {
+        let aw = self.ambiguous_wide;
+        let reserved = src.and_then(|s| self.images.image_box(s).map(|b| (s, b)));
+        if let Some((src, (cols, rows))) = reserved {
+            let cols = (cols as usize).min(self.content_width);
+            if cols >= IMAGE_MIN_COLS as usize && rows >= 1 {
+                for r in 0..rows {
+                    let span = LaidSpan {
+                        text: " ".repeat(cols),
+                        kind: SpanKind::ImageRow {
+                            src: src.to_string(),
+                            row: r,
+                            rows,
+                        },
+                    };
+                    self.push_line(finalize(self.pad_width, &[span], &[]), r > 0);
+                }
+                return;
+            }
+        }
+        self.emit_plain_wrapped(clusters_from_str(
+            &format!("[image: {alt}]"),
+            SpanKind::Image,
+            aw,
+        ));
+    }
+
+    /// Emit a caption line (PRD FR-RD-8): dim italics, wrapped to the content
+    /// column.
+    fn emit_caption(&mut self, caption: &str) {
+        let aw = self.ambiguous_wide;
+        self.emit_plain_wrapped(clusters_from_str(caption, SpanKind::Caption, aw));
+    }
+
+    /// Emit a gallery (PRD FR-RD-8 "captioned strips or lists"): a horizontal
+    /// captioned strip when the content column is wide enough (captions laid
+    /// across the row, wrapping), else a vertical list of `[image: caption]`.
+    /// Gallery thumbnails are not decoded to half-blocks in this build (a
+    /// documented scope choice — the strip/list is caption-only); the alt/
+    /// caption text is always present.
+    fn emit_gallery(&mut self, items: &[GalleryItem]) {
+        let aw = self.ambiguous_wide;
+        let strip = self.content_width >= GALLERY_STRIP_MIN_WIDTH && items.len() > 1;
+        if strip {
+            let joined = items
+                .iter()
+                .map(|it| format!("[{}]", it.caption))
+                .collect::<Vec<_>>()
+                .join("   ");
+            let clusters = clusters_from_str(&joined, SpanKind::Caption, aw);
+            for (i, wl) in wrap_content(clusters, self.content_width.max(1))
+                .into_iter()
+                .enumerate()
+            {
+                self.push_line(finalize(self.pad_width, &[], &wl), i > 0);
+            }
+        } else {
+            for item in items {
                 self.emit_plain_wrapped(clusters_from_str(
-                    &format!("[image: {alt}]"),
+                    &format!("[image: {}]", item.caption),
                     SpanKind::Image,
                     aw,
                 ));
-                self.blank();
-                block_lines.push(anchor);
             }
         }
     }
@@ -811,6 +964,7 @@ impl Emitter<'_> {
                 pad_width: 0,
                 content_width: left_w,
                 ambiguous_wide: aw,
+                images: self.images,
             };
             for b in lead_blocks {
                 tem.emit_block(
@@ -1189,7 +1343,20 @@ fn infobox_card_lines(rows: &[(String, String)], box_w: usize, aw: bool) -> Vec<
 
 /// Lay `doc` out for a terminal `width` cells wide. See the module docs for
 /// the guarantees this upholds.
+/// Image-unaware entry point (PRD FR-RD-8): every image renders as its
+/// alt-text placeholder. Test-only convenience — the reading view uses
+/// [`layout_document_with_images`] with a real box map.
+#[cfg(test)]
 pub fn layout_document(doc: &Document, width: u16, options: LayoutOptions) -> Layout {
+    layout_document_with_images(doc, width, options, &NoImages)
+}
+
+pub fn layout_document_with_images(
+    doc: &Document,
+    width: u16,
+    options: LayoutOptions,
+    images: &dyn ImageResolver,
+) -> Layout {
     let available = (width.max(1)) as usize;
     let content_width = available.min((options.measure.max(1)) as usize);
     let pad_width = available.saturating_sub(content_width) / 2;
@@ -1230,6 +1397,7 @@ pub fn layout_document(doc: &Document, width: u16, options: LayoutOptions) -> La
             pad_width,
             content_width,
             ambiguous_wide: aw,
+            images,
         };
         // Title, then a blank line — mirrors the previous renderer's header.
         em.emit_plain_wrapped(clusters_from_str(&doc.title, SpanKind::Title, aw));
@@ -1480,7 +1648,7 @@ fn occurrence_from_origins(origins: &[Option<(usize, usize)>]) -> Option<Occurre
 /// [`LayoutCacheKey`] (PRD FR-OFF-1's L1 layer) so a stale schema can never
 /// be silently replayed across an upgrade — a version bump makes every
 /// existing L1 entry a guaranteed miss instead.
-pub const LAYOUT_SCHEMA_VERSION: u32 = 2;
+pub const LAYOUT_SCHEMA_VERSION: u32 = 3;
 
 /// PRD §6.8's L1 hit target (< 50 ms) only holds if the cache stays small
 /// enough that a linear scan over it is free — 8 entries covers "the
@@ -1639,6 +1807,129 @@ mod tests {
             </body></html>"##
         );
         parse_article_html("Edge Cases", &html)
+    }
+
+    const IMG_HTML: &str = r#"<html><head><title>Img</title></head><body>
+      <p>Lead.</p>
+      <figure><img src="https://ex.org/p.png" alt="An owl"/><figcaption>An owl</figcaption></figure>
+    </body></html>"#;
+
+    fn image_rows(layout: &Layout) -> usize {
+        layout
+            .lines
+            .iter()
+            .filter(|l| {
+                l.spans
+                    .iter()
+                    .any(|s| matches!(s.kind, SpanKind::ImageRow { .. }))
+            })
+            .count()
+    }
+
+    #[test]
+    fn image_without_resolver_box_is_the_alt_placeholder() {
+        let doc = parse_article_html("Img", IMG_HTML);
+        let layout = layout_document(&doc, 80, LayoutOptions::default());
+        assert_eq!(image_rows(&layout), 0, "no box reserved without a resolver");
+        let has_placeholder = layout.lines.iter().any(|l| {
+            l.spans
+                .iter()
+                .any(|s| matches!(s.kind, SpanKind::Image) && s.text.contains("[image: An owl]"))
+        });
+        assert!(has_placeholder, "expected the [image: alt] placeholder");
+        // The caption still renders below the placeholder.
+        assert!(layout.lines.iter().any(|l| l.spans.iter().any(|s| matches!(
+            s.kind,
+            SpanKind::Caption
+        )
+            && s.text.contains("An owl"))));
+    }
+
+    #[test]
+    fn image_with_resolver_reserves_a_half_block_box_and_caption() {
+        let doc = parse_article_html("Img", IMG_HTML);
+        let mut boxes = std::collections::HashMap::new();
+        boxes.insert("https://ex.org/p.png".to_string(), (20u16, 5u16));
+        let layout = layout_document_with_images(&doc, 80, LayoutOptions::default(), &boxes);
+        assert_eq!(image_rows(&layout), 5, "five reserved image rows");
+        // Each image row is exactly the reserved width, and rows count is
+        // carried in every row's kind.
+        for l in &layout.lines {
+            for s in &l.spans {
+                if let SpanKind::ImageRow { rows, .. } = s.kind {
+                    assert_eq!(rows, 5);
+                    assert_eq!(s.text.chars().count(), 20);
+                }
+            }
+        }
+        assert!(
+            layout.lines.iter().any(|l| l
+                .spans
+                .iter()
+                .any(|s| matches!(&s.kind, SpanKind::Caption) && s.text.contains("An owl"))),
+            "caption below the box"
+        );
+    }
+
+    #[test]
+    fn huge_image_box_is_clamped_to_the_content_column() {
+        let doc = parse_article_html("Img", IMG_HTML);
+        let mut boxes = std::collections::HashMap::new();
+        // Resolver hands back an over-wide box; layout must clamp cols to the
+        // content column (width 30 → content 30).
+        boxes.insert("https://ex.org/p.png".to_string(), (200u16, 4u16));
+        let layout = layout_document_with_images(&doc, 30, LayoutOptions::default(), &boxes);
+        for l in &layout.lines {
+            for s in &l.spans {
+                if matches!(s.kind, SpanKind::ImageRow { .. }) {
+                    assert!(
+                        s.text.chars().count() <= 30,
+                        "image row wider than content column"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gallery_is_a_strip_when_wide_and_a_list_when_narrow() {
+        let html = r#"<html><head><title>G</title></head><body>
+          <ul class="gallery">
+            <li class="gallerybox"><img src="https://ex.org/1.png" alt="a"/><div class="gallerytext">Alpha</div></li>
+            <li class="gallerybox"><img src="https://ex.org/2.png" alt="b"/><div class="gallerytext">Beta</div></li>
+          </ul>
+        </body></html>"#;
+        let doc = parse_article_html("G", html);
+
+        // Wide: both captions share one line (a horizontal strip).
+        let wide = layout_document(&doc, 100, LayoutOptions::default());
+        let strip_line = wide.lines.iter().any(|l| {
+            let text: String = l.spans.iter().map(|s| s.text.as_str()).collect();
+            text.contains("Alpha") && text.contains("Beta")
+        });
+        assert!(
+            strip_line,
+            "wide gallery should place captions side by side"
+        );
+
+        // Narrow: each caption on its own [image: …] line (a list).
+        let narrow = layout_document(&doc, 24, LayoutOptions::default());
+        let alpha_line = narrow
+            .lines
+            .iter()
+            .position(|l| l.spans.iter().any(|s| s.text.contains("Alpha")));
+        let beta_line = narrow
+            .lines
+            .iter()
+            .position(|l| l.spans.iter().any(|s| s.text.contains("Beta")));
+        assert!(alpha_line.is_some() && beta_line.is_some());
+        assert_ne!(alpha_line, beta_line, "narrow gallery is a vertical list");
+        assert!(
+            narrow
+                .lines
+                .iter()
+                .any(|l| l.spans.iter().any(|s| s.text.contains("[image: Alpha]")))
+        );
     }
 
     #[test]

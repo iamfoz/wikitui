@@ -11,8 +11,10 @@ mod crashguard;
 mod doc;
 mod doctor;
 mod fuzzy;
+mod graphics;
 mod hints;
 mod history;
+mod image;
 mod jsonl;
 mod layout;
 mod research;
@@ -96,6 +98,15 @@ struct TabLoadOutcome {
     lang: String,
     title: String,
     result: std::result::Result<FetchOutcome, String>,
+}
+
+/// One completed (or failed) inline-image fetch+decode (PRD FR-RD-8),
+/// delivered off the event loop like article/typeahead loads so decoding
+/// never blocks the UI. `decoded` is `None` on any fetch/decode failure — the
+/// alt-text placeholder simply stands (never logged or retried in-session).
+struct ImageOutcome {
+    src: String,
+    decoded: Option<crate::image::DecodedImage>,
 }
 
 enum RevalidationResult {
@@ -248,6 +259,8 @@ async fn main() -> Result<()> {
         cite_style,
         resolved.readlater_auto_dequeue.value,
         resolved.history_retention_days.value,
+        resolved.images.value,
+        resolved.include_nonfree.value,
         config_ctx,
         reload_flag,
     )
@@ -768,6 +781,8 @@ async fn run(
     cite_style: CiteStyle,
     readlater_auto_dequeue: bool,
     history_retention_days: u64,
+    images_config: Option<bool>,
+    include_nonfree: bool,
     config_ctx: ConfigContext,
     reload_flag: Arc<AtomicBool>,
 ) -> Result<()> {
@@ -777,6 +792,15 @@ async fn run(
     app.ambiguous_wide = ambiguous_wide;
     app.cite_style = cite_style;
     app.readlater_auto_dequeue = readlater_auto_dequeue;
+    // PRD FR-RD-8/§6.3: terminal graphics capability snapshot, taken once.
+    // The `no_color`/`images_enabled` decision is layered on live in
+    // `App::graphics_protocol`.
+    app.graphics_env = {
+        use std::io::IsTerminal;
+        graphics::GraphicsEnv::from_process_env(std::io::stdout().is_terminal())
+    };
+    app.images_override = images_config;
+    app.include_nonfree = include_nonfree;
     app.config_ctx = config_ctx;
     app.incognito = cli.incognito;
     // The real, on-disk reading history (PRD §6.4) — `App::new` defaults to
@@ -794,6 +818,8 @@ async fn run(
     let (typeahead_tx, mut typeahead_rx) = mpsc::unbounded_channel::<TypeaheadOutcome>();
     let (revalidate_tx, mut revalidate_rx) = mpsc::unbounded_channel::<RevalidationOutcome>();
     let (open_tx, mut open_rx) = mpsc::unbounded_channel::<TabLoadOutcome>();
+    // PRD FR-RD-8: inline-image fetch+decode results (lazy, never blocking).
+    let (image_tx, mut image_rx) = mpsc::unbounded_channel::<ImageOutcome>();
 
     if let Some(query) = cli.search {
         app.search_input = query;
@@ -814,6 +840,12 @@ async fn run(
 
         terminal.draw(|f| ui::draw(f, &mut app))?;
 
+        // PRD FR-RD-8: after each draw, lazily kick off fetches for any
+        // not-yet-loaded images the active document references (a no-op when
+        // images are off / no graphics protocol / a text theme). Idempotent —
+        // it spawns exactly one fetch per source URL.
+        request_visible_images(client, &mut app, &image_tx);
+
         // PRD §7 / v0.5's "crash-safe terminal restore": a deliberate,
         // inert-by-default panic trigger for exercising the crash path
         // (terminal restore, crash report, stderr message) end to end
@@ -833,7 +865,11 @@ async fn run(
         // revalidation/reload notices land without a keypress. Everywhere else
         // — plain Reading mode, nothing in flight — keeps the block-until-input
         // behavior (PRD FR-ACS-2: no gratuitous redraws/CPU use while idle).
-        if app.mode == Mode::Search || app.pending_revalidations > 0 || app.any_tab_loading() {
+        if app.mode == Mode::Search
+            || app.pending_revalidations > 0
+            || app.any_tab_loading()
+            || app.image_store.any_loading()
+        {
             let poll_interval = if app.mode == Mode::Search {
                 TYPEAHEAD_POLL
             } else {
@@ -879,6 +915,11 @@ async fn run(
             }
             while let Ok(outcome) = open_rx.try_recv() {
                 apply_tab_load_outcome(client, &mut app, outcome, &revalidate_tx);
+            }
+            // PRD FR-RD-8: install decoded inline images; each triggers one
+            // relayout so its half-block box appears (`App::deliver_image`).
+            while let Ok(outcome) = image_rx.try_recv() {
+                app.deliver_image(outcome.src, outcome.decoded);
             }
         } else if let Event::Key(key) = event::read()? {
             // Block until an event arrives instead of redrawing on a timer —
@@ -929,6 +970,44 @@ fn fire_typeahead(client: &WikiClient, app: &App, tx: &UnboundedSender<Typeahead
     });
 }
 
+/// Lazily fetch+decode inline images the active document references (PRD
+/// FR-RD-8), one spawned task per source URL. A no-op unless images are
+/// enabled *and* the terminal has a graphics protocol — so a text theme
+/// (`images = false`) never touches the network for images (FR-TH-7), which
+/// is the property the text-theme pty check asserts. Idempotent: the store's
+/// `contains` guard means a source already loading/loaded/failed is never
+/// re-fetched. Gallery thumbnails are not fetched (galleries render as
+/// caption text in this build).
+fn request_visible_images(client: &WikiClient, app: &mut App, tx: &UnboundedSender<ImageOutcome>) {
+    if !app.images_enabled() || matches!(app.graphics_protocol(), graphics::GraphicsProtocol::None)
+    {
+        return;
+    }
+    let mut to_load: Vec<String> = Vec::new();
+    if let Some(doc) = app.active_tab().doc.as_ref() {
+        for block in &doc.blocks {
+            if let doc::Block::Image { src: Some(src), .. } = block
+                && !app.image_store.contains(src)
+                && !to_load.contains(src)
+            {
+                to_load.push(src.clone());
+            }
+        }
+    }
+    for src in to_load {
+        app.image_store.mark_loading(src.clone());
+        let client = client.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let decoded = match client.fetch_image(&src).await {
+                Ok(bytes) => crate::image::decode_image(&bytes),
+                Err(_) => None,
+            };
+            let _ = tx.send(ImageOutcome { src, decoded });
+        });
+    }
+}
+
 /// `:config reload` and SIGHUP both land here (PRD §6.7): re-resolve
 /// against the exact CLI/env overrides pinned at startup — so they still
 /// outrank the file after a reload — and live-apply theme, measure, and
@@ -942,11 +1021,19 @@ fn apply_config_reload(app: &mut App) {
         app.config_ctx.config_path.as_deref(),
     );
     if let Some(theme) = Theme::by_name(&resolved.theme.value) {
-        app.theme = theme;
+        app.set_theme(theme);
     }
     app.measure = resolved.measure.value;
     app.ambiguous_wide = resolved.ambiguous_wide.value;
     app.readlater_auto_dequeue = resolved.readlater_auto_dequeue.value;
+    // PRD FR-TH-7: a reload can flip the `images` config override; a `:set`
+    // made this session is a per-run override that the config file's value
+    // does not silently undo, so only take the file's value when it set one.
+    if resolved.images.source != config::Source::Default {
+        app.images_override = resolved.images.value;
+        app.note_image_state_change();
+    }
+    app.include_nonfree = resolved.include_nonfree.value;
     // Measure/ambiguous_wide feed layout, not just paint — drop the cached
     // layout so the next `ensure_layout` recomputes instead of reusing a
     // stale one keyed on the old options.
@@ -1784,10 +1871,20 @@ async fn execute_command(
         }
         Command::Theme(name) => {
             if let Some(theme) = Theme::by_name(&name) {
-                app.theme = theme;
+                app.set_theme(theme);
                 app.notice = Some(format!("Theme: {name}"));
             }
         }
+        Command::Set { key, value } => match key.as_str() {
+            "images" => {
+                let on = value == "on";
+                app.set_images(on);
+                app.notice = Some(format!("images={value}"));
+            }
+            other => {
+                app.notice = Some(format!("unknown :set key {other:?} (try: images)"));
+            }
+        },
         Command::Style(name) => {
             if let Some(style) = cite::CiteStyle::by_name(&name) {
                 app.cite_style = style;

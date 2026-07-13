@@ -62,6 +62,11 @@ pub enum Command {
     /// Clearing a single article stays picker-only (`d`), not an
     /// ex-command argument.
     HistoryClear(HistoryClearScope),
+    /// `:set <key>=<value>` — runtime render override. Today handles
+    /// `images=on|off` (PRD FR-TH-7); this is the seed for FR-PC-4's broader
+    /// per-tab `:set` (width/justify/images), which will extend the accepted
+    /// keys here.
+    Set { key: String, value: String },
     /// `:q` / `:quit` — exit.
     Quit,
 }
@@ -77,7 +82,7 @@ pub enum HistoryClearScope {
     All,
 }
 
-pub const USAGE: &str = "commands: open <title>, lang <code>, theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], config reload, help, quit";
+pub const USAGE: &str = "commands: open <title>, lang <code>, theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], set images=on|off, config reload, help, quit";
 
 pub fn parse(input: &str) -> Result<Command, String> {
     let input = input.trim();
@@ -227,6 +232,28 @@ pub fn parse(input: &str) -> Result<Command, String> {
                     "unknown citation style {arg:?} — one of: {}",
                     CiteStyle::NAMES.join(", ")
                 ))
+            }
+        }
+        // `:set images=on|off` (PRD FR-TH-7). Parsed as a generic
+        // `key=value`; only `images` is wired today (FR-PC-4 will add more).
+        "set" => {
+            let assignment = require_arg("key=value")?;
+            let (key, value) = assignment
+                .split_once('=')
+                .ok_or_else(|| "usage: :set images=on|off".to_string())?;
+            let (key, value) = (key.trim(), value.trim());
+            match key {
+                "images" => {
+                    if value == "on" || value == "off" {
+                        Ok(Command::Set {
+                            key: "images".to_string(),
+                            value: value.to_string(),
+                        })
+                    } else {
+                        Err(format!("images must be on or off (got {value:?})"))
+                    }
+                }
+                other => Err(format!("unknown :set key {other:?} — try: images=on|off")),
             }
         }
         "help" | "h" => Ok(Command::Help),
@@ -380,6 +407,36 @@ mod tests {
             parse("history clear today"),
             Ok(Command::HistoryClear(HistoryClearScope::Today))
         );
+    }
+
+    #[test]
+    fn set_images_parses_on_and_off_and_rejects_others() {
+        assert_eq!(
+            parse("set images=on"),
+            Ok(Command::Set {
+                key: "images".to_string(),
+                value: "on".to_string()
+            })
+        );
+        assert_eq!(
+            parse("set images=off"),
+            Ok(Command::Set {
+                key: "images".to_string(),
+                value: "off".to_string()
+            })
+        );
+        // Surrounding whitespace around the assignment is tolerated.
+        assert_eq!(
+            parse("set  images = off "),
+            Ok(Command::Set {
+                key: "images".to_string(),
+                value: "off".to_string()
+            })
+        );
+        assert!(parse("set images=maybe").is_err());
+        assert!(parse("set width=90").is_err(), "only images is wired today");
+        assert!(parse("set images").is_err(), "needs key=value");
+        assert!(parse("set").is_err());
     }
 
     #[test]

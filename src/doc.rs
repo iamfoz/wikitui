@@ -29,7 +29,7 @@ pub const MAX_ARTICLE_HTML_BYTES: usize = 10 * 1024 * 1024;
 
 /// PRD SEC-3: recursion depth cap for the DOM walkers below
 /// (`walk_blocks`/`collect_inline`/`collect_text`/`descendant_tags`/
-/// `find_img_alt`). A real article's DOM nests at most a few dozen levels
+/// `find_img_src_alt`). A real article's DOM nests at most a few dozen levels
 /// deep; a hostile page can otherwise force unbounded recursion (e.g. 10k
 /// nested `<div>`s) and overflow the stack. Past this depth, a walker stops
 /// recursing and flattens whatever remains of the subtree to plain text via
@@ -96,7 +96,31 @@ pub enum Block {
     /// Rendered as a boxed card — floated right of the lead on wide
     /// terminals, a top block on narrower ones (PRD FR-RD-5, §6.3 tiers).
     Infobox(Vec<(String, String)>),
-    Image(String),
+    /// An inline image (PRD FR-RD-8). `src` is the sanitized thumbnail URL
+    /// (http(s) only — see [`sanitize_image_src`]; `None` when the source was
+    /// missing or a rejected scheme, in which case only the alt text renders).
+    /// `alt` is always present (the placeholder / accessibility text, kept
+    /// available regardless of render path). `caption` is the `<figcaption>`
+    /// text, rendered in dim italics below the image.
+    Image {
+        src: Option<String>,
+        alt: String,
+        caption: Option<String>,
+    },
+    /// A `<ul class="gallery">` of images (PRD FR-RD-8 "galleries as captioned
+    /// strips or lists"). Rendered as a captioned horizontal strip when the
+    /// width allows, else a vertical list of `[image: caption]`.
+    Gallery(Vec<GalleryItem>),
+}
+
+/// One entry of a [`Block::Gallery`] (PRD FR-RD-8). `caption` is the
+/// gallery-box label (falling back to the image's alt text when the box has
+/// no explicit caption), always non-empty enough to identify the item in the
+/// list/strip; `src` is the sanitized thumbnail URL (http(s) only) or `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GalleryItem {
+    pub src: Option<String>,
+    pub caption: String,
 }
 
 /// One cell of a [`Table`]'s expanded grid (PRD FR-RD-4). Content is
@@ -814,10 +838,39 @@ fn collapse_infobox(node: NodeRef<Node>) -> Vec<(String, String)> {
     rows
 }
 
-/// PRD SEC-3: past `MAX_DOM_DEPTH` this gives up and reports no image
-/// rather than recursing further — a missed caption on a pathologically
-/// nested `<figure>` is an acceptable degradation; a stack overflow is not.
-fn find_img_alt(node: NodeRef<Node>, depth: usize) -> Option<String> {
+/// PRD SEC-2 spirit: only `http`/`https` image URLs are kept; every other
+/// scheme (`data:`, `javascript:`, relative wiki paths that need a base we
+/// don't resolve here, …) is dropped so only the alt text renders (PRD
+/// FR-RD-8: "alt text always available"). Parsoid's common protocol-relative
+/// thumbnail form (`//upload.wikimedia.org/...`) is upgraded to `https`.
+fn sanitize_image_src(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let url = match s.strip_prefix("//") {
+        Some(rest) => format!("https://{rest}"),
+        None => s.to_string(),
+    };
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        Some(sanitize::sanitize_and_cap_single_line(
+            &url,
+            sanitize::MAX_SPAN_CHARS,
+        ))
+    } else {
+        None
+    }
+}
+
+/// The sanitized `src` and always-present `alt` of the first `<img>` under
+/// `node` (PRD FR-RD-8). `src` from the `src` attribute, falling back to
+/// Parsoid's `resource`; `alt` from `alt`, defaulting to "image".
+///
+/// PRD SEC-3: past `MAX_DOM_DEPTH` this gives up rather than recursing — a
+/// missed image on a pathologically nested `<figure>` is acceptable; a stack
+/// overflow is not.
+fn find_img_src_alt(node: NodeRef<Node>, depth: usize) -> Option<(Option<String>, String)> {
     if depth > MAX_DOM_DEPTH {
         return None;
     }
@@ -825,18 +878,93 @@ fn find_img_alt(node: NodeRef<Node>, depth: usize) -> Option<String> {
         if let Node::Element(el) = child.value() {
             if el.name() == "img" {
                 let alt = el.attr("alt").unwrap_or("").trim();
-                return Some(if alt.is_empty() {
+                let alt = if alt.is_empty() {
                     "image".to_string()
                 } else {
                     alt.to_string()
-                });
+                };
+                let src = el
+                    .attr("src")
+                    .or_else(|| el.attr("resource"))
+                    .and_then(sanitize_image_src);
+                return Some((src, alt));
             }
-            if let Some(found) = find_img_alt(child, depth + 1) {
+            if let Some(found) = find_img_src_alt(child, depth + 1) {
                 return Some(found);
             }
         }
     }
     None
+}
+
+/// The first `<figcaption>` text under `node` (a `<figure>`'s caption).
+fn find_figcaption(node: NodeRef<Node>, depth: usize) -> Option<String> {
+    if depth > MAX_DOM_DEPTH {
+        return None;
+    }
+    for child in node.children() {
+        if let Node::Element(el) = child.value() {
+            if el.name() == "figcaption" {
+                let text = normalize_ws(&text_content(child));
+                return (!text.is_empty()).then_some(text);
+            }
+            if let Some(found) = find_figcaption(child, depth + 1) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// The caption of one gallery box: its `.gallerytext` (MediaWiki's standard
+/// gallery-item caption wrapper) or a `<figcaption>` fallback.
+fn find_gallery_caption(node: NodeRef<Node>, depth: usize) -> Option<String> {
+    if depth > MAX_DOM_DEPTH {
+        return None;
+    }
+    for child in node.children() {
+        if let Node::Element(el) = child.value() {
+            let is_caption = el.name() == "figcaption"
+                || el.attr("class").is_some_and(|c| c.contains("gallerytext"));
+            if is_caption {
+                let text = normalize_ws(&text_content(child));
+                if !text.is_empty() {
+                    return Some(text);
+                }
+            }
+            if let Some(found) = find_gallery_caption(child, depth + 1) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// Parse a `<ul class="gallery">` into its items (PRD FR-RD-8). Each `<li>`
+/// (`.gallerybox`) yields a [`GalleryItem`] with its thumbnail src and a
+/// caption (its `.gallerytext`, else the image alt). Boxes with neither an
+/// image nor a caption are skipped.
+fn parse_gallery(node: NodeRef<Node>) -> Vec<GalleryItem> {
+    let mut items = Vec::new();
+    for li in node.children() {
+        let Node::Element(el) = li.value() else {
+            continue;
+        };
+        if el.name() != "li" {
+            continue;
+        }
+        let img = find_img_src_alt(li, 0);
+        let caption_text = find_gallery_caption(li, 0);
+        if img.is_none() && caption_text.is_none() {
+            continue;
+        }
+        let (src, alt) = img.unwrap_or((None, "image".to_string()));
+        items.push(GalleryItem {
+            src,
+            caption: caption_text.unwrap_or(alt),
+        });
+    }
+    items
 }
 
 /// PRD SEC-3: `depth` guards recursion (distinct from `list_depth`, which is
@@ -880,6 +1008,15 @@ fn walk_blocks(node: NodeRef<Node>, blocks: &mut Vec<Block>, list_depth: u8, dep
                 }
             }
             "ul" | "ol" => {
+                // A `<ul class="gallery">` is an image gallery (PRD FR-RD-8),
+                // not an ordinary list — intercept it before list handling.
+                if tag == "ul" && el.attr("class").is_some_and(|c| c.contains("gallery")) {
+                    let items = parse_gallery(child);
+                    if !items.is_empty() {
+                        blocks.push(Block::Gallery(items));
+                    }
+                    continue;
+                }
                 let ordered = tag == "ol";
                 let mut index = 0usize;
                 for li in child.children() {
@@ -932,17 +1069,29 @@ fn walk_blocks(node: NodeRef<Node>, blocks: &mut Vec<Block>, list_depth: u8, dep
                 }
             }
             "figure" => {
-                if let Some(alt) = find_img_alt(child, 0) {
-                    blocks.push(Block::Image(alt));
-                }
+                let (src, alt) = find_img_src_alt(child, 0).unwrap_or((None, "image".to_string()));
+                blocks.push(Block::Image {
+                    src,
+                    alt,
+                    caption: find_figcaption(child, 0),
+                });
             }
             "img" => {
                 let alt = el.attr("alt").unwrap_or("").trim();
-                blocks.push(Block::Image(if alt.is_empty() {
+                let alt = if alt.is_empty() {
                     "image".to_string()
                 } else {
                     alt.to_string()
-                }));
+                };
+                let src = el
+                    .attr("src")
+                    .or_else(|| el.attr("resource"))
+                    .and_then(sanitize_image_src);
+                blocks.push(Block::Image {
+                    src,
+                    alt,
+                    caption: None,
+                });
             }
             _ => walk_blocks(child, blocks, list_depth, depth + 1),
         }
@@ -1198,8 +1347,20 @@ fn sanitize_document(doc: &mut Document) {
                         sanitize::sanitize_and_cap_single_line(value, sanitize::MAX_SPAN_CHARS);
                 }
             }
-            Block::Image(alt) => {
+            Block::Image { alt, caption, .. } => {
                 *alt = sanitize::sanitize_and_cap_single_line(alt, sanitize::MAX_SPAN_CHARS);
+                if let Some(caption) = caption {
+                    *caption =
+                        sanitize::sanitize_and_cap_single_line(caption, sanitize::MAX_SPAN_CHARS);
+                }
+            }
+            Block::Gallery(items) => {
+                for item in items {
+                    item.caption = sanitize::sanitize_and_cap_single_line(
+                        &item.caption,
+                        sanitize::MAX_SPAN_CHARS,
+                    );
+                }
             }
             Block::Rule => {}
         }
@@ -1353,8 +1514,18 @@ pub fn render_plain(doc: &Document) -> String {
                 }
                 out.push('\n');
             }
-            Block::Image(alt) => {
-                out.push_str(&format!("[image: {alt}]\n\n"));
+            Block::Image { alt, caption, .. } => {
+                out.push_str(&format!("[image: {alt}]\n"));
+                if let Some(caption) = caption {
+                    out.push_str(&format!("{caption}\n"));
+                }
+                out.push('\n');
+            }
+            Block::Gallery(items) => {
+                for item in items {
+                    out.push_str(&format!("[image: {}]\n", item.caption));
+                }
+                out.push('\n');
             }
         }
     }
@@ -1470,11 +1641,116 @@ mod tests {
         let has_image = doc
             .blocks
             .iter()
-            .any(|b| matches!(b, Block::Image(alt) if alt == "A test picture"));
+            .any(|b| matches!(b, Block::Image { alt, src, .. } if alt == "A test picture" && src.is_none()));
         assert!(
             has_image,
-            "expected the figure's image to produce a placeholder block"
+            "expected the figure's image to produce an image block (relative src dropped to alt-only)"
         );
+    }
+
+    #[test]
+    fn figure_parses_http_src_alt_and_caption() {
+        let html = r#"<html><head><title>T</title></head><body>
+          <figure typeof="mw:File">
+            <img src="https://upload.example.org/thumb/Pic.png" alt="A cat"/>
+            <figcaption>A tabby cat, 1904</figcaption>
+          </figure>
+        </body></html>"#;
+        let doc = parse_article_html("T", html);
+        let img = doc
+            .blocks
+            .iter()
+            .find_map(|b| match b {
+                Block::Image { src, alt, caption } => {
+                    Some((src.clone(), alt.clone(), caption.clone()))
+                }
+                _ => None,
+            })
+            .expect("figure produces an image block");
+        assert_eq!(
+            img.0.as_deref(),
+            Some("https://upload.example.org/thumb/Pic.png")
+        );
+        assert_eq!(img.1, "A cat");
+        assert_eq!(img.2.as_deref(), Some("A tabby cat, 1904"));
+    }
+
+    #[test]
+    fn protocol_relative_src_is_upgraded_and_bad_schemes_dropped() {
+        // Parsoid's `//host/...` thumbnails upgrade to https; data:/relative
+        // URLs drop to alt-only (SEC-2 spirit), alt always preserved.
+        let cases = [
+            (
+                "//upload.example.org/a.png",
+                Some("https://upload.example.org/a.png"),
+            ),
+            ("data:image/png;base64,AAAA", None),
+            ("/w/local/thumb.png", None),
+            ("javascript:alert(1)", None),
+        ];
+        for (raw, expect) in cases {
+            let html = format!(
+                "<html><body><figure><img src=\"{raw}\" alt=\"x\"/></figure></body></html>"
+            );
+            let doc = parse_article_html("T", &html);
+            let src = doc.blocks.iter().find_map(|b| match b {
+                Block::Image { src, .. } => Some(src.clone()),
+                _ => None,
+            });
+            assert_eq!(
+                src.expect("image block").as_deref(),
+                expect,
+                "src {raw:?} sanitized wrong"
+            );
+        }
+    }
+
+    #[test]
+    fn gallery_parses_items_with_captions() {
+        let html = r#"<html><head><title>T</title></head><body>
+          <ul class="gallery mw-gallery-traditional">
+            <li class="gallerybox">
+              <div class="thumb"><img src="https://ex.org/1.png" alt="one"/></div>
+              <div class="gallerytext">First caption</div>
+            </li>
+            <li class="gallerybox">
+              <div class="thumb"><img src="https://ex.org/2.png" alt="two"/></div>
+              <div class="gallerytext">Second caption</div>
+            </li>
+          </ul>
+        </body></html>"#;
+        let doc = parse_article_html("T", html);
+        let items = doc
+            .blocks
+            .iter()
+            .find_map(|b| match b {
+                Block::Gallery(items) => Some(items.clone()),
+                _ => None,
+            })
+            .expect("gallery block present");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].caption, "First caption");
+        assert_eq!(items[0].src.as_deref(), Some("https://ex.org/1.png"));
+        assert_eq!(items[1].caption, "Second caption");
+    }
+
+    #[test]
+    fn render_plain_shows_alt_caption_and_gallery_as_text() {
+        let html = r#"<html><head><title>T</title></head><body>
+          <figure><img src="https://ex.org/p.png" alt="An owl"/><figcaption>An owl at night</figcaption></figure>
+          <ul class="gallery"><li class="gallerybox"><img src="https://ex.org/g.png" alt="g"/><div class="gallerytext">Gallery one</div></li></ul>
+        </body></html>"#;
+        let doc = parse_article_html("T", html);
+        let dump = render_plain(&doc);
+        assert!(dump.contains("[image: An owl]"), "alt in dump: {dump:?}");
+        assert!(dump.contains("An owl at night"), "caption in dump");
+        assert!(
+            dump.contains("[image: Gallery one]"),
+            "gallery caption in dump"
+        );
+        // A plain dump carries no escape/half-block bytes.
+        assert!(!dump.contains('\u{1b}'));
+        assert!(!dump.contains('▀'));
     }
 
     #[test]
@@ -1946,7 +2222,7 @@ mod tests {
             .blocks
             .iter()
             .find_map(|b| match b {
-                Block::Image(alt) => Some(alt),
+                Block::Image { alt, .. } => Some(alt),
                 _ => None,
             })
             .expect("image present");
@@ -2217,7 +2493,17 @@ mod tests {
                         assert_terminal_safe(value, &format!("{context} (infobox value)"));
                     }
                 }
-                Block::Image(alt) => assert_terminal_safe(alt, &format!("{context} (alt)")),
+                Block::Image { alt, caption, .. } => {
+                    assert_terminal_safe(alt, &format!("{context} (alt)"));
+                    if let Some(caption) = caption {
+                        assert_terminal_safe(caption, &format!("{context} (caption)"));
+                    }
+                }
+                Block::Gallery(items) => {
+                    for item in items {
+                        assert_terminal_safe(&item.caption, &format!("{context} (gallery)"));
+                    }
+                }
                 Block::Rule => {}
             }
         }

@@ -257,6 +257,32 @@ impl WikiClient {
         Ok(FetchedArticle { html, revid, etag })
     }
 
+    /// Fetch a raw image (thumbnail) by absolute URL for inline rendering
+    /// (PRD FR-RD-8). The URL is a sanitized http(s) media URL from the
+    /// document model (`doc::sanitize_image_src` already rejected other
+    /// schemes); this refuses anything else defensively. The body is read
+    /// through the same size-capping reader as article HTML (PRD SEC-3), at a
+    /// thumbnail-appropriate cap, so a hostile/huge asset can't exhaust
+    /// memory.
+    pub async fn fetch_image(&self, url: &str) -> Result<Vec<u8>> {
+        let lower = url.to_ascii_lowercase();
+        if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+            bail!("refusing to fetch non-http(s) image URL {url:?}");
+        }
+        let resp = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .with_context(|| format!("requesting image {url:?}"))?
+            .error_for_status()
+            .context("fetching image")?;
+        const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+        read_capped(resp, MAX_IMAGE_BYTES)
+            .await
+            .context("reading image body")
+    }
+
     /// The cheap revalidation call (PRD FR-OFF-2 / Appendix A's "Page
     /// metadata / latest revid" row): `GET /w/rest.php/v1/page/{title}/bare`
     /// returns just `{"latest": {"id": revid}}`, so a background staleness

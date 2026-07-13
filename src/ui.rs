@@ -58,6 +58,17 @@ fn colored_bg(no_color: bool, fg: Color, bg: Color) -> Style {
     }
 }
 
+/// The opaque RGB the half-block renderer composites image alpha over (PRD
+/// FR-RD-8): the theme's background. Themes with inline images set an RGB bg
+/// (`full` #101418, `paper` cream); anything without a concrete RGB bg falls
+/// back to black, the safe assumption for a dark terminal.
+fn theme_bg_rgb(theme: &Theme) -> (u8, u8, u8) {
+    match theme.bg {
+        Some(Color::Rgb(r, g, b)) => (r, g, b),
+        _ => (0, 0, 0),
+    }
+}
+
 /// The base style for a full-area widget: the theme's background/foreground
 /// (or nothing at all for `terminal`, which must inherit the user's
 /// palette), skipped entirely under `NO_COLOR`.
@@ -106,6 +117,12 @@ fn kind_style(
         SpanKind::Table => colored(no_color, theme.table),
         SpanKind::Infobox => colored(no_color, theme.infobox),
         SpanKind::Image => colored(no_color, theme.image).add_modifier(Modifier::ITALIC),
+        // A caption under an image/gallery: dim italics (PRD FR-RD-8).
+        SpanKind::Caption => colored(no_color, theme.dim).add_modifier(Modifier::ITALIC),
+        // An image-box row is replaced by half-block cells in `paint_line`
+        // before this ever renders it; a plain style is the safe fallback for
+        // the window where the decoded pixels aren't reachable.
+        SpanKind::ImageRow { .. } => Style::default(),
         SpanKind::Link(occ) => {
             if Some(*occ) == focused_link {
                 colored_bg(no_color, theme.focus_fg, theme.focus_bg).add_modifier(Modifier::BOLD)
@@ -156,12 +173,37 @@ fn paint_line(
     no_color: bool,
     matches: &[MatchSpan],
     is_current: &dyn Fn(MatchSpan) -> bool,
+    image_store: &crate::image::ImageStore,
 ) -> Line<'static> {
     let mut spans: Vec<RSpan<'static>> = Vec::new();
     let mut col = 0usize; // grapheme column from the start of the line
     let mut mi = 0usize; // index into `matches`, advances monotonically
 
     for s in &line.spans {
+        // An inline-image box row (PRD FR-RD-8): replace the reserved blank
+        // span with `cols` upper-half-block (`▀`) cells whose fg/bg come from
+        // the decoded pixels. Image rows carry no find matches (they are
+        // blank spaces at layout time), so they bypass the match splicing.
+        if let SpanKind::ImageRow { src, row, rows } = &s.kind {
+            let width = s.text.graphemes(true).count();
+            if let Some(img) = image_store.ready(src) {
+                let bg = theme_bg_rgb(theme);
+                for cell in crate::image::half_block_row(img, width as u16, *rows, *row, bg) {
+                    spans.push(RSpan::styled(
+                        crate::image::HALF_BLOCK,
+                        Style::default()
+                            .fg(Color::Rgb(cell.fg.0, cell.fg.1, cell.fg.2))
+                            .bg(Color::Rgb(cell.bg.0, cell.bg.1, cell.bg.2)),
+                    ));
+                }
+            } else {
+                // The decode isn't reachable (raced with a store change):
+                // keep the row's width as blanks rather than shifting layout.
+                spans.push(RSpan::raw(s.text.clone()));
+            }
+            col += width;
+            continue;
+        }
         let base_style = kind_style(&s.kind, focused_link, links, visited, theme, no_color);
         let graphemes: Vec<&str> = s.text.graphemes(true).collect();
         let mut cursor = 0usize;
@@ -227,6 +269,7 @@ fn paint_document(
     no_color: bool,
     find_occurrences: &[crate::layout::Occurrence],
     find_index: usize,
+    image_store: &crate::image::ImageStore,
 ) -> Text<'static> {
     let mut per_line: Vec<Vec<MatchSpan>> = vec![Vec::new(); lines.len()];
     for occurrence in find_occurrences {
@@ -256,6 +299,7 @@ fn paint_document(
                     no_color,
                     &per_line[i],
                     &is_current,
+                    image_store,
                 )
             })
             .collect::<Vec<_>>(),
@@ -708,6 +752,7 @@ fn draw_reading(frame: &mut Frame, app: &mut App, area: Rect) {
                 app.no_color,
                 &tab.find_occurrences,
                 tab.find_index,
+                &app.image_store,
             );
             let paragraph = Paragraph::new(text)
                 .style(base_style(&app.theme, app.no_color))
@@ -1508,6 +1553,7 @@ mod tests {
             false,
             &[],
             0,
+            &crate::image::ImageStore::new(),
         );
 
         for section in &sections {
@@ -1570,7 +1616,17 @@ mod tests {
 
         let theme = Theme::full();
         let layout = layout_document(&doc, 80, LayoutOptions::default());
-        let text = paint_document(&layout.lines, None, &links, &visited, &theme, false, &[], 0);
+        let text = paint_document(
+            &layout.lines,
+            None,
+            &links,
+            &visited,
+            &theme,
+            false,
+            &[],
+            0,
+            &crate::image::ImageStore::new(),
+        );
 
         let paragraph_line = text
             .lines
@@ -1691,6 +1747,7 @@ mod tests {
             false,
             &occurrences,
             0, // the first occurrence is "current"
+            &crate::image::ImageStore::new(),
         );
 
         let match_spans: Vec<_> = text
@@ -1758,6 +1815,7 @@ mod tests {
             false,
             &[occurrence],
             0,
+            &crate::image::ImageStore::new(),
         );
 
         let reversed_on = |line: usize, needle: &str| {

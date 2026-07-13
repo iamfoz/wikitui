@@ -1,4 +1,4 @@
-import http.server, urllib.parse, json, time, os
+import http.server, urllib.parse, json, time, os, zlib, struct
 
 # PRD FR-OFF-1/2 fixture revids: stable fake MediaWiki revision ids, one per
 # PAGES key, exposed via the `ETag` header on `/page/{title}/html`
@@ -13,7 +13,39 @@ REVIDS = {
     "アラン・チューリング": 1005,
     "計算機科学": 1006,
     "Rendering_Showcase": 1007,
+    "Image_Showcase": 1008,
 }
+
+# PRD FR-RD-8 media fixture: build a real, tiny PNG at import time (stdlib
+# zlib, no third-party deps) so the /media endpoint serves genuine image
+# bytes the app decodes end to end. A 2x2 image with four distinct solid
+# quadrants (TL red, TR green, BL blue, BR yellow) makes the half-block
+# colour mapping verifiable: rendered to a 2-col x 1-row cell box, cell 0 is
+# fg=red/bg=blue and cell 1 is fg=green/bg=yellow.
+def _make_png(width, height, rows):
+    def chunk(typ, data):
+        body = typ + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xffffffff)
+    sig = b"\x89PNG\r\n\x1a\n"
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)  # 8-bit RGB
+    raw = bytearray()
+    for row in rows:
+        raw.append(0)  # per-scanline filter type 0 (None)
+        for (r, g, b) in row:
+            raw += bytes((r, g, b))
+    idat = zlib.compress(bytes(raw))
+    return sig + chunk(b"IHDR", ihdr) + chunk(b"IDAT", idat) + chunk(b"IEND", b"")
+
+
+QUAD_PNG = _make_png(2, 2, [
+    [(255, 0, 0), (0, 255, 0)],
+    [(0, 0, 255), (255, 255, 0)],
+])
+
+# Counts /media requests so a pty test can assert a text theme fetches NO
+# image bytes (FR-TH-7) while the full theme does. Single-threaded HTTPServer,
+# so a plain global is race-free. Exposed at /debug/media-hits.
+MEDIA_HITS = 0
 
 # Simulates a wiki edit for exactly one fixture, for stale-while-revalidate
 # pty verification: when set to a PAGES key, that title's revid is reported
@@ -180,6 +212,29 @@ PAGES["アラン・チューリング"] = """<html><head><title>アラン・チ�
   <p>チューリングの業績は今日ますます広く認められており、計算機科学における最高の栄誉として毎年チューリング賞が授与されている。2021年からはイングランド銀行の50ポンド紙幣に肖像が採用された。</p>
 </body></html>"""
 
+# PRD FR-RD-8 pty-verification fixture: a figure with an http media src +
+# figcaption, and a two-item gallery. The img src points at this same mock's
+# /media endpoint so the app's lazy image fetch resolves against it.
+PAGES["Image_Showcase"] = """<html><head><title>Image Showcase</title></head><body>
+  <p>This article exercises inline image rendering described in FR-RD-8: a
+  figure with a caption, and a small gallery below it.</p>
+  <figure typeof="mw:File">
+    <img src="http://127.0.0.1:8943/media/quadrants.png" alt="Four-colour test pattern"/>
+    <figcaption>A four-colour test pattern with red, green, blue and yellow quadrants.</figcaption>
+  </figure>
+  <h2>Gallery</h2>
+  <ul class="gallery mw-gallery-traditional">
+    <li class="gallerybox">
+      <div class="thumb"><img src="http://127.0.0.1:8943/media/quadrants.png" alt="thumb one"/></div>
+      <div class="gallerytext">Gallery item one</div>
+    </li>
+    <li class="gallerybox">
+      <div class="thumb"><img src="http://127.0.0.1:8943/media/quadrants.png" alt="thumb two"/></div>
+      <div class="gallerytext">Gallery item two</div>
+    </li>
+  </ul>
+</body></html>"""
+
 PAGES["計算機科学"] = """<html><head><title>計算機科学</title></head><body>
   <p>計算機科学は、情報と計算の理論的基礎、およびそのコンピュータ上への実装と応用に関する研究分野である。</p>
 </body></html>"""
@@ -279,9 +334,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._serve_search_title(params)
         elif parsed.path.endswith('/search/page'):
             self._serve_search_page(params)
+        elif parsed.path.startswith('/media/'):
+            self._serve_media()
+        elif parsed.path == '/debug/media-hits':
+            self._send_json({"hits": MEDIA_HITS})
         else:
             self.send_response(404)
             self.end_headers()
+
+    def _serve_media(self):
+        # PRD FR-RD-8: serve the real tiny PNG, counting the hit so tests can
+        # assert whether an image request was made at all (text-theme gating).
+        global MEDIA_HITS
+        MEDIA_HITS += 1
+        self.send_response(200)
+        self.send_header('Content-Type', 'image/png')
+        self.send_header('Content-Length', str(len(QUAD_PNG)))
+        self.end_headers()
+        self.wfile.write(QUAD_PNG)
 
     def _serve_article(self, parts):
         title = urllib.parse.unquote(parts[-2])
