@@ -1,6 +1,9 @@
 use std::time::{Duration, Instant};
 
 use crate::api::{SearchResult, TitleSuggestion};
+use crate::bookmarks::{
+    self, Bookmark, BookmarkStore, ReadLaterEntry, ReadLaterStore, ToggleOutcome,
+};
 use crate::cache::PageCache;
 use crate::cite::CiteStyle;
 use crate::config::ConfigContext;
@@ -46,6 +49,24 @@ pub enum Mode {
     /// `f` (follow in this tab) or `F` (open in a background tab — see
     /// `App::hint_background`); Esc cancels back to Reading.
     Hint,
+    /// `B` / `:bookmarks` (PRD FR-BM-1): a selectable list of saved
+    /// bookmarks. Enter opens (same tab), `d` deletes, `t` edits tags,
+    /// `/` enters [`Mode::BookmarkFilter`]; Esc closes.
+    BookmarkPicker,
+    /// The bookmark picker's `/` live filter (tag-expression + fuzzy-title
+    /// grammar — see `bookmarks::parse_filter`): typed characters narrow
+    /// `App::bookmark_filter_input` on every keystroke. Enter/Esc return to
+    /// [`Mode::BookmarkPicker`] with the filter still applied — only the
+    /// picker's own Esc clears it.
+    BookmarkFilter,
+    /// The bookmark picker's `t` inline tag editor: a small prompt seeded
+    /// with the selected bookmark's current tags, comma/space-separated.
+    /// Enter replaces the tag set (`bookmarks::parse_tags`); Esc cancels.
+    BookmarkTagEdit,
+    /// `:readlater` (PRD FR-BM-3): the read-later queue, oldest first.
+    /// Enter opens and (per `readlater_auto_dequeue`) removes the entry;
+    /// `d` removes without opening; Esc closes.
+    ReadLaterPicker,
 }
 
 /// Where the currently open article's content came from (PRD FR-OFF-6's
@@ -123,7 +144,10 @@ pub struct App {
     pub selected_tab_pick: usize,
     /// Selection cursor for the `gb` back-stack picker.
     pub selected_history: usize,
-    /// The `bb` chord's pending-key latch (mirrors `pending_g` for `gg`).
+    /// The `b`-prefix chord's pending-key latch (mirrors `pending_g` for
+    /// `gg`): dispatches to `bb` (tab picker, PRD FR-TB-1) or `ba` (annotate
+    /// the current article's bookmark, PRD FR-BM-2) by its second key — see
+    /// `resolve_b_prefix`.
     pub pending_b: bool,
     /// `Q`'s one-keypress quit confirmation (PRD Appendix B): armed by `Q`,
     /// resolved by the next key (`y` quits, anything else cancels).
@@ -251,6 +275,42 @@ pub struct App {
     /// `App::new` and overwritten by `main` right after construction — most
     /// tests never touch it (there's no file to reload from `::default()`).
     pub config_ctx: ConfigContext,
+
+    // -- Bookmarks, annotations, read-later (PRD §5.6) --------------------
+    /// The saved-bookmarks store (PRD FR-BM-1/7), persisted to disk.
+    pub bookmarks: BookmarkStore,
+    /// The read-later queue (PRD FR-BM-3/7), persisted to disk.
+    pub readlater: ReadLaterStore,
+    /// The `r`-prefix chord's pending-key latch (`rl` read-later vs `r`'s
+    /// own "open Research mode"). See `Mode::Reading`'s `pending_r` arm in
+    /// `main.rs` for the documented precedence against the unrelated
+    /// "background revalidation ready — `r` reloads" notice, which never
+    /// engages this latch at all.
+    pub pending_r: bool,
+    /// Selection cursor into the *filtered* bookmark list (`App::
+    /// visible_bookmarks`), not into `bookmarks.bookmarks` directly.
+    pub selected_bookmark: usize,
+    /// The mode `open_bookmark_picker` was entered from, restored on Esc.
+    pub bookmark_prior_mode: Mode,
+    /// The bookmark picker's live `/` filter input (PRD FR-BM-1's tag-
+    /// expression + fuzzy-title grammar).
+    pub bookmark_filter_input: String,
+    /// The `t` inline tag-editor's in-progress input, seeded from the
+    /// selected bookmark's current tags on entry.
+    pub bookmark_tag_input: String,
+    /// Selection cursor for the read-later queue picker.
+    pub selected_readlater: usize,
+    /// The mode `open_readlater_picker` was entered from, restored on Esc.
+    pub readlater_prior_mode: Mode,
+    /// PRD FR-BM-3's "(config)" `readlater_auto_dequeue`: whether opening a
+    /// read-later entry removes it from the queue. Defaults to `true`;
+    /// live-set from `config.toml`/`WIKITUI_READLATER_AUTO_DEQUEUE` at
+    /// startup and on `:config reload` (see `config::resolve`).
+    pub readlater_auto_dequeue: bool,
+    /// Export-overwrite confirmation for `:bookmarks export`, mirroring
+    /// `pending_export_overwrite` — the exact target path just warned
+    /// about; running the same export again for that same path proceeds.
+    pub pending_bookmark_export_overwrite: Option<std::path::PathBuf>,
 }
 
 impl App {
@@ -304,6 +364,17 @@ impl App {
             hint_input: String::new(),
             hint_background: false,
             config_ctx: ConfigContext::default(),
+            bookmarks: BookmarkStore::load(),
+            readlater: ReadLaterStore::load(),
+            pending_r: false,
+            selected_bookmark: 0,
+            bookmark_prior_mode: Mode::Reading,
+            bookmark_filter_input: String::new(),
+            bookmark_tag_input: String::new(),
+            selected_readlater: 0,
+            readlater_prior_mode: Mode::Reading,
+            readlater_auto_dequeue: true,
+            pending_bookmark_export_overwrite: None,
         }
     }
 
@@ -1168,6 +1239,287 @@ impl App {
             (self.selected_suggestion + len - 1) % len
         };
     }
+
+    // -- Bookmarks (PRD FR-BM-1, FR-BM-7) ----------------------------------
+
+    /// `m`: bookmarks the active tab's article, or un-bookmarks it if it
+    /// already was (the toggle idiom — see `bookmarks::BookmarkStore::
+    /// toggle`'s doc comment). Sets `notice` either way so the reader always
+    /// gets feedback, not just on the add half.
+    pub fn toggle_bookmark(&mut self) {
+        let Some(doc) = self.active_tab().doc.as_ref() else {
+            self.status = "Open an article first".to_string();
+            return;
+        };
+        let title = doc.title.clone();
+        let lang = self.active_tab().lang.clone();
+        let revid = self.active_tab().current_revid;
+        let revid = (revid != 0).then_some(revid);
+
+        match self.bookmarks.toggle(&lang, &title, revid) {
+            ToggleOutcome::Added => self.notice = Some(format!("Bookmarked \"{title}\"")),
+            ToggleOutcome::Removed => {
+                self.notice = Some(format!("Removed bookmark for \"{title}\""))
+            }
+        }
+    }
+
+    /// The bookmark picker's live list: indices into `self.bookmarks.
+    /// bookmarks` that satisfy the current `/` filter, in store order —
+    /// `selected_bookmark` indexes into *this*, not the underlying store
+    /// directly, so narrowing the filter never leaves the cursor pointing
+    /// at a bookmark that's no longer shown.
+    pub fn visible_bookmarks(&self) -> Vec<usize> {
+        let filter = bookmarks::parse_filter(&self.bookmark_filter_input);
+        self.bookmarks
+            .bookmarks
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| bookmarks::matches_filter(b, &filter))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The real store index the picker's current selection refers to, or
+    /// `None` when the filtered list is empty.
+    pub fn selected_bookmark_index(&self) -> Option<usize> {
+        self.visible_bookmarks()
+            .get(self.selected_bookmark)
+            .copied()
+    }
+
+    pub fn selected_bookmark_entry(&self) -> Option<&Bookmark> {
+        self.selected_bookmark_index()
+            .and_then(|i| self.bookmarks.bookmarks.get(i))
+    }
+
+    /// `B` / `:bookmarks`: opens the picker over the whole bookmark store.
+    pub fn open_bookmark_picker(&mut self) {
+        self.bookmark_prior_mode = self.mode;
+        self.mode = Mode::BookmarkPicker;
+        self.bookmark_filter_input.clear();
+        self.selected_bookmark = 0;
+        self.status =
+            "j/k: move   /: filter   t: tags   d: delete   Enter: open   Esc: close".to_string();
+    }
+
+    pub fn close_bookmark_picker(&mut self) {
+        self.mode = self.bookmark_prior_mode;
+        self.status = match &self.active_tab().doc {
+            Some(doc) => doc.title.clone(),
+            None => "Press / to search, ? for help, q to quit".to_string(),
+        };
+    }
+
+    /// Moves the picker's selection, wrapping over the *filtered* list —
+    /// a no-op with nothing visible.
+    pub fn cycle_bookmark(&mut self, forward: bool) {
+        let len = self.visible_bookmarks().len();
+        if len == 0 {
+            self.selected_bookmark = 0;
+            return;
+        }
+        self.selected_bookmark = if forward {
+            (self.selected_bookmark + 1) % len
+        } else {
+            (self.selected_bookmark + len - 1) % len
+        };
+    }
+
+    /// `d` in the picker: deletes the selected bookmark, keeping the cursor
+    /// on a valid index into whatever the filter still shows afterwards.
+    pub fn delete_selected_bookmark(&mut self) {
+        let Some(index) = self.selected_bookmark_index() else {
+            return;
+        };
+        if let Some((removed, persisted)) = self.bookmarks.remove(index) {
+            let visible_len = self.visible_bookmarks().len();
+            if visible_len == 0 {
+                self.selected_bookmark = 0;
+            } else {
+                self.selected_bookmark = self.selected_bookmark.min(visible_len - 1);
+            }
+            self.status = match persisted {
+                Ok(()) => format!("Removed bookmark for \"{}\"", removed.title),
+                Err(e) => format!(
+                    "Removed \"{}\" from this session, but updating the file failed: {e}",
+                    removed.title
+                ),
+            };
+        }
+    }
+
+    /// `t` in the picker: opens the inline tag editor, seeded with the
+    /// selected bookmark's current tags (comma-separated, so re-committing
+    /// unchanged input is a no-op edit).
+    pub fn begin_tag_edit(&mut self) {
+        let Some(bookmark) = self.selected_bookmark_entry() else {
+            self.status = "No bookmark selected".to_string();
+            return;
+        };
+        self.bookmark_tag_input = bookmark.tags.join(", ");
+        self.mode = Mode::BookmarkTagEdit;
+    }
+
+    /// Enter in the tag editor: replaces the selected bookmark's tag set
+    /// with `bookmarks::parse_tags(&self.bookmark_tag_input)` and returns
+    /// to the picker.
+    pub fn commit_tag_edit(&mut self) {
+        if let Some(bookmark) = self.selected_bookmark_entry() {
+            let lang = bookmark.lang.clone();
+            let title = bookmark.title.clone();
+            let tags = bookmarks::parse_tags(&self.bookmark_tag_input);
+            self.bookmarks.set_tags(&lang, &title, tags);
+        }
+        self.mode = Mode::BookmarkPicker;
+    }
+
+    // -- Read-later queue (PRD FR-BM-3, FR-BM-7) ---------------------------
+
+    /// `rl`'s target (PRD FR-BM-3 "enqueues from link or article"): the
+    /// focused link's internal target if one is focused and followable,
+    /// else the article on screen; `None` with nothing open at all. A
+    /// focused *external* link has no internal target to cache offline, so
+    /// it falls back to the article too, same as Enter's own "not yet
+    /// followable" treatment of external links elsewhere.
+    pub fn read_later_target(&self) -> Option<(String, String)> {
+        let tab = self.active_tab();
+        if let Some(link) = tab.focused_link.and_then(|i| tab.links.get(i))
+            && let Some(title) = &link.internal_title
+        {
+            return Some((tab.lang.clone(), title.clone()));
+        }
+        tab.doc
+            .as_ref()
+            .map(|d| (tab.lang.clone(), d.title.clone()))
+    }
+
+    /// The read-later queue's live list, oldest first (append order is
+    /// FIFO order — see `ReadLaterStore::enqueue`'s doc comment).
+    pub fn open_readlater_picker(&mut self) {
+        self.readlater_prior_mode = self.mode;
+        self.mode = Mode::ReadLaterPicker;
+        self.selected_readlater = self
+            .selected_readlater
+            .min(self.readlater.entries.len().saturating_sub(1));
+        self.status = "Enter: open (auto-dequeues)   d: remove   Esc: close".to_string();
+    }
+
+    pub fn close_readlater_picker(&mut self) {
+        self.mode = self.readlater_prior_mode;
+        self.status = match &self.active_tab().doc {
+            Some(doc) => doc.title.clone(),
+            None => "Press / to search, ? for help, q to quit".to_string(),
+        };
+    }
+
+    pub fn cycle_readlater(&mut self, forward: bool) {
+        let len = self.readlater.entries.len();
+        if len == 0 {
+            return;
+        }
+        self.selected_readlater = if forward {
+            (self.selected_readlater + 1) % len
+        } else {
+            (self.selected_readlater + len - 1) % len
+        };
+    }
+
+    /// `d` in the read-later picker: removes the selected entry without
+    /// opening it.
+    pub fn remove_selected_readlater(&mut self) {
+        if let Some((removed, persisted)) = self.readlater.remove(self.selected_readlater) {
+            let len = self.readlater.entries.len();
+            self.selected_readlater = if len == 0 {
+                0
+            } else {
+                self.selected_readlater.min(len - 1)
+            };
+            self.status = match persisted {
+                Ok(()) => format!("Removed \"{}\" from the read-later queue", removed.title),
+                Err(e) => format!(
+                    "Removed \"{}\" from this session, but updating the file failed: {e}",
+                    removed.title
+                ),
+            };
+        }
+    }
+
+    /// Enter in the read-later picker, PRD FR-BM-3's "opening auto-dequeues
+    /// (config)": returns the entry to open, and — when
+    /// `readlater_auto_dequeue` is on — removes it from the queue first
+    /// (before the caller's own fetch, so a fetch failure doesn't leave a
+    /// half-dequeued entry: it's just gone, matching "opening" being the
+    /// action that consumed it, not "opening successfully").
+    pub fn take_selected_readlater(&mut self) -> Option<ReadLaterEntry> {
+        let index = self.selected_readlater;
+        if self.readlater_auto_dequeue {
+            self.readlater.remove(index).map(|(entry, _)| entry)
+        } else {
+            self.readlater.entries.get(index).cloned()
+        }
+    }
+
+    // -- Bookmark export (PRD FR-BM-4) -------------------------------------
+
+    /// `:bookmarks export <format> [path]`: resolves the default timestamped
+    /// path under the data dir's `exports/` (§6.4) when `path` is `None`.
+    pub fn export_bookmarks(&mut self, format: &str, path: Option<&std::path::Path>) {
+        if self.bookmarks.bookmarks.is_empty() {
+            self.notice = Some("Nothing to export — no bookmarks saved yet".to_string());
+            return;
+        }
+        let target = match path {
+            Some(p) => p.to_path_buf(),
+            None => match crate::bookmark_export::default_export_path(format) {
+                Some(p) => p,
+                None => {
+                    self.notice = Some(format!(
+                        "unknown export format {format:?} — one of: {}",
+                        crate::bookmark_export::FORMATS.join(", ")
+                    ));
+                    return;
+                }
+            },
+        };
+        self.export_bookmarks_to(format, target);
+    }
+
+    /// The testable core of `export_bookmarks`: same behavior, explicit
+    /// target path. Overwriting an existing export requires a second
+    /// confirming run of the same command (mirrors `export_bibliography_to`).
+    pub fn export_bookmarks_to(&mut self, format: &str, target: std::path::PathBuf) {
+        let Some(content) = crate::bookmark_export::render(&self.bookmarks.bookmarks, format)
+        else {
+            self.notice = Some(format!(
+                "unknown export format {format:?} — one of: {}",
+                crate::bookmark_export::FORMATS.join(", ")
+            ));
+            return;
+        };
+        if target.exists()
+            && self.pending_bookmark_export_overwrite.as_deref() != Some(target.as_path())
+        {
+            self.pending_bookmark_export_overwrite = Some(target.clone());
+            self.notice = Some(format!(
+                "{} already exists — run the export again to overwrite",
+                target.display()
+            ));
+            return;
+        }
+        self.pending_bookmark_export_overwrite = None;
+        if let Some(parent) = target.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        self.notice = Some(match std::fs::write(&target, content) {
+            Ok(()) => format!(
+                "Exported {} bookmarks to {}",
+                self.bookmarks.bookmarks.len(),
+                target.display()
+            ),
+            Err(e) => format!("Export failed: {e}"),
+        });
+    }
 }
 
 /// Pure debounce-elapsed check (PRD FR-SR-1), isolated from the real clock
@@ -1195,6 +1547,60 @@ pub fn zero_results_message(query: &str, suggestion: Option<&str>) -> String {
     match suggestion {
         Some(s) => format!("No results for \"{query}\". Did you mean {s}? (Enter to search)"),
         None => format!("No results for \"{query}\""),
+    }
+}
+
+/// What the `b`-prefix chord's second key means (PRD FR-TB-1's `bb`, FR-BM-2's
+/// `ba`) — a pure decision, like `resolve_hint_action`, so `main.rs`'s
+/// `handle_key` only has to turn the answer into the actual mode
+/// change/editor spawn, not decide it inline where a test can't reach it
+/// without a live terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BPrefixAction {
+    /// `bb`: open the tab picker.
+    TabPicker,
+    /// `ba`: annotate the current article's bookmark.
+    Annotate,
+    /// Any other second key: dead prefix — `handle_key` processes it as if
+    /// `b` had never been typed (mirrors the existing `g`-prefix fallback,
+    /// e.g. `gj` still scrolls).
+    PassThrough,
+}
+
+pub fn resolve_b_prefix(second_key: char) -> BPrefixAction {
+    match second_key {
+        'b' => BPrefixAction::TabPicker,
+        'a' => BPrefixAction::Annotate,
+        _ => BPrefixAction::PassThrough,
+    }
+}
+
+/// What the `r`-prefix chord's second key means (PRD FR-BM-3's `rl`).
+/// Reached only when no background-revalidation "r to reload" notice is
+/// armed — `Mode::Reading`'s `pending_r` arm in `main.rs` never engages this
+/// latch at all when one is (bare `r` reloads on the spot then, as it always
+/// has, taking precedence over the read-later chord entirely).
+///
+/// Unlike the `g`/`b` prefixes — which have no standalone meaning, so an
+/// unrecognized second key falls through to being processed as itself
+/// (`PassThrough` above) — bare `r` always used to open Research mode
+/// outright. That meaning survives here as `OpenResearch`, the fallback for
+/// every second key except `l`: the second key is consumed as part of
+/// resolving the chord, not reprocessed as its own binding. The two
+/// prefixes deliberately disagree on this point because only `r` ever had a
+/// standalone action worth preserving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RPrefixAction {
+    /// `rl`: enqueue `read_later_target()` for later.
+    ReadLater,
+    /// Any other second key: `r`'s own original meaning (open Research mode).
+    OpenResearch,
+}
+
+pub fn resolve_r_prefix(second_key: char) -> RPrefixAction {
+    match second_key {
+        'l' => RPrefixAction::ReadLater,
+        _ => RPrefixAction::OpenResearch,
     }
 }
 
@@ -2584,5 +2990,327 @@ mod tests {
              no longer be hinted — a stale hint here would follow the wrong \
              thing if the reader typed its old label"
         );
+    }
+
+    // ---- Bookmarks / read-later (PRD FR-BM-1..4, 7) ----------------------
+
+    fn app_with_bookmarks() -> App {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.bookmarks = crate::bookmarks::BookmarkStore::in_memory();
+        app.readlater = crate::bookmarks::ReadLaterStore::in_memory();
+        app
+    }
+
+    #[test]
+    fn toggle_bookmark_adds_then_removes_with_a_notice_both_ways() {
+        let mut app = app_with_bookmarks();
+        app.set_document(doc("Alan Turing"));
+        app.active_tab_mut().current_revid = 7;
+
+        app.toggle_bookmark();
+        assert!(app.bookmarks.is_bookmarked("en", "Alan Turing"));
+        assert!(app.notice.as_deref().unwrap().contains("Bookmarked"));
+        assert_eq!(app.bookmarks.bookmarks[0].revid_at_bookmark, Some(7));
+
+        app.toggle_bookmark();
+        assert!(!app.bookmarks.is_bookmarked("en", "Alan Turing"));
+        assert!(app.notice.as_deref().unwrap().contains("Removed"));
+    }
+
+    #[test]
+    fn toggle_bookmark_with_no_document_reports_instead_of_panicking() {
+        let mut app = app_with_bookmarks();
+        app.toggle_bookmark();
+        assert!(app.status.contains("Open an article first"));
+    }
+
+    #[test]
+    fn bookmark_picker_filter_narrows_the_visible_list() {
+        let mut app = app_with_bookmarks();
+        app.bookmarks.toggle("en", "Enigma machine", None);
+        app.bookmarks
+            .set_tags("en", "Enigma machine", vec!["crypto".into()]);
+        app.bookmarks.toggle("en", "Ada Lovelace", None);
+
+        app.open_bookmark_picker();
+        assert_eq!(
+            app.visible_bookmarks().len(),
+            2,
+            "no filter shows everything"
+        );
+
+        app.bookmark_filter_input = "#crypto".to_string();
+        assert_eq!(
+            app.visible_bookmarks(),
+            vec![0],
+            "only the tagged one matches"
+        );
+
+        app.bookmark_filter_input = "#nope".to_string();
+        assert!(
+            app.visible_bookmarks().is_empty(),
+            "an unused tag matches nothing"
+        );
+
+        app.bookmark_filter_input = "lovelace".to_string();
+        assert_eq!(app.visible_bookmarks(), vec![1]);
+    }
+
+    #[test]
+    fn cycle_bookmark_wraps_over_the_filtered_list_not_the_whole_store() {
+        let mut app = app_with_bookmarks();
+        app.bookmarks.toggle("en", "A", None);
+        app.bookmarks.set_tags("en", "A", vec!["x".into()]);
+        app.bookmarks.toggle("en", "B", None); // untagged
+        app.bookmarks.toggle("en", "C", None);
+        app.bookmarks.set_tags("en", "C", vec!["x".into()]);
+
+        app.open_bookmark_picker();
+        app.bookmark_filter_input = "#x".to_string();
+        assert_eq!(app.visible_bookmarks(), vec![0, 2]);
+
+        assert_eq!(app.selected_bookmark, 0);
+        app.cycle_bookmark(true);
+        assert_eq!(app.selected_bookmark, 1, "second (and last) visible entry");
+        app.cycle_bookmark(true);
+        assert_eq!(app.selected_bookmark, 0, "wraps within the filtered list");
+    }
+
+    #[test]
+    fn delete_selected_bookmark_removes_it_and_keeps_selection_in_range() {
+        let mut app = app_with_bookmarks();
+        app.bookmarks.toggle("en", "A", None);
+        app.bookmarks.toggle("en", "B", None);
+        app.open_bookmark_picker();
+        app.selected_bookmark = 1; // "B"
+
+        app.delete_selected_bookmark();
+        assert!(!app.bookmarks.is_bookmarked("en", "B"));
+        assert!(app.bookmarks.is_bookmarked("en", "A"));
+        assert_eq!(app.selected_bookmark, 0);
+    }
+
+    #[test]
+    fn tag_edit_round_trips_through_the_prompt() {
+        let mut app = app_with_bookmarks();
+        app.bookmarks.toggle("en", "Alan Turing", None);
+        app.open_bookmark_picker();
+
+        app.begin_tag_edit();
+        assert_eq!(app.mode, Mode::BookmarkTagEdit);
+        assert_eq!(
+            app.bookmark_tag_input, "",
+            "a fresh bookmark starts untagged"
+        );
+
+        app.bookmark_tag_input = "crypto, ww2".to_string();
+        app.commit_tag_edit();
+        assert_eq!(app.mode, Mode::BookmarkPicker);
+        assert_eq!(
+            app.bookmarks.find("en", "Alan Turing").unwrap().tags,
+            vec!["crypto", "ww2"]
+        );
+
+        // Re-opening the editor seeds from the now-current tags.
+        app.begin_tag_edit();
+        assert_eq!(app.bookmark_tag_input, "crypto, ww2");
+    }
+
+    #[test]
+    fn read_later_target_prefers_the_focused_internal_link_over_the_article() {
+        let mut app = app_with_bookmarks();
+        let html =
+            r##"<html><body><p>See <a href="./Enigma_machine">Enigma</a>.</p></body></html>"##;
+        app.set_document(crate::doc::parse_article_html("Alan Turing", html));
+        app.active_tab_mut().focused_link = Some(0);
+
+        assert_eq!(
+            app.read_later_target(),
+            Some(("en".to_string(), "Enigma machine".to_string())),
+            "a focused internal link wins over the article on screen"
+        );
+
+        app.active_tab_mut().focused_link = None;
+        assert_eq!(
+            app.read_later_target(),
+            Some(("en".to_string(), "Alan Turing".to_string())),
+            "with nothing focused, the article itself is the target"
+        );
+    }
+
+    #[test]
+    fn read_later_target_falls_back_to_the_article_for_an_external_focused_link() {
+        let mut app = app_with_bookmarks();
+        let html = r##"<html><body><p><a href="https://example.com/">Ext</a></p></body></html>"##;
+        app.set_document(crate::doc::parse_article_html("Alan Turing", html));
+        app.active_tab_mut().focused_link = Some(0);
+
+        assert_eq!(
+            app.read_later_target(),
+            Some(("en".to_string(), "Alan Turing".to_string())),
+            "an external link has nothing internal to cache offline"
+        );
+    }
+
+    #[test]
+    fn read_later_target_with_nothing_open_is_none() {
+        let app = app_with_bookmarks();
+        assert_eq!(app.read_later_target(), None);
+    }
+
+    #[test]
+    fn readlater_picker_fifo_order_and_auto_dequeue_on_take() {
+        let mut app = app_with_bookmarks();
+        app.readlater.enqueue(crate::bookmarks::ReadLaterEntry {
+            title: "First".to_string(),
+            lang: "en".to_string(),
+            enqueued_at: crate::bookmarks::now_ts(),
+            priority: 0,
+        });
+        app.readlater.enqueue(crate::bookmarks::ReadLaterEntry {
+            title: "Second".to_string(),
+            lang: "en".to_string(),
+            enqueued_at: crate::bookmarks::now_ts(),
+            priority: 0,
+        });
+        assert_eq!(
+            app.readlater
+                .entries
+                .iter()
+                .map(|e| e.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["First", "Second"],
+            "append order is queue order"
+        );
+
+        app.open_readlater_picker();
+        assert_eq!(app.selected_readlater, 0);
+        assert!(app.readlater_auto_dequeue, "default is auto-dequeue-on");
+
+        let taken = app.take_selected_readlater().expect("an entry to take");
+        assert_eq!(taken.title, "First");
+        assert_eq!(
+            app.readlater.entries.len(),
+            1,
+            "auto-dequeue must remove it from the queue"
+        );
+        assert_eq!(app.readlater.entries[0].title, "Second");
+    }
+
+    #[test]
+    fn readlater_take_without_auto_dequeue_leaves_the_entry_queued() {
+        let mut app = app_with_bookmarks();
+        app.readlater_auto_dequeue = false;
+        app.readlater.enqueue(crate::bookmarks::ReadLaterEntry {
+            title: "Keep me queued".to_string(),
+            lang: "en".to_string(),
+            enqueued_at: crate::bookmarks::now_ts(),
+            priority: 0,
+        });
+        app.selected_readlater = 0;
+
+        let taken = app.take_selected_readlater().expect("an entry to take");
+        assert_eq!(taken.title, "Keep me queued");
+        assert_eq!(
+            app.readlater.entries.len(),
+            1,
+            "still queued when the config is off"
+        );
+    }
+
+    #[test]
+    fn remove_selected_readlater_deletes_without_returning_it() {
+        let mut app = app_with_bookmarks();
+        app.readlater.enqueue(crate::bookmarks::ReadLaterEntry {
+            title: "Gone".to_string(),
+            lang: "en".to_string(),
+            enqueued_at: crate::bookmarks::now_ts(),
+            priority: 0,
+        });
+        app.selected_readlater = 0;
+        app.remove_selected_readlater();
+        assert!(app.readlater.entries.is_empty());
+    }
+
+    #[test]
+    fn export_bookmarks_writes_the_file_and_requires_a_second_run_to_overwrite() {
+        let mut app = app_with_bookmarks();
+        app.bookmarks.toggle("en", "Alan Turing", Some(1));
+
+        let dir = std::env::temp_dir().join(format!(
+            "wikitui-bookmark-export-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("bookmarks.md");
+
+        app.export_bookmarks_to("md", target.clone());
+        let first = std::fs::read_to_string(&target).unwrap();
+        assert!(first.contains("Alan Turing"));
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("Exported 1 bookmarks")
+        );
+
+        // A hand-edit the export shouldn't silently clobber without a second
+        // confirming run — same two-press pattern as `export_bibliography_to`.
+        std::fs::write(&target, "hand-annotated").unwrap();
+        app.export_bookmarks_to("md", target.clone());
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("run the export again to overwrite"),
+            "{:?}",
+            app.notice
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "hand-annotated");
+
+        app.export_bookmarks_to("md", target.clone());
+        assert!(
+            std::fs::read_to_string(&target)
+                .unwrap()
+                .contains("Alan Turing")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_bookmarks_with_nothing_saved_reports_instead_of_writing() {
+        let mut app = app_with_bookmarks();
+        app.export_bookmarks("md", None);
+        assert!(app.notice.as_deref().unwrap().contains("Nothing to export"));
+    }
+
+    #[test]
+    fn export_bookmarks_rejects_an_unknown_format() {
+        let mut app = app_with_bookmarks();
+        app.bookmarks.toggle("en", "Alan Turing", None);
+        app.export_bookmarks("carrier-pigeon", None);
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("unknown export format")
+        );
+    }
+
+    // ---- b-/r-prefix dispatch (PRD FR-TB-1, FR-BM-2, FR-BM-3) -------------
+
+    #[test]
+    fn b_prefix_dispatches_bb_to_the_tab_picker_and_ba_to_annotate() {
+        assert_eq!(resolve_b_prefix('b'), BPrefixAction::TabPicker);
+        assert_eq!(resolve_b_prefix('a'), BPrefixAction::Annotate);
+        assert_eq!(resolve_b_prefix('x'), BPrefixAction::PassThrough);
+    }
+
+    #[test]
+    fn r_prefix_dispatches_rl_to_read_later_and_anything_else_to_research() {
+        assert_eq!(resolve_r_prefix('l'), RPrefixAction::ReadLater);
+        assert_eq!(resolve_r_prefix('r'), RPrefixAction::OpenResearch);
+        assert_eq!(resolve_r_prefix('j'), RPrefixAction::OpenResearch);
     }
 }

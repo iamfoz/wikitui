@@ -42,11 +42,22 @@ pub enum Command {
     TabNew(Option<String>),
     /// `:tabs` — open the fuzzy tab picker (same view as `bb`).
     Tabs,
+    /// `:bookmarks` — open the bookmark picker (same view as `B`).
+    Bookmarks,
+    /// `:bookmarks export <format> [path]` (PRD FR-BM-4): `format` is one of
+    /// `bookmark_export::FORMATS`; `path` overrides the default timestamped
+    /// location under the data dir's `exports/`.
+    BookmarksExport {
+        format: String,
+        path: Option<String>,
+    },
+    /// `:readlater` — open the read-later queue view.
+    ReadLater,
     /// `:q` / `:quit` — exit.
     Quit,
 }
 
-pub const USAGE: &str = "commands: open <title>, lang <code>, theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, config reload, help, quit";
+pub const USAGE: &str = "commands: open <title>, lang <code>, theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, config reload, help, quit";
 
 pub fn parse(input: &str) -> Result<Command, String> {
     let input = input.trim();
@@ -125,6 +136,42 @@ pub fn parse(input: &str) -> Result<Command, String> {
             }
         }
         "tabs" => Ok(Command::Tabs),
+        // `:bookmarks` alone opens the picker; `:bookmarks export
+        // md|html|json|netscape [path]` exports it (PRD FR-BM-4).
+        "bookmarks" => {
+            let (sub, rest) = match arg.split_once(char::is_whitespace) {
+                Some((s, r)) => (s, r.trim()),
+                None => (arg, ""),
+            };
+            match sub {
+                "" => Ok(Command::Bookmarks),
+                "export" => {
+                    let (format, path) = match rest.split_once(char::is_whitespace) {
+                        Some((f, p)) => (f, Some(p.trim()).filter(|p| !p.is_empty())),
+                        None => (rest, None),
+                    };
+                    if format.is_empty() {
+                        return Err(
+                            "usage: :bookmarks export md|html|json|netscape [path]".to_string()
+                        );
+                    }
+                    if !crate::bookmark_export::FORMATS.contains(&format) {
+                        return Err(format!(
+                            "unknown export format {format:?} — one of: {}",
+                            crate::bookmark_export::FORMATS.join(", ")
+                        ));
+                    }
+                    Ok(Command::BookmarksExport {
+                        format: format.to_string(),
+                        path: path.map(str::to_string),
+                    })
+                }
+                other => Err(format!(
+                    "unknown bookmarks subcommand {other:?} — try: bookmarks, bookmarks export md|html|json|netscape [path]"
+                )),
+            }
+        }
+        "readlater" => Ok(Command::ReadLater),
         "library" | "lib" => Ok(Command::Library),
         "research" => Ok(Command::Research),
         "toc" => Ok(Command::Toc),
@@ -240,5 +287,39 @@ mod tests {
             parse("  open   Alan Turing  "),
             Ok(Command::Open("Alan Turing".to_string()))
         );
+    }
+
+    #[test]
+    fn bookmarks_bare_opens_the_picker() {
+        assert_eq!(parse("bookmarks"), Ok(Command::Bookmarks));
+        assert_eq!(parse("readlater"), Ok(Command::ReadLater));
+    }
+
+    #[test]
+    fn bookmarks_export_parses_format_and_optional_path() {
+        assert_eq!(
+            parse("bookmarks export md"),
+            Ok(Command::BookmarksExport {
+                format: "md".to_string(),
+                path: None
+            })
+        );
+        assert_eq!(
+            parse("bookmarks export netscape /tmp/out.html"),
+            Ok(Command::BookmarksExport {
+                format: "netscape".to_string(),
+                path: Some("/tmp/out.html".to_string())
+            })
+        );
+        for format in ["md", "html", "json", "netscape"] {
+            assert!(parse(&format!("bookmarks export {format}")).is_ok());
+        }
+    }
+
+    #[test]
+    fn bookmarks_export_rejects_bad_input() {
+        assert!(parse("bookmarks export").is_err());
+        assert!(parse("bookmarks export carrier-pigeon").is_err());
+        assert!(parse("bookmarks frobnicate").is_err());
     }
 }

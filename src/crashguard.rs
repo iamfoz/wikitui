@@ -84,6 +84,48 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// Temporarily yields the terminal to an external, interactively-run
+/// program — PRD FR-BM-2's `ba` annotate, the first (only, today) caller,
+/// spawning `$EDITOR` (SEC-5's external-command boundary: the child gets a
+/// normal-looking terminal to draw its own UI into, never the alternate
+/// screen wikitui itself owns). `suspend` leaves the alternate screen and
+/// disables raw mode; `Drop` restores both — the same RAII shape as
+/// [`TerminalGuard`] and for the identical reason: whatever the caller does
+/// between `suspend()` and the guard going out of scope (running the child
+/// process, reading its output, an early `return` on error) restores the
+/// terminal on every exit path, not just the one a call-symmetric
+/// enter/leave pair would remember to cover.
+pub struct SuspendedTerminal<'a> {
+    terminal: &'a mut Terminal<CrosstermBackend<io::Stdout>>,
+}
+
+impl<'a> SuspendedTerminal<'a> {
+    /// Best-effort by construction (see [`restore_terminal_best_effort`]):
+    /// a failed step here still returns a guard whose `Drop` will attempt
+    /// the corresponding restore, never leaving the terminal in a worse
+    /// state than pressing on with the external command anyway.
+    pub fn suspend(terminal: &'a mut Terminal<CrosstermBackend<io::Stdout>>) -> Self {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), crossterm::cursor::Show);
+        Self { terminal }
+    }
+}
+
+impl Drop for SuspendedTerminal<'_> {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::enable_raw_mode();
+        let _ = execute!(io::stdout(), EnterAlternateScreen);
+        // The external program just drew its own content over the real
+        // screen while wikitui was away; ratatui's diffing otherwise
+        // assumes the terminal still shows whatever it last painted, so a
+        // stale diff here would leave leftover fragments of the child
+        // program's UI on screen. `clear()` forces the next `draw()` to
+        // repaint every cell instead of diffing against that stale buffer.
+        let _ = self.terminal.clear();
+    }
+}
+
 /// What "restore the terminal" means, shared by `TerminalGuard::drop` and
 /// the panic hook. Every step is attempted independently — never chained
 /// with `?` — for two reasons at once: it must be **best-effort** (one

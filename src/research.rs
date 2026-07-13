@@ -7,7 +7,6 @@
 //! server, no account risk).
 
 use serde::{Deserialize, Serialize};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::doc::Citation;
@@ -79,18 +78,8 @@ impl ResearchStore {
     }
 
     fn load_from(path: PathBuf) -> Self {
-        let citations = std::fs::read_to_string(&path)
-            .ok()
-            .map(|content| {
-                content
-                    .lines()
-                    .filter(|l| !l.trim().is_empty())
-                    .filter_map(|l| serde_json::from_str(l).ok())
-                    .collect()
-            })
-            .unwrap_or_default();
         Self {
-            citations,
+            citations: crate::jsonl::load(&path),
             path: Some(path),
         }
     }
@@ -101,21 +90,9 @@ impl ResearchStore {
     /// preferable to crashing the reader over a permissions error.
     pub fn add(&mut self, citation: SavedCitation) {
         if let Some(path) = &self.path {
-            let _ = Self::append(path, &citation);
+            let _ = crate::jsonl::append(path, &citation);
         }
         self.citations.push(citation);
-    }
-
-    fn append(path: &Path, citation: &SavedCitation) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-        let line = serde_json::to_string(citation).map_err(std::io::Error::other)?;
-        writeln!(file, "{line}")
     }
 
     /// Deletes the entry at `index` — deletion is the one operation that
@@ -137,74 +114,12 @@ impl ResearchStore {
     }
 
     /// Removes from the file the first line that parses to a citation
-    /// equal to `target`, keeping every other line byte-for-byte. Working
-    /// from a fresh read of the file — never from this instance's
-    /// in-memory snapshot — means lines this version can't parse (a
-    /// corrupt byte, an entry written by a newer wikitui) and citations
-    /// appended by another running instance since we loaded all survive a
-    /// delete instead of being silently erased with it.
-    ///
-    /// The write goes through a unique (per-call) temp file in the same
-    /// directory, fsynced before an atomic rename, so neither a process
-    /// crash nor — on typical filesystems — a power loss can destroy the
-    /// bibliography. Two instances deleting at the same moment can still
-    /// race on the final rename; the loser's *deletion* may not stick
-    /// (its entry reappears), but no other entry is ever lost.
+    /// equal to `target`, keeping every other line byte-for-byte — see
+    /// `jsonl::rewrite_matching`'s doc comment for the full safety
+    /// contract (fresh read, unique-temp-file + fsync + rename) this
+    /// delegates to.
     fn remove_line_from_file(path: &Path, target: &SavedCitation) -> std::io::Result<()> {
-        let content = match std::fs::read_to_string(path) {
-            Ok(content) => content,
-            // No file yet (nothing this store added ever persisted):
-            // there's nothing the deletion needs to update.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e),
-        };
-        let mut kept: Vec<&str> = Vec::new();
-        let mut removed_one = false;
-        for line in content.lines() {
-            if !removed_one
-                && serde_json::from_str::<SavedCitation>(line).ok().as_ref() == Some(target)
-            {
-                removed_one = true;
-                continue;
-            }
-            kept.push(line);
-        }
-        if !removed_one {
-            // Not on disk (already removed externally, or its add() never
-            // persisted) — nothing to rewrite.
-            return Ok(());
-        }
-
-        let mut out = kept.join("\n");
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        // The temp name must be unique per *call*, not just per process:
-        // two concurrent removes (different threads, or different stores
-        // sharing a directory) would otherwise clobber each other's temp
-        // file between write and rename.
-        static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let unique = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let base = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("citations.jsonl");
-        let tmp = path.with_file_name(format!(".{base}.{}.{unique}.tmp", std::process::id()));
-        {
-            let mut file = std::fs::File::create(&tmp)?;
-            file.write_all(out.as_bytes())?;
-            file.sync_all()?;
-        }
-        std::fs::rename(&tmp, path)?;
-        // Best-effort directory sync so the rename itself is durable;
-        // opening a directory for sync only works on Unix, and its
-        // failure shouldn't fail the (already-visible) rename.
-        if let Some(parent) = path.parent()
-            && let Ok(dir) = std::fs::File::open(parent)
-        {
-            let _ = dir.sync_all();
-        }
-        Ok(())
+        crate::jsonl::rewrite_matching(path, |c: &SavedCitation| c == target, None).map(|_| ())
     }
 }
 

@@ -352,6 +352,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Mode::Library => draw_library(frame, app, content_area),
         Mode::TabPicker => draw_tab_picker(frame, app, content_area),
         Mode::HistoryPicker => draw_history_picker(frame, app, content_area),
+        // The `/` filter and `t` tag editor draw over the same picker view;
+        // only the status line changes to show the live prompt.
+        Mode::BookmarkPicker | Mode::BookmarkFilter | Mode::BookmarkTagEdit => {
+            draw_bookmark_picker(frame, app, content_area)
+        }
+        Mode::ReadLaterPicker => draw_readlater_picker(frame, app, content_area),
     }
 
     draw_status_bar(frame, app, status_area);
@@ -1056,6 +1062,125 @@ fn draw_library(frame: &mut Frame, app: &App, area: Rect) {
     render_selectable_list(frame, list, area, app.selected_library);
 }
 
+/// The `B` / `:bookmarks` picker (PRD FR-BM-1): title, `#tag` list (dim),
+/// note-preview first line (dim italic), and created date per entry — the
+/// same selectable-list pattern as the TOC/library views, over the
+/// currently-filtered subset (`App::visible_bookmarks`). The `/` filter and
+/// `t` tag editor draw this same view; only the status line changes.
+fn draw_bookmark_picker(frame: &mut Frame, app: &App, area: Rect) {
+    let visible = app.visible_bookmarks();
+    let items: Vec<ListItem> = visible
+        .iter()
+        .enumerate()
+        .map(|(row, &store_index)| {
+            let b = &app.bookmarks.bookmarks[store_index];
+            let mut header: Vec<RSpan> = vec![RSpan::styled(
+                b.title.clone(),
+                Style::default().add_modifier(Modifier::BOLD),
+            )];
+            if !b.tags.is_empty() {
+                let tags = b
+                    .tags
+                    .iter()
+                    .map(|t| format!("#{t}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                header.push(RSpan::styled(
+                    format!("   {tags}"),
+                    colored(app.no_color, app.theme.dim),
+                ));
+            }
+            header.push(RSpan::styled(
+                format!("   {}", crate::bookmarks::display_date(&b.created_at)),
+                colored(app.no_color, app.theme.dim),
+            ));
+            let mut lines = vec![Line::from(header)];
+            if let Some(note) = b.note.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+                let first = note.lines().next().unwrap_or(note);
+                lines.push(Line::from(RSpan::styled(
+                    format!("      {first}"),
+                    colored(app.no_color, app.theme.dim).add_modifier(Modifier::ITALIC),
+                )));
+            }
+            let style = if row == app.selected_bookmark {
+                colored_bg(app.no_color, app.theme.selected_fg, app.theme.selected_bg)
+            } else {
+                Style::default()
+            };
+            ListItem::new(lines).style(style)
+        })
+        .collect();
+
+    let filter_note = if app.bookmark_filter_input.is_empty() {
+        String::new()
+    } else {
+        format!(" (filter: {})", app.bookmark_filter_input)
+    };
+    let title = format!(
+        "Bookmarks — {} of {}{filter_note}",
+        visible.len(),
+        app.bookmarks.bookmarks.len()
+    );
+    let list = List::new(items)
+        .style(base_style(&app.theme, app.no_color))
+        .block(UiBlock::default().borders(Borders::ALL).title(title));
+    render_selectable_list(frame, list, area, app.selected_bookmark);
+}
+
+/// The `:readlater` queue view (PRD FR-BM-3): title + enqueued date +
+/// reading-time placeholder. The estimate itself arrives with FR-RD-11
+/// (chunked reading time); until then every row shows "—" — the marked seam
+/// is `reading_time_estimate` below, the single place a real estimate will
+/// slot in.
+fn draw_readlater_picker(frame: &mut Frame, app: &App, area: Rect) {
+    let items: Vec<ListItem> = app
+        .readlater
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let line = Line::from(vec![
+                RSpan::styled(
+                    entry.title.clone(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                RSpan::styled(
+                    format!(
+                        "   [{}]   enqueued {}   ~{} read",
+                        entry.lang,
+                        crate::bookmarks::display_date(&entry.enqueued_at),
+                        reading_time_estimate(entry),
+                    ),
+                    colored(app.no_color, app.theme.dim),
+                ),
+            ]);
+            let style = if i == app.selected_readlater {
+                colored_bg(app.no_color, app.theme.selected_fg, app.theme.selected_bg)
+            } else {
+                Style::default()
+            };
+            ListItem::new(line).style(style)
+        })
+        .collect();
+
+    let title = format!(
+        "Read later ({}) — Enter: open  d: remove  Esc: close",
+        app.readlater.entries.len()
+    );
+    let list = List::new(items)
+        .style(base_style(&app.theme, app.no_color))
+        .block(UiBlock::default().borders(Borders::ALL).title(title));
+    render_selectable_list(frame, list, area, app.selected_readlater);
+}
+
+/// FR-RD-11 seam: the per-entry reading-time estimate the read-later view
+/// shows. Returns the placeholder "—" until the chunked reading-time
+/// feature lands and can compute a real figure from the cached article —
+/// isolated here so that later chunk changes exactly one function.
+fn reading_time_estimate(_entry: &crate::bookmarks::ReadLaterEntry) -> &'static str {
+    "—"
+}
+
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let tab = app.active_tab();
     let text = match app.mode {
@@ -1096,6 +1221,17 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         // The library's status line carries transient action feedback
         // (delete/export/style outcomes overwrite it) — see open_library.
         Mode::Library => app.status.clone(),
+        // The `/` filter and `t` tag editor show their live prompt; the
+        // plain picker carries its transient action feedback via `status`.
+        Mode::BookmarkFilter => format!("filter: {}   Esc: apply", app.bookmark_filter_input),
+        Mode::BookmarkTagEdit => {
+            format!(
+                "tags (comma/space): {}   Enter: save   Esc: cancel",
+                app.bookmark_tag_input
+            )
+        }
+        Mode::BookmarkPicker => app.status.clone(),
+        Mode::ReadLaterPicker => app.status.clone(),
         Mode::Help => "Press any key to close help".to_string(),
         Mode::Reading if app.loading => "Loading…".to_string(),
         // Command feedback outranks the focused-link line until the next
@@ -1145,7 +1281,12 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     };
     let style = if matches!(
         app.mode,
-        Mode::Search | Mode::Find | Mode::Command | Mode::Hint
+        Mode::Search
+            | Mode::Find
+            | Mode::Command
+            | Mode::Hint
+            | Mode::BookmarkFilter
+            | Mode::BookmarkTagEdit
     ) {
         colored_bg(app.no_color, app.theme.focus_fg, app.theme.focus_bg)
     } else {
@@ -1156,7 +1297,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
     let width = 62.min(area.width.saturating_sub(4)).max(20);
-    let height = 25.min(area.height.saturating_sub(4)).max(8);
+    let height = 31.min(area.height.saturating_sub(4)).max(8);
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
         y: area.y + (area.height.saturating_sub(height)) / 2,
@@ -1188,6 +1329,12 @@ fn draw_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(":            command (:open, :lang, :theme, :tab, :tabs, :q)"),
         Line::from("r            research mode: cite this page & its sources"),
         Line::from("R            library: browse/export saved bibliography"),
+        Line::from("m            bookmark / un-bookmark this article (toggle)"),
+        Line::from("B            bookmark picker   ba  annotate ($EDITOR note)"),
+        Line::from("  in picker  /: filter   t: edit tags   d: delete   Enter: open"),
+        Line::from("  filter     free text fuzzy-matches title; #tag needs ALL tags"),
+        Line::from("rl           read later (focused link, else article)"),
+        Line::from(":readlater   read-later queue   :bookmarks[ export md|html|json|netscape]"),
         Line::from("/            search: type for suggestions, Enter opens, Tab full-text"),
         Line::from("Ctrl-f       find in this page (smart-case), n/N: cycle matches"),
         Line::from("Esc          cancel / close"),

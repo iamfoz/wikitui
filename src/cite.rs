@@ -188,8 +188,9 @@ fn format_reference(citation: &SavedCitation, style: CiteStyle) -> String {
 /// article titles actually contain ("M*A*S*H (TV series)" would otherwise
 /// render as italicized "MASH"). Underscores are deliberately NOT escaped:
 /// CommonMark doesn't emphasize intraword `_`, and escaping it would
-/// mangle every wiki URL (`Alan\_Turing`).
-fn escape_markdown(text: &str) -> String {
+/// mangle every wiki URL (`Alan\_Turing`). `pub(crate)` so `bookmark_export`
+/// shares this instead of a second copy for the same Markdown-export need.
+pub(crate) fn escape_markdown(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
         if matches!(ch, '*' | '`' | '[') {

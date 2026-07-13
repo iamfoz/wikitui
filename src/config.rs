@@ -117,6 +117,8 @@ pub struct EnvOverrides {
     pub ambiguous_width: Option<String>,
     pub cite_style: Option<String>,
     pub base_url: Option<String>,
+    /// PRD FR-BM-3's "(config)" `readlater_auto_dequeue`.
+    pub readlater_auto_dequeue: Option<String>,
 }
 
 impl EnvOverrides {
@@ -133,6 +135,7 @@ impl EnvOverrides {
             ambiguous_width: get("WIKITUI_AMBIGUOUS_WIDTH"),
             cite_style: get("WIKITUI_CITE_STYLE"),
             base_url: get("WIKITUI_BASE_URL"),
+            readlater_auto_dequeue: get("WIKITUI_READLATER_AUTO_DEQUEUE"),
         }
     }
 }
@@ -169,6 +172,9 @@ pub struct ResolvedConfig {
     /// is substituted by `api::WikiClient` when present, else used
     /// verbatim (arbitrary MediaWiki sites, FR-ML-5, aren't per-language).
     pub base_url_template: Valued<String>,
+    /// PRD FR-BM-3's "(config)" read-later behavior: whether opening a
+    /// queued entry removes it. Defaults to `true`.
+    pub readlater_auto_dequeue: Valued<bool>,
     /// Parse errors, unknown keys, and rejected values — never fatal, but
     /// `doctor` reports them and exits 1 if any is `IssueLevel::Error`.
     pub issues: Vec<Issue>,
@@ -235,6 +241,7 @@ pub fn resolve(
         "cache",
         "active_wiki",
         "wiki",
+        "readlater_auto_dequeue",
     ]
     .into_iter()
     .collect();
@@ -296,6 +303,7 @@ pub fn resolve(
     let (cache_max_mb, cache_fresh_ttl_hours, cache_force_refetch_days) =
         resolve_cache(&table, &mut issues);
     let (active_wiki, base_url_template) = resolve_wiki(env, &table, &mut issues);
+    let readlater_auto_dequeue = resolve_readlater_auto_dequeue(env, &table, &mut issues);
 
     ResolvedConfig {
         config_version: Valued {
@@ -317,6 +325,7 @@ pub fn resolve(
         cache_force_refetch_days,
         active_wiki,
         base_url_template,
+        readlater_auto_dequeue,
         migration_summary: config_version.1,
         issues,
         config_path: config_path.map(Path::to_path_buf),
@@ -670,6 +679,62 @@ fn resolve_ambiguous_width(
                 issues.push(Issue::warning(
                     "ambiguous_width must be an integer (1 or 2); using default 1".to_string(),
                 ));
+                default
+            }
+        },
+        None => default,
+    }
+}
+
+/// Loose boolean parsing for the env-var layer (process env only ever
+/// carries strings, unlike TOML's native `bool`): the usual truthy/falsy
+/// spellings, case-insensitively.
+fn parse_bool_ish(raw: &str) -> Option<bool> {
+    match raw.to_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// PRD FR-BM-3's "(config)" `readlater_auto_dequeue`: file + env only (no
+/// CLI flag — like the `cache.*` settings, this is a preference someone sets
+/// once in `config.toml`, not something worth a flag for a single run).
+fn resolve_readlater_auto_dequeue(
+    env: &EnvOverrides,
+    table: &toml::Table,
+    issues: &mut Vec<Issue>,
+) -> Valued<bool> {
+    const DEFAULT: bool = true;
+    let default = Valued {
+        value: DEFAULT,
+        source: Source::Default,
+    };
+
+    if let Some(raw) = &env.readlater_auto_dequeue {
+        return match parse_bool_ish(raw) {
+            Some(value) => Valued {
+                value,
+                source: Source::Env,
+            },
+            None => {
+                issues.push(Issue::warning(format!(
+                    "readlater_auto_dequeue: {raw:?} (from environment) is not a boolean; using default {DEFAULT}"
+                )));
+                default
+            }
+        };
+    }
+    match table.get("readlater_auto_dequeue") {
+        Some(v) => match v.as_bool() {
+            Some(value) => Valued {
+                value,
+                source: Source::File,
+            },
+            None => {
+                issues.push(Issue::warning(format!(
+                    "readlater_auto_dequeue must be a boolean; using default {DEFAULT}"
+                )));
                 default
             }
         },
@@ -1109,6 +1174,51 @@ mod tests {
         assert!(!resolved_one.ambiguous_wide.value);
         cleanup(&path);
         cleanup(&path_one);
+    }
+
+    #[test]
+    fn readlater_auto_dequeue_defaults_true_and_honors_file_and_env() {
+        let default = resolve(&CliOverrides::default(), &EnvOverrides::default(), None);
+        assert!(default.readlater_auto_dequeue.value);
+        assert_eq!(default.readlater_auto_dequeue.source, Source::Default);
+
+        let path = temp_config("readlater_auto_dequeue = false\n");
+        let from_file = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert!(!from_file.readlater_auto_dequeue.value);
+        assert_eq!(from_file.readlater_auto_dequeue.source, Source::File);
+        cleanup(&path);
+
+        let env = EnvOverrides {
+            readlater_auto_dequeue: Some("false".to_string()),
+            ..Default::default()
+        };
+        let from_env = resolve(&CliOverrides::default(), &env, None);
+        assert!(!from_env.readlater_auto_dequeue.value);
+        assert_eq!(from_env.readlater_auto_dequeue.source, Source::Env);
+    }
+
+    #[test]
+    fn readlater_auto_dequeue_rejects_a_non_boolean_with_a_warning() {
+        let path = temp_config("readlater_auto_dequeue = \"sometimes\"\n");
+        let resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert!(
+            resolved.readlater_auto_dequeue.value,
+            "falls back to the default"
+        );
+        assert_eq!(resolved.readlater_auto_dequeue.source, Source::Default);
+        assert!(resolved.issues.iter().any(|i| {
+            i.message
+                .contains("readlater_auto_dequeue must be a boolean")
+        }));
+        cleanup(&path);
     }
 
     #[test]

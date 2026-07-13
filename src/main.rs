@@ -1,5 +1,7 @@
 mod api;
 mod app;
+mod bookmark_export;
+mod bookmarks;
 mod cache;
 mod cite;
 mod cli;
@@ -9,6 +11,7 @@ mod crashguard;
 mod doc;
 mod doctor;
 mod hints;
+mod jsonl;
 mod layout;
 mod research;
 mod sanitize;
@@ -30,11 +33,12 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 
 use api::{TitleSuggestion, WikiClient};
 use app::{App, Mode, PageSource, PendingReload};
+use bookmarks::ReadLaterEntry;
 use cache::{PageCache, RevalidateAction, SwrDecision};
 use cite::CiteStyle;
 use cli::{Cli, Commands, ConfigAction};
 use config::ConfigContext;
-use crashguard::TerminalGuard;
+use crashguard::{SuspendedTerminal, TerminalGuard};
 use tab::{HistoryEntry, TabId};
 use theme::Theme;
 
@@ -238,6 +242,7 @@ async fn main() -> Result<()> {
         resolved.measure.value,
         resolved.ambiguous_wide.value,
         cite_style,
+        resolved.readlater_auto_dequeue.value,
         config_ctx,
         reload_flag,
     )
@@ -583,6 +588,151 @@ fn yank_to_clipboard(text: &str) -> std::io::Result<()> {
     out.flush()
 }
 
+/// `ba` (PRD FR-BM-2): opens `$EDITOR` on a temp Markdown file seeded with
+/// the bookmark's current note, suspending the TUI for the duration (SEC-5:
+/// the editor gets the temp file's PATH as argv — never the note's content,
+/// which only ever flows through the file itself). Auto-bookmarks the
+/// current article first if it wasn't already saved, since annotating an
+/// article implies wanting to keep it. Synchronous (not `async`): the editor
+/// is an interactive child process the reader is directly waiting on, the
+/// same "block this task, not the whole process" tradeoff `event::read()`
+/// already makes in `run`'s own loop.
+fn annotate_current_article(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) {
+    let Some(doc) = app.active_tab().doc.as_ref() else {
+        app.status = "Open an article first".to_string();
+        return;
+    };
+    let title = doc.title.clone();
+    let lang = app.active_tab().lang.clone();
+    let revid = app.active_tab().current_revid;
+    let revid = (revid != 0).then_some(revid);
+
+    let Ok(editor_spec) = std::env::var("EDITOR") else {
+        app.notice = Some("set $EDITOR to annotate".to_string());
+        return;
+    };
+    let Some((program, args)) = bookmarks::parse_editor_command(&editor_spec) else {
+        app.notice = Some("set $EDITOR to annotate".to_string());
+        return;
+    };
+
+    let was_new = app.bookmarks.ensure_bookmarked(&lang, &title, revid);
+    let existing_note = app
+        .bookmarks
+        .find(&lang, &title)
+        .and_then(|b| b.note.clone());
+
+    let tmp = std::env::temp_dir().join(format!(
+        "wikitui-annotate-{}-{}.md",
+        std::process::id(),
+        ANNOTATE_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    if std::fs::write(&tmp, bookmarks::seed_note_content(existing_note.as_deref())).is_err() {
+        app.notice = Some("Could not create a temp file to annotate".to_string());
+        return;
+    }
+
+    let status = {
+        // RAII: leaves the alternate screen/raw mode for exactly the
+        // lifetime of this block, restored on drop regardless of which
+        // branch below runs next (SuspendedTerminal's own doc comment).
+        let _suspended = SuspendedTerminal::suspend(terminal);
+        std::process::Command::new(&program)
+            .args(&args)
+            .arg(&tmp)
+            .status()
+    };
+
+    let saved_note = match status {
+        Ok(exit) if exit.success() => std::fs::read_to_string(&tmp)
+            .ok()
+            .map(|raw| bookmarks::note_from_editor_output(&raw)),
+        // A nonzero exit (user aborted the editor) or a failure to even
+        // launch it (bad $EDITOR) both keep the old note untouched.
+        Ok(_) | Err(_) => None,
+    };
+    let _ = std::fs::remove_file(&tmp);
+
+    match saved_note {
+        Some(note) => {
+            app.bookmarks.set_note(&lang, &title, note);
+            app.notice = Some(if was_new {
+                format!("Bookmarked \"{title}\" and saved the note")
+            } else {
+                "Note saved".to_string()
+            });
+        }
+        None => {
+            app.notice = Some("Editor exited without saving — note unchanged".to_string());
+        }
+    }
+}
+
+/// Per-call-unique temp filenames for [`annotate_current_article`] within
+/// one process (mirroring `jsonl::atomic_rewrite`'s own counter) — a second
+/// `ba` before the first's temp file is cleaned up (shouldn't happen given
+/// the editor is spawned synchronously, but costs nothing to guard) must
+/// never collide with it.
+static ANNOTATE_TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `rl` (PRD FR-BM-3): enqueues `app.read_later_target()` — the focused
+/// link's target, or the article itself with nothing focused — rejecting a
+/// duplicate `(lang, title)` with a notice instead of a second queue slot.
+/// "Enqueue triggers T0 offline save": makes sure the target is in the L2
+/// cache before returning, so an immediate `:readlater` Enter still has
+/// something to serve even offline.
+async fn enqueue_read_later(client: &WikiClient, cache: &PageCache, app: &mut App) {
+    let Some((lang, title)) = app.read_later_target() else {
+        app.notice = Some("Open an article first".to_string());
+        return;
+    };
+    if app.readlater.contains(&lang, &title) {
+        app.notice = Some(format!("\"{title}\" is already in the read-later queue"));
+        return;
+    }
+
+    // T0 offline save (FR-BM-3). FR-OFF-4's full tiered/pinned save (quota
+    // tracking, integrity checks) is a later chunk — this is the minimal
+    // seam read-later needs now: an ordinary L2 cache write via the same
+    // fetch path every other open already uses, just with no tab attached.
+    let saved_offline = ensure_cached(client, cache, &lang, &title).await;
+    app.readlater.enqueue(ReadLaterEntry {
+        title: title.clone(),
+        lang,
+        enqueued_at: bookmarks::now_ts(),
+        priority: 0,
+    });
+    app.notice = Some(if saved_offline {
+        format!("Enqueued \"{title}\" for later")
+    } else {
+        format!("Enqueued \"{title}\" for later (offline save failed — will retry on open)")
+    });
+}
+
+/// Whether `(lang, title)` is already in L2, fetching it in if not. Returns
+/// whether it's cached by the time this returns (a network failure here is
+/// reported to the reader, not retried — the queue entry still gets
+/// created either way; opening it later tries again via the normal fetch
+/// path).
+async fn ensure_cached(client: &WikiClient, cache: &PageCache, lang: &str, title: &str) -> bool {
+    if cache.get(lang, title).is_some() {
+        return true;
+    }
+    match client.fetch_article_html(lang, title).await {
+        Ok(fetched) => {
+            cache.put(
+                lang,
+                title,
+                &fetched.html,
+                fetched.revid,
+                fetched.etag.as_deref(),
+            );
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
@@ -595,6 +745,7 @@ async fn run(
     measure: u16,
     ambiguous_wide: bool,
     cite_style: CiteStyle,
+    readlater_auto_dequeue: bool,
     config_ctx: ConfigContext,
     reload_flag: Arc<AtomicBool>,
 ) -> Result<()> {
@@ -602,6 +753,7 @@ async fn run(
     app.measure = measure;
     app.ambiguous_wide = ambiguous_wide;
     app.cite_style = cite_style;
+    app.readlater_auto_dequeue = readlater_auto_dequeue;
     app.config_ctx = config_ctx;
 
     // Delivers typeahead responses, background revalidation outcomes, and
@@ -668,6 +820,7 @@ async fn run(
                     key.modifiers,
                     &revalidate_tx,
                     &open_tx,
+                    terminal,
                 )
                 .await;
             }
@@ -708,6 +861,7 @@ async fn run(
                     key.modifiers,
                     &revalidate_tx,
                     &open_tx,
+                    terminal,
                 )
                 .await;
             }
@@ -757,6 +911,7 @@ fn apply_config_reload(app: &mut App) {
     }
     app.measure = resolved.measure.value;
     app.ambiguous_wide = resolved.ambiguous_wide.value;
+    app.readlater_auto_dequeue = resolved.readlater_auto_dequeue.value;
     // Measure/ambiguous_wide feed layout, not just paint — drop the cached
     // layout so the next `ensure_layout` recomputes instead of reusing a
     // stale one keyed on the old options.
@@ -871,6 +1026,7 @@ async fn handle_key(
     modifiers: KeyModifiers,
     revalidate_tx: &UnboundedSender<RevalidationOutcome>,
     open_tx: &UnboundedSender<TabLoadOutcome>,
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
 ) {
     // `Q`'s one-keypress quit confirmation (PRD Appendix B) is intercepted
     // before any mode dispatch so no other binding can leak through: `y`
@@ -1140,6 +1296,81 @@ async fn handle_key(
             }
             _ => {}
         },
+        // PRD FR-BM-1's `B` / `:bookmarks` picker: a selectable list, `/`
+        // enters the live filter (`Mode::BookmarkFilter`), `t` the inline
+        // tag editor (`Mode::BookmarkTagEdit`), `d` deletes, Enter opens in
+        // this tab (consistent with Results/history — no new-tab surprise).
+        Mode::BookmarkPicker => match code {
+            KeyCode::Esc => app.close_bookmark_picker(),
+            KeyCode::Char('j') | KeyCode::Down => app.cycle_bookmark(true),
+            KeyCode::Char('k') | KeyCode::Up => app.cycle_bookmark(false),
+            KeyCode::Char('/') => app.mode = Mode::BookmarkFilter,
+            KeyCode::Char('t') => app.begin_tag_edit(),
+            KeyCode::Char('d') => app.delete_selected_bookmark(),
+            KeyCode::Enter => {
+                if let Some(bookmark) = app.selected_bookmark_entry().cloned() {
+                    app.lang = bookmark.lang.clone();
+                    open_title(client, cache, app, &bookmark.title, revalidate_tx).await;
+                }
+            }
+            KeyCode::Char('?') => {
+                app.prior_mode = app.mode;
+                app.mode = Mode::Help;
+            }
+            _ => {}
+        },
+        // The bookmark picker's `/` filter (PRD FR-BM-1's tag-expression +
+        // fuzzy-title grammar, `bookmarks::parse_filter`): every keystroke
+        // narrows the live list `handle_key`'s draw already reads from
+        // `app.bookmark_filter_input`; Enter/Esc both just return to
+        // navigating the (already-filtered) picker.
+        Mode::BookmarkFilter => match code {
+            KeyCode::Esc | KeyCode::Enter => {
+                app.mode = Mode::BookmarkPicker;
+                app.selected_bookmark = 0;
+            }
+            KeyCode::Backspace => {
+                app.bookmark_filter_input.pop();
+                app.selected_bookmark = 0;
+            }
+            KeyCode::Char(c) => {
+                app.bookmark_filter_input.push(c);
+                app.selected_bookmark = 0;
+            }
+            _ => {}
+        },
+        // The picker's `t` inline tag editor (PRD FR-BM-1): a small prompt,
+        // comma/space-separated, that replaces the selected bookmark's tag
+        // set outright on Enter (`bookmarks::parse_tags`).
+        Mode::BookmarkTagEdit => match code {
+            KeyCode::Esc => app.mode = Mode::BookmarkPicker,
+            KeyCode::Enter => app.commit_tag_edit(),
+            KeyCode::Backspace => {
+                app.bookmark_tag_input.pop();
+            }
+            KeyCode::Char(c) => app.bookmark_tag_input.push(c),
+            _ => {}
+        },
+        // `:readlater`'s queue view (PRD FR-BM-3): Enter opens and — per
+        // `readlater_auto_dequeue` — removes the entry; `d` removes without
+        // opening.
+        Mode::ReadLaterPicker => match code {
+            KeyCode::Esc => app.close_readlater_picker(),
+            KeyCode::Char('j') | KeyCode::Down => app.cycle_readlater(true),
+            KeyCode::Char('k') | KeyCode::Up => app.cycle_readlater(false),
+            KeyCode::Char('d') => app.remove_selected_readlater(),
+            KeyCode::Enter => {
+                if let Some(entry) = app.take_selected_readlater() {
+                    app.lang = entry.lang.clone();
+                    open_title(client, cache, app, &entry.title, revalidate_tx).await;
+                }
+            }
+            KeyCode::Char('?') => {
+                app.prior_mode = app.mode;
+                app.mode = Mode::Help;
+            }
+            _ => {}
+        },
         Mode::Reading => {
             // g-prefix chords (PRD Appendix B): the g-latch's second key.
             // `gg` top, `gt`/`gT` next/prev tab (FR-TB-1), `gb` back-stack
@@ -1172,22 +1403,63 @@ async fn handle_key(
                     _ => {} // dead prefix — handle this key normally below.
                 }
             }
-            // b-prefix chord: `bb` opens the tab picker (FR-TB-1). Any other
-            // second key cancels the latch and is handled normally.
+            // b-prefix chord: `bb` opens the tab picker (FR-TB-1), `ba`
+            // annotates the current article's bookmark (FR-BM-2). Any other
+            // second key cancels the latch and is handled normally (falls
+            // through to `code`'s own binding below, matching the g-prefix's
+            // dead-prefix fallback).
             if app.pending_b {
                 app.pending_b = false;
-                if let KeyCode::Char('b') = code {
-                    app.selected_tab_pick = app.active;
-                    app.mode = Mode::TabPicker;
-                    return;
+                if let KeyCode::Char(c) = code {
+                    match app::resolve_b_prefix(c) {
+                        app::BPrefixAction::TabPicker => {
+                            app.selected_tab_pick = app.active;
+                            app.mode = Mode::TabPicker;
+                            return;
+                        }
+                        app::BPrefixAction::Annotate => {
+                            annotate_current_article(terminal, app);
+                            return;
+                        }
+                        app::BPrefixAction::PassThrough => {} // handle `code` normally below.
+                    }
                 }
             }
 
             // Captured before `app.notice` is cleared below: PRD FR-OFF-2's
             // "updated — r to reload" notice means this keypress, if it's
-            // `r`, reloads instead of opening Research mode — see the `r`
-            // arm's own comment for why the two share a key.
+            // `r`, reloads instead of arming the read-later/Research prefix
+            // — see the `r` arm's own comment for why the two share a key.
             let had_pending_reload = app.active_tab().pending_reload.is_some();
+            // `r`-prefix chord (PRD FR-BM-3's `rl`), reached only when no
+            // reload is pending (see above): `rl` enqueues for later, any
+            // other second key falls back to `r`'s own original meaning
+            // (open Research mode) — see `app::resolve_r_prefix`'s doc
+            // comment for why this, unlike `g`/`b`, consumes the second key
+            // rather than reprocessing it as its own binding.
+            if app.pending_r {
+                app.pending_r = false;
+                app.notice = None;
+                if let KeyCode::Char(c) = code {
+                    match app::resolve_r_prefix(c) {
+                        app::RPrefixAction::ReadLater => {
+                            enqueue_read_later(client, cache, app).await;
+                        }
+                        app::RPrefixAction::OpenResearch => {
+                            if app.active_tab().doc.is_some() {
+                                app.mode = Mode::Research;
+                            } else {
+                                app.status = "Open an article first".to_string();
+                            }
+                        }
+                    }
+                } else if app.active_tab().doc.is_some() {
+                    app.mode = Mode::Research;
+                } else {
+                    app.status = "Open an article first".to_string();
+                }
+                return;
+            }
             app.notice = None;
             match code {
                 // PRD Appendix B: `q` closes the current tab (quitting if it
@@ -1326,21 +1598,25 @@ async fn handle_key(
                         app.status = "Open an article first".to_string();
                     }
                 }
-                // PRD FR-OFF-2's "r to reload" and Research mode's own `r`
-                // entrypoint share a key: when a background revalidation
-                // just posted an update notice, `r` reloads the article
-                // (the notice already told the reader what `r` means right
-                // now); otherwise it opens Research mode as always.
+                // PRD FR-OFF-2's "r to reload", Research mode's `r`
+                // entrypoint, and FR-BM-3's `rl` read-later chord all share
+                // this key: when a background revalidation just posted an
+                // update notice, `r` reloads the article on the spot (the
+                // notice already told the reader what `r` means right now),
+                // taking precedence over the prefix below entirely — a
+                // reload is a one-keystroke action, never a chord. Only when
+                // no reload is pending does `r` become the two-keystroke
+                // `r`-prefix latch (handled at the top of this arm, mirroring
+                // `pending_g`/`pending_b`) rather than opening Research mode
+                // on the spot as it once did.
                 KeyCode::Char('r') if had_pending_reload => {
                     app.reload_from_pending_update(cache);
                 }
                 KeyCode::Char('r') => {
-                    if app.active_tab().doc.is_some() {
-                        app.mode = Mode::Research;
-                    } else {
-                        app.status = "Open an article first".to_string();
-                    }
+                    app.pending_r = true;
                 }
+                KeyCode::Char('m') => app.toggle_bookmark(),
+                KeyCode::Char('B') => app.open_bookmark_picker(),
                 KeyCode::Char('R') => app.open_library(),
                 KeyCode::Char('f') if modifiers.contains(KeyModifiers::CONTROL) => {
                     app.mode = Mode::Find;
@@ -1368,6 +1644,7 @@ async fn handle_key(
                 KeyCode::Esc => {
                     app.pending_g = false;
                     app.pending_b = false;
+                    app.pending_r = false;
                     app.clear_find();
                 }
                 _ => {}
@@ -1380,6 +1657,9 @@ async fn handle_key(
     }
     if !matches!(code, KeyCode::Char('b')) {
         app.pending_b = false;
+    }
+    if !matches!(code, KeyCode::Char('r')) {
+        app.pending_r = false;
     }
 }
 
@@ -1471,6 +1751,12 @@ async fn execute_command(
             app.selected_tab_pick = app.active;
             app.mode = Mode::TabPicker;
         }
+        Command::Bookmarks => app.open_bookmark_picker(),
+        Command::BookmarksExport { format, path } => {
+            let path = path.map(std::path::PathBuf::from);
+            app.export_bookmarks(&format, path.as_deref());
+        }
+        Command::ReadLater => app.open_readlater_picker(),
         Command::Quit => app.should_quit = true,
     }
 }

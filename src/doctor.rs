@@ -86,6 +86,10 @@ fn print_resolved_config(resolved: &ResolvedConfig) {
         "  base_url = {:?} ({})",
         resolved.base_url_template.value, resolved.base_url_template.source
     );
+    println!(
+        "  readlater_auto_dequeue = {} ({})",
+        resolved.readlater_auto_dequeue.value, resolved.readlater_auto_dequeue.source
+    );
 }
 
 fn print_problems(resolved: &ResolvedConfig) {
