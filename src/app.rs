@@ -690,6 +690,7 @@ mod tests {
             title: title.to_string(),
             blocks: Vec::new(),
             citations: Vec::new(),
+            truncated: false,
         }
     }
 

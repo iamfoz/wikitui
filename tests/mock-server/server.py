@@ -53,6 +53,26 @@ PAGES = {
       science spans theoretical disciplines to applied disciplines.</p>
     </body></html>""",
 
+    # PRD SEC-1 pty verification fixture: a hostile article exercising every
+    # terminal-injection vector the sanitizer (src/sanitize.rs) must strip,
+    # plus two categories of content it must NOT strip. Real bytes/code
+    # points, not escaped text, so a pty session reading this article is a
+    # genuine end-to-end check of doc::parse_article_html's sanitize pass:
+    #   - \x1b]0;pwned\x07  -- an OSC window-title-set attempt
+    #   - \x1b[31m ... \x1b[0m -- a CSI color-change escape
+    #   - ‮ ... ‬ -- a right-to-left-override spoofing attempt
+    #   - a ZWJ-joined family emoji, which MUST survive as one glyph
+    #   - an IPA transcription built from combining marks, which MUST
+    #     survive untouched (FR-RD-10)
+    "Terminal_Injection_Test": """<html><head><title>Terminal Injection Test</title></head><body>
+      <p>Before the attack. A window-title hijack attempt follows:
+      \x1b]0;pwned\x07 -- did the terminal's title change? Next, a color-change
+      escape sequence: \x1b[31mred text that must never reach the terminal live\x1b[0m --
+      and now a right-to-left override spoofing attempt: ‮evil-looking-reversed-text‬ end.
+      A family emoji that must survive intact: \U0001F468‍\U0001F469‍\U0001F467 (zero-width-joiner joined).
+      An IPA word built from combining marks that must survive: t͡ʃɔːñ (a nasalized vowel).</p>
+    </body></html>""",
+
 }
 
 # Japanese fixture: long CJK paragraphs that must wrap per-character with

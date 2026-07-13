@@ -12,6 +12,17 @@
 //! the supported way to point wikitui at a mock server or another
 //! MediaWiki site — no source edits required, unlike the old ad hoc
 //! testing hack this replaces.
+//!
+//! PRD SEC-3: every response body read in this module goes through
+//! [`read_capped`] rather than reqwest's own unbounded `.text()`/`.json()`
+//! (both buffer the whole body regardless of size) — see its doc comment.
+//! PRD SEC-1: every field this module hands back that the UI displays
+//! (search/typeahead titles, descriptions, excerpts) is sanitized once,
+//! right after parsing, by `sanitize_search_result`/`sanitize_title_suggestion`
+//! — the single choke point for this module, mirroring `doc.rs`'s
+//! `sanitize_document`. Article HTML itself is deliberately NOT sanitized
+//! here: it is still raw markup at this point, and `doc::parse_article_html`
+//! is the module responsible for turning it into sanitized `Document` text.
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -21,6 +32,46 @@ const USER_AGENT_BASE: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     " (https://github.com/iamfoz/wikitui) reqwest"
 );
+
+/// PRD SEC-3: search/typeahead responses are bounded by a `limit` query
+/// param (≤100 results) and are never expected to approach this size in
+/// practice; it exists purely as a hard ceiling against a broken or hostile
+/// server, so search can't be made to buffer unbounded memory the way
+/// article HTML could without its own cap.
+const MAX_SEARCH_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+/// PRD SEC-3: reads a response body in chunks, stopping once more than
+/// `cap` bytes have been buffered, instead of trusting `Content-Length` (a
+/// hostile server can lie about it) or calling reqwest's own unbounded
+/// `.text()`/`.bytes()`/`.json()`, all of which buffer the entire body
+/// before this code ever sees it. A body larger than `cap` is returned
+/// anyway, truncated to at most one chunk over the cap (reqwest/hyper
+/// chunks are small, so the overshoot is bounded, not unbounded) — deciding
+/// exactly where to cut and what to do about it (parse-anyway-and-flag vs.
+/// error) is the caller's job; this function only bounds memory during the
+/// read itself.
+async fn read_capped(mut resp: reqwest::Response, cap: usize) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    while buf.len() <= cap {
+        match resp.chunk().await.context("reading response body")? {
+            Some(chunk) => buf.extend_from_slice(&chunk),
+            None => break,
+        }
+    }
+    Ok(buf)
+}
+
+/// Decodes response bytes as UTF-8 with lossy replacement of malformed
+/// sequences (`char::REPLACEMENT_CHARACTER`) — the same guarantee
+/// `reqwest::Response::text()` documents (BOM-stripped, malformed-sequence
+/// replacement; charset is UTF-8-only here since this crate doesn't enable
+/// reqwest's `charset` feature, and Parsoid/MediaWiki REST responses are
+/// always UTF-8 regardless). Replacing `.text()` with `read_capped` +
+/// this function keeps that guarantee while adding the SEC-3 size cap
+/// `.text()` doesn't have.
+fn decode_lossy_utf8(bytes: Vec<u8>) -> String {
+    String::from_utf8_lossy(&bytes).into_owned()
+}
 
 /// Cloned to hand a copy to a spawned background task (PRD FR-SR-1's
 /// typeahead can't block the UI thread on the loop's redraw/`event::poll`
@@ -139,7 +190,15 @@ impl WikiClient {
             bail!("no article named {title:?} on {lang}.wikipedia.org");
         }
         let resp = resp.error_for_status().context("fetching article HTML")?;
-        let html = resp.text().await.context("reading article HTML body")?;
+        // PRD SEC-3: bounds memory during the read itself; the authoritative
+        // truncate-and-flag decision for oversized article HTML is
+        // `doc::parse_article_html`'s own cap, run against whatever string
+        // this returns (fresh fetch, on-disk cache, or a test fixture all go
+        // through that same check).
+        let bytes = read_capped(resp, crate::doc::MAX_ARTICLE_HTML_BYTES)
+            .await
+            .context("reading article HTML body")?;
+        let html = decode_lossy_utf8(bytes);
         Ok((title.to_string(), html))
     }
 
@@ -159,10 +218,23 @@ impl WikiClient {
             .context("requesting search results")?
             .error_for_status()
             .context("search request failed")?;
-        let parsed: SearchPageResponse = resp.json().await.context("parsing search response")?;
+        let bytes = read_capped(resp, MAX_SEARCH_RESPONSE_BYTES)
+            .await
+            .context("reading search response body")?;
+        let mut parsed: SearchPageResponse =
+            serde_json::from_slice(&bytes).context("parsing search response")?;
+        // PRD SEC-1: this module's choke point — every display field a
+        // search response carries is sanitized here, once, before it can
+        // reach `ui.rs`'s results list or its `searchmatch` excerpt parser.
+        for result in &mut parsed.pages {
+            sanitize_search_result(result);
+        }
+        let suggestion = parsed
+            .suggestion
+            .map(|s| crate::sanitize::sanitize_single_line(&s).into_owned());
         Ok(SearchOutcome {
             results: parsed.pages,
-            suggestion: parsed.suggestion,
+            suggestion,
         })
     }
 
@@ -189,9 +261,41 @@ impl WikiClient {
             .context("requesting typeahead suggestions")?
             .error_for_status()
             .context("typeahead request failed")?;
-        let parsed: SearchTitleResponse =
-            resp.json().await.context("parsing typeahead response")?;
+        let bytes = read_capped(resp, MAX_SEARCH_RESPONSE_BYTES)
+            .await
+            .context("reading typeahead response body")?;
+        let mut parsed: SearchTitleResponse =
+            serde_json::from_slice(&bytes).context("parsing typeahead response")?;
+        // PRD SEC-1: same choke point as `search`, for the typeahead dropdown.
+        for suggestion in &mut parsed.pages {
+            sanitize_title_suggestion(suggestion);
+        }
         Ok(parsed.pages)
+    }
+}
+
+/// PRD SEC-1: sanitizes every field of one full-text search result that the
+/// UI displays as a single line (title, description). `excerpt` carries
+/// deliberate `<span class="searchmatch">...</span>` markup that
+/// `ui::parse_searchmatch` parses back out — sanitizing doesn't touch `<`/
+/// `>`/ordinary ASCII, only control/bidi/zero-width characters, so the
+/// markup survives untouched while any hostile bytes inside the excerpt
+/// text don't.
+fn sanitize_search_result(result: &mut SearchResult) {
+    result.title = crate::sanitize::sanitize_single_line(&result.title).into_owned();
+    if let Some(description) = &mut result.description {
+        *description = crate::sanitize::sanitize_single_line(description).into_owned();
+    }
+    if let Some(excerpt) = &mut result.excerpt {
+        *excerpt = crate::sanitize::sanitize_single_line(excerpt).into_owned();
+    }
+}
+
+/// PRD SEC-1: the typeahead-dropdown counterpart of `sanitize_search_result`.
+fn sanitize_title_suggestion(suggestion: &mut TitleSuggestion) {
+    suggestion.title = crate::sanitize::sanitize_single_line(&suggestion.title).into_owned();
+    if let Some(description) = &mut suggestion.description {
+        *description = crate::sanitize::sanitize_single_line(description).into_owned();
     }
 }
 
@@ -278,5 +382,88 @@ mod tests {
             Some("British mathematician")
         );
         assert_eq!(parsed.pages[1].description, None);
+    }
+
+    /// PRD SEC-1: `sanitize_search_result` is the module's choke point for
+    /// full-text search fields — a hostile title/description/excerpt must
+    /// come out free of control bytes while the `searchmatch` markup
+    /// `ui::parse_searchmatch` depends on survives untouched.
+    #[test]
+    fn sanitize_search_result_strips_control_bytes_but_keeps_searchmatch_markup() {
+        let mut result = SearchResult {
+            title: "Evil\x1b[31mTitle".to_string(),
+            description: Some("desc\x07ription".to_string()),
+            excerpt: Some(
+                r#"before <span class="searchmatch">hit\x1b</span> after"#.replace("\\x1b", "\x1b"),
+            ),
+            size: None,
+            wordcount: None,
+            timestamp: None,
+        };
+        sanitize_search_result(&mut result);
+        assert!(!result.title.contains('\x1b'));
+        assert!(!result.description.unwrap().contains('\x07'));
+        let excerpt = result.excerpt.unwrap();
+        assert!(!excerpt.contains('\x1b'));
+        assert!(
+            excerpt.contains(r#"<span class="searchmatch">"#),
+            "searchmatch markup must survive sanitization: {excerpt:?}"
+        );
+    }
+
+    #[test]
+    fn sanitize_title_suggestion_strips_control_bytes() {
+        let mut suggestion = TitleSuggestion {
+            title: "Al\x1ban Turing".to_string(),
+            description: Some("bri\x07tish".to_string()),
+        };
+        sanitize_title_suggestion(&mut suggestion);
+        assert_eq!(suggestion.title, "Alan Turing");
+        assert_eq!(suggestion.description.as_deref(), Some("british"));
+    }
+
+    /// PRD SEC-3: the network-level read cap bounds memory for an oversized
+    /// (or hostile) response body instead of buffering it in full the way
+    /// reqwest's own `.text()`/`.bytes()`/`.json()` would. A tiny raw
+    /// std-socket server (no test-only HTTP framework dependency needed)
+    /// serves a body well over `doc::MAX_ARTICLE_HTML_BYTES`; the client
+    /// must come back with something bounded near the cap, not the full
+    /// body.
+    #[tokio::test]
+    async fn fetch_article_html_bounds_the_network_read_for_an_oversized_body() {
+        use std::io::{Read, Write};
+
+        let oversized = crate::doc::MAX_ARTICLE_HTML_BYTES + 5_000_000;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut discard = [0u8; 4096];
+                let _ = stream.read(&mut discard);
+                let body = vec![b'A'; oversized];
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(&body);
+            }
+        });
+
+        let client = WikiClient::new(format!("http://127.0.0.1:{port}")).unwrap();
+        let (_, html) = client
+            .fetch_article_html("en", "Test")
+            .await
+            .expect("capped read must still succeed, not error, on an oversized body");
+        assert!(
+            html.len() < oversized,
+            "must not buffer the full oversized body, got {} of {oversized}",
+            html.len()
+        );
+        assert!(
+            html.len() <= crate::doc::MAX_ARTICLE_HTML_BYTES + 4_000_000,
+            "overshoot past the cap must be bounded (a few chunks at most), got {}",
+            html.len()
+        );
     }
 }

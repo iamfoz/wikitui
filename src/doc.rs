@@ -1,9 +1,47 @@
 //! The document model: a small, renderer-agnostic representation of an
 //! article, produced by parsing Parsoid HTML (see PRD §6.3). Everything the
 //! terminal UI draws, and everything `--dump` prints, comes from here.
+//!
+//! PRD SEC-3 parser hardening lives in this module too, in three layers:
+//! [`MAX_ARTICLE_HTML_BYTES`] caps parser input size (degrading to a
+//! truncation banner, never a crash or unbounded work); `cap_html_nesting_depth`
+//! is a cheap pre-parse scan that cuts off pathologically deep tag nesting
+//! *before* html5ever ever sees it (its tree builder is empirically
+//! superlinear in nesting depth — see that function's doc comment for
+//! measurements); and `MAX_DOM_DEPTH` separately caps the recursive DOM
+//! walkers below, flattening anything deeper to plain text instead of
+//! recursing further, as a backstop for whatever the pre-scan's heuristic
+//! nature lets through. `MAX_CITATIONS` bounds how many References-section
+//! entries are harvested. PRD SEC-1 sanitization is the last step of
+//! `parse_article_html` (`sanitize_document`) — see its doc comment for the
+//! single choke point this module routes every emitted string through.
 
+use crate::sanitize;
 use ego_tree::NodeRef;
 use scraper::{Html, Node, Selector};
+
+/// PRD SEC-3: "10x the largest real article" pathological-payload budget.
+/// HTML beyond this is never handed to the parser at all — `parse_article_html`
+/// truncates to this many bytes (on a UTF-8 char boundary) first and sets
+/// `Document::truncated`, so parse time and memory are bounded regardless
+/// of how large (or how hostile) the source response was.
+pub const MAX_ARTICLE_HTML_BYTES: usize = 10 * 1024 * 1024;
+
+/// PRD SEC-3: recursion depth cap for the DOM walkers below
+/// (`walk_blocks`/`collect_inline`/`collect_text`/`descendant_tags`/
+/// `find_img_alt`). A real article's DOM nests at most a few dozen levels
+/// deep; a hostile page can otherwise force unbounded recursion (e.g. 10k
+/// nested `<div>`s) and overflow the stack. Past this depth, a walker stops
+/// recursing and flattens whatever remains of the subtree to plain text via
+/// `flatten_deep_subtree`, which walks with `NodeRef::descendants()` —
+/// pointer-following, not call-stack recursion, so it can't itself overflow.
+const MAX_DOM_DEPTH: usize = 256;
+
+/// PRD SEC-3: caps how many `ol.references li` entries `extract_citations`
+/// harvests. A real article has dozens to a few hundred; 5000 is generous
+/// headroom while still bounding a hostile page that pads its references
+/// list arbitrarily.
+const MAX_CITATIONS: usize = 5000;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SpanStyle {
@@ -53,6 +91,13 @@ pub struct Document {
     /// this entry" half (the other half being the article's own citation,
     /// generated on demand — see `research::self_citation`).
     pub citations: Vec<Citation>,
+    /// PRD SEC-3: `true` when the source HTML exceeded
+    /// [`MAX_ARTICLE_HTML_BYTES`] and only the first slice of it was
+    /// parsed. `parse_article_html` also prepends a visible banner block
+    /// when this is set (§7's "degraded rendering" contract); the flag
+    /// itself is kept for callers/tests that want to check the condition
+    /// without string-matching the banner text.
+    pub truncated: bool,
 }
 
 /// One entry from an article's References/bibliography list: the raw
@@ -90,7 +135,12 @@ fn internal_title_from_href(href: &str) -> Option<String> {
         return None;
     }
     let decoded = urlencoding::decode(path).ok()?.into_owned();
-    Some(decoded.replace('_', " "))
+    // PRD SEC-1: percent-decoding happens here, downstream of
+    // `sanitize_document`'s own href sanitization — a percent-escape like
+    // `%1B` is inert ASCII text before decoding and only becomes a live
+    // control byte after it, so the decoded title (which becomes the next
+    // page's fetch title if this link is followed) is sanitized again here.
+    Some(sanitize::sanitize_single_line(&decoded.replace('_', " ")).into_owned())
 }
 
 /// Collects every link in the blocks that can render one interactively
@@ -276,13 +326,33 @@ fn trim_inline_ends(spans: &mut Vec<Span>) {
     }
 }
 
-fn text_content(node: NodeRef<Node>) -> String {
+/// PRD SEC-3's non-recursive fallback: once a walker hits `MAX_DOM_DEPTH` it
+/// stops recursing and instead collects the subtree's text via
+/// `NodeRef::descendants()`, which walks by following sibling/parent
+/// pointers rather than the call stack — so, unlike every other function in
+/// this file, it cannot itself overflow no matter how deep the subtree
+/// nests below this point.
+fn flatten_deep_subtree(node: NodeRef<Node>) -> String {
     let mut out = String::new();
-    collect_text(node, &mut out);
+    for n in node.descendants() {
+        if let Node::Text(t) = n.value() {
+            out.push_str(&t.text);
+        }
+    }
     out
 }
 
-fn collect_text(node: NodeRef<Node>, out: &mut String) {
+fn text_content(node: NodeRef<Node>) -> String {
+    let mut out = String::new();
+    collect_text(node, &mut out, 0);
+    out
+}
+
+fn collect_text(node: NodeRef<Node>, out: &mut String, depth: usize) {
+    if depth > MAX_DOM_DEPTH {
+        out.push_str(&flatten_deep_subtree(node));
+        return;
+    }
     for child in node.children() {
         match child.value() {
             Node::Text(t) => out.push_str(&t.text),
@@ -290,14 +360,27 @@ fn collect_text(node: NodeRef<Node>, out: &mut String) {
                 if is_skipped_tag(el.name()) || is_noise(el) {
                     continue;
                 }
-                collect_text(child, out);
+                collect_text(child, out, depth + 1);
             }
             _ => {}
         }
     }
 }
 
-fn collect_inline(node: NodeRef<Node>, style: &SpanStyle, spans: &mut Vec<Span>) {
+fn collect_inline(node: NodeRef<Node>, style: &SpanStyle, spans: &mut Vec<Span>, depth: usize) {
+    if depth > MAX_DOM_DEPTH {
+        // Flatten-to-text (SEC-3): stop descending and fold whatever
+        // remains of this subtree into one plain-styled span rather than
+        // recursing further.
+        let text = collapse_ws(&flatten_deep_subtree(node));
+        if !text.is_empty() {
+            spans.push(Span {
+                text,
+                style: style.clone(),
+            });
+        }
+        return;
+    }
     for child in node.children() {
         match child.value() {
             Node::Text(t) => {
@@ -334,7 +417,7 @@ fn collect_inline(node: NodeRef<Node>, style: &SpanStyle, spans: &mut Vec<Span>)
                         _ => style.clone(),
                     }
                 };
-                collect_inline(child, &child_style, spans);
+                collect_inline(child, &child_style, spans, depth + 1);
             }
             _ => {}
         }
@@ -343,7 +426,7 @@ fn collect_inline(node: NodeRef<Node>, style: &SpanStyle, spans: &mut Vec<Span>)
 
 fn inline_spans(node: NodeRef<Node>) -> Vec<Span> {
     let mut spans = Vec::new();
-    collect_inline(node, &SpanStyle::Plain, &mut spans);
+    collect_inline(node, &SpanStyle::Plain, &mut spans, 0);
     trim_inline_ends(&mut spans);
     spans
 }
@@ -383,7 +466,19 @@ fn blockquote_spans(node: NodeRef<Node>) -> Vec<Span> {
 /// including) nested tables so a top-level table's row-collapse doesn't
 /// also vacuum up rows that belong to a table nested inside one of its
 /// cells (a common infobox pattern).
-fn descendant_tags<'a>(node: NodeRef<'a, Node>, tag: &str, out: &mut Vec<NodeRef<'a, Node>>) {
+///
+/// PRD SEC-3: beyond `MAX_DOM_DEPTH` this simply stops descending —
+/// pathologically nested table markup yields a table missing its
+/// deepest rows rather than a stack overflow.
+fn descendant_tags<'a>(
+    node: NodeRef<'a, Node>,
+    tag: &str,
+    out: &mut Vec<NodeRef<'a, Node>>,
+    depth: usize,
+) {
+    if depth > MAX_DOM_DEPTH {
+        return;
+    }
     for child in node.children() {
         if let Node::Element(el) = child.value() {
             if el.name() == tag {
@@ -396,14 +491,14 @@ fn descendant_tags<'a>(node: NodeRef<'a, Node>, tag: &str, out: &mut Vec<NodeRef
                 continue;
             }
         }
-        descendant_tags(child, tag, out);
+        descendant_tags(child, tag, out, depth + 1);
     }
 }
 
 fn collapse_table(node: NodeRef<Node>) -> Vec<String> {
     let mut lines = Vec::new();
     let mut rows = Vec::new();
-    descendant_tags(node, "tr", &mut rows);
+    descendant_tags(node, "tr", &mut rows, 0);
 
     let mut headers: Vec<String> = Vec::new();
     for tr in rows {
@@ -446,7 +541,7 @@ fn collapse_table(node: NodeRef<Node>) -> Vec<String> {
 fn collapse_infobox(node: NodeRef<Node>) -> Vec<(String, String)> {
     let mut rows = Vec::new();
     let mut trs = Vec::new();
-    descendant_tags(node, "tr", &mut trs);
+    descendant_tags(node, "tr", &mut trs, 0);
     for tr in trs {
         let mut cells = Vec::new();
         for cell in tr.children() {
@@ -473,7 +568,13 @@ fn collapse_infobox(node: NodeRef<Node>) -> Vec<(String, String)> {
     rows
 }
 
-fn find_img_alt(node: NodeRef<Node>) -> Option<String> {
+/// PRD SEC-3: past `MAX_DOM_DEPTH` this gives up and reports no image
+/// rather than recursing further — a missed caption on a pathologically
+/// nested `<figure>` is an acceptable degradation; a stack overflow is not.
+fn find_img_alt(node: NodeRef<Node>, depth: usize) -> Option<String> {
+    if depth > MAX_DOM_DEPTH {
+        return None;
+    }
     for child in node.children() {
         if let Node::Element(el) = child.value() {
             if el.name() == "img" {
@@ -484,7 +585,7 @@ fn find_img_alt(node: NodeRef<Node>) -> Option<String> {
                     alt.to_string()
                 });
             }
-            if let Some(found) = find_img_alt(child) {
+            if let Some(found) = find_img_alt(child, depth + 1) {
                 return Some(found);
             }
         }
@@ -492,7 +593,23 @@ fn find_img_alt(node: NodeRef<Node>) -> Option<String> {
     None
 }
 
-fn walk_blocks(node: NodeRef<Node>, blocks: &mut Vec<Block>, list_depth: u8) {
+/// PRD SEC-3: `depth` guards recursion (distinct from `list_depth`, which is
+/// a rendering concept — how many `<ul>/<ol>` levels deep a `<li>` sits, used
+/// only for indentation). Past `MAX_DOM_DEPTH` a walker stops descending and
+/// flattens whatever remains of the subtree into one paragraph instead — a
+/// pathologically deep DOM (e.g. thousands of nested `<div>`s) degrades to
+/// plain text rather than overflowing the stack.
+fn walk_blocks(node: NodeRef<Node>, blocks: &mut Vec<Block>, list_depth: u8, depth: usize) {
+    if depth > MAX_DOM_DEPTH {
+        let text = normalize_ws(&flatten_deep_subtree(node));
+        if !text.is_empty() {
+            blocks.push(Block::Paragraph(vec![Span {
+                text,
+                style: SpanStyle::Plain,
+            }]));
+        }
+        return;
+    }
     for child in node.children() {
         let el = match child.value() {
             Node::Element(el) => el,
@@ -534,7 +651,7 @@ fn walk_blocks(node: NodeRef<Node>, blocks: &mut Vec<Block>, list_depth: u8) {
                             });
                         }
                         // Recurse for nested lists/paragraphs inside this <li>.
-                        walk_blocks(li, blocks, list_depth + 1);
+                        walk_blocks(li, blocks, list_depth + 1, depth + 1);
                     }
                 }
             }
@@ -569,7 +686,7 @@ fn walk_blocks(node: NodeRef<Node>, blocks: &mut Vec<Block>, list_depth: u8) {
                 }
             }
             "figure" => {
-                if let Some(alt) = find_img_alt(child) {
+                if let Some(alt) = find_img_alt(child, 0) {
                     blocks.push(Block::Image(alt));
                 }
             }
@@ -581,7 +698,7 @@ fn walk_blocks(node: NodeRef<Node>, blocks: &mut Vec<Block>, list_depth: u8) {
                     alt.to_string()
                 }));
             }
-            _ => walk_blocks(child, blocks, list_depth),
+            _ => walk_blocks(child, blocks, list_depth, depth + 1),
         }
     }
 }
@@ -600,7 +717,160 @@ fn page_display_title(parsed: &Html) -> Option<String> {
     (!normalized.is_empty()).then_some(normalized)
 }
 
+/// PRD SEC-3: truncates `html` to at most `MAX_ARTICLE_HTML_BYTES` bytes (on
+/// a UTF-8 char boundary, never splitting a multi-byte character) before it
+/// ever reaches the parser. Returns `(slice, was_truncated)`. This is the
+/// authoritative truncation decision for the whole app: `api.rs`'s own
+/// network-level read cap only bounds memory during the fetch and does not
+/// itself decide the truncation flag — whatever HTML string parse_article_html
+/// is handed (fresh fetch, on-disk cache, or a test fixture), this is where
+/// "too big" is decided, consistently.
+fn cap_html_size(html: &str) -> (&str, bool) {
+    if html.len() <= MAX_ARTICLE_HTML_BYTES {
+        return (html, false);
+    }
+    let mut cut = MAX_ARTICLE_HTML_BYTES;
+    while cut > 0 && !html.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    (&html[..cut], true)
+}
+
+/// HTML5 void elements: never have a closing tag and never nest content, so
+/// they must not count as a lasting depth increment even when a hostile (or
+/// just old-style) document writes them without a self-closing `/>`.
+const VOID_ELEMENTS: &[&str] = &[
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
+    "track", "wbr",
+];
+
+/// Raw-text elements: everything up to the matching close tag is opaque
+/// content, never tag nesting (a `<script>` body routinely contains `<`/`>`
+/// that isn't markup at all).
+const RAW_TEXT_ELEMENTS: &[&str] = &["script", "style"];
+
+/// PRD SEC-3: html5ever's tree-construction algorithm is empirically
+/// superlinear in DOM nesting depth — measured directly against this
+/// crate's `scraper`/`html5ever` versions, a document that's just `<div>`
+/// nested a few thousand deep (a few hundred KB, nowhere near
+/// `MAX_ARTICLE_HTML_BYTES`) takes seconds to parse, and doubling depth
+/// roughly quadruples the time. The byte-size cap alone does not bound this
+/// class of pathological input, so this is a cheap **linear** pre-scan run
+/// *before* `Html::parse_document` ever sees the content, cutting the HTML
+/// off the moment counted nesting depth exceeds `max_depth` — comfortably
+/// inside html5ever's fast zone, since a real article's DOM nests at most a
+/// few dozen levels.
+///
+/// This is deliberately not a full HTML5 tokenizer — that would mean
+/// reimplementing html5ever — but it accounts for the cases that would
+/// otherwise make it wildly wrong on ordinary articles: comments,
+/// doctype/processing-instruction markers, quoted attribute values (so a
+/// `>` inside `alt="a > b"` doesn't end a tag early), the void-element list,
+/// and raw-text element bodies. It can still mis-count on sufficiently
+/// unusual or malformed markup (mismatched quote types, for instance); that
+/// is an accepted approximation for a pre-parse guard, not the source of
+/// truth — the DOM-depth guard on the walkers below (`MAX_DOM_DEPTH`) is the
+/// backstop for whatever this pre-scan lets through.
+fn cap_html_nesting_depth(html: &str, max_depth: usize) -> (&str, bool) {
+    let bytes = html.as_bytes();
+    let len = bytes.len();
+    let mut i = 0usize;
+    let mut depth: usize = 0;
+
+    while i < len {
+        if bytes[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        if html[i..].starts_with("<!--") {
+            match html[i + 4..].find("-->") {
+                Some(end) => i += 4 + end + 3,
+                None => break,
+            }
+            continue;
+        }
+        if matches!(bytes.get(i + 1), Some(b'!') | Some(b'?')) {
+            match html[i..].find('>') {
+                Some(rel) => i += rel + 1,
+                None => break,
+            }
+            continue;
+        }
+        if bytes.get(i + 1) == Some(&b'/') {
+            depth = depth.saturating_sub(1);
+            match html[i..].find('>') {
+                Some(rel) => i += rel + 1,
+                None => break,
+            }
+            continue;
+        }
+
+        // Opening tag: extract the name, then scan to its end respecting
+        // quoted attribute values.
+        let tag_start = i + 1;
+        let name_end = html[tag_start..]
+            .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
+            .map(|o| tag_start + o)
+            .unwrap_or(len);
+        if name_end == tag_start {
+            // A bare '<' not starting a tag name (stray '<' in text) — not
+            // markup; move past just this character.
+            i += 1;
+            continue;
+        }
+        let name = html[tag_start..name_end].to_ascii_lowercase();
+
+        let mut j = name_end;
+        let mut in_quote: Option<u8> = None;
+        let mut self_closing = false;
+        while j < len {
+            let b = bytes[j];
+            match in_quote {
+                Some(q) if b == q => in_quote = None,
+                Some(_) => {}
+                None => match b {
+                    b'"' | b'\'' => in_quote = Some(b),
+                    b'>' => break,
+                    b'/' if bytes.get(j + 1) == Some(&b'>') => self_closing = true,
+                    _ => {}
+                },
+            }
+            j += 1;
+        }
+        i = (j + 1).min(len);
+
+        if RAW_TEXT_ELEMENTS.contains(&name.as_str()) {
+            let closing = format!("</{name}");
+            match html[i..].to_ascii_lowercase().find(&closing) {
+                Some(rel) => i += rel,
+                None => i = len,
+            }
+            continue;
+        }
+
+        if !self_closing && !VOID_ELEMENTS.contains(&name.as_str()) {
+            depth += 1;
+            if depth > max_depth {
+                return (&html[..tag_start - 1], true);
+            }
+        }
+    }
+    (html, false)
+}
+
+/// PRD §7's "degraded rendering" banner text for a truncated article,
+/// prepended as the first block so it shows up both in the interactive
+/// reading view and in `--dump` output — no separate UI plumbing needed.
+const TRUNCATED_BANNER: &str = "⚠ Degraded rendering: this article exceeded a PRD SEC-3 parser limit (size or DOM nesting depth) and was truncated. Content beyond that point was not parsed.";
+
 pub fn parse_article_html(title: &str, html: &str) -> Document {
+    let (html, size_truncated) = cap_html_size(html);
+    // Depth guard runs second (SEC-3): a genuinely oversized article is
+    // already cut to at most MAX_ARTICLE_HTML_BYTES above, so this scan
+    // — and the parse after it — is bounded by that same ceiling either
+    // way, size-pathological or depth-pathological.
+    let (html, depth_truncated) = cap_html_nesting_depth(html, MAX_DOM_DEPTH);
+    let truncated = size_truncated || depth_truncated;
     let parsed = Html::parse_document(html);
     let body_sel = Selector::parse("body").unwrap();
     let start = parsed
@@ -610,13 +880,105 @@ pub fn parse_article_html(title: &str, html: &str) -> Document {
         .unwrap_or_else(|| parsed.tree.root());
 
     let mut blocks = Vec::new();
-    walk_blocks(start, &mut blocks, 0);
+    walk_blocks(start, &mut blocks, 0, 0);
     let citations = extract_citations(&parsed);
     let display_title = page_display_title(&parsed).unwrap_or_else(|| title.to_string());
-    Document {
+    let mut document = Document {
         title: display_title,
         blocks,
         citations,
+        truncated,
+    };
+
+    // PRD SEC-1: the single choke point every string this function put into
+    // `document` passes through before it's handed back to callers (the UI,
+    // `--dump`, the clipboard yank, `cite.rs` exports) — see its doc comment.
+    sanitize_document(&mut document);
+
+    if document.truncated {
+        document.blocks.insert(
+            0,
+            Block::Paragraph(vec![Span {
+                text: TRUNCATED_BANNER.to_string(),
+                style: SpanStyle::Bold,
+            }]),
+        );
+    }
+
+    document
+}
+
+/// PRD SEC-1's single sanitization choke point for this module. Called
+/// exactly once, as the last step of `parse_article_html`, over the fully
+/// assembled `Document` — not scattered across `collect_inline`/
+/// `walk_blocks`/etc, so there is one place to audit and one place future
+/// fields must be wired into.
+///
+/// Every consumer downstream of this function only ever sees
+/// already-sanitized data, "by construction": `--dump` calls `render_plain`
+/// on this same `Document`; the OSC 52 clipboard yank (`main::yank_to_clipboard`)
+/// only ever encodes `research::article_url`/`yank_markdown`, both built
+/// from `doc.title`; `cite.rs`'s bibliography export only ever formats
+/// `Citation`s that were either produced here or copied from here into
+/// `research::SavedCitation`. None of those call sites need — or get — a
+/// second sanitization pass.
+fn sanitize_document(doc: &mut Document) {
+    doc.title = sanitize::sanitize_and_cap_single_line(&doc.title, sanitize::MAX_SPAN_CHARS);
+
+    for block in &mut doc.blocks {
+        match block {
+            Block::Heading { spans, .. }
+            | Block::Paragraph(spans)
+            | Block::ListItem { spans, .. }
+            | Block::Blockquote(spans) => sanitize_spans(spans),
+            Block::Code(text) => {
+                *text = sanitize::sanitize_and_cap_multiline(text, sanitize::MAX_SPAN_CHARS);
+            }
+            Block::Table(lines) => {
+                for line in lines {
+                    *line = sanitize::sanitize_and_cap_single_line(line, sanitize::MAX_SPAN_CHARS);
+                }
+            }
+            Block::Infobox(rows) => {
+                for (label, value) in rows {
+                    *label =
+                        sanitize::sanitize_and_cap_single_line(label, sanitize::MAX_SPAN_CHARS);
+                    *value =
+                        sanitize::sanitize_and_cap_single_line(value, sanitize::MAX_SPAN_CHARS);
+                }
+            }
+            Block::Image(alt) => {
+                *alt = sanitize::sanitize_and_cap_single_line(alt, sanitize::MAX_SPAN_CHARS);
+            }
+            Block::Rule => {}
+        }
+    }
+
+    for citation in &mut doc.citations {
+        citation.id =
+            sanitize::sanitize_and_cap_single_line(&citation.id, sanitize::MAX_SPAN_CHARS);
+        citation.text =
+            sanitize::sanitize_and_cap_single_line(&citation.text, sanitize::MAX_SPAN_CHARS);
+        if let Some(url) = &mut citation.url {
+            *url = sanitize::sanitize_and_cap_single_line(url, sanitize::MAX_SPAN_CHARS);
+        }
+    }
+}
+
+/// Sanitizes both a span's visible text and, for a link span, the `href` it
+/// carries — the latter matters because `main.rs` displays an external
+/// link's raw href verbatim ("External link: {href}") and because
+/// `internal_title_from_href` decodes it into the title used to open the
+/// next page; sanitizing here means neither path can see a raw control
+/// byte, even though `internal_title_from_href` also sanitizes its own
+/// decoded output (a hostile `%1B`-style percent-escape only becomes a live
+/// control byte *after* decoding, downstream of this pass).
+fn sanitize_spans(spans: &mut [Span]) {
+    for span in spans {
+        span.text = sanitize::sanitize_and_cap_multiline(&span.text, sanitize::MAX_SPAN_CHARS);
+        if let SpanStyle::Link(href) = &mut span.style {
+            *href = sanitize::sanitize_and_cap_single_line(href, sanitize::MAX_SPAN_CHARS);
+        }
     }
 }
 
@@ -637,6 +999,10 @@ fn strip_backlink_markers(s: &str) -> String {
 /// `.reference-text` span holding the rendered citation) — not a full
 /// bibliographic parser, and third-party wikis without that convention
 /// simply yield no citations.
+///
+/// PRD SEC-3: capped at `MAX_CITATIONS` — a hostile page padding its
+/// references list arbitrarily large shouldn't make Research mode (or a
+/// bibliography export) scale with it.
 fn extract_citations(parsed: &Html) -> Vec<Citation> {
     let li_sel = Selector::parse("ol.references li").unwrap();
     let reftext_sel = Selector::parse(".reference-text").unwrap();
@@ -644,6 +1010,7 @@ fn extract_citations(parsed: &Html) -> Vec<Citation> {
 
     parsed
         .select(&li_sel)
+        .take(MAX_CITATIONS)
         .map(|li| {
             let id = li.value().attr("id").unwrap_or_default().to_string();
             let text_source = li.select(&reftext_sel).next().unwrap_or(li);
@@ -1100,5 +1467,341 @@ mod tests {
         let html = "<html><body><p>No head/title here.</p></body></html>";
         let doc = parse_article_html("Fallback Title", html);
         assert_eq!(doc.title, "Fallback Title");
+    }
+
+    // ---- PRD SEC-1/SEC-3: sanitizer, size cap, and DOM-depth guard ----
+
+    #[test]
+    fn hostile_span_text_and_link_href_are_sanitized() {
+        let html = "<html><body><p>before\x1b[31mhostile<a href=\"./Evil\x1bTitle\">link</a>\
+                    after\x07</p></body></html>";
+        let doc = parse_article_html("Test", html);
+        let paragraph = doc
+            .blocks
+            .iter()
+            .find_map(|b| match b {
+                Block::Paragraph(spans) => Some(spans),
+                _ => None,
+            })
+            .expect("paragraph present");
+        for span in paragraph {
+            assert!(!span.text.contains('\x1b'), "{:?}", span.text);
+            assert!(!span.text.contains('\x07'), "{:?}", span.text);
+            if let SpanStyle::Link(href) = &span.style {
+                assert!(!href.contains('\x1b'), "{href:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn hostile_title_code_alt_and_citation_text_are_sanitized() {
+        let html = concat!(
+            "<html><head><title>Evil\u{202E}Title\u{202C}</title></head><body>",
+            "<pre>code\u{9B}31mline</pre>",
+            "<figure><img src=\"x.jpg\" alt=\"alt\u{200B}text\u{1B}hostile\"/></figure>",
+            "<div class=\"mw-references-wrap\"><ol class=\"references\"><li id=\"cite_note-1\">",
+            "<span class=\"reference-text\">Ref\u{1B}[31mtext</span></li></ol></div>",
+            "</body></html>"
+        );
+        let doc = parse_article_html("Test", html);
+        assert!(!doc.title.contains('\u{202E}'));
+        assert!(!doc.title.contains('\u{202C}'));
+
+        let code = doc
+            .blocks
+            .iter()
+            .find_map(|b| match b {
+                Block::Code(text) => Some(text),
+                _ => None,
+            })
+            .expect("code block present");
+        assert!(!code.contains('\u{9B}'));
+
+        let alt = doc
+            .blocks
+            .iter()
+            .find_map(|b| match b {
+                Block::Image(alt) => Some(alt),
+                _ => None,
+            })
+            .expect("image present");
+        assert!(!alt.contains('\u{200B}'));
+        assert!(!alt.contains('\u{1B}'));
+
+        assert_eq!(doc.citations.len(), 1);
+        assert!(!doc.citations[0].text.contains('\u{1B}'));
+    }
+
+    #[test]
+    fn citation_harvest_is_capped_at_max_citations() {
+        let mut html =
+            String::from("<html><body><div class=\"mw-references-wrap\"><ol class=\"references\">");
+        for i in 0..(MAX_CITATIONS + 50) {
+            html.push_str(&format!(
+                "<li id=\"cite_note-{i}\"><span class=\"reference-text\">Source {i}</span></li>"
+            ));
+        }
+        html.push_str("</ol></div></body></html>");
+        let doc = parse_article_html("Test", &html);
+        assert_eq!(doc.citations.len(), MAX_CITATIONS);
+    }
+
+    #[test]
+    fn oversized_html_is_truncated_and_flagged_with_a_banner() {
+        let mut html = String::from("<html><body><p>");
+        html.push_str(&"A".repeat(MAX_ARTICLE_HTML_BYTES + 1_000_000));
+        html.push_str("</p></body></html>");
+        let start = std::time::Instant::now();
+        let doc = parse_article_html("Test", &html);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "parsing an oversized article must stay within a generous time bound, took {:?}",
+            start.elapsed()
+        );
+        assert!(
+            doc.truncated,
+            "an 11 MB article must set the truncated flag"
+        );
+        let has_banner = doc.blocks.first().is_some_and(|b| matches!(
+            b,
+            Block::Paragraph(spans) if spans.iter().any(|s| s.text.contains("Degraded rendering"))
+        ));
+        assert!(
+            has_banner,
+            "the first block must be the degraded-rendering banner"
+        );
+    }
+
+    #[test]
+    fn html_at_or_under_the_cap_is_not_truncated() {
+        let doc = parse_article_html("Test", FIXTURE);
+        assert!(!doc.truncated);
+    }
+
+    /// 10k-deep nested `<div>`s trigger `cap_html_nesting_depth`'s pre-parse
+    /// cut (SEC-3): html5ever's tree builder is empirically superlinear in
+    /// nesting depth (measured directly — see that function's doc comment),
+    /// so without this cut a document like this one takes single-digit
+    /// *seconds* to parse despite being only a few hundred KB. The content
+    /// past the cut point (including the paragraph, which sits at depth
+    /// 10,000) is never handed to the parser at all — that's the point —
+    /// so this locks in "completes fast and is flagged truncated", not "the
+    /// deep content survives".
+    #[test]
+    fn deeply_nested_divs_are_cut_before_the_parser_sees_them() {
+        let depth = 10_000;
+        let mut html = String::from("<html><body>");
+        html.push_str(&"<div>".repeat(depth));
+        html.push_str("<p>deeply nested text</p>");
+        html.push_str(&"</div>".repeat(depth));
+        html.push_str("</body></html>");
+
+        let start = std::time::Instant::now();
+        let doc = parse_article_html("Test", &html);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "10k-deep nested divs must parse within a generous time bound \
+             (pre-parse nesting-depth cap), took {:?}",
+            start.elapsed()
+        );
+        assert!(
+            doc.truncated,
+            "nesting depth past MAX_DOM_DEPTH must set the truncated flag"
+        );
+    }
+
+    /// A DOM that nests well within `MAX_DOM_DEPTH` (a handful of levels, as
+    /// any real article does) must parse untouched — `cap_html_nesting_depth`
+    /// must not false-positive on ordinary structure, including the void
+    /// elements (`<br>`, `<img>`, `<hr>`) and self-closing tags a real
+    /// article is full of at the *same* depth, not nested inside each other.
+    #[test]
+    fn shallow_nesting_with_void_elements_is_left_untouched() {
+        let html = "<html><body><div><p>Text with a break<br>and an image \
+                     <img src=\"x.jpg\" alt=\"a > b\"/> and a rule<hr>done.</p></div></body></html>";
+        let (kept, truncated) = cap_html_nesting_depth(html, MAX_DOM_DEPTH);
+        assert!(!truncated);
+        assert_eq!(kept, html);
+
+        let doc = parse_article_html("Test", html);
+        assert!(!doc.truncated);
+    }
+
+    /// `<script>`/`<style>` bodies are opaque raw text, not tag nesting —
+    /// their content (which can itself contain `<`/`>`) must not be
+    /// misread as deeply nested markup.
+    #[test]
+    fn script_and_style_bodies_do_not_count_toward_nesting_depth() {
+        let html = "<html><body><script>if (1 < 2) { console.log('<div><div>'); }</script>\
+                     <style>.a { content: '<<<'; }</style><p>ok</p></body></html>";
+        let (kept, truncated) = cap_html_nesting_depth(html, 10);
+        assert!(!truncated, "raw-text content must not inflate depth");
+        assert_eq!(kept, html);
+    }
+
+    #[test]
+    fn nesting_depth_cap_truncates_exactly_at_the_offending_tag() {
+        let html = "<div><div><div>too deep</div></div></div>";
+        let (kept, truncated) = cap_html_nesting_depth(html, 2);
+        assert!(truncated);
+        assert_eq!(kept, "<div><div>");
+    }
+
+    /// PRD §9's fuzz corpus: a battery of hostile inputs across every text
+    /// surface `parse_article_html` emits, each asserting the resulting
+    /// `Document` (and, for the ones that matter to rendering, its laid-out
+    /// lines) never carries a raw control/DEL/C1/bidi-override character —
+    /// while zero-width-joiner emoji and IPA combining marks, which must
+    /// NOT be stripped, survive intact.
+    #[test]
+    fn fuzz_corpus_never_leaks_control_bidi_or_c1_bytes_and_terminates_promptly() {
+        let family_emoji = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        let ipa = "\u{0283}\u{0361}\u{0288} n\u{0303}";
+
+        let corpus: Vec<(&str, String)> = vec![
+            (
+                "esc_csi_in_paragraph",
+                "<html><body><p>before\x1b[31;1mhostile\x1b[0m after</p></body></html>".to_string(),
+            ),
+            (
+                "osc_title_set_in_heading",
+                "<html><body><h2>Title\x1b]0;pwned\x07End</h2></body></html>".to_string(),
+            ),
+            (
+                "c1_bytes_in_code_block",
+                "<html><body><pre>code\u{9B}31mline\u{9D}0;pwned\u{9C}</pre></body></html>"
+                    .to_string(),
+            ),
+            (
+                "bidi_override_in_alt_text",
+                "<html><body><figure><img src=\"x.jpg\" alt=\"safe\u{202E}evil\u{202C}text\"/></figure></body></html>"
+                    .to_string(),
+            ),
+            (
+                "bidi_isolate_in_paragraph",
+                "<html><body><p>a\u{2066}bidi\u{2069}b</p></body></html>".to_string(),
+            ),
+            (
+                "hostile_citation_text",
+                concat!(
+                    "<html><body><div class=\"mw-references-wrap\"><ol class=\"references\">",
+                    "<li id=\"cite_note-1\"><span class=\"reference-text\">Ref\x1b[31m\u{202E}text</span></li>",
+                    "</ol></div></body></html>"
+                )
+                .to_string(),
+            ),
+            (
+                "nul_bytes_in_paragraph",
+                "<html><body><p>before\0after</p></body></html>".to_string(),
+            ),
+            (
+                "zwj_emoji_family_must_survive",
+                format!("<html><body><p>Family: {family_emoji} together</p></body></html>"),
+            ),
+            (
+                "ipa_combining_marks_must_survive",
+                format!("<html><body><p>IPA: {ipa}</p></body></html>"),
+            ),
+        ];
+
+        let options = crate::layout::LayoutOptions::default();
+        for (name, html) in &corpus {
+            let start = std::time::Instant::now();
+            let doc = parse_article_html("Fuzz", html);
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(5),
+                "corpus entry {name} must parse within a generous time bound, took {:?}",
+                start.elapsed()
+            );
+            assert_document_is_terminal_safe(&doc, name);
+
+            let laid_out = crate::layout::layout_document(&doc, 80, options);
+            for line in &laid_out.lines {
+                for span in &line.spans {
+                    assert_terminal_safe(&span.text, &format!("{name} (laid-out line)"));
+                }
+            }
+        }
+
+        // The two "must survive" entries: confirm the content wasn't merely
+        // left non-hostile but was actually preserved, not deleted.
+        let family_doc = parse_article_html(
+            "Fuzz",
+            &format!("<html><body><p>Family: {family_emoji} together</p></body></html>"),
+        );
+        assert!(
+            render_plain(&family_doc).contains(family_emoji),
+            "ZWJ emoji family must survive sanitization intact"
+        );
+
+        let ipa_doc = parse_article_html(
+            "Fuzz",
+            &format!("<html><body><p>IPA: {ipa}</p></body></html>"),
+        );
+        assert!(
+            render_plain(&ipa_doc).contains(ipa),
+            "IPA combining marks must survive sanitization intact"
+        );
+    }
+
+    /// PRD §9's assertion, checked against every string a `Document`
+    /// exposes: no C0 control other than `\n`/`\t`, no DEL, no C1, no bidi
+    /// override/isolate character.
+    fn assert_terminal_safe(s: &str, context: &str) {
+        for c in s.chars() {
+            let cp = c as u32;
+            assert!(
+                !((cp < 0x20 && c != '\n' && c != '\t') || c == '\u{7F}'),
+                "found a raw control/DEL byte {c:?} (U+{cp:04X}) in {context}: {s:?}"
+            );
+            assert!(
+                !(0x80..=0x9F).contains(&cp),
+                "found a raw C1 control byte {c:?} (U+{cp:04X}) in {context}: {s:?}"
+            );
+            assert!(
+                !matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'),
+                "found a bidi override/isolate character {c:?} (U+{cp:04X}) in {context}: {s:?}"
+            );
+        }
+    }
+
+    fn assert_document_is_terminal_safe(doc: &Document, context: &str) {
+        assert_terminal_safe(&doc.title, &format!("{context} (title)"));
+        for block in &doc.blocks {
+            match block {
+                Block::Heading { spans, .. }
+                | Block::Paragraph(spans)
+                | Block::ListItem { spans, .. }
+                | Block::Blockquote(spans) => {
+                    for span in spans {
+                        assert_terminal_safe(&span.text, &format!("{context} (span)"));
+                        if let SpanStyle::Link(href) = &span.style {
+                            assert_terminal_safe(href, &format!("{context} (href)"));
+                        }
+                    }
+                }
+                Block::Code(text) => assert_terminal_safe(text, &format!("{context} (code)")),
+                Block::Table(lines) => {
+                    for line in lines {
+                        assert_terminal_safe(line, &format!("{context} (table)"));
+                    }
+                }
+                Block::Infobox(rows) => {
+                    for (label, value) in rows {
+                        assert_terminal_safe(label, &format!("{context} (infobox label)"));
+                        assert_terminal_safe(value, &format!("{context} (infobox value)"));
+                    }
+                }
+                Block::Image(alt) => assert_terminal_safe(alt, &format!("{context} (alt)")),
+                Block::Rule => {}
+            }
+        }
+        for citation in &doc.citations {
+            assert_terminal_safe(&citation.id, &format!("{context} (citation id)"));
+            assert_terminal_safe(&citation.text, &format!("{context} (citation text)"));
+            if let Some(url) = &citation.url {
+                assert_terminal_safe(url, &format!("{context} (citation url)"));
+            }
+        }
     }
 }

@@ -19,7 +19,19 @@ pub fn is_lang_code(s: &str) -> bool {
     s.len() >= 2 && s.chars().all(|c| c.is_ascii_lowercase() || c == '-')
 }
 
+/// PRD SEC-1: `parse`'s single sanitization choke point. `parse_raw` below
+/// has three different resolution paths (URL decode, lang-prefixed title,
+/// plain title) and three early returns; rather than sanitize at each one,
+/// every path funnels through this wrapper before the title can reach the
+/// fetch/open path — and, eventually, the terminal — same rationale as
+/// `doc::parse_article_html`'s `sanitize_document`.
 pub fn parse(input: &str) -> Target {
+    let mut target = parse_raw(input);
+    target.title = crate::sanitize::sanitize_single_line(&target.title).into_owned();
+    target
+}
+
+fn parse_raw(input: &str) -> Target {
     let input = input.trim();
 
     // Full URL: https://{lang}.wikipedia.org/wiki/{Title}[#fragment]

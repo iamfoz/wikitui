@@ -5,10 +5,12 @@ mod cite;
 mod cli;
 mod command;
 mod config;
+mod crashguard;
 mod doc;
 mod doctor;
 mod layout;
 mod research;
+mod sanitize;
 mod target;
 mod theme;
 mod ui;
@@ -16,10 +18,6 @@ mod ui;
 use anyhow::Result;
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use std::io::{self, Stdout};
@@ -34,6 +32,7 @@ use cache::PageCache;
 use cite::CiteStyle;
 use cli::{Cli, Commands, ConfigAction};
 use config::ConfigContext;
+use crashguard::TerminalGuard;
 use theme::Theme;
 
 /// How often the loop wakes up while the Search prompt is open, purely so
@@ -156,10 +155,21 @@ async fn main() -> Result<()> {
     let reload_flag = Arc::new(AtomicBool::new(false));
     spawn_sighup_listener(Arc::clone(&reload_flag));
 
-    install_panic_hook();
-    let mut terminal = init_terminal()?;
-    let result = run(
-        &mut terminal,
+    // Installed before the terminal is touched at all (PRD §7's "Crash"
+    // row): a panic during `TerminalGuard::enter` itself has nothing to
+    // restore yet, but anything after does, and the hook must already be in
+    // place for it.
+    crashguard::install_panic_hook();
+    // `TerminalGuard` (not a bare `init_terminal`/`restore_terminal` pair)
+    // owns raw mode and the alternate screen for the rest of this function:
+    // its `Drop` restores both no matter how this scope is left — the
+    // normal path below, an early `?` a future edit might add, or `run`
+    // itself returning early — which a call-restore-after-the-fact pattern
+    // can't guarantee. See `crashguard`'s module doc comment for why the
+    // panic hook above is still separately necessary.
+    let mut guard = TerminalGuard::enter()?;
+    run(
+        guard.terminal(),
         &client,
         &page_cache,
         cli,
@@ -172,9 +182,7 @@ async fn main() -> Result<()> {
         config_ctx,
         reload_flag,
     )
-    .await;
-    restore_terminal(&mut terminal)?;
-    result
+    .await
 }
 
 /// The CLI-flag layer of PRD §6.7's precedence chain, read off the parsed
@@ -195,6 +203,19 @@ fn cli_overrides_from(cli: &Cli) -> config::CliOverrides {
 /// capability report so both agree on what "active" means.
 pub(crate) fn no_color_active() -> bool {
     std::env::var("NO_COLOR").is_ok_and(|v| !v.is_empty())
+}
+
+/// PRD §7 / the v0.5 milestone's "crash-safe terminal restore": whether a
+/// deliberate test panic was requested. Gated on an env var rather than a
+/// hidden keybinding so a pty-based test can trigger the real crash path —
+/// terminal restore, crash report file, stderr message — just by setting
+/// the child process's environment, with zero risk of an accidental
+/// production panic path reachable by any key sequence a real user could
+/// press. Kept in the tree deliberately (not stripped before commit) as a
+/// documented testing/doctor-adjacent aid, the same category of
+/// intentional escape hatch as `WIKITUI_BASE_URL` or `WIKITUI_ANIMATIONS`.
+fn debug_panic_requested() -> bool {
+    std::env::var("WIKITUI_DEBUG_PANIC").is_ok_and(|v| !v.is_empty() && v != "0")
 }
 
 /// Listens for SIGHUP and sets `flag`, picked up by the event loop on its
@@ -258,44 +279,29 @@ async fn fetch_page(
     }
 }
 
+/// Builds the OSC 52 clipboard-set escape sequence for `text`, split out
+/// from `yank_to_clipboard` so the framing can be verified directly (PRD
+/// SEC-2): base64's alphabet (`A-Za-z0-9+/=`) contains no C0/C1 control
+/// bytes, so no matter what `text` contains — a title is expected to already
+/// be sanitized by the time it gets here (PRD SEC-1, `doc::parse_article_html`),
+/// but this holds even for arbitrary content — the encoded payload between
+/// the `\x1b]52;c;` prefix and the `\x07` terminator can never itself
+/// contain a raw ESC/BEL byte that could break out of the sequence.
+fn osc52_clipboard_sequence(text: &str) -> String {
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    format!("\x1b]52;c;{encoded}\x07")
+}
+
 /// Copies text to the system clipboard via OSC 52 (PRD FR-NV-10), which
 /// works over SSH because the *terminal emulator* performs the copy.
 /// Terminals without OSC 52 support silently ignore the sequence — the
 /// status line still reports what was yanked so the user can tell.
 fn yank_to_clipboard(text: &str) -> std::io::Result<()> {
-    use base64::Engine as _;
     use std::io::Write as _;
-    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
     let mut out = io::stdout();
-    write!(out, "\x1b]52;c;{encoded}\x07")?;
+    write!(out, "{}", osc52_clipboard_sequence(text))?;
     out.flush()
-}
-
-fn init_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    Ok(Terminal::new(backend)?)
-}
-
-fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    Ok(())
-}
-
-/// Ensure the terminal is never left in raw/alternate-screen mode after a
-/// panic (PRD §7: "Crash — panic handler restores terminal state" — a
-/// recorded failure mode of the incumbent client).
-fn install_panic_hook() {
-    let original = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
-        original(info);
-    }));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -342,6 +348,18 @@ async fn run(
         }
 
         terminal.draw(|f| ui::draw(f, &mut app))?;
+
+        // PRD §7 / v0.5's "crash-safe terminal restore": a deliberate,
+        // inert-by-default panic trigger for exercising the crash path
+        // (terminal restore, crash report, stderr message) end to end
+        // without waiting for a real bug. See `debug_panic_requested`'s doc
+        // comment for why this is an env var kept in the tree rather than a
+        // keybinding removed before commit.
+        if debug_panic_requested() {
+            panic!(
+                "WIKITUI_DEBUG_PANIC requested a deliberate panic for crash-safety testing (PRD §7)"
+            );
+        }
 
         if app.mode == Mode::Search {
             // The only mode that wakes on a timer instead of blocking
@@ -860,4 +878,63 @@ async fn run_search(client: &WikiClient, app: &mut App) {
         }
     }
     app.loading = false;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PRD SEC-2: a hostile title containing raw ESC/BEL bytes must not be
+    /// able to break out of the OSC 52 payload. In normal operation the
+    /// title is already sanitized (PRD SEC-1) by the time it reaches here,
+    /// but this property must hold unconditionally — base64 simply has no
+    /// way to represent a control byte in its output alphabet.
+    #[test]
+    fn osc52_sequence_cannot_carry_a_raw_esc_or_bel_from_hostile_content() {
+        let hostile = "\x1b]0;pwned\x07Evil\x1bTitle\x07with\x1bcontrol\x07bytes";
+        let seq = osc52_clipboard_sequence(hostile);
+
+        assert!(seq.starts_with("\x1b]52;c;"), "{seq:?}");
+        assert!(seq.ends_with('\x07'), "{seq:?}");
+        assert_eq!(
+            seq.matches('\x1b').count(),
+            1,
+            "exactly one ESC — the sequence's own opener, not one contributed by content: {seq:?}"
+        );
+        assert_eq!(
+            seq.matches('\x07').count(),
+            1,
+            "exactly one BEL — the sequence's own terminator, not one contributed by content: {seq:?}"
+        );
+
+        // Everything between the fixed prefix and the trailing BEL is pure
+        // base64 output — its alphabet (`A-Za-z0-9+/=`) cannot itself
+        // contain a control byte no matter what was encoded.
+        let payload = &seq["\x1b]52;c;".len()..seq.len() - 1];
+        assert!(
+            payload
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=')),
+            "payload must be pure base64: {payload:?}"
+        );
+
+        // And round-tripping it back must recover the exact original bytes
+        // (proving nothing was silently mutated on the way in either).
+        use base64::Engine as _;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .unwrap();
+        assert_eq!(decoded, hostile.as_bytes());
+    }
+
+    #[test]
+    fn osc52_sequence_round_trips_ordinary_text() {
+        let seq = osc52_clipboard_sequence("Alan Turing");
+        use base64::Engine as _;
+        let payload = &seq["\x1b]52;c;".len()..seq.len() - 1];
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .unwrap();
+        assert_eq!(decoded, b"Alan Turing");
+    }
 }
