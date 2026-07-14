@@ -145,7 +145,7 @@ pub enum SaveSpec {
 /// parse-time constant so `command` doesn't depend on the render module.
 const SAVE_EXPORT_FORMATS: [&str; 3] = ["md", "txt", "html"];
 
-pub const USAGE: &str = "commands: open <title>, lang [<code>], theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, prefetch-log, start, today, random [good], related, set images=on|off|prefetch=on|off, config reload, help, quit";
+pub const USAGE: &str = "commands: open <title>, lang [<code>], theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, prefetch-log, start, today, random [good], related, set theme=<name>|images=on|off|prefetch=on|off|measure=N|ambiguous_width=1|2, config reload, help, quit";
 
 pub fn parse(input: &str) -> Result<Command, String> {
     let input = input.trim();
@@ -358,38 +358,81 @@ pub fn parse(input: &str) -> Result<Command, String> {
                 ))
             }
         }
-        // `:set images=on|off` (PRD FR-TH-7). Parsed as a generic
-        // `key=value`; only `images` is wired today (FR-PC-4 will add more).
+        // `:set <key>=<value>` — session-global render/behavior overrides
+        // (PRD FR-PC-4 seed; FR-TH-7, FR-PF-6). Values are validated here so
+        // execution (`main::execute_command`) is a pure apply; per-article /
+        // per-tab scoping is FR-PC-4's remaining scope (a documented seam).
         "set" => {
             let assignment = require_arg("key=value")?;
             let (key, value) = assignment
                 .split_once('=')
                 .ok_or_else(|| "usage: :set images=on|off".to_string())?;
             let (key, value) = (key.trim(), value.trim());
+            let on_off = |value: &str| -> Result<String, String> {
+                if value == "on" || value == "off" {
+                    Ok(value.to_string())
+                } else {
+                    Err(format!("{key} must be on or off (got {value:?})"))
+                }
+            };
             match key {
-                "images" => {
-                    if value == "on" || value == "off" {
+                // PRD FR-TH-7.
+                "images" => Ok(Command::Set {
+                    key: "images".to_string(),
+                    value: on_off(value)?,
+                }),
+                // PRD FR-PF-6 kill switch.
+                "prefetch" => Ok(Command::Set {
+                    key: "prefetch".to_string(),
+                    value: on_off(value)?,
+                }),
+                // PRD FR-TH-2: live theme switch, same validation as
+                // `:theme <name>` and the config loader.
+                "theme" => {
+                    if Theme::by_name(value).is_some() {
                         Ok(Command::Set {
-                            key: "images".to_string(),
+                            key: "theme".to_string(),
                             value: value.to_string(),
                         })
                     } else {
-                        Err(format!("images must be on or off (got {value:?})"))
+                        Err(format!(
+                            "unknown theme {value:?} — one of: {}",
+                            Theme::NAMES.join(", ")
+                        ))
                     }
                 }
-                // PRD FR-PF-6 kill switch.
-                "prefetch" => {
-                    if value == "on" || value == "off" {
+                // PRD FR-RD-9 / FR-PC-4: line measure, same 40..=200 bounds
+                // the config loader enforces.
+                "measure" => match value.parse::<u16>() {
+                    Ok(n)
+                        if (crate::config::MEASURE_MIN..=crate::config::MEASURE_MAX)
+                            .contains(&n) =>
+                    {
                         Ok(Command::Set {
-                            key: "prefetch".to_string(),
+                            key: "measure".to_string(),
+                            value: n.to_string(),
+                        })
+                    }
+                    Ok(n) => Err(format!(
+                        "measure must be {}..={} (got {n})",
+                        crate::config::MEASURE_MIN,
+                        crate::config::MEASURE_MAX
+                    )),
+                    Err(_) => Err(format!("measure must be an integer (got {value:?})")),
+                },
+                // PRD FR-RD-10: East-Asian-Ambiguous width, 1 (narrow) or 2 (wide).
+                "ambiguous_width" => {
+                    if value == "1" || value == "2" {
+                        Ok(Command::Set {
+                            key: "ambiguous_width".to_string(),
                             value: value.to_string(),
                         })
                     } else {
-                        Err(format!("prefetch must be on or off (got {value:?})"))
+                        Err(format!("ambiguous_width must be 1 or 2 (got {value:?})"))
                     }
                 }
                 other => Err(format!(
-                    "unknown :set key {other:?} — try: images=on|off, prefetch=on|off"
+                    "unknown :set key {other:?} — try: theme, images=on|off, prefetch=on|off, measure=N, ambiguous_width=1|2"
                 )),
             }
         }
@@ -596,6 +639,47 @@ mod tests {
         assert!(parse("set width=90").is_err(), "width is not wired yet");
         assert!(parse("set images").is_err(), "needs key=value");
         assert!(parse("set").is_err());
+    }
+
+    /// PRD FR-PC-4 seed: `:set` now takes a small typed set beyond images.
+    #[test]
+    fn set_theme_measure_and_ambiguous_width_parse_and_validate() {
+        assert_eq!(
+            parse("set theme=paper"),
+            Ok(Command::Set {
+                key: "theme".to_string(),
+                value: "paper".to_string()
+            })
+        );
+        assert!(parse("set theme=sepia").is_err(), "unknown theme rejected");
+
+        assert_eq!(
+            parse("set measure=60"),
+            Ok(Command::Set {
+                key: "measure".to_string(),
+                value: "60".to_string()
+            })
+        );
+        // Bounds match the config loader (40..=200).
+        assert!(parse("set measure=10").is_err(), "below the floor");
+        assert!(parse("set measure=999").is_err(), "above the ceiling");
+        assert!(parse("set measure=wide").is_err(), "non-integer");
+
+        assert_eq!(
+            parse("set ambiguous_width=2"),
+            Ok(Command::Set {
+                key: "ambiguous_width".to_string(),
+                value: "2".to_string()
+            })
+        );
+        assert_eq!(
+            parse("set ambiguous_width=1"),
+            Ok(Command::Set {
+                key: "ambiguous_width".to_string(),
+                value: "1".to_string()
+            })
+        );
+        assert!(parse("set ambiguous_width=3").is_err());
     }
 
     #[test]

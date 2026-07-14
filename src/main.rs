@@ -22,6 +22,7 @@ mod layout;
 mod netqueue;
 mod prefetch;
 mod random;
+mod registry;
 mod research;
 mod sanitize;
 mod saved;
@@ -245,6 +246,26 @@ async fn main() -> Result<()> {
         eprintln!("wikitui: config: {summary}");
     }
 
+    // PRD FR-CS-3: build the active keymap — the selected preset (vim/emacs)
+    // plus any per-key overrides from `keymap.toml` (a sibling of
+    // config.toml). Parse warnings print here, alongside the config issues,
+    // before the terminal is touched.
+    let mut keymap = registry::Keymap::preset(&resolved.keymap_preset.value);
+    if let Some(dir) = config_path.as_deref().and_then(|p| p.parent())
+        && let Ok(text) = std::fs::read_to_string(dir.join("keymap.toml"))
+    {
+        for warning in keymap.apply_user_toml(&text) {
+            eprintln!("wikitui: keymap: {warning}");
+        }
+    }
+
+    // PRD FR-CS-8: onboarding shows once — only in an interactive TUI session
+    // with no config file yet. Never for `--dump` (which returns below before
+    // this matters), non-tty output, or when explicitly opted out.
+    let show_onboarding = !cli.no_onboarding
+        && std::io::IsTerminal::is_terminal(&std::io::stdout())
+        && config::first_run(config_path.as_deref());
+
     // NF-NET-2: the default contact needs no rebuild of the UA string; only a
     // configured `[network] contact` takes the `with_contact` path.
     let client = if resolved.network_contact.source == config::Source::Default {
@@ -335,6 +356,8 @@ async fn main() -> Result<()> {
         resolved.prefetch.enabled.value,
         config_ctx,
         reload_flag,
+        keymap,
+        show_onboarding,
     )
     .await
 }
@@ -1506,8 +1529,11 @@ async fn run(
     prefetch_enabled: bool,
     config_ctx: ConfigContext,
     reload_flag: Arc<AtomicBool>,
+    keymap: registry::Keymap,
+    show_onboarding: bool,
 ) -> Result<()> {
     let mut app = App::new(lang, theme, no_color);
+    app.keymap = keymap;
     app.languages = languages;
     app.accessible = accessible;
     app.measure = measure;
@@ -1620,6 +1646,13 @@ async fn run(
     // ensures it only runs while the reader is idle; the daily feed cache makes
     // it a single call per day.
     schedule_trending_prefetch(&app);
+
+    // PRD FR-CS-8: overlay the first-run tour on top of whatever loaded (the
+    // start page in the common case). Any key dismisses it and writes the
+    // default config so it never shows again.
+    if show_onboarding {
+        app.mode = Mode::Onboarding;
+    }
 
     loop {
         // Checked once per turn rather than mid-`event::read()`, which
@@ -2386,10 +2419,133 @@ async fn handle_key(
         return;
     }
 
+    // PRD FR-CS-1: Ctrl-p opens the command palette from the reading view.
+    // Additive — Ctrl-p was previously unbound there; the text-input modes
+    // (Search's own Ctrl-p moves the suggestion) are deliberately excluded.
+    if palette_allowed(app.mode)
+        && !app.pending_g
+        && !app.pending_b
+        && !app.pending_r
+        && code == KeyCode::Char('p')
+        && modifiers.contains(KeyModifiers::CONTROL)
+    {
+        app.open_palette();
+        return;
+    }
+
+    // PRD FR-CS-3: the active keymap's *override* layer (a user keymap.toml or
+    // the emacs preset) is consulted ahead of the hardcoded arms below. The
+    // vim default has an empty override layer, so `runtime_action` returns
+    // `None` for every default binding and this is a no-op — `handle_key`'s
+    // existing dispatch and behavior are untouched. Only a rebinding surfaces
+    // here. Scoped to the reading view (where `dispatch_action` is well
+    // defined) and to single keys — the g/b/r chord latches are resolved
+    // below, so we skip while one is pending.
+    if !app.pending_g
+        && !app.pending_b
+        && !app.pending_r
+        && let Some(ctx) = override_context(app)
+        && let Some(chord) = registry::Chord::from_key(code, modifiers)
+        && let Some(action) = app.keymap.runtime_action(ctx, &chord)
+    {
+        dispatch_action(
+            action,
+            client,
+            cache,
+            app,
+            revalidate_tx,
+            open_tx,
+            save_tx,
+            related_tx,
+            langlinks_tx,
+            terminal,
+        )
+        .await;
+        return;
+    }
+
     match app.mode {
+        // PRD FR-CS-4: the help overlay is scrollable so it can never clip,
+        // however tall the generated cheatsheet. Navigation keys scroll;
+        // Esc/?/q/Enter close (returning to the view it was opened over).
         Mode::Help => {
-            // Any key closes the help overlay.
-            app.mode = app.prior_mode;
+            let visible = terminal
+                .size()
+                .map(|s| s.height.saturating_sub(4))
+                .unwrap_or(20);
+            let max_scroll = (ui::help_view_len(app) as u16).saturating_sub(visible);
+            let set = |v: u16| v.min(max_scroll);
+            match code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?') | KeyCode::Char('q') => {
+                    app.mode = app.prior_mode;
+                    app.help_scroll = 0;
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    app.help_scroll = set(app.help_scroll.saturating_add(1))
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    app.help_scroll = app.help_scroll.saturating_sub(1)
+                }
+                KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.help_scroll = set(app.help_scroll.saturating_add(10))
+                }
+                KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.help_scroll = app.help_scroll.saturating_sub(10)
+                }
+                KeyCode::Char(' ') => app.help_scroll = set(app.help_scroll.saturating_add(10)),
+                KeyCode::Char('g') => app.help_scroll = 0,
+                KeyCode::Char('G') => app.help_scroll = max_scroll,
+                _ => {}
+            }
+        }
+        // PRD FR-CS-1's command palette: fuzzy-filter as you type, Enter runs
+        // the highlighted command in the context it was opened from, Esc
+        // cancels. Ctrl-n/p and the arrows move the selection (mirroring the
+        // typeahead dropdown's grammar).
+        Mode::Palette => match code {
+            KeyCode::Esc => {
+                app.mode = app.palette_prior_mode;
+                app.palette_input.clear();
+            }
+            KeyCode::Enter => {
+                let action = app.palette_selection();
+                app.mode = app.palette_prior_mode;
+                app.palette_input.clear();
+                if let Some(action) = action {
+                    dispatch_action(
+                        action,
+                        client,
+                        cache,
+                        app,
+                        revalidate_tx,
+                        open_tx,
+                        save_tx,
+                        related_tx,
+                        langlinks_tx,
+                        terminal,
+                    )
+                    .await;
+                }
+            }
+            KeyCode::Up => app.palette_move(-1),
+            KeyCode::Down => app.palette_move(1),
+            KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => app.palette_move(1),
+            KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => app.palette_move(-1),
+            KeyCode::Backspace => {
+                app.palette_input.pop();
+                app.palette_selected = 0;
+            }
+            KeyCode::Char(c) => {
+                app.palette_input.push(c);
+                app.palette_selected = 0;
+            }
+            _ => {}
+        },
+        // PRD FR-CS-8's first-run onboarding: any key dismisses the tour and
+        // writes the default config so it never shows again.
+        Mode::Onboarding => {
+            app.mode = Mode::Reading;
+            finish_onboarding(app);
         }
         // PRD FR-PF-4: the prefetch-log panel is read-only — any key closes it.
         Mode::PrefetchLog => app.close_prefetch_log(),
@@ -3309,6 +3465,241 @@ async fn handle_key(
     }
 }
 
+/// The modes `Ctrl-p` opens the command palette from (PRD FR-CS-1). The
+/// reading view only: from there the palette's commands (search, toc, random,
+/// theme, ...) are all meaningful, and `Ctrl-p` was previously unbound, so
+/// this is purely additive. The text-input modes are excluded (Search's own
+/// `Ctrl-p` moves the suggestion).
+fn palette_allowed(mode: Mode) -> bool {
+    matches!(mode, Mode::Reading)
+}
+
+/// The [`registry::KeyContext`] whose keymap *override* layer applies to a
+/// raw keypress (PRD FR-CS-3). Only the reading view: there `dispatch_action`
+/// covers every action, so a rebinding is safe to route through it. Returns
+/// `None` everywhere else, leaving those modes' hardcoded handlers untouched
+/// (picker/search key remapping is a documented seam).
+fn override_context(app: &App) -> Option<registry::KeyContext> {
+    match app.mode {
+        Mode::Reading => Some(if app.active_tab().doc.is_none() {
+            registry::KeyContext::StartPage
+        } else {
+            registry::KeyContext::Reading
+        }),
+        _ => None,
+    }
+}
+
+/// PRD FR-CS-8: dismissing the first-run tour writes `config.toml` with
+/// commented defaults so onboarding never shows again (its presence is the
+/// first-run sentinel — see `config::first_run`). A write failure is
+/// non-fatal: the tour simply reappears next run, surfaced as a notice.
+fn finish_onboarding(app: &mut App) {
+    match config::write_default_config(app.config_ctx.config_path.as_deref()) {
+        Ok(true) => app.status = "Welcome — defaults written to your config file".to_string(),
+        Ok(false) => {} // a file already exists (or no config dir); nothing to do
+        Err(e) => app.notice = Some(format!("Could not write the default config: {e}")),
+    }
+}
+
+/// Execute a registry [`registry::Action`] (PRD §5.13): the single dispatch
+/// point the command palette (FR-CS-1) and the keymap override layer
+/// (FR-CS-3) both drive through. Each arm performs exactly what
+/// `handle_key`'s corresponding hardcoded binding does, so routing a command
+/// here — from a palette row or a rebound key — is behavior-identical to
+/// pressing its default key.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_action(
+    action: registry::Action,
+    client: &WikiClient,
+    cache: &PageCache,
+    app: &mut App,
+    revalidate_tx: &UnboundedSender<RevalidationOutcome>,
+    open_tx: &UnboundedSender<TabLoadOutcome>,
+    save_tx: &UnboundedSender<SaveOutcome>,
+    related_tx: &UnboundedSender<RelatedOutcome>,
+    langlinks_tx: &UnboundedSender<LangLinksOutcome>,
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+) {
+    use registry::Action;
+    match action {
+        Action::ScrollDown => app.scroll_by(1),
+        Action::ScrollUp => app.scroll_by(-1),
+        Action::HalfPageDown => app.scroll_by(10),
+        Action::HalfPageUp => app.scroll_by(-10),
+        Action::PageDown => app.scroll_by(15),
+        Action::ScrollTop => app.scroll_to_top(),
+        Action::ScrollBottom => app.scroll_to_bottom(),
+        Action::ScrollTablesLeft => app.scroll_tables(-1),
+        Action::ScrollTablesRight => app.scroll_tables(1),
+        Action::LinkCycleNext => app.cycle_link(true),
+        Action::LinkCyclePrev => app.cycle_link(false),
+        Action::LinkHints => app.enter_hint_mode(false),
+        Action::LinkHintsBackground => app.enter_hint_mode(true),
+        Action::FollowLink => {
+            let link = app
+                .active_tab()
+                .focused_link
+                .and_then(|i| app.active_tab().links.get(i))
+                .cloned();
+            if let Some(link) = link {
+                match link.internal_title {
+                    Some(title) => {
+                        open_title(client, cache, app, &title, revalidate_tx, langlinks_tx).await
+                    }
+                    None => app.status = format!("External link: {}", link.href),
+                }
+            }
+        }
+        Action::OpenBackgroundTab => {
+            let link = app
+                .active_tab()
+                .focused_link
+                .and_then(|i| app.active_tab().links.get(i))
+                .cloned();
+            match link.and_then(|l| l.internal_title) {
+                Some(title) => {
+                    let lang = app.lang.clone();
+                    let id = app.open_background_tab(title.clone(), lang.clone());
+                    fire_background_load(client, cache, id, lang, title, open_tx);
+                    app.status = "Opening in a background tab…".to_string();
+                }
+                None => app.status = "No internal link focused to open in a tab".to_string(),
+            }
+        }
+        Action::Back => {
+            if let Some(entry) = app.navigate_back_target() {
+                open_history_entry(client, cache, app, entry, revalidate_tx).await;
+            } else {
+                app.status = "No earlier page in history".to_string();
+            }
+        }
+        Action::Forward => {
+            if let Some(entry) = app.navigate_forward_target() {
+                open_history_entry(client, cache, app, entry, revalidate_tx).await;
+            } else {
+                app.status = "No later page in history".to_string();
+            }
+        }
+        Action::BackStackPicker => {
+            if app.active_tab().back_stack.is_empty() {
+                app.status = "No history to show in this tab".to_string();
+            } else {
+                app.selected_history = app.active_tab().back_stack.len() - 1;
+                app.mode = Mode::HistoryPicker;
+            }
+        }
+        Action::ReadingHistory => app.open_reading_history_picker(),
+        Action::NextTab => app.next_tab(),
+        Action::PrevTab => app.prev_tab(),
+        Action::TabPicker => {
+            app.selected_tab_pick = app.active;
+            app.mode = Mode::TabPicker;
+        }
+        Action::ReopenClosedTab => {
+            if !app.reopen_closed_tab() {
+                app.status = "No recently closed tabs to reopen".to_string();
+            }
+        }
+        Action::CloseTab => {
+            if app.close_active_tab() {
+                app.should_quit = true;
+            }
+        }
+        Action::Toc => {
+            if app.active_tab().sections.is_empty() {
+                app.status = "No sections on this page".to_string();
+            } else {
+                app.mode = Mode::Toc;
+            }
+        }
+        Action::CycleTheme => app.cycle_theme(),
+        Action::Search => {
+            app.mode = Mode::Search;
+            app.search_input.clear();
+            app.typeahead.clear();
+            app.search_suggestion = None;
+            app.search_debounce_at = None;
+        }
+        Action::CommandLine => {
+            app.mode = Mode::Command;
+            app.command_input.clear();
+        }
+        Action::Help => {
+            app.prior_mode = app.mode;
+            app.help_scroll = 0;
+            app.mode = Mode::Help;
+        }
+        Action::Palette => app.open_palette(),
+        Action::YankUrl => {
+            if let Some(url) = app.yank_url() {
+                app.status = match yank_to_clipboard(&url) {
+                    Ok(()) => format!("Yanked {url}"),
+                    Err(e) => format!("Yank failed: {e}"),
+                };
+            } else {
+                app.status = "Open an article first".to_string();
+            }
+        }
+        Action::YankMarkdown => {
+            if let Some(link) = app.yank_markdown() {
+                app.status = match yank_to_clipboard(&link) {
+                    Ok(()) => format!("Yanked {link}"),
+                    Err(e) => format!("Yank failed: {e}"),
+                };
+            } else {
+                app.status = "Open an article first".to_string();
+            }
+        }
+        Action::ReadLater => enqueue_read_later(client, cache, app).await,
+        Action::Research => {
+            if app.active_tab().doc.is_some() {
+                app.mode = Mode::Research;
+            } else {
+                app.status = "Open an article first".to_string();
+            }
+        }
+        Action::Library => app.open_library(),
+        Action::BookmarkToggle => app.toggle_bookmark(),
+        Action::BookmarkPicker => app.open_bookmark_picker(),
+        Action::Annotate => annotate_current_article(terminal, app),
+        Action::FindInPage => {
+            app.mode = Mode::Find;
+            app.clear_find();
+        }
+        Action::FindNext => {
+            if app.active_tab().find_matches.is_empty() {
+                app.status = "No active search — Ctrl-f to find in this page".to_string();
+            } else {
+                app.find_next();
+            }
+        }
+        Action::FindPrev => {
+            if app.active_tab().find_matches.is_empty() {
+                app.status = "No active search — Ctrl-f to find in this page".to_string();
+            } else {
+                app.find_prev();
+            }
+        }
+        Action::SaveOffline => start_current_save(client, cache, app, Tier::T0, save_tx),
+        Action::RandomArticle => {
+            open_random_article(client, cache, app, revalidate_tx, langlinks_tx).await
+        }
+        Action::RelatedPanel => open_related(app, client, related_tx),
+        Action::LangPicker => open_lang_picker(app, client, langlinks_tx),
+        Action::Home => app.go_home(),
+        Action::Today => fetch_on_this_day(client, app).await,
+        Action::Quit => {
+            app.pending_quit_confirm = true;
+            app.notice = Some("really quit? (y/n)".to_string());
+        }
+        // Picker-generic actions are handled inline by each picker's own arm;
+        // they are never routed here (not palette-exposed, and the override
+        // layer is scoped to the reading view).
+        Action::MoveDown | Action::MoveUp | Action::Select | Action::Close => {}
+    }
+}
+
 /// Executes a parsed `:` command. Parsing already validated arguments
 /// (theme/style/lang names), so the arms here mostly delegate to existing
 /// features.
@@ -3356,9 +3747,34 @@ async fn execute_command(
             }
             // PRD FR-PF-6 kill switch.
             "prefetch" => app.set_prefetch(value == "on"),
+            // PRD FR-TH-2: live theme switch (value already validated by the
+            // parser, so `by_name` cannot fail here).
+            "theme" => {
+                if let Some(theme) = Theme::by_name(&value) {
+                    app.set_theme(theme);
+                    app.notice = Some(format!("theme={value}"));
+                }
+            }
+            // PRD FR-RD-9 / FR-PC-4: re-measure and re-center. Dropping the
+            // cached layout forces `ensure_layout` to recompute at the new
+            // width (measure feeds layout, not just paint) — same seam
+            // `apply_config_reload` uses.
+            "measure" => {
+                if let Ok(n) = value.parse::<u16>() {
+                    app.measure = n;
+                    app.layout = None;
+                    app.notice = Some(format!("measure={n}"));
+                }
+            }
+            // PRD FR-RD-10: East-Asian-Ambiguous width feeds layout too.
+            "ambiguous_width" => {
+                app.ambiguous_wide = value == "2";
+                app.layout = None;
+                app.notice = Some(format!("ambiguous_width={value}"));
+            }
             other => {
                 app.notice = Some(format!(
-                    "unknown :set key {other:?} (try: images, prefetch)"
+                    "unknown :set key {other:?} (try: theme, images, prefetch, measure, ambiguous_width)"
                 ));
             }
         },

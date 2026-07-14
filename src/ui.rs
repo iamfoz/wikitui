@@ -12,6 +12,7 @@ use crate::doc::LinkRef;
 use crate::layout::{
     FLOOR_MIN_HEIGHT, FLOOR_MIN_WIDTH, LaidLine, MatchSpan, SizeTier, SpanKind, size_tier,
 };
+use crate::registry;
 use crate::search_ops;
 use crate::startpage::{self, StartPageConfig, StartPageModel};
 use crate::theme::Theme;
@@ -439,6 +440,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         // The `/` filter draws over the same picker view; only the status
         // line changes to show the live prompt.
         Mode::LangPicker | Mode::LangFilter => draw_lang_picker(frame, app, content_area),
+        // The palette (FR-CS-1) and onboarding (FR-CS-8) are modal overlays
+        // painted after the status bar below; the reading view sits behind them.
+        Mode::Palette | Mode::Onboarding => draw_reading(frame, app, content_area),
     }
 
     draw_status_bar(frame, app, status_area);
@@ -464,6 +468,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     if app.mode == Mode::Help {
         draw_help_overlay(frame, app, area);
+    }
+
+    // PRD FR-CS-1's command palette and FR-CS-8's onboarding: modal overlays,
+    // drawn last so they layer over everything (same ordering as help above).
+    if app.mode == Mode::Palette {
+        draw_palette(frame, app, area);
+    }
+    if app.mode == Mode::Onboarding {
+        draw_onboarding(frame, app, area);
     }
 }
 
@@ -2022,7 +2035,12 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Related => app.status.clone(),
         Mode::LangPicker => app.status.clone(),
         Mode::LangFilter => format!("filter: {}   Esc: apply", app.lang_filter_input),
-        Mode::Help => "Press any key to close help".to_string(),
+        Mode::Help => "j/k: scroll   Esc/?/q: close".to_string(),
+        Mode::Palette => format!(
+            "> {}   Enter: run   \u{2191}/\u{2193}: move   Esc: cancel",
+            app.palette_input
+        ),
+        Mode::Onboarding => "Press any key to start reading".to_string(),
         Mode::Reading if app.loading => "Loading…".to_string(),
         // Command feedback outranks the focused-link line until the next
         // keypress clears it (see App::notice).
@@ -2113,9 +2131,22 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(text).style(style), area);
 }
 
+/// PRD FR-CS-4's context-sensitive help overlay — the direct answer to
+/// wiki-tui's most-upvoted issue (#177). The cheatsheet is *generated* from
+/// the command registry + active keymap (`registry::reading_help` /
+/// `picker_help`), so it can never drift from the real bindings, and it shows
+/// the keys the reader has actually configured. It is **scrollable** (j/k,
+/// arrows, Ctrl-d/u, g/G — handled in `main::handle_key`) so however tall the
+/// content and short the terminal, it can always reach its own bottom: the
+/// single fixed-height popup this replaced clipped ~40 rows into ~29.
 fn draw_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
-    let width = 62.min(area.width.saturating_sub(4)).max(20);
-    let height = 31.min(area.height.saturating_sub(4)).max(8);
+    let (title, lines) = help_content(app);
+
+    let width = 66.min(area.width.saturating_sub(4)).max(20);
+    // Take most of the screen height; the content scrolls within it.
+    let height = (lines.len() as u16 + 2)
+        .min(area.height.saturating_sub(2))
+        .max(6);
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
         y: area.y + (area.height.saturating_sub(height)) / 2,
@@ -2123,56 +2154,269 @@ fn draw_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
         height,
     };
 
-    let help_text = Text::from(vec![
-        Line::from(RSpan::styled(
-            "wikitui — help",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from("j/k, ↓/↑     scroll"),
-        Line::from("Ctrl-d/u     half page down/up"),
-        Line::from("gg / G       top / bottom"),
-        Line::from("Tab/S-Tab    cycle links"),
-        Line::from("f            link hints: type the label to follow"),
-        Line::from("F            link hints: open the label in a background tab"),
-        Line::from("Enter        follow link / open selected result"),
-        Line::from("Ctrl-Enter   open focused link in a background tab"),
-        Line::from("H / L        back / forward (per tab, restores scroll)"),
-        Line::from("gb           back-stack picker (breadcrumb trail)"),
-        Line::from("Ctrl-h       reading history (persistent)   :history clear today|all"),
-        Line::from("gt / gT      next / previous tab"),
-        Line::from("gr           random article   :random good  (assessment ≥ GA)"),
-        Line::from("gR           related articles (morelike:)   :related"),
-        Line::from(":lang        language editions of this article (autonym/langname)"),
-        Line::from("bb           tab picker    u  reopen closed tab"),
-        Line::from("t            table of contents"),
-        Line::from("[ / ]        scroll wide tables left / right"),
-        Line::from("T            cycle color theme"),
-        Line::from("y / Y        yank URL / Markdown link"),
-        Line::from(":            command (:open, :lang, :theme, :tab, :tabs, :q)"),
-        Line::from("r            research mode: cite this page & its sources"),
-        Line::from("R            library: browse/export saved bibliography"),
-        Line::from("m            bookmark / un-bookmark this article (toggle)"),
-        Line::from("B            bookmark picker   ba  annotate ($EDITOR note)"),
-        Line::from("  in picker  /: filter   t: edit tags   d: delete   Enter: open"),
-        Line::from("  filter     free text fuzzy-matches title; #tag needs ALL tags"),
-        Line::from("rl           read later (focused link, else article)"),
-        Line::from(":readlater   read-later queue   :bookmarks[ export md|html|json|netscape]"),
-        Line::from("/            search: type for suggestions, Enter opens, Tab full-text"),
-        Line::from("  in search  ?: operator cheat-sheet (intitle:, morelike:, ...)"),
-        Line::from("             Tab on a partial operator name completes it"),
-        Line::from("Ctrl-f       find in this page (smart-case), n/N: cycle matches"),
-        Line::from("Esc          cancel / close"),
-        Line::from("?            toggle this help"),
-        Line::from("q            close current tab (quits on the last)"),
-        Line::from("Q            quit (with y/n confirm)"),
-    ]);
+    // Rows visible inside the border, and the furthest we can usefully scroll.
+    let inner_rows = popup.height.saturating_sub(2);
+    let max_scroll = (lines.len() as u16).saturating_sub(inner_rows);
+    let offset = app.help_scroll.min(max_scroll);
+    let heading = if max_scroll > 0 {
+        let last = (offset + inner_rows).min(lines.len() as u16);
+        format!("{title}  ({}-{}/{})", offset + 1, last, lines.len())
+    } else {
+        title
+    };
 
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new(help_text)
+        Paragraph::new(Text::from(lines))
             .style(base_style(&app.theme, app.no_color))
-            .block(UiBlock::default().borders(Borders::ALL).title("Help")),
+            .scroll((offset, 0))
+            .block(UiBlock::default().borders(Borders::ALL).title(heading)),
+        popup,
+    );
+}
+
+/// The number of lines the current help cheatsheet holds — `main::handle_key`
+/// uses it to clamp the scroll offset so `?`-help can never over-scroll past
+/// its own bottom (PRD FR-CS-4).
+pub fn help_view_len(app: &App) -> usize {
+    help_content(app).1.len()
+}
+
+/// Build the help title and lines for whatever view the overlay was opened
+/// from (`app.prior_mode`) — PRD FR-CS-4's per-view cheatsheet.
+fn help_content(app: &App) -> (String, Vec<Line<'static>>) {
+    let heading = |s: &str| {
+        Line::from(RSpan::styled(
+            s.to_string(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ))
+    };
+    let row = |key: &str, help: &str| {
+        Line::from(vec![
+            RSpan::styled(
+                format!("{key:<12}"),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            RSpan::raw(help.to_string()),
+        ])
+    };
+
+    // The start page is a Reading mode with no document — its own short sheet.
+    if app.prior_mode == Mode::Reading && app.active_tab().doc.is_none() {
+        let lines = vec![
+            heading("Start page"),
+            Line::from(""),
+            row("j/k", "move the selection"),
+            row("Enter", "open the focused item"),
+            row("t", "reroll the TIL widget"),
+            row("/", "search Wikipedia"),
+            row(":", "command line"),
+            row("Ctrl-p", "command palette"),
+            row("gr", "random article"),
+            row("T", "cycle color theme"),
+            row("?", "this help"),
+            row("q", "close / quit"),
+        ];
+        return ("Start page — keys".to_string(), lines);
+    }
+
+    if app.prior_mode == Mode::Reading {
+        let mut lines = vec![heading("Reading"), Line::from("")];
+        for r in registry::reading_help(&app.keymap) {
+            lines.push(row(&r.key, &r.help));
+        }
+        return ("Reading — keys".to_string(), lines);
+    }
+
+    // Every other view is a picker: the generated navigation sheet plus the
+    // concrete extras this particular picker binds.
+    let (name, extras) = picker_help_extras(app.prior_mode);
+    let mut lines = vec![heading(name), Line::from("")];
+    for r in registry::picker_help(&app.keymap) {
+        lines.push(row(&r.key, &r.help));
+    }
+    if !extras.is_empty() {
+        lines.push(Line::from(""));
+        for (key, help) in extras {
+            lines.push(row(key, help));
+        }
+    }
+    (format!("{name} — keys"), lines)
+}
+
+/// The human name and the picker-specific extra keys for a picker mode (PRD
+/// FR-CS-4). The generic j/k/Enter/Esc/? navigation is generated from the
+/// registry (`registry::picker_help`); this fills in each view's own keys.
+fn picker_help_extras(mode: Mode) -> (&'static str, &'static [(&'static str, &'static str)]) {
+    match mode {
+        Mode::Toc => ("Table of contents", &[("Enter", "jump to the section")]),
+        Mode::Results => (
+            "Search results",
+            &[("Enter", "open (or search the suggestion)")],
+        ),
+        Mode::Research => (
+            "Research",
+            &[("s/Enter", "save citation"), ("R", "open the library")],
+        ),
+        Mode::Library => (
+            "Library",
+            &[
+                ("s", "cycle citation style"),
+                ("d", "delete"),
+                ("e", "export bibliography"),
+            ],
+        ),
+        Mode::TabPicker => ("Tab picker", &[("d", "close the highlighted tab")]),
+        Mode::HistoryPicker => ("Back-stack", &[]),
+        Mode::BookmarkPicker => (
+            "Bookmarks",
+            &[
+                ("/", "filter (#tag or fuzzy title)"),
+                ("t", "edit tags"),
+                ("d", "delete"),
+            ],
+        ),
+        Mode::ReadLaterPicker => ("Read-later queue", &[("d", "remove without opening")]),
+        Mode::ReadingHistory => (
+            "Reading history",
+            &[("/", "filter"), ("d", "delete this article's history")],
+        ),
+        Mode::SavedPicker => ("Saved pages", &[("d", "un-pin")]),
+        Mode::OnThisDay => ("On this day", &[("Tab / h l", "switch type")]),
+        Mode::Related => ("Related", &[]),
+        Mode::LangPicker => (
+            "Language editions",
+            &[("/", "filter (autonym / langname / code)")],
+        ),
+        _ => ("Help", &[]),
+    }
+}
+
+/// PRD FR-CS-1's command palette (`Ctrl-p`): a fuzzy list over every registry
+/// command applicable in the context it was opened from, each row showing the
+/// display name, its current keybinding, and the one-line help. Enter runs the
+/// highlighted command, Esc cancels.
+fn draw_palette(frame: &mut Frame, app: &App, area: Rect) {
+    let rows = app.palette_rows();
+
+    let width = 72.min(area.width.saturating_sub(4)).max(24);
+    let height = (rows.len() as u16 + 4)
+        .min(area.height.saturating_sub(2))
+        .max(6);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+
+    // A visible window around the selection so a long, filtered list still
+    // shows the highlighted row (same idiom as the other selectable lists).
+    let list_rows = popup.height.saturating_sub(3) as usize;
+    let start = app
+        .palette_selected
+        .saturating_sub(list_rows.saturating_sub(1));
+    let key_col = rows
+        .iter()
+        .map(|r| r.key.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(3);
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(RSpan::styled(
+            format!("> {}", app.palette_input),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    if rows.is_empty() {
+        lines.push(Line::from(RSpan::styled(
+            "no matching command",
+            colored(app.no_color, app.theme.dim),
+        )));
+    }
+    for (i, r) in rows.iter().enumerate().skip(start).take(list_rows) {
+        let style = if i == app.palette_selected {
+            colored_bg(app.no_color, app.theme.selected_fg, app.theme.selected_bg)
+        } else {
+            Style::default()
+        };
+        lines.push(
+            Line::from(vec![
+                RSpan::raw(format!("{:<width$}  ", r.display, width = 26)),
+                RSpan::styled(
+                    format!("{:<key_col$}  ", r.key, key_col = key_col),
+                    colored(app.no_color, app.theme.dim),
+                ),
+                RSpan::styled(r.help.to_string(), colored(app.no_color, app.theme.dim)),
+            ])
+            .style(style),
+        );
+    }
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .style(base_style(&app.theme, app.no_color))
+            .block(
+                UiBlock::default()
+                    .borders(Borders::ALL)
+                    .title("Command palette"),
+            ),
+        popup,
+    );
+}
+
+/// PRD FR-CS-8's first-run onboarding: a one-screen tour naming the three keys
+/// a newcomer needs first, shown once over the start page and dismissed with
+/// any key (which also writes the default config so it never shows again).
+fn draw_onboarding(frame: &mut Frame, app: &App, area: Rect) {
+    let width = 56.min(area.width.saturating_sub(4)).max(24);
+    let height = 15.min(area.height.saturating_sub(2)).max(8);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+
+    let key = |k: &str, help: &str| {
+        Line::from(vec![
+            RSpan::styled(
+                format!("  {k:<8}"),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            RSpan::raw(help.to_string()),
+        ])
+    };
+    let lines = vec![
+        Line::from(RSpan::styled(
+            "Welcome to wikitui",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from("A keyboard-first Wikipedia reader. Three keys to start:"),
+        Line::from(""),
+        key("/", "search Wikipedia"),
+        key("?", "help — every key for the current view"),
+        key("T", "cycle the color theme"),
+        Line::from(""),
+        Line::from(RSpan::styled(
+            "A config file with commented defaults is being written",
+            colored(app.no_color, app.theme.dim),
+        )),
+        Line::from(RSpan::styled(
+            "for you. Press any key to begin.",
+            colored(app.no_color, app.theme.dim),
+        )),
+    ];
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .style(base_style(&app.theme, app.no_color))
+            .block(UiBlock::default().borders(Borders::ALL).title("First run")),
         popup,
     );
 }
@@ -2182,6 +2426,53 @@ mod tests {
     use super::*;
     use crate::doc::{parse_article_html, section_outline};
     use crate::layout::{LayoutOptions, layout_document};
+
+    /// PRD FR-CS-4: the `?` cheatsheet is per-view and generated from the
+    /// registry + keymap. The Reading sheet is long (hence scrollable, hence
+    /// the overflow fix); a picker sheet names that view and its own keys.
+    /// Asserts the model, not pixels.
+    #[test]
+    fn help_content_is_per_view_and_registry_generated() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(parse_article_html("Alan Turing", "<p>x</p>"));
+
+        // The reading view: a long sheet (would clip a fixed popup — the very
+        // bug this replaced), titled from the view.
+        app.prior_mode = Mode::Reading;
+        let (title, lines) = help_content(&app);
+        assert!(title.starts_with("Reading"), "reading title: {title}");
+        assert!(
+            lines.len() > 30,
+            "reading cheatsheet has {} rows — must be scrollable",
+            lines.len()
+        );
+        let reading_text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        // A representative registry-sourced key + help pairing.
+        assert!(reading_text.contains('j') && reading_text.contains("scroll one line down"));
+
+        // A picker view: named for that view, with its own extra keys plus
+        // the generic navigation generated from the registry.
+        app.prior_mode = Mode::Toc;
+        let (title, lines) = help_content(&app);
+        assert!(title.starts_with("Table of contents"), "toc title: {title}");
+        let picker_text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            picker_text.contains("jump to the section"),
+            "picker extra shown: {picker_text}"
+        );
+        assert!(
+            picker_text.contains("selection") || picker_text.contains("confirm"),
+            "generic navigation from the registry shown"
+        );
+    }
 
     /// The paint step maps each heading's layout line (via
     /// `section_outline` + `Layout::block_lines`) back to the rendered row.

@@ -67,6 +67,12 @@ pub struct Cli {
     /// FR-PR-3, not built yet).
     #[arg(long)]
     pub incognito: bool,
+
+    /// Skip the first-run onboarding tour (FR-CS-8) even when no config file
+    /// exists yet. Scripting and `--dump` never trigger onboarding anyway;
+    /// this is for an interactive session that wants to opt out.
+    #[arg(long)]
+    pub no_onboarding: bool,
 }
 
 #[derive(Subcommand, Debug)]

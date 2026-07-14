@@ -32,6 +32,11 @@ pub const CONFIG_VERSION: u32 = 1;
 /// Built-in fallback when no CLI flag, env var, or config file sets a
 /// wiki's base URL (PRD §6.2 rule 1: per-wiki `{lang}.wikipedia.org`).
 pub const DEFAULT_BASE_URL_TEMPLATE: &str = "https://{lang}.wikipedia.org";
+
+/// The sane bounds for `measure` (FR-RD-9), shared with `:set measure=N`
+/// (FR-PC-4) so the runtime override and the config loader agree.
+pub const MEASURE_MIN: u16 = 40;
+pub const MEASURE_MAX: u16 = 200;
 const DEFAULT_WIKI_NAME: &str = "wikipedia";
 
 /// Where a resolved value came from, in the precedence order the PRD
@@ -167,6 +172,10 @@ pub struct ResolvedConfig {
     pub lang: Valued<String>,
     pub languages: Valued<Vec<String>>,
     pub theme: Valued<String>,
+    /// PRD FR-CS-3's keymap preset selector (`keymap = "vim"|"emacs"`,
+    /// default `vim`). The concrete keymap (preset + any `keymap.toml`
+    /// overrides) is built by `main` from this — see `registry::Keymap`.
+    pub keymap_preset: Valued<String>,
     pub measure: Valued<u16>,
     pub ambiguous_wide: Valued<bool>,
     pub cite_style: Valued<String>,
@@ -268,6 +277,82 @@ pub fn resolve_config_path(cli_path: Option<PathBuf>, env_var: Option<String>) -
     directories::ProjectDirs::from("", "", "wikitui").map(|d| d.config_dir().join("config.toml"))
 }
 
+/// PRD FR-CS-8's first-run sentinel: the absence of the config file. `None`
+/// (no config directory at all — e.g. a headless box with no home) is treated
+/// as "not a first run" since there is nowhere to write the defaults that
+/// would end onboarding, so showing a tour we can't dismiss permanently would
+/// be worse than skipping it.
+pub fn first_run(config_path: Option<&Path>) -> bool {
+    config_path.is_some_and(|p| !p.exists())
+}
+
+/// The commented-defaults config file written on first run (PRD FR-CS-8).
+/// Every setting is shown commented at its default, so a reader can
+/// uncomment and edit rather than hunt the docs — and, crucially, loading it
+/// produces an empty table (all comments), so `resolve` reports zero issues
+/// and every value keeps its built-in default.
+pub const DEFAULT_CONFIG_TEMPLATE: &str = "\
+# wikitui configuration. Every setting below is shown at its default,
+# commented out. Uncomment and edit the ones you want to change.
+# See also: keymap.toml (keybindings) and themes/*.toml in this directory.
+
+# config_version = 1
+
+# Wikipedia language edition and the fallback chain for search/open.
+# lang = \"en\"
+# languages = [\"en\"]
+
+# Color theme: terminal | full | homebrew | night | paper | contrast.
+# theme = \"terminal\"
+
+# Keybinding preset: vim (default) | emacs. Per-key overrides go in keymap.toml.
+# keymap = \"vim\"
+
+# Typography (FR-RD-9/10): line measure in cells (40..=200), and how wide
+# East-Asian-Ambiguous characters are (1 = narrow, 2 = wide).
+# measure = 88
+# ambiguous_width = 1
+
+# Citation style for Research mode: apa | harvard | mla | chicago.
+# cite_style = \"apa\"
+
+# Start page (FR-DL-1): feed | blank | resume.
+# startpage = \"feed\"
+
+# Inline images (FR-TH-7): follow the theme unless set here.
+# images = \"on\"
+
+# Prefetch (FR-PF-*): the kill switch and byte/request budgets.
+# [prefetch]
+# enabled = true
+# daily_mb = 20
+# hourly_requests = 100
+
+# Page cache (FR-OFF-*).
+# [cache]
+# max_mb = 500
+";
+
+/// Write [`DEFAULT_CONFIG_TEMPLATE`] to `config_path`, creating parent
+/// directories as needed (PRD FR-CS-8). Returns `Ok(true)` when a file was
+/// written, `Ok(false)` when there was nothing to do — no config path, or a
+/// file already exists (never clobber a user's config). The write is
+/// best-effort: any I/O error is returned for the caller to surface, never
+/// panicked.
+pub fn write_default_config(config_path: Option<&Path>) -> std::io::Result<bool> {
+    let Some(path) = config_path else {
+        return Ok(false);
+    };
+    if path.exists() {
+        return Ok(false);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, DEFAULT_CONFIG_TEMPLATE)?;
+    Ok(true)
+}
+
 /// Loads and resolves the full configuration. `config_path` is the
 /// already-resolved file location (see `resolve_config_path`) — `None`
 /// (or a nonexistent path) simply means "no file", not an error: a fresh
@@ -285,6 +370,7 @@ pub fn resolve(
         "lang",
         "languages",
         "theme",
+        "keymap",
         "ambiguous_width",
         "measure",
         "cite_style",
@@ -336,6 +422,20 @@ pub fn resolve(
         },
         &mut issues,
     );
+    let keymap_preset = resolve_string_field(
+        "keymap",
+        None,
+        None,
+        table.get("keymap"),
+        "vim",
+        |s| match s {
+            "vim" | "emacs" => Ok(s.to_string()),
+            other => Err(format!(
+                "unknown keymap preset {other:?} — one of: vim, emacs"
+            )),
+        },
+        &mut issues,
+    );
     let cite_style = resolve_string_field(
         "cite_style",
         cli.cite_style.as_deref(),
@@ -379,6 +479,7 @@ pub fn resolve(
         lang,
         languages,
         theme,
+        keymap_preset,
         measure,
         ambiguous_wide,
         cite_style,
@@ -629,8 +730,8 @@ fn resolve_measure(
     table: &toml::Table,
     issues: &mut Vec<Issue>,
 ) -> Valued<u16> {
-    const MIN: i64 = 40;
-    const MAX: i64 = 200;
+    const MIN: i64 = MEASURE_MIN as i64;
+    const MAX: i64 = MEASURE_MAX as i64;
     const DEFAULT: u16 = 88;
 
     let cli_raw = cli.measure.map(|m| m.to_string());
@@ -1380,6 +1481,104 @@ mod tests {
 
     fn cleanup(path: &Path) {
         let _ = std::fs::remove_file(path);
+    }
+
+    /// A path to a config file that does *not* exist yet (for first-run and
+    /// write tests) — unique per call, cleaned up by the test.
+    fn absent_config_path() -> PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "wikitui-config-absent-{}-{n}/config.toml",
+            std::process::id()
+        ))
+    }
+
+    /// PRD FR-CS-8: the config file's absence is the first-run sentinel;
+    /// its presence (or no config path at all) is not.
+    #[test]
+    fn first_run_is_true_only_when_the_config_file_is_absent() {
+        let path = absent_config_path();
+        assert!(first_run(Some(&path)), "absent file is a first run");
+        assert!(!first_run(None), "no config path is not a first run");
+
+        let existing = temp_config("");
+        assert!(
+            !first_run(Some(&existing)),
+            "present file is not a first run"
+        );
+        cleanup(&existing);
+    }
+
+    /// PRD FR-CS-8: dismissing onboarding writes commented defaults, and that
+    /// file must load cleanly (all comments -> empty table -> zero issues,
+    /// every value at its built-in default).
+    #[test]
+    fn write_default_config_writes_a_clean_loadable_file_once() {
+        let path = absent_config_path();
+        assert!(first_run(Some(&path)));
+
+        let wrote = write_default_config(Some(&path)).expect("write ok");
+        assert!(wrote, "a fresh path gets written");
+        assert!(path.exists(), "the file now exists");
+        assert!(!first_run(Some(&path)), "no longer a first run");
+
+        // A second call is a no-op — never clobber an existing config.
+        assert!(!write_default_config(Some(&path)).expect("second call ok"));
+
+        // The written defaults load with no issues and keep every default.
+        let resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert!(
+            resolved.issues.is_empty(),
+            "clean load: {:?}",
+            resolved.issues
+        );
+        assert_eq!(resolved.theme.value, "terminal");
+        assert_eq!(resolved.keymap_preset.value, "vim");
+        assert_eq!(resolved.measure.value, 88);
+
+        let _ = std::fs::remove_file(&path);
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::remove_dir(dir);
+        }
+    }
+
+    #[test]
+    fn write_default_config_is_a_noop_with_no_config_path() {
+        assert!(!write_default_config(None).expect("no path is a no-op, not an error"));
+    }
+
+    /// PRD FR-CS-3: the keymap preset selector, validated like every other
+    /// named field.
+    #[test]
+    fn keymap_preset_resolves_and_validates() {
+        let resolved = resolve(&CliOverrides::default(), &EnvOverrides::default(), None);
+        assert_eq!(resolved.keymap_preset.value, "vim");
+        assert_eq!(resolved.keymap_preset.source, Source::Default);
+
+        let path = temp_config("keymap = \"emacs\"\n");
+        let resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(resolved.keymap_preset.value, "emacs");
+        assert_eq!(resolved.keymap_preset.source, Source::File);
+        cleanup(&path);
+
+        // An unknown preset warns and falls back to the default.
+        let path = temp_config("keymap = \"kakoune\"\n");
+        let resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(resolved.keymap_preset.value, "vim");
+        assert!(resolved.issues.iter().any(|i| i.message.contains("keymap")));
+        cleanup(&path);
     }
 
     #[test]

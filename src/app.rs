@@ -14,6 +14,7 @@ use crate::fetch_queue::FetchQueue;
 use crate::hints::{self, HintTarget};
 use crate::layout::{self, Layout, LayoutCache, LayoutOptions};
 use crate::prefetch::FeedCache;
+use crate::registry;
 use crate::research::{ResearchStore, SavedCitation};
 use crate::saved::{SavedPages, Tier};
 use crate::startpage::{self, OnThisDayModel, OtdType, StartPageConfig, StartPageModel};
@@ -126,6 +127,15 @@ pub enum Mode {
     /// `App::lang_filter_input`; Enter/Esc both return to
     /// [`Mode::LangPicker`] with the filter still applied.
     LangFilter,
+    /// `Ctrl-p` — PRD FR-CS-1's command palette: a fuzzy list over every
+    /// registry command applicable in the context it was opened from, each
+    /// row showing display name, current keybinding, and one-line help. Enter
+    /// runs the highlighted command, Esc cancels back to `palette_prior_mode`.
+    Palette,
+    /// PRD FR-CS-8's first-run onboarding: a one-screen tour shown once, over
+    /// the start page, when no config file exists yet. Any key dismisses it,
+    /// writing the default config so it never shows again.
+    Onboarding,
 }
 
 /// Where the currently open article's content came from (PRD FR-OFF-6's
@@ -574,6 +584,23 @@ pub struct App {
     /// langlinks point at one). Rendered as a low-priority status-bar
     /// suffix — see `ui::draw_status_bar` — never a takeover notice.
     pub language_hint: Option<String>,
+    /// PRD FR-CS-1/3/4's command registry + active keymap: the single source
+    /// of truth the palette, the help overlay, and any user/preset key
+    /// rebinding read from. The built-in vim default keeps its override layer
+    /// empty, so `handle_key`'s hardcoded arms stay the dispatch path for
+    /// every default binding — a preset or `keymap.toml` populates the
+    /// overrides that `handle_key` consults ahead of them.
+    pub keymap: registry::Keymap,
+    /// The `Ctrl-p` command-palette query the user is typing (PRD FR-CS-1).
+    pub palette_input: String,
+    /// Which palette match Enter runs (index into the live fuzzy-filtered rows).
+    pub palette_selected: usize,
+    /// The mode `Ctrl-p` was pressed from, restored on Esc and used to scope
+    /// which commands the palette offers (its [`registry::KeyContext`]).
+    pub palette_prior_mode: Mode,
+    /// The scroll offset of the `?` help overlay (PRD FR-CS-4): the sheet is
+    /// scrollable so it can never clip, however tall the terminal.
+    pub help_scroll: u16,
 }
 
 /// A confirmed-and-resolved bulk save (PRD FR-OFF-5): the human label for the
@@ -690,7 +717,63 @@ impl App {
             lang_loading: false,
             pending_langlinks: 0,
             language_hint: None,
+            keymap: registry::Keymap::vim(),
+            palette_input: String::new(),
+            palette_selected: 0,
+            palette_prior_mode: Mode::Reading,
+            help_scroll: 0,
         }
+    }
+
+    /// PRD FR-CS-1: open the command palette over the current context. The
+    /// context (which commands apply) and the mode to restore on cancel are
+    /// captured from wherever `Ctrl-p` was pressed.
+    pub fn open_palette(&mut self) {
+        self.palette_prior_mode = self.mode;
+        self.palette_input.clear();
+        self.palette_selected = 0;
+        self.mode = Mode::Palette;
+    }
+
+    /// The [`registry::KeyContext`] a mode maps to, for scoping the palette
+    /// and generating the help cheatsheet (PRD FR-CS-1/4).
+    pub fn key_context(&self, mode: Mode) -> registry::KeyContext {
+        use registry::KeyContext;
+        match mode {
+            Mode::Reading if self.active_tab().doc.is_none() => KeyContext::StartPage,
+            Mode::Reading => KeyContext::Reading,
+            Mode::Search => KeyContext::Search,
+            _ => KeyContext::Picker,
+        }
+    }
+
+    /// The live, fuzzy-filtered palette rows for the current query (PRD
+    /// FR-CS-1) — scoped to the context the palette was opened from.
+    pub fn palette_rows(&self) -> Vec<registry::PaletteRow> {
+        registry::palette_matches(
+            &self.keymap,
+            self.key_context(self.palette_prior_mode),
+            &self.palette_input,
+        )
+    }
+
+    /// Move the palette selection, clamped to the current match count.
+    pub fn palette_move(&mut self, delta: i32) {
+        let len = self.palette_rows().len();
+        if len == 0 {
+            self.palette_selected = 0;
+            return;
+        }
+        let max = len - 1;
+        self.palette_selected =
+            (self.palette_selected as i32 + delta).clamp(0, max as i32) as usize;
+    }
+
+    /// The action the highlighted palette row would run, if any.
+    pub fn palette_selection(&self) -> Option<registry::Action> {
+        self.palette_rows()
+            .get(self.palette_selected)
+            .map(|r| r.action)
     }
 
     /// PRD FR-PF-4: open the `:prefetch-log` transparency panel.
@@ -5773,5 +5856,78 @@ mod tests {
         assert_eq!(app.saved.list().len(), 1);
         // Selection stays in range over what remains.
         assert!(app.selected_saved_target().is_some());
+    }
+
+    // ---- Command palette & context (PRD FR-CS-1) ---------------------------
+
+    /// `Ctrl-p` opens the palette, capturing the mode it was opened from so
+    /// Esc restores it and the offered commands are scoped to that context.
+    #[test]
+    fn open_palette_captures_the_prior_mode_and_context() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(doc("Alan Turing"));
+        app.mode = Mode::Reading;
+        app.open_palette();
+        assert_eq!(app.mode, Mode::Palette);
+        assert_eq!(app.palette_prior_mode, Mode::Reading);
+        assert_eq!(
+            app.key_context(app.palette_prior_mode),
+            registry::KeyContext::Reading
+        );
+    }
+
+    /// The start page (Reading with no document) is its own key context.
+    #[test]
+    fn start_page_is_the_start_page_context() {
+        let app = App::new("en".to_string(), Theme::terminal(), false);
+        assert!(app.active_tab().doc.is_none());
+        assert_eq!(
+            app.key_context(Mode::Reading),
+            registry::KeyContext::StartPage
+        );
+    }
+
+    /// The palette fuzzy-filters over context-applicable commands and runs the
+    /// highlighted one; the selection clamps to the match count.
+    #[test]
+    fn palette_filters_selects_and_clamps() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(doc("Alan Turing"));
+        app.open_palette();
+
+        // Empty query lists every reading/global palette command.
+        let all = app.palette_rows();
+        assert!(all.iter().any(|r| r.action == registry::Action::Toc));
+        assert!(
+            all.iter()
+                .any(|r| r.action == registry::Action::RandomArticle)
+        );
+
+        // "toc" narrows to the table-of-contents command, ranked first.
+        app.palette_input = "toc".to_string();
+        app.palette_selected = 0;
+        let rows = app.palette_rows();
+        assert_eq!(rows[0].action, registry::Action::Toc);
+        assert_eq!(app.palette_selection(), Some(registry::Action::Toc));
+
+        // Moving down past the end clamps to the last row, not out of bounds.
+        for _ in 0..50 {
+            app.palette_move(1);
+        }
+        assert!(app.palette_selected < rows.len().max(1));
+        assert!(app.palette_selection().is_some());
+    }
+
+    /// PRD FR-CS-4: the help view length is generated per view, and the
+    /// reading cheatsheet is long enough that a fixed popup would clip — which
+    /// is exactly why the overlay scrolls. (Model assertion, not pixels.)
+    #[test]
+    fn reading_help_is_long_enough_to_require_scrolling() {
+        let rows = registry::reading_help(&registry::Keymap::vim());
+        assert!(
+            rows.len() > 30,
+            "the reading cheatsheet has {} rows — it must be scrollable",
+            rows.len()
+        );
     }
 }
