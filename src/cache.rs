@@ -608,6 +608,7 @@ pub fn age_human(secs: u64) -> String {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -939,6 +940,23 @@ mod tests {
         entries.iter().map(|(_, size, _)| size).sum()
     }
 
+    /// Pins a file's mtime to an exact instant rather than trusting real
+    /// wall-clock separation between rapid successive writes: fs mtime
+    /// resolution is coarse enough (and slow enough under full-suite
+    /// parallel load to *not* help) that two writes milliseconds apart can
+    /// land in the same tick, leaving `evict_to_cap`'s oldest-first sort to
+    /// fall back on directory-read order — which has no relation to which
+    /// entry was actually read least recently. Reuses the same
+    /// `set_modified` call `touch_mtime` (the production LRU signal) makes,
+    /// just with an explicit target instead of "now".
+    fn stamp_mtime(path: &Path, time: SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .and_then(|f| f.set_modified(time))
+            .expect("stamping mtime for a deterministic LRU order in this test");
+    }
+
     #[test]
     fn evicts_least_recently_read_entries_once_over_cap_counting_blob_and_index_bytes() {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -946,6 +964,14 @@ mod tests {
             "wikitui-cache-evict-test-{}-{n}",
             std::process::id()
         ));
+
+        // The same bytes for all three entries (only revid/title differ):
+        // real zstd ratios vary slightly by input, so different seeds here
+        // used to make the number of evictions needed depend on which
+        // entry happened to compress smallest rather than on the LRU logic
+        // under test. Equal content means equal-sized blobs, so the tight
+        // `+ 20` cap below is exact regardless of compression variance.
+        let content = pseudo_random_content(1, 400);
 
         // Write two entries with a generous cap (no eviction pressure),
         // then measure their real combined blob+index footprint so the
@@ -956,8 +982,8 @@ mod tests {
             FRESH_TTL_SECS,
             DEFAULT_FORCE_REFETCH_SECS,
         );
-        roomy.put("en", "First", &pseudo_random_content(1, 400), 1, None);
-        roomy.put("en", "Second", &pseudo_random_content(2, 400), 2, None);
+        roomy.put("en", "First", &content, 1, None);
+        roomy.put("en", "Second", &content, 2, None);
         // Small safety margin: at this cap, adding a same-sized third entry
         // forces eviction of exactly one LRU victim, never two.
         let cap = dir_size(&dir) + 20;
@@ -967,7 +993,24 @@ mod tests {
         // proving eviction follows reads, not just insertion order.
         assert!(cache.get("en", "First").is_some());
 
-        cache.put("en", "Third", &pseudo_random_content(3, 400), 3, None); // pushes total past cap
+        // `get` just touched First's mtime to real "now", but real
+        // wall-clock mtimes aren't a reliable ordering signal on their own
+        // (see `stamp_mtime`'s doc comment) — pin both entries' mtimes to
+        // instants 10s apart so the LRU order the rest of this test depends
+        // on is exact, not a race against clock resolution.
+        let now = SystemTime::now();
+        let blob_path = |revid: u64, title: &str| {
+            dir.join("blob")
+                .join("en")
+                .join(format!("{revid}-{:016x}.zst", fnv1a(title.as_bytes())))
+        };
+        let index_path = |title: &str| dir.join("page").join("en").join(format!("{title}.json"));
+        stamp_mtime(&blob_path(2, "Second"), now - Duration::from_secs(20));
+        stamp_mtime(&index_path("Second"), now - Duration::from_secs(20));
+        stamp_mtime(&blob_path(1, "First"), now - Duration::from_secs(10));
+        stamp_mtime(&index_path("First"), now - Duration::from_secs(10));
+
+        cache.put("en", "Third", &content, 3, None); // pushes total past cap
 
         assert!(cache.get("en", "First").is_some(), "recently read: kept");
         assert!(
