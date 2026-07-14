@@ -148,6 +148,18 @@ pub fn article_url(title: &str, lang: &str) -> String {
     )
 }
 
+/// PRD FR-DL-5 / §7's "Redlink followed" card: the wiki's own "create this
+/// page" URL — `action=edit` on a nonexistent title opens MediaWiki's page
+/// creation editor directly, the same link a reader would reach by clicking
+/// a live redlink on wikipedia.org itself. Yankable via the redlink card's
+/// `y` (PRD's "yankable create-URL").
+pub fn create_page_url(title: &str, lang: &str) -> String {
+    format!(
+        "https://{lang}.wikipedia.org/w/index.php?title={}&action=edit",
+        title.replace(' ', "_")
+    )
+}
+
 /// Today's date as `YYYY-MM-DD`, for a citation's "retrieved on" field.
 /// Local time, not UTC: an access date is the date on the researcher's
 /// own calendar (UTC would date an evening US save "tomorrow").

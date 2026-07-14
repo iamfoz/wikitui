@@ -26,7 +26,7 @@
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 /// The canonical project URL and HTTP-library token for the User-Agent
@@ -298,15 +298,39 @@ struct ProjectAssessment {
     class: String,
 }
 
+/// PRD FR-DL-5's `generator=links&prop=info` missing-flag response
+/// (formatversion=2): the real MediaWiki technique for "which of this
+/// page's links are broken" — a linked title that doesn't exist comes back
+/// with `"missing": true` and no `pageid`, exactly like `action=query&
+/// titles=` on a nonexistent title directly.
+#[derive(Debug, Deserialize, Default)]
+struct MissingLinksResponse {
+    #[serde(default)]
+    query: Option<MissingLinksQuery>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MissingLinksQuery {
+    #[serde(default)]
+    pages: Vec<MissingLinksPage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MissingLinksPage {
+    title: String,
+    #[serde(default)]
+    missing: bool,
+}
+
 /// PRD FR-DL-3's quality classes as `prop=pageassessments` reports them
 /// (Appendix A "Quality"), ordered low→high so `Ord`/`>=` express "at least
 /// as good as" directly — FR-SR-5's "random good article" filter is exactly
 /// `>= Ga`. Only the six classes the PRD names are recognized; anything
 /// else a real wiki reports (`FL`, `A`, `Disambig`, `List`, `NA`,
-/// `Redirect`, …) parses to `None` rather than inventing a rank for it —
-/// full quality-badge classification (FR-DL-3's `★FA/+GA/B/C/Start/Stub`
-/// display) is a separate, unshipped feature; this enum only needs to
-/// answer "good or better" for the random-good filter.
+/// `Redirect`, …) parses to `None` rather than inventing a rank for it — a
+/// wiki that only ever reports those never shows a badge at all, same as one
+/// with no PageAssessments extension (§7-adjacent graceful degradation, not
+/// a bug).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum QualityClass {
     Stub,
@@ -336,6 +360,23 @@ impl QualityClass {
     /// PRD FR-SR-5's "random good article" filter: assessment ≥ GA.
     pub fn is_good_or_better(self) -> bool {
         self >= Self::Ga
+    }
+
+    /// PRD FR-DL-3's display glyph: `★FA`/`+GA`/`B`/`C`/`Start`/`Stub`, shown
+    /// in the status bar and prefixed on search-result rows (`ui.rs`). A
+    /// wiki with no PageAssessments data for a title (or no PageAssessments
+    /// extension at all) simply has no `QualityClass` to call this on — see
+    /// `App::quality_badge_for`, which is where "no badge" actually happens;
+    /// this method itself always has something to show once a class parsed.
+    pub fn badge(self) -> &'static str {
+        match self {
+            Self::Fa => "★FA",
+            Self::Ga => "+GA",
+            Self::B => "B",
+            Self::C => "C",
+            Self::Start => "Start",
+            Self::Stub => "Stub",
+        }
     }
 }
 
@@ -749,6 +790,53 @@ impl WikiClient {
             }
         }
         Ok(best)
+    }
+
+    /// PRD FR-DL-5's batched redlink check: `source_title`'s own outgoing
+    /// links (`generator=links`, same `gpllimit=50` cap `fetch_link_
+    /// pageviews` uses) joined with `prop=info` in **one** request — never a
+    /// per-link fanout (§6.2 rule 10 / NF-NET-5) — returning the subset
+    /// `info` reports `missing: true` for. This is the *fallback* path
+    /// (PRD: "otherwise"): it runs after — and independently of — Parsoid's
+    /// own cheaper `class="new"` pre-marking (`doc::SpanStyle::RedLink`,
+    /// checked at parse time with no network at all), so it only ever needs
+    /// to catch what that cheaper signal missed. Callers are expected to
+    /// gate this on `App::prefetch_active()` (PRD's "skippable on budget") —
+    /// this method itself has no budget awareness, matching `page_
+    /// assessments`'s own scope (a plain batched call, not a netqueue job;
+    /// see `main::open_title`'s doc comment for why this chunk chose that
+    /// over full substrate integration).
+    pub async fn fetch_missing_links(
+        &self,
+        lang: &str,
+        source_title: &str,
+    ) -> Result<HashSet<String>> {
+        let url = format!(
+            "{}/w/api.php?action=query&format=json&formatversion=2&generator=links&titles={}&gpllimit=50&gplnamespace=0&prop=info",
+            self.host(lang),
+            urlencoding::encode(&source_title.replace(' ', "_"))
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .context("requesting link info")?
+            .error_for_status()
+            .context("link info request failed")?;
+        let bytes = read_capped(resp, MAX_SEARCH_RESPONSE_BYTES)
+            .await
+            .context("reading link info response body")?;
+        let parsed: MissingLinksResponse =
+            serde_json::from_slice(&bytes).context("parsing link info response")?;
+        Ok(parsed
+            .query
+            .map(|q| q.pages)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| p.missing)
+            .map(|p| crate::sanitize::sanitize_single_line(&p.title).into_owned())
+            .collect())
     }
 
     /// The cheap revalidation call (PRD FR-OFF-2 / Appendix A's "Page
@@ -1712,6 +1800,89 @@ mod tests {
         assert!(!QualityClass::Start.is_good_or_better());
         assert!(!QualityClass::Stub.is_good_or_better());
         assert!(QualityClass::Fa > QualityClass::Ga, "FA outranks GA");
+    }
+
+    /// PRD FR-DL-3's exact display glyphs — locks the mapping the status bar
+    /// and search-result rows both render.
+    #[test]
+    fn quality_class_badge_glyphs() {
+        assert_eq!(QualityClass::Fa.badge(), "★FA");
+        assert_eq!(QualityClass::Ga.badge(), "+GA");
+        assert_eq!(QualityClass::B.badge(), "B");
+        assert_eq!(QualityClass::C.badge(), "C");
+        assert_eq!(QualityClass::Start.badge(), "Start");
+        assert_eq!(QualityClass::Stub.badge(), "Stub");
+    }
+
+    /// PRD FR-DL-5 / §6.2 rule 10: `fetch_missing_links` sends the source
+    /// article's own outgoing links in **one** `generator=links&prop=info`
+    /// request (never one per link) and returns only the titles the response
+    /// marked `missing: true`.
+    #[tokio::test]
+    async fn fetch_missing_links_batches_one_source_into_one_request() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let cap2 = captured.clone();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                *cap2.lock().unwrap() = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let body = br#"{"query":{"pages":[
+                    {"title":"Real Article","pageid":1},
+                    {"title":"Nonexistent Concept X","missing":true},
+                    {"title":"Uncharted Topic Y","missing":true}
+                ]}}"#;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+        let client = WikiClient::new(format!("http://127.0.0.1:{port}")).unwrap();
+        let missing = client
+            .fetch_missing_links("en", "Redlink Showcase")
+            .await
+            .unwrap();
+        assert_eq!(missing.len(), 2);
+        assert!(missing.contains("Nonexistent Concept X"));
+        assert!(missing.contains("Uncharted Topic Y"));
+        assert!(
+            !missing.contains("Real Article"),
+            "a page present without `missing: true` must not be reported as a redlink"
+        );
+        let head = captured.lock().unwrap().clone();
+        let request_line = head.lines().next().unwrap_or_default();
+        assert!(request_line.contains("generator=links"), "{request_line:?}");
+        assert!(request_line.contains("prop=info"), "{request_line:?}");
+        assert!(
+            request_line.contains(&urlencoding::encode("Redlink_Showcase").into_owned()),
+            "{request_line:?}"
+        );
+    }
+
+    /// A page absent from the response entirely (as opposed to present with
+    /// `missing: false`) must not be treated as missing — only an explicit
+    /// `missing: true` counts.
+    #[test]
+    fn missing_links_response_only_flags_explicit_missing_true() {
+        let json = br#"{"query":{"pages":[
+            {"title":"A","pageid":1},
+            {"title":"B","missing":true},
+            {"title":"C"}
+        ]}}"#;
+        let parsed: MissingLinksResponse = serde_json::from_slice(json).unwrap();
+        let pages = parsed.query.unwrap().pages;
+        let missing: Vec<&str> = pages
+            .iter()
+            .filter(|p| p.missing)
+            .map(|p| p.title.as_str())
+            .collect();
+        assert_eq!(missing, vec!["B"]);
     }
 
     /// PRD FR-ML-1/2: `LangLinksResponse`'s full parse table — autonym,

@@ -116,9 +116,20 @@ fn spans_to_md(spans: &[Span], lang: &str) -> String {
             SpanStyle::Link(href) => {
                 out.push_str(&format!("[{text}]({})", resolve_href(href, lang)));
             }
+            // PRD FR-DL-5: still a link to a real title once it's created —
+            // a saved/exported copy has no ongoing "does it exist" state to
+            // preserve, so this renders exactly like an ordinary link.
+            SpanStyle::RedLink(href) => {
+                out.push_str(&format!("[{text}]({})", resolve_href(href, lang)));
+            }
             // Superscript/plain render as their text (Markdown has no portable
             // superscript; references read fine inline).
             SpanStyle::Plain | SpanStyle::Superscript => out.push_str(&text),
+            // PRD FR-RD-7: raw TeX passthrough in an inline code span — the
+            // *un*-escaped source (Markdown's backslash-escaping would mangle
+            // TeX's own backslash commands), backticks so it renders
+            // literally rather than being reinterpreted as Markdown itself.
+            SpanStyle::Math(tex) => out.push_str(&format!("`{tex}`")),
         }
     }
     out
@@ -193,6 +204,11 @@ fn render_md(doc: &Document, lang: &str) -> String {
                 }
                 out.push('\n');
             }
+            // PRD FR-RD-7: raw TeX in a fenced code block — passthrough, no
+            // escaping, same choice as `spans_to_md`'s inline case.
+            Block::Math { tex, .. } => {
+                out.push_str(&format!("```\n{tex}\n```\n\n"));
+            }
         }
     }
     out.push_str("\n---\n\n*");
@@ -225,13 +241,17 @@ fn spans_to_html(spans: &[Span], lang: &str) -> String {
             SpanStyle::Bold => out.push_str(&format!("<strong>{text}</strong>")),
             SpanStyle::Italic => out.push_str(&format!("<em>{text}</em>")),
             SpanStyle::Superscript => out.push_str(&format!("<sup>{text}</sup>")),
-            SpanStyle::Link(href) => {
+            SpanStyle::Link(href) | SpanStyle::RedLink(href) => {
                 out.push_str(&format!(
                     "<a href=\"{}\">{text}</a>",
                     escape_html(&resolve_href(href, lang))
                 ));
             }
             SpanStyle::Plain => out.push_str(&text),
+            // PRD FR-RD-7: raw TeX passthrough, HTML-entity-escaped (`text`
+            // already is, above) but otherwise untouched, in `<code>` so it
+            // renders literally.
+            SpanStyle::Math(_) => out.push_str(&format!("<code>{text}</code>")),
         }
     }
     out
@@ -351,6 +371,11 @@ fn render_html(
                     ));
                 }
                 out.push_str("</ul>\n");
+            }
+            // PRD FR-RD-7: raw TeX passthrough, same choice as `render_md`'s
+            // fenced block.
+            Block::Math { tex, .. } => {
+                out.push_str(&format!("<pre><code>{}</code></pre>\n", escape_html(tex)));
             }
         }
     }

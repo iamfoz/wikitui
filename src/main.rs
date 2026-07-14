@@ -390,6 +390,7 @@ async fn main() -> Result<()> {
         accessible,
         resolved.measure.value,
         resolved.ambiguous_wide.value,
+        resolved.reading_wpm.value,
         cite_style,
         resolved.readlater_auto_dequeue.value,
         resolved.history_retention_days.value,
@@ -1607,6 +1608,7 @@ async fn run(
     accessible: bool,
     measure: u16,
     ambiguous_wide: bool,
+    reading_wpm: u32,
     cite_style: CiteStyle,
     readlater_auto_dequeue: bool,
     history_retention_days: u64,
@@ -1626,6 +1628,7 @@ async fn run(
     app.accessible = accessible;
     app.measure = measure;
     app.ambiguous_wide = ambiguous_wide;
+    app.reading_wpm = reading_wpm;
     app.cite_style = cite_style;
     app.readlater_auto_dequeue = readlater_auto_dequeue;
     // PRD FR-RD-8/§6.3: terminal graphics capability snapshot, taken once.
@@ -2273,6 +2276,7 @@ fn apply_config_reload(app: &mut App) {
     }
     app.measure = resolved.measure.value;
     app.ambiguous_wide = resolved.ambiguous_wide.value;
+    app.reading_wpm = resolved.reading_wpm.value;
     app.readlater_auto_dequeue = resolved.readlater_auto_dequeue.value;
     // PRD FR-ML-2: the fallback chain and picker-pinning both read this
     // live, like measure/ambiguous_wide above — no restart needed to pick
@@ -2320,6 +2324,74 @@ fn apply_config_reload(app: &mut App) {
 /// off the event loop (`fire_langlinks`) — never blocking this navigation —
 /// so the `:lang` picker is warm and the "available in your preferred
 /// language" hint can surface without the reader pressing anything first.
+/// PRD FR-DL-5: the shared "follow this internal link" entry point for
+/// Enter, the registry's `Action::FollowLink`, and a resolved link hint
+/// (`HintFollowAction::Foreground`) — the one place that checks whether
+/// `title` is already a known redlink (`App::is_redlink`, either Parsoid's
+/// `class="new"` pre-marking or the batched info check) before ever
+/// attempting a fetch. A confirmed redlink shows §7's "doesn't exist yet"
+/// card directly — no network round trip to (re)discover what this session
+/// already knows — anything else falls through to the ordinary `open_title`
+/// navigation. Deliberately not applied to the *background*-tab-open paths
+/// (Ctrl-Enter, `Action::OpenBackgroundTab`): those already tolerate a 404
+/// via the ordinary error path, and routing a background tab through a
+/// foreground card would fight the "doesn't move focus" contract FR-TB-3
+/// gives that action — a documented, narrower scope than the foreground
+/// follow paths this covers.
+async fn follow_internal_link(
+    client: &WikiClient,
+    cache: &PageCache,
+    app: &mut App,
+    title: &str,
+    revalidate_tx: &UnboundedSender<RevalidationOutcome>,
+    langlinks_tx: &UnboundedSender<LangLinksOutcome>,
+) {
+    if app.is_redlink(title) {
+        app.show_redlink_card(app.lang.clone(), title.to_string());
+        return;
+    }
+    open_title(client, cache, app, title, revalidate_tx, langlinks_tx).await;
+}
+
+/// PRD FR-DL-3/FR-DL-5: after an article installs, opportunistically fetches
+/// its quality-assessment badge and checks its own outgoing links for
+/// redlinks the parse-time `class="new"` signal didn't already catch — both
+/// single batched calls (never a fanout: `WikiClient::page_assessments`
+/// takes one title, `fetch_missing_links` takes one source and gets every
+/// one of its links in the same request) — and both session-cached
+/// (`App::quality_cache`/`checked_redlink_sources`) so a re-visited article
+/// costs nothing the second time.
+///
+/// Awaited inline rather than backgrounded through a channel+`tokio::spawn`
+/// (contrast `fire_langlinks`, deliberately fire-and-forget): doing the same
+/// for these two would mean threading a third `_tx`/`*Outcome` pair through
+/// every one of `open_title`/`open_history_entry`'s many call sites for a
+/// pair of small, already-batched, already-tested requests — this chunk
+/// judged that plumbing cost not worth it against the extra latency of
+/// awaiting them inline. Routing both through the netqueue substrate
+/// (PRD's "at low priority") instead of a dedicated call is the documented
+/// seam for a later pass, not a limitation of the API methods themselves.
+/// The redlink check is additionally skipped outright when prefetch is off
+/// (kill switch or incognito) — FR-DL-5's "skippable on budget", realized as
+/// "skippable when the reader already said no to background traffic."
+async fn enrich_article(client: &WikiClient, app: &mut App, lang: &str, title: &str) {
+    let key = (lang.to_string(), title.to_string());
+    if !app.quality_cache.contains_key(&key)
+        && let Ok(assessments) = client.page_assessments(lang, &[title.to_string()]).await
+        && let Some(class) = assessments.get(title)
+    {
+        app.quality_cache.insert(key.clone(), *class);
+    }
+
+    if app.prefetch_active() && !app.checked_redlink_sources.contains(&key) {
+        app.checked_redlink_sources.insert(key.clone());
+        if let Ok(missing) = client.fetch_missing_links(lang, title).await {
+            app.confirmed_redlinks
+                .extend(missing.into_iter().map(|t| (lang.to_string(), t)));
+        }
+    }
+}
+
 async fn open_title(
     client: &WikiClient,
     cache: &PageCache,
@@ -2357,6 +2429,7 @@ async fn open_title(
                     return;
                 }
                 let document = doc::parse_article_html(title, &outcome.html);
+                let article_title = document.title.clone();
                 app.lang = lang.clone();
                 {
                     let tab = app.active_tab_mut();
@@ -2384,6 +2457,11 @@ async fn open_title(
                 schedule_link_prefetch(app);
                 fire_langlinks(client, lang, title, langlinks_tx);
                 app.pending_langlinks += 1;
+                // PRD FR-DL-3/FR-DL-5: quality badge + redlink info, both
+                // session-cached and batched — see `enrich_article`'s doc
+                // comment for why this is awaited inline rather than
+                // threaded through yet another background channel.
+                enrich_article(client, app, lang, &article_title).await;
                 app.loading = false;
                 return;
             }
@@ -2432,6 +2510,8 @@ async fn open_history_entry(
     match outcome {
         Ok(outcome) => {
             let document = doc::parse_article_html(&entry.title, &outcome.html);
+            let article_title = document.title.clone();
+            let entry_lang = entry.lang.clone();
             {
                 let tab = app.active_tab_mut();
                 tab.page_source = outcome.source;
@@ -2457,6 +2537,10 @@ async fn open_history_entry(
                 }
             }
             schedule_link_prefetch(app);
+            // PRD FR-DL-3/FR-DL-5: session-cached, so a back/forward hop to
+            // an article already visited this session costs no extra
+            // request — see `enrich_article`'s doc comment.
+            enrich_article(client, app, &entry_lang, &article_title).await;
         }
         Err(e) => {
             app.status = format!("Error: {e}");
@@ -2782,8 +2866,15 @@ async fn handle_key(
                     app.exit_hint_mode();
                     match action {
                         Some(app::HintFollowAction::Foreground(title)) => {
-                            open_title(client, cache, app, &title, revalidate_tx, langlinks_tx)
-                                .await;
+                            follow_internal_link(
+                                client,
+                                cache,
+                                app,
+                                &title,
+                                revalidate_tx,
+                                langlinks_tx,
+                            )
+                            .await;
                         }
                         Some(app::HintFollowAction::Background(title)) => {
                             let lang = app.lang.clone();
@@ -3180,6 +3271,28 @@ async fn handle_key(
             KeyCode::Esc => app.close_offline_card(),
             _ => {}
         },
+        // PRD FR-DL-5 / §7's "Redlink followed" card: `s` searches for a
+        // similar title (dismissing the card into the results it finds), `y`
+        // yanks the wiki's own create-page URL, Esc dismisses.
+        Mode::RedlinkCard => match code {
+            KeyCode::Char('s') => {
+                if let Some((_, title)) = app.redlink_card_target.clone() {
+                    app.close_redlink_card();
+                    app.search_input = title;
+                    run_search(client, app).await;
+                }
+            }
+            KeyCode::Char('y') => {
+                if let Some(url) = app.redlink_create_url() {
+                    app.notice = Some(match yank_to_clipboard(&url) {
+                        Ok(()) => format!("Yanked {url}"),
+                        Err(e) => format!("Yank failed: {e}"),
+                    });
+                }
+            }
+            KeyCode::Esc => app.close_redlink_card(),
+            _ => {}
+        },
         // PRD FR-DL-2's `:today` panel: j/k move within the current type
         // tab, Tab/Shift-Tab (and h/l, since the tabs are laid out
         // horizontally) switch type, Enter opens the focused entry's linked
@@ -3453,8 +3566,15 @@ async fn handle_key(
                     if let Some(link) = link {
                         match link.internal_title {
                             Some(title) => {
-                                open_title(client, cache, app, &title, revalidate_tx, langlinks_tx)
-                                    .await
+                                follow_internal_link(
+                                    client,
+                                    cache,
+                                    app,
+                                    &title,
+                                    revalidate_tx,
+                                    langlinks_tx,
+                                )
+                                .await
                             }
                             None => app.status = format!("External link: {}", link.href),
                         }
@@ -3673,7 +3793,15 @@ async fn dispatch_action(
             if let Some(link) = link {
                 match link.internal_title {
                     Some(title) => {
-                        open_title(client, cache, app, &title, revalidate_tx, langlinks_tx).await
+                        follow_internal_link(
+                            client,
+                            cache,
+                            app,
+                            &title,
+                            revalidate_tx,
+                            langlinks_tx,
+                        )
+                        .await
                     }
                     None => app.status = format!("External link: {}", link.href),
                 }
@@ -3900,9 +4028,18 @@ async fn execute_command(
                 app.layout = None;
                 app.notice = Some(format!("ambiguous_width={value}"));
             }
+            // PRD FR-RD-11: the WPM divisor feeds the layout's header line
+            // (`layout_options`), so it needs the same relayout seam.
+            "reading_wpm" => {
+                if let Ok(n) = value.parse::<u32>() {
+                    app.reading_wpm = n;
+                    app.layout = None;
+                    app.notice = Some(format!("reading_wpm={n}"));
+                }
+            }
             other => {
                 app.notice = Some(format!(
-                    "unknown :set key {other:?} (try: theme, images, prefetch, measure, ambiguous_width)"
+                    "unknown :set key {other:?} (try: theme, images, prefetch, measure, ambiguous_width, reading_wpm)"
                 ));
             }
         },
@@ -4095,6 +4232,27 @@ async fn run_search(client: &WikiClient, app: &mut App) {
             app.search_suggestion = outcome.suggestion;
             app.selected_result = 0;
             app.mode = Mode::Results;
+            // PRD FR-DL-3: every result title not already cached this
+            // session, batched into ONE `prop=pageassessments` call (§6.2
+            // rule 10 / NF-NET-5) — never one request per row. A search with
+            // zero results, or where every title is already cached, skips
+            // the request entirely.
+            let lang = app.lang.clone();
+            let uncached: Vec<String> = app
+                .results
+                .iter()
+                .map(|r| r.title.clone())
+                .filter(|t| !app.quality_cache.contains_key(&(lang.clone(), t.clone())))
+                .collect();
+            if !uncached.is_empty()
+                && let Ok(assessments) = client.page_assessments(&lang, &uncached).await
+            {
+                app.quality_cache.extend(
+                    assessments
+                        .into_iter()
+                        .map(|(title, class)| ((lang.clone(), title), class)),
+                );
+            }
         }
         Err(e) => {
             app.status = format!("Search error: {e}");

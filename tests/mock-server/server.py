@@ -14,6 +14,8 @@ REVIDS = {
     "計算機科学": 1006,
     "Rendering_Showcase": 1007,
     "Image_Showcase": 1008,
+    "Math_Showcase": 1009,
+    "Redlink_Showcase": 1010,
 }
 
 # PRD FR-RD-8 media fixture: build a real, tiny PNG at import time (stdlib
@@ -248,6 +250,47 @@ PAGES["計算機科学"] = """<html><head><title>計算機科学</title></head><
   <p>計算機科学は、情報と計算の理論的基礎、およびそのコンピュータ上への実装と応用に関する研究分野である。</p>
 </body></html>"""
 
+# PRD FR-RD-7 pty-verification fixture: inline math (with alttext, a
+# superscript, and a Greek-letter macro) plus a display equation reached via
+# Parsoid's `<dl><dd>` leading-colon shape (`display="block"` on `<math>`, no
+# `alttext` — exercising the annotation fallback tier, distinct from the
+# inline node's alttext-wins path). Real Parsoid math markup is far more
+# verbose (MathML presentation tree, an accessible fallback `<img>`); this
+# mock keeps only what `doc::extract_math` actually reads (`alttext`, the
+# `annotation` child, `display`) since a hand-rolled fixture that faked the
+# rest would just be untested filler.
+PAGES["Math_Showcase"] = """<html><head><title>Math Showcase</title></head><body>
+  <p>This article exercises math passthrough (FR-RD-7). Mass-energy
+  equivalence is written <span typeof="mw:Extension/math">
+    <math alttext="E=mc^2"><semantics><mrow></mrow>
+    <annotation encoding="application/x-tex">E=mc^2</annotation></semantics></math>
+  </span>, and the sum of two angles is <span typeof="mw:Extension/math">
+    <math alttext="\\alpha + \\beta = \\gamma"><semantics><mrow></mrow>
+    <annotation encoding="application/x-tex">\\alpha + \\beta = \\gamma</annotation></semantics></math>
+  </span>.</p>
+  <h2>Newton's second law</h2>
+  <p>The net force on a body is shown below.</p>
+  <dl><dd><span typeof="mw:Extension/math">
+    <math display="block"><semantics><mrow></mrow>
+    <annotation encoding="application/x-tex">F_{net} = m a</annotation></semantics></math>
+  </span></dd></dl>
+</body></html>"""
+
+# PRD FR-DL-5 pty-verification fixture: one link Parsoid itself pre-marks as
+# a redlink (`class="new"`, the cheap parse-time path — never reaches the
+# network), one link that looks ordinary in the HTML but isn't a real PAGES
+# title (caught only by the batched `generator=links&prop=info` check, see
+# PAGE_LINKS below), and one real link that must render and follow normally.
+PAGES["Redlink_Showcase"] = """<html><head><title>Redlink Showcase</title></head><body>
+  <p>This article exercises redlink detection (FR-DL-5). It links to a
+  <a href="./Nonexistent_Concept_X" class="new" title="Nonexistent Concept X (page does not exist)">nonexistent concept</a>
+  that Parsoid itself marks as a redlink, and separately to
+  <a href="./Uncharted_Topic_Y">an uncharted topic</a> that isn't pre-marked
+  but doesn't exist either — the batched link/info check is what catches
+  that one. It also links to a real article, <a href="./Computer_science">computer science</a>,
+  which must render and follow as an ordinary link.</p>
+</body></html>"""
+
 # PRD FR-ML-1/2 (Appendix A "Langlinks") fixture: `action=query&
 # prop=langlinks&llprop=autonym|langname|url`, keyed by the display title
 # (spaces, matching how `titles=` arrives after this file's usual `_`->` `
@@ -391,6 +434,21 @@ LINK_PAGEVIEWS = {
     "Alan Turing": [
         {"title": "Enigma machine", "views": 12000},
         {"title": "Computer science", "views": 5000},
+    ],
+}
+
+# PRD FR-DL-5 fixture: `generator=links&prop=info`'s batched missing-flag
+# check. Keyed by the source article's display title, same shape as
+# LINK_PAGEVIEWS above — a source's entry lists exactly the titles a real
+# `generator=links` call would generate from its wikitext. Whether one comes
+# back `missing` is decided generically in `_serve_missing_links` (any title
+# that isn't a real PAGES key), so this dict only needs to say which titles
+# the source links to, not which ones are missing.
+PAGE_LINKS = {
+    "Redlink Showcase": [
+        "Nonexistent Concept X",
+        "Uncharted Topic Y",
+        "Computer science",
     ],
 }
 
@@ -629,6 +687,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
             pages = [
                 {"title": link["title"], "pageviews": {"2026-07-13": link["views"]}}
                 for link in links
+            ]
+            self._send_json({"query": {"pages": pages}})
+            return
+        # PRD FR-DL-5: the ONE batched generator=links + prop=info redlink
+        # check — a linked title comes back `"missing": true` (and no
+        # `pageid`) unless it's a real PAGES key, exactly the real
+        # MediaWiki "which of this page's links are broken" technique.
+        if action == 'query' and generator == 'links' and prop == 'info':
+            source = params.get('titles', [''])[0].replace('_', ' ')
+            real_titles = {t.replace('_', ' ') for t in PAGES}
+            links = PAGE_LINKS.get(source, [])
+            pages = [
+                {"title": t} if t in real_titles else {"title": t, "missing": True}
+                for t in links
             ]
             self._send_json({"query": {"pages": pages}})
             return

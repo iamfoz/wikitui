@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -97,6 +97,11 @@ pub enum Mode {
     /// a followed link is neither cached nor saved. `f` queues it for fetch
     /// when online, `s` opens the saved-pages browser, Esc dismisses.
     OfflineCard,
+    /// PRD FR-DL-5 / §7's "Redlink followed" card: shown instead of
+    /// attempting a fetch when the link just followed is already known not
+    /// to exist (see `App::is_redlink`). `s` searches for a similar title,
+    /// `y` yanks the wiki's "create this page" URL, Esc dismisses.
+    RedlinkCard,
     /// `:prefetch-log` (PRD FR-PF-4): the prefetch transparency/debug panel —
     /// recent prefetch actions with their reason strings, status, and bytes,
     /// plus the live budget state. Read-only; any key / Esc closes it.
@@ -351,6 +356,11 @@ pub struct App {
     /// East-Asian-Ambiguous width toggle (FR-RD-10, default false); a config
     /// file will wire this later.
     pub ambiguous_wide: bool,
+    /// PRD FR-RD-11's reading-time WPM divisor (`config::resolve_reading_wpm`
+    /// / `:set reading_wpm=N`, default 230). Part of `layout_options()`, so
+    /// changing it invalidates the cached layout the same way `measure`
+    /// does.
+    pub reading_wpm: u32,
     /// The active tab's currently-labeled link hints (PRD FR-NV-1), valid
     /// only while `mode == Mode::Hint`. Recomputed from scratch by
     /// `refresh_hint_targets` on entry and on every draw — never patched
@@ -481,6 +491,33 @@ pub struct App {
     /// The `(lang, title)` the offline card is currently offering to queue or
     /// find in saved pages — `Some` exactly while `mode == Mode::OfflineCard`.
     pub offline_card_target: Option<(String, String)>,
+    /// PRD FR-DL-3: per-`(lang, title)` quality-class cache for the session.
+    /// The current article's status-bar badge (`current_quality_badge`) and a
+    /// batch of search-result rows (`quality_badge_for`) both read from this
+    /// one map, so a title looked up once — whichever path touched it first —
+    /// never re-fetches for the rest of the session. Populated by
+    /// `main::open_title`/`open_history_entry` (one title) and `main::
+    /// run_search` (one batched call for every result row) — never a
+    /// per-article fanout (§6.2 rule 10 / NF-NET-5).
+    pub quality_cache: HashMap<(String, String), crate::api::QualityClass>,
+    /// PRD FR-DL-5: `(lang, title)` pairs the batched `generator=links&
+    /// prop=info` missing-flag check has confirmed don't exist — the
+    /// async-checked complement to a `LinkRef`'s own parse-time `redlink`
+    /// flag (Parsoid's `class="new"` pre-marking). Consulted at paint time
+    /// (`ui::confirmed_redlink_titles`, layered on exactly like visited-link
+    /// coloring) and by `is_redlink` before following a link, so a redlink
+    /// this session already confirmed never even attempts a fetch that would
+    /// just 404 a second time.
+    pub confirmed_redlinks: HashSet<(String, String)>,
+    /// PRD FR-DL-5: `(lang, title)` source articles `enrich_article`'s
+    /// batched `generator=links&prop=info` check has already run for this
+    /// session — a source with zero redlinks would otherwise leave no trace
+    /// in `confirmed_redlinks` and get re-checked on every revisit.
+    pub checked_redlink_sources: HashSet<(String, String)>,
+    /// The `(lang, title)` the redlink card (PRD FR-DL-5 / §7 "Redlink
+    /// followed") is currently showing — `Some` exactly while `mode ==
+    /// Mode::RedlinkCard`. Mirrors `offline_card_target`'s shape.
+    pub redlink_card_target: Option<(String, String)>,
     /// A bulk save awaiting the reader's y/n confirmation (PRD FR-OFF-5's cost
     /// preview): the resolved target list and tier, held until `y` proceeds.
     pub pending_bulk_save: Option<BulkSaveRequest>,
@@ -666,6 +703,7 @@ impl App {
             viewport_height: 0,
             measure: 88,
             ambiguous_wide: false,
+            reading_wpm: 230,
             hint_targets: Vec::new(),
             hint_input: String::new(),
             hint_background: false,
@@ -698,6 +736,10 @@ impl App {
             saved_prior_mode: Mode::Reading,
             fetch_queue: FetchQueue::load(),
             offline_card_target: None,
+            quality_cache: HashMap::new(),
+            confirmed_redlinks: HashSet::new(),
+            checked_redlink_sources: HashSet::new(),
+            redlink_card_target: None,
             pending_bulk_save: None,
             pending_saves: 0,
             pending_saved_export_overwrite: None,
@@ -1470,6 +1512,7 @@ impl App {
             accessible: self.accessible,
             table_col_offset: self.active_tab().table_col_offset,
             image_epoch: self.image_epoch,
+            reading_wpm: self.reading_wpm,
         }
     }
 
@@ -2866,6 +2909,68 @@ impl App {
         added
     }
 
+    // -- Redlinks (PRD FR-DL-5, §7) -----------------------------------------
+
+    /// Whether `title` is already known not to exist on the active tab's
+    /// wiki edition — either the very link that names it was Parsoid-marked
+    /// (`LinkRef::redlink`, the cheapest signal, checked first) or the
+    /// batched info check confirmed it after some article that links to it
+    /// loaded (`confirmed_redlinks`). Either is sufficient; this is the one
+    /// place both signals are combined, so call sites (following a link,
+    /// painting it) never have to know there are two.
+    pub fn is_redlink(&self, title: &str) -> bool {
+        let tab = self.active_tab();
+        self.confirmed_redlinks
+            .contains(&(tab.lang.clone(), title.to_string()))
+            || tab
+                .links
+                .iter()
+                .any(|l| l.redlink && l.internal_title.as_deref() == Some(title))
+    }
+
+    /// Show §7's "Redlink followed" card for `(lang, title)` — called
+    /// instead of attempting a fetch that would just 404, since the target is
+    /// already known not to exist (`is_redlink`).
+    pub fn show_redlink_card(&mut self, lang: String, title: String) {
+        self.redlink_card_target = Some((lang, title));
+        self.mode = Mode::RedlinkCard;
+    }
+
+    pub fn close_redlink_card(&mut self) {
+        self.redlink_card_target = None;
+        self.mode = Mode::Reading;
+    }
+
+    /// The redlink card's `y`: the wiki's own "create this page" URL for the
+    /// pending target, ready to yank (PRD §7's "yankable create-URL").
+    pub fn redlink_create_url(&self) -> Option<String> {
+        let (lang, title) = self.redlink_card_target.as_ref()?;
+        Some(crate::research::create_page_url(title, lang))
+    }
+
+    // -- Quality badges (PRD FR-DL-3) ---------------------------------------
+
+    /// The active tab's article's quality badge (`★FA`/`+GA`/`B`/`C`/`Start`/
+    /// `Stub`), or `None` when nothing is cached for it yet — an unassessed
+    /// article, a non-PageAssessments wiki (both indistinguishable from "not
+    /// fetched yet", by design: FR-DL-3 says both simply show no badge), or
+    /// the batched fetch that would populate `quality_cache` hasn't landed.
+    pub fn current_quality_badge(&self) -> Option<&'static str> {
+        let tab = self.active_tab();
+        let title = tab.doc.as_ref()?.title.as_str();
+        self.quality_badge_for(title)
+    }
+
+    /// `title`'s quality badge from the session cache, for the active tab's
+    /// language — shared by `current_quality_badge` and the search-results
+    /// list (`ui::draw_results`), so both read the exact same map regardless
+    /// of which one caused it to be populated first.
+    pub fn quality_badge_for(&self, title: &str) -> Option<&'static str> {
+        self.quality_cache
+            .get(&(self.active_tab().lang.clone(), title.to_string()))
+            .map(|class| class.badge())
+    }
+
     // -- Saved-page export (PRD FR-OFF-7) ----------------------------------
 
     /// `:save export md|txt|html [path]`: export the article on screen (which,
@@ -3990,16 +4095,19 @@ mod tests {
                 href: "./A".into(),
                 text: "A".into(),
                 internal_title: Some("A".into()),
+                redlink: false,
             },
             LinkRef {
                 href: "./B".into(),
                 text: "B".into(),
                 internal_title: Some("B".into()),
+                redlink: false,
             },
             LinkRef {
                 href: "./C".into(),
                 text: "C".into(),
                 internal_title: Some("C".into()),
+                redlink: false,
             },
         ];
         app.active_tab_mut().focused_link = None;
@@ -5896,6 +6004,118 @@ mod tests {
         // Queuing the same target again is rejected as a duplicate.
         app.show_offline_card("en".to_string(), "Deep Learning".to_string());
         assert!(!app.queue_offline_target(), "duplicate rejected");
+    }
+
+    /// PRD FR-DL-5 / §7's "Redlink followed" card — same show/dismiss shape
+    /// as the offline card.
+    #[test]
+    fn redlink_card_show_and_dismiss_routing() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.show_redlink_card("en".to_string(), "Nonexistent Concept X".to_string());
+        assert_eq!(app.mode, Mode::RedlinkCard);
+        assert_eq!(
+            app.redlink_card_target,
+            Some(("en".to_string(), "Nonexistent Concept X".to_string()))
+        );
+        app.close_redlink_card();
+        assert_eq!(app.mode, Mode::Reading);
+        assert!(app.redlink_card_target.is_none());
+    }
+
+    /// The redlink card's `y`: the wiki's own create-page URL for whatever
+    /// target the card is currently showing, `None` when no card is up.
+    #[test]
+    fn redlink_create_url_is_the_wikis_edit_action_url() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        assert_eq!(app.redlink_create_url(), None, "no card showing yet");
+        app.show_redlink_card("de".to_string(), "New Concept".to_string());
+        assert_eq!(
+            app.redlink_create_url().as_deref(),
+            Some("https://de.wikipedia.org/w/index.php?title=New_Concept&action=edit")
+        );
+    }
+
+    /// PRD FR-DL-5: `is_redlink` combines both signals — a `LinkRef` Parsoid
+    /// itself pre-marked (`class="new"`), and a title the batched info check
+    /// separately confirmed via `confirmed_redlinks` — either one is
+    /// sufficient, and an ordinary link matches neither.
+    #[test]
+    fn is_redlink_checks_both_the_parsoid_flag_and_the_confirmed_set() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.active_tab_mut().links = vec![
+            LinkRef {
+                href: "./Nonexistent_Concept_X".into(),
+                text: "concept".into(),
+                internal_title: Some("Nonexistent Concept X".into()),
+                redlink: true,
+            },
+            LinkRef {
+                href: "./Computer_science".into(),
+                text: "computer science".into(),
+                internal_title: Some("Computer science".into()),
+                redlink: false,
+            },
+        ];
+        assert!(app.is_redlink("Nonexistent Concept X"));
+        assert!(!app.is_redlink("Computer science"));
+        assert!(
+            !app.is_redlink("Uncharted Topic Y"),
+            "not yet confirmed by anything"
+        );
+
+        app.confirmed_redlinks
+            .insert(("en".to_string(), "Uncharted Topic Y".to_string()));
+        assert!(
+            app.is_redlink("Uncharted Topic Y"),
+            "the batched-check signal alone must be sufficient"
+        );
+    }
+
+    // -- Quality badges (PRD FR-DL-3) ---------------------------------------
+
+    #[test]
+    fn quality_badge_for_reads_the_session_cache_by_lang_and_title() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        assert_eq!(
+            app.quality_badge_for("Alan Turing"),
+            None,
+            "nothing cached yet"
+        );
+        app.quality_cache.insert(
+            ("en".to_string(), "Alan Turing".to_string()),
+            crate::api::QualityClass::Fa,
+        );
+        assert_eq!(app.quality_badge_for("Alan Turing"), Some("★FA"));
+        assert_eq!(
+            app.quality_badge_for("Some Other Article"),
+            None,
+            "a different title must not pick up an unrelated cache entry"
+        );
+    }
+
+    /// `current_quality_badge` reads the *active tab's* document title —
+    /// proving it's wired to whatever article is actually on screen, not a
+    /// hardcoded lookup.
+    #[test]
+    fn current_quality_badge_reflects_the_active_tabs_document() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        assert_eq!(app.current_quality_badge(), None, "no document open yet");
+        app.set_document(Document {
+            title: "Enigma machine".to_string(),
+            blocks: Vec::new(),
+            citations: Vec::new(),
+            truncated: false,
+        });
+        assert_eq!(
+            app.current_quality_badge(),
+            None,
+            "open, but nothing cached for it yet"
+        );
+        app.quality_cache.insert(
+            ("en".to_string(), "Enigma machine".to_string()),
+            crate::api::QualityClass::Ga,
+        );
+        assert_eq!(app.current_quality_badge(), Some("+GA"));
     }
 
     #[test]

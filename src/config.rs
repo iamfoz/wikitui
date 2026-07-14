@@ -37,6 +37,11 @@ pub const DEFAULT_BASE_URL_TEMPLATE: &str = "https://{lang}.wikipedia.org";
 /// (FR-PC-4) so the runtime override and the config loader agree.
 pub const MEASURE_MIN: u16 = 40;
 pub const MEASURE_MAX: u16 = 200;
+/// The sane bounds for `reading_wpm` (FR-RD-11), shared with `:set
+/// reading_wpm=N` so the runtime override and the config loader agree —
+/// same split as `MEASURE_MIN`/`MEASURE_MAX`.
+pub const READING_WPM_MIN: u32 = 50;
+pub const READING_WPM_MAX: u32 = 2000;
 const DEFAULT_WIKI_NAME: &str = "wikipedia";
 
 /// Where a resolved value came from, in the precedence order the PRD
@@ -217,6 +222,11 @@ pub struct ResolvedConfig {
     /// not worth a CLI flag or env var for a single run. Parsed into
     /// `startpage::StartPageConfig` by `App::start_page_for_launch`.
     pub startpage: Valued<String>,
+    /// PRD FR-RD-11's reading-time WPM divisor, default 230. File only (like
+    /// `startpage`/`include_nonfree`) — also settable at runtime via `:set
+    /// reading_wpm=N` (`main::Command::Set`), same split as `measure`'s
+    /// config-default-plus-runtime-override.
+    pub reading_wpm: Valued<u32>,
     /// PRD §5.8 / FR-PF-1..6 prefetch settings (the `[prefetch]` table).
     pub prefetch: ResolvedPrefetch,
     /// PRD NF-NET-2 User-Agent contact channel (`[network] contact`).
@@ -390,6 +400,7 @@ pub fn resolve(
         "images",
         "include_nonfree",
         "startpage",
+        "reading_wpm",
         "prefetch",
         "network",
     ]
@@ -472,6 +483,7 @@ pub fn resolve(
     let images = resolve_images(env, &table, &mut issues);
     let include_nonfree = resolve_include_nonfree(&table, &mut issues);
     let startpage = resolve_startpage(&table, &mut issues);
+    let reading_wpm = resolve_reading_wpm(&table, &mut issues);
     let prefetch = resolve_prefetch(env, &table, &mut issues);
     let network_contact = resolve_network_contact(env, &table, &mut issues);
 
@@ -502,6 +514,7 @@ pub fn resolve(
         images,
         include_nonfree,
         startpage,
+        reading_wpm,
         prefetch,
         network_contact,
         migration_summary: config_version.1,
@@ -1009,6 +1022,47 @@ fn resolve_startpage(table: &toml::Table, issues: &mut Vec<Issue>) -> Valued<Str
             _ => {
                 issues.push(Issue::warning(format!(
                     "startpage must be one of feed|blank|resume; using default {DEFAULT}"
+                )));
+                default
+            }
+        },
+    }
+}
+
+/// PRD FR-RD-11's reading-time WPM divisor, default 230 (an average adult
+/// silent-reading rate). File only — unlike `measure`, no CLI flag or env
+/// var (a preference set once, matching `startpage`/`include_nonfree`'s own
+/// scope); also settable at runtime via `:set reading_wpm=N`. Clamped to a
+/// sane 50..=2000: below 50 turns any real article into an implausible
+/// "N hour read", and above 2000 is faster than silent reading gets either
+/// way the number stops being useful feedback, so the default is a better
+/// fallback than an obviously-wrong outlier.
+fn resolve_reading_wpm(table: &toml::Table, issues: &mut Vec<Issue>) -> Valued<u32> {
+    const MIN: i64 = READING_WPM_MIN as i64;
+    const MAX: i64 = READING_WPM_MAX as i64;
+    const DEFAULT: u32 = 230;
+    let default = Valued {
+        value: DEFAULT,
+        source: Source::Default,
+    };
+    match table.get("reading_wpm") {
+        None => default,
+        Some(v) => match v.as_integer() {
+            Some(n) => {
+                let clamped = n.clamp(MIN, MAX);
+                if clamped != n {
+                    issues.push(Issue::warning(format!(
+                        "reading_wpm {n} is outside the sane {MIN}..={MAX} range; clamped to {clamped}"
+                    )));
+                }
+                Valued {
+                    value: clamped as u32,
+                    source: Source::File,
+                }
+            }
+            None => {
+                issues.push(Issue::warning(format!(
+                    "reading_wpm must be an integer; using default {DEFAULT}"
                 )));
                 default
             }
@@ -1891,6 +1945,60 @@ mod tests {
         );
         assert_eq!(r.startpage.source, Source::Default);
         assert!(r.issues.iter().any(|i| i.message.contains("startpage")));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn reading_wpm_defaults_to_230_and_honors_the_file() {
+        let default = resolve(&CliOverrides::default(), &EnvOverrides::default(), None);
+        assert_eq!(default.reading_wpm.value, 230);
+        assert_eq!(default.reading_wpm.source, Source::Default);
+
+        let path = temp_config("reading_wpm = 300\n");
+        let r = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(r.reading_wpm.value, 300);
+        assert_eq!(r.reading_wpm.source, Source::File);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn reading_wpm_out_of_range_is_clamped_not_rejected() {
+        let low = temp_config("reading_wpm = 1\n");
+        let r = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&low),
+        );
+        assert_eq!(r.reading_wpm.value, READING_WPM_MIN);
+        assert_eq!(r.reading_wpm.source, Source::File);
+        assert!(r.issues.iter().any(|i| i.message.contains("reading_wpm")));
+        cleanup(&low);
+
+        let high = temp_config("reading_wpm = 999999\n");
+        let r = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&high),
+        );
+        assert_eq!(r.reading_wpm.value, READING_WPM_MAX);
+        cleanup(&high);
+    }
+
+    #[test]
+    fn reading_wpm_non_integer_falls_back_to_the_default_with_a_warning() {
+        let path = temp_config("reading_wpm = \"fast\"\n");
+        let r = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(r.reading_wpm.value, 230);
+        assert_eq!(r.reading_wpm.source, Source::Default);
+        assert!(r.issues.iter().any(|i| i.message.contains("reading_wpm")));
         cleanup(&path);
     }
 

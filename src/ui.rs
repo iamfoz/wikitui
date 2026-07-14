@@ -42,6 +42,21 @@ fn visited_titles(app: &App) -> HashSet<&str> {
     set
 }
 
+/// PRD FR-DL-5: titles the batched `generator=links&prop=info` check has
+/// confirmed missing on the active tab's wiki edition, for the redlink
+/// styling `kind_style` layers on at paint time — the async-checked
+/// complement to `LinkRef::redlink`'s own parse-time (`class="new"`) signal,
+/// built fresh each draw exactly like `visited_titles` reads
+/// `history::History` fresh each draw rather than caching a snapshot.
+fn confirmed_redlink_titles(app: &App) -> HashSet<&str> {
+    let lang = &app.active_tab().lang;
+    app.confirmed_redlinks
+        .iter()
+        .filter(|(l, _)| l == lang)
+        .map(|(_, title)| title.as_str())
+        .collect()
+}
+
 /// A single color, respecting `NO_COLOR` (PRD FR-TH-5): when set, every
 /// style still carries its modifiers (bold/italic/underline) so meaning
 /// isn't lost, just the color.
@@ -93,11 +108,13 @@ fn base_style(theme: &Theme, no_color: bool) -> Style {
 /// `ratatui` style, applying the theme, focus state, and visited state at
 /// paint time — the layout itself is theme-independent (PRD §6.3), so this is
 /// the only place colors enter and a theme/focus change is O(paint).
+#[allow(clippy::too_many_arguments)]
 fn kind_style(
     kind: &SpanKind,
     focused_link: Option<usize>,
     links: &[LinkRef],
     visited: &HashSet<&str>,
+    redlinks: &HashSet<&str>,
     theme: &Theme,
     no_color: bool,
 ) -> Style {
@@ -127,6 +144,24 @@ fn kind_style(
         // the window where the decoded pixels aren't reachable.
         SpanKind::ImageRow { .. } => Style::default(),
         SpanKind::Link(occ) => {
+            // PRD FR-DL-5: a redlink is dim/struck regardless of focus or
+            // visited state — Parsoid's own `class="new"` pre-marking
+            // (`LinkRef::redlink`) or the batched info-check's confirmation
+            // (`redlinks`, populated from `App::confirmed_redlinks` exactly
+            // like `visited` is populated from history) are two independent
+            // signals for the same fact, either one enough. Checked first,
+            // ahead of focus: a focused redlink should still read as "this
+            // doesn't exist" rather than the ordinary focus highlight lying
+            // about it.
+            let is_redlink = links.get(*occ).is_some_and(|l| {
+                l.redlink
+                    || l.internal_title
+                        .as_deref()
+                        .is_some_and(|title| redlinks.contains(title))
+            });
+            if is_redlink {
+                return colored(no_color, theme.dim).add_modifier(Modifier::CROSSED_OUT);
+            }
             if Some(*occ) == focused_link {
                 colored_bg(no_color, theme.focus_fg, theme.focus_bg).add_modifier(Modifier::BOLD)
             } else {
@@ -149,6 +184,11 @@ fn kind_style(
         SpanKind::Hint => {
             colored_bg(no_color, theme.focus_bg, theme.focus_fg).add_modifier(Modifier::BOLD)
         }
+        // PRD FR-RD-7: dim italics — visually distinct from ordinary prose
+        // and from a caption (`Caption` is also dim italic, but math never
+        // appears where the two could be confused) without needing a new
+        // theme color (`§FR-RD-7` allows "a math color *or* dim").
+        SpanKind::Math => colored(no_color, theme.dim).add_modifier(Modifier::ITALIC),
     }
 }
 
@@ -172,6 +212,7 @@ fn paint_line(
     focused_link: Option<usize>,
     links: &[LinkRef],
     visited: &HashSet<&str>,
+    redlinks: &HashSet<&str>,
     theme: &Theme,
     no_color: bool,
     matches: &[MatchSpan],
@@ -207,7 +248,15 @@ fn paint_line(
             col += width;
             continue;
         }
-        let base_style = kind_style(&s.kind, focused_link, links, visited, theme, no_color);
+        let base_style = kind_style(
+            &s.kind,
+            focused_link,
+            links,
+            visited,
+            redlinks,
+            theme,
+            no_color,
+        );
         let graphemes: Vec<&str> = s.text.graphemes(true).collect();
         let mut cursor = 0usize;
         while cursor < graphemes.len() {
@@ -268,6 +317,7 @@ fn paint_document(
     focused_link: Option<usize>,
     links: &[LinkRef],
     visited: &HashSet<&str>,
+    redlinks: &HashSet<&str>,
     theme: &Theme,
     no_color: bool,
     find_occurrences: &[crate::layout::Occurrence],
@@ -298,6 +348,7 @@ fn paint_document(
                     focused_link,
                     links,
                     visited,
+                    redlinks,
                     theme,
                     no_color,
                     &per_line[i],
@@ -435,6 +486,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         // The offline card overlays the reading view (drawn after the status
         // bar below, like the help overlay).
         Mode::OfflineCard => draw_reading(frame, app, content_area),
+        // PRD FR-DL-5 / §7's "Redlink followed" card — same overlay pattern.
+        Mode::RedlinkCard => draw_reading(frame, app, content_area),
         Mode::OnThisDay => draw_on_this_day(frame, app, content_area),
         Mode::Related => draw_related(frame, app, content_area),
         // The `/` filter draws over the same picker view; only the status
@@ -449,6 +502,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     if app.mode == Mode::OfflineCard {
         draw_offline_card(frame, app, area);
+    }
+
+    if app.mode == Mode::RedlinkCard {
+        draw_redlink_card(frame, app, area);
     }
 
     // PRD FR-SR-3b: the operator cheat-sheet takes priority over the
@@ -764,6 +821,7 @@ fn draw_reading(frame: &mut Frame, app: &mut App, area: Rect) {
         let scroll = app.active_tab().scroll;
 
         let visited = visited_titles(app);
+        let redlinks = confirmed_redlink_titles(app);
         if let Some(layout) = app.layout.as_ref() {
             let tab = app.active_tab();
             // In hint mode, paint a hint-overlaid COPY of the layout's lines
@@ -785,6 +843,7 @@ fn draw_reading(frame: &mut Frame, app: &mut App, area: Rect) {
                 tab.focused_link,
                 &tab.links,
                 &visited,
+                &redlinks,
                 &app.theme,
                 app.no_color,
                 &tab.find_occurrences,
@@ -1012,8 +1071,18 @@ fn draw_results(frame: &mut Frame, app: &App, area: Rect) {
         .iter()
         .enumerate()
         .map(|(i, r)| {
+            // PRD FR-DL-3: the quality badge, prefixed on the title exactly
+            // like the status bar's own current-article badge — session
+            // cache only (`App::quality_cache`, populated in one batched call
+            // right after the search that produced these results), so a wiki
+            // with no PageAssessments support (or an unassessed title) simply
+            // shows no prefix.
+            let title = match app.quality_badge_for(&r.title) {
+                Some(badge) => format!("{badge} {}", r.title),
+                None => r.title.clone(),
+            };
             let mut lines = vec![Line::from(RSpan::styled(
-                r.title.clone(),
+                title,
                 Style::default().add_modifier(Modifier::BOLD),
             ))];
             if let Some(desc) = &r.description {
@@ -1043,7 +1112,7 @@ fn draw_results(frame: &mut Frame, app: &App, area: Rect) {
                     lines.push(Line::from(spans));
                 }
             }
-            if let Some(meta) = result_meta_line(r) {
+            if let Some(meta) = result_meta_line(r, app.reading_wpm) {
                 lines.push(Line::from(RSpan::styled(
                     meta,
                     colored(app.no_color, app.theme.dim),
@@ -1069,16 +1138,23 @@ fn draw_results(frame: &mut Frame, app: &App, area: Rect) {
     render_selectable_list(frame, list, area, app.selected_result);
 }
 
-/// FR-SR-2's "size, wordcount, last-edit date" line: omits whatever fields
-/// the endpoint didn't provide, and the whole line if it provided none —
-/// callers never see a line of empty punctuation.
-fn result_meta_line(r: &crate::api::SearchResult) -> Option<String> {
+/// FR-SR-2's "size, wordcount, last-edit date" line, plus FR-RD-11's reading
+/// time wherever a result already carries a `wordcount` (the search API's
+/// own field — no extra fetch needed for this one, unlike the current
+/// article's estimate which needs the full document model): omits whatever
+/// fields the endpoint didn't provide, and the whole line if it provided
+/// none — callers never see a line of empty punctuation.
+fn result_meta_line(r: &crate::api::SearchResult, reading_wpm: u32) -> Option<String> {
     let mut parts = Vec::new();
     if let Some(size) = r.size {
         parts.push(human_bytes(size));
     }
     if let Some(words) = r.wordcount {
         parts.push(format!("{words} words"));
+        let minutes = crate::doc::reading_minutes(words, reading_wpm);
+        if minutes > 0 {
+            parts.push(format!("{minutes} min read"));
+        }
     }
     if let Some(ts) = &r.timestamp {
         parts.push(format!("edited {}", ts.get(..10).unwrap_or(ts)));
@@ -1968,6 +2044,46 @@ fn draw_offline_card(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+/// PRD FR-DL-5 / §7's "Redlink followed" card: shown instead of attempting a
+/// fetch that would just 404, since a redlink is already known not to exist
+/// (Parsoid's `class="new"` or the batched info check — see
+/// `App::show_redlink_card`). Offers the two documented actions: search for
+/// a similar title, or yank the wiki's own "create this page" URL.
+fn draw_redlink_card(frame: &mut Frame, app: &App, area: Rect) {
+    let width = 58.min(area.width.saturating_sub(4)).max(20);
+    let height = 9.min(area.height.saturating_sub(2)).max(7);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    let title = app
+        .redlink_card_target
+        .as_ref()
+        .map(|(_, t)| t.clone())
+        .unwrap_or_default();
+    let body = Text::from(vec![
+        Line::from(RSpan::styled(
+            "Article doesn't exist yet",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(format!("\"{title}\" has no article on this wiki yet.")),
+        Line::from(""),
+        Line::from("s  search for a similar title"),
+        Line::from("y  yank the create-page URL"),
+        Line::from("Esc  dismiss"),
+    ]);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(body)
+            .style(base_style(&app.theme, app.no_color))
+            .block(UiBlock::default().borders(Borders::ALL).title("Redlink")),
+        popup,
+    );
+}
+
 /// PRD FR-PR-3's "visible status glyph": a persistent, plain-text
 /// `[incognito]` marker prepended to the status bar in *every* mode (not
 /// just Reading — a picker or a prompt is exactly when a reader most needs
@@ -2043,6 +2159,9 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         Mode::OfflineCard => {
             "f: queue for fetch when online   s: search saved pages   Esc: dismiss".to_string()
         }
+        Mode::RedlinkCard => {
+            "s: search similar titles   y: yank create URL   Esc: dismiss".to_string()
+        }
         Mode::ReadingHistory => app.status.clone(),
         Mode::ReadingHistoryFilter => {
             format!("filter: {}   Esc: apply", app.history_pick_filter)
@@ -2099,10 +2218,20 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                 .as_deref()
                 .map(|h| format!("   {h}"))
                 .unwrap_or_default();
+            // PRD FR-DL-3: the current article's quality badge, same
+            // low-priority-suffix treatment as the language hint — shown
+            // whenever this session has an assessment cached for it
+            // (`App::current_quality_badge`), silently absent otherwise
+            // (unassessed article, non-PageAssessments wiki, or the batched
+            // fetch hasn't landed yet).
+            let badge = app
+                .current_quality_badge()
+                .map(|b| format!("   {b}"))
+                .unwrap_or_default();
             match tab.focused_link.and_then(|i| tab.links.get(i)) {
                 Some(link) if link.internal_title.is_some() => {
                     format!(
-                        "{}→ {} ({}/{})   Tab/S-Tab: cycle   Enter: open   H: back   L: forward{hint}",
+                        "{}→ {} ({}/{})   Tab/S-Tab: cycle   Enter: open   H: back   L: forward{hint}{badge}",
                         tab.page_source.prefix(),
                         link.text,
                         tab.focused_link.unwrap() + 1,
@@ -2110,7 +2239,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                     )
                 }
                 Some(link) => format!(
-                    "{}→ {} (external, not yet followable){hint}",
+                    "{}→ {} (external, not yet followable){hint}{badge}",
                     tab.page_source.prefix(),
                     link.text
                 ),
@@ -2123,9 +2252,9 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                     if titles.len() > 1 {
                         let prefix = tab.page_source.prefix();
                         let budget = (area.width as usize).saturating_sub(display_width(&prefix));
-                        format!("{prefix}{}{hint}", build_breadcrumb(&titles, budget))
+                        format!("{prefix}{}{hint}{badge}", build_breadcrumb(&titles, budget))
                     } else {
-                        format!("{}{hint}", app.status)
+                        format!("{}{hint}{badge}", app.status)
                     }
                 }
             }
@@ -2521,6 +2650,7 @@ mod tests {
             None,
             &[],
             &HashSet::new(),
+            &HashSet::new(),
             &theme,
             false,
             &[],
@@ -2593,6 +2723,7 @@ mod tests {
             None,
             &links,
             &visited,
+            &HashSet::new(),
             &theme,
             false,
             &[],
@@ -2623,6 +2754,105 @@ mod tests {
             theme.link_visited, theme.link,
             "the two colors must actually differ for this test to mean anything"
         );
+    }
+
+    /// PRD FR-DL-5: a redlink (Parsoid's `class="new"`) renders dim/struck
+    /// regardless of focus or visited state — distinct from every other link
+    /// color the theme defines.
+    #[test]
+    fn redlink_renders_dim_and_struck_even_when_focused() {
+        let html = concat!(
+            "<html><body><p>See <a href=\"./Nonexistent\" class=\"new\">a redlink</a>",
+            " and <a href=\"./Computer_science\">a real link</a>.</p></body></html>"
+        );
+        let doc = parse_article_html("Test", html);
+        let links = crate::doc::collect_links(&doc);
+        assert!(links[0].redlink);
+        assert!(!links[1].redlink);
+
+        let theme = Theme::full();
+        let layout = layout_document(&doc, 80, LayoutOptions::default());
+        // Focus the redlink itself (occurrence 0) — it must still render as
+        // a redlink, not the ordinary focus highlight.
+        let text = paint_document(
+            &layout.lines,
+            Some(0),
+            &links,
+            &HashSet::new(),
+            &HashSet::new(),
+            &theme,
+            false,
+            &[],
+            0,
+            &crate::image::ImageStore::new(),
+        );
+        let line = text
+            .lines
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content.contains("redlink")))
+            .expect("paragraph line present");
+        let redlink_span = line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("redlink"))
+            .unwrap();
+        let real_span = line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("real link"))
+            .unwrap();
+        assert_eq!(redlink_span.style.fg, Some(theme.dim));
+        assert!(
+            redlink_span
+                .style
+                .add_modifier
+                .contains(Modifier::CROSSED_OUT)
+        );
+        assert_ne!(
+            real_span.style.fg,
+            Some(theme.dim),
+            "an ordinary link must not pick up the redlink styling"
+        );
+    }
+
+    /// A title confirmed missing by the batched info check (`redlinks`,
+    /// distinct from `LinkRef::redlink`) must render the same dim/struck way
+    /// — the two detection paths are independent but produce identical
+    /// styling.
+    #[test]
+    fn confirmed_redlink_from_the_batch_check_renders_the_same_as_a_parsoid_one() {
+        let html = r#"<html><body><p>See <a href="./Uncharted_Topic">an uncharted topic</a>.</p></body></html>"#;
+        let doc = parse_article_html("Test", html);
+        let links = crate::doc::collect_links(&doc);
+        assert!(
+            !links[0].redlink,
+            "not pre-marked by Parsoid in this fixture"
+        );
+
+        let mut redlinks = HashSet::new();
+        redlinks.insert("Uncharted Topic");
+        let theme = Theme::full();
+        let layout = layout_document(&doc, 80, LayoutOptions::default());
+        let text = paint_document(
+            &layout.lines,
+            None,
+            &links,
+            &HashSet::new(),
+            &redlinks,
+            &theme,
+            false,
+            &[],
+            0,
+            &crate::image::ImageStore::new(),
+        );
+        let span = text
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.contains("uncharted"))
+            .unwrap();
+        assert_eq!(span.style.fg, Some(theme.dim));
+        assert!(span.style.add_modifier.contains(Modifier::CROSSED_OUT));
     }
 
     #[test]
@@ -2715,6 +2945,7 @@ mod tests {
             None,
             &[],
             &HashSet::new(),
+            &HashSet::new(),
             &theme,
             false,
             &occurrences,
@@ -2782,6 +3013,7 @@ mod tests {
             &layout.lines,
             None,
             &[],
+            &HashSet::new(),
             &HashSet::new(),
             &theme,
             false,

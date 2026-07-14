@@ -51,6 +51,12 @@ pub enum SpanKind {
     Table,
     Infobox,
     Image,
+    /// PRD FR-RD-7: TeX passthrough, inline or (via `Block::Math`) a
+    /// standalone display line — either way the *text* carried in the
+    /// `LaidSpan` is already the ⟨delimited⟩, `normalize_trivial_math`-ed
+    /// display form (produced by `flatten_spans`/the `Block::Math` emitter,
+    /// not by `paint`), so this variant only needs to say "style it as math."
+    Math,
     /// A caption line under an image or gallery (PRD FR-RD-8): dim italics.
     Caption,
     /// One reserved row of an inline image's half-block box (PRD FR-RD-8).
@@ -139,6 +145,12 @@ pub struct LayoutOptions {
     /// FR-RD-8, FR-OFF-1). The reserved box sizes themselves come from an
     /// [`ImageResolver`] passed alongside, not from this field.
     pub image_epoch: u64,
+    /// PRD FR-RD-11's WPM divisor for the "N min read" header line
+    /// (`config::resolve_reading_wpm` / `:set reading_wpm=N`, default 230).
+    /// Part of the L1 cache key like every other field here: changing it
+    /// changes the laid-out header line, so a stale cached layout must not
+    /// be reused across a change.
+    pub reading_wpm: u32,
 }
 
 impl Default for LayoutOptions {
@@ -149,6 +161,7 @@ impl Default for LayoutOptions {
             accessible: false,
             table_col_offset: 0,
             image_epoch: 0,
+            reading_wpm: 230,
         }
     }
 }
@@ -350,7 +363,13 @@ fn clusters_from_str(s: &str, kind: SpanKind, ambiguous_wide: bool) -> Vec<Clust
 /// numbering must match `doc::collect_links` exactly.
 fn span_kind(style: &SpanStyle, plain_kind: &SpanKind, link_counter: &mut usize) -> SpanKind {
     match style {
-        SpanStyle::Link(_) => {
+        // PRD FR-DL-5: a redlink is still a link for numbering/cycling/hint
+        // purposes — it counts here exactly like `Link` (this numbering must
+        // match `doc::collect_links`'s order, which also counts both
+        // variants as links) — its dim/struck styling is a paint-time
+        // decision (`ui::kind_style`) keyed off `LinkRef::redlink`/
+        // `App::confirmed_redlinks`, not a distinct `SpanKind`.
+        SpanStyle::Link(_) | SpanStyle::RedLink(_) => {
             let occ = *link_counter;
             *link_counter += 1;
             SpanKind::Link(occ)
@@ -359,7 +378,25 @@ fn span_kind(style: &SpanStyle, plain_kind: &SpanKind, link_counter: &mut usize)
         SpanStyle::Italic => SpanKind::Italic,
         SpanStyle::Superscript => SpanKind::Dim,
         SpanStyle::Plain => plain_kind.clone(),
+        // PRD FR-RD-7: styled distinctly at paint time (`ui::kind_style`);
+        // the delimiter-wrapped, Unicode-normalized text itself is produced
+        // by `flatten_spans` below, not here (this function only maps style
+        // to *kind*, never rewrites `text`).
+        SpanStyle::Math(_) => SpanKind::Math,
     }
+}
+
+/// PRD FR-RD-7's inline rendering of a math node: the raw TeX passed through
+/// `normalize_trivial_math` (simple sup/sub + Greek-letter cases become
+/// Unicode; anything non-trivial stays raw) and wrapped in `⟨…⟩` so it reads
+/// as a distinct unit from surrounding prose even before styling is applied.
+/// Shared by `flatten_spans` (inline math) and `Emitter::emit_block`'s
+/// `Block::Math` case (a standalone display equation) so both spellings
+/// agree; `--dump`/`render_plain` deliberately does *not* call this — it
+/// shows the raw `doc::Span`/`Block::Math` text untouched (PRD: "TeX as
+/// plain text, no escapes").
+fn render_math_display(tex: &str) -> String {
+    format!("⟨{}⟩", crate::doc::normalize_trivial_math(tex))
 }
 
 fn flatten_spans(
@@ -371,7 +408,14 @@ fn flatten_spans(
     let mut out = Vec::new();
     for span in spans {
         let kind = span_kind(&span.style, &plain_kind, link_counter);
-        out.extend(clusters_from_str(&span.text, kind, ambiguous_wide));
+        let rendered;
+        let text: &str = if let SpanStyle::Math(tex) = &span.style {
+            rendered = render_math_display(tex);
+            &rendered
+        } else {
+            &span.text
+        };
+        out.extend(clusters_from_str(text, kind, ambiguous_wide));
     }
     out
 }
@@ -810,7 +854,46 @@ impl Emitter<'_> {
                 self.blank();
                 block_lines.push(anchor);
             }
+            Block::Math { tex, display } => {
+                let anchor = self.lines.len();
+                self.emit_math(tex, *display);
+                block_lines.push(anchor);
+            }
         }
+    }
+
+    /// Emit a standalone math node (PRD FR-RD-7): a display equation centers
+    /// on its own line (approximately — a leading pad wide enough to center
+    /// the *first* wrapped line, reused as every continuation line's prefix
+    /// too, rather than re-centering each one individually; exact per-line
+    /// centering of a wrapped equation is not worth the complexity for v1.0
+    /// passthrough). Reuses `emit_wrapped`'s existing centered-content-column
+    /// math (via a blank-space "prefix") rather than hand-rolling padding, so
+    /// a formula too wide for the column still wraps safely instead of
+    /// overflowing. `display: false` (reached only if a math node with no
+    /// `display="block"` signal was found directly at block-scanning level —
+    /// see `doc::walk_blocks`'s `"span"` arm) just left-aligns like any other
+    /// block.
+    fn emit_math(&mut self, tex: &str, display: bool) {
+        let aw = self.ambiguous_wide;
+        let text = render_math_display(tex);
+        self.blank();
+        if display {
+            let text_width = display_width(&text, aw);
+            let extra_pad = self.content_width.saturating_sub(text_width) / 2;
+            let pad_prefix = vec![LaidSpan {
+                text: " ".repeat(extra_pad),
+                kind: SpanKind::Plain,
+            }];
+            self.emit_wrapped(
+                clusters_from_str(&text, SpanKind::Math, aw),
+                pad_prefix.clone(),
+                pad_prefix,
+            );
+        } else {
+            self.emit_plain_wrapped(clusters_from_str(&text, SpanKind::Math, aw));
+        }
+        self.blank();
     }
 
     /// Emit one inline image (PRD FR-RD-8): the reserved half-block box when
@@ -1401,6 +1484,21 @@ pub fn layout_document_with_images(
         };
         // Title, then a blank line — mirrors the previous renderer's header.
         em.emit_plain_wrapped(clusters_from_str(&doc.title, SpanKind::Title, aw));
+        // PRD FR-RD-11: "N min read" in the article header area, right under
+        // the title. A pure function of the document + configured WPM, so —
+        // unlike the quality badge (network data, shown in the status bar
+        // instead, `ui::draw_status_bar`) — it is safe to bake into the
+        // cached layout: nothing about it can arrive *after* this layout
+        // pass already ran.
+        let words = crate::doc::word_count(doc);
+        let minutes = crate::doc::reading_minutes(words, options.reading_wpm);
+        if minutes > 0 {
+            em.emit_plain_wrapped(clusters_from_str(
+                &format!("{minutes} min read"),
+                SpanKind::Dim,
+                aw,
+            ));
+        }
         em.blank();
 
         let mut i = 0;
@@ -2875,5 +2973,130 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- FR-RD-11: "N min read" header line -------------------------------
+
+    /// The header emits "N min read" right under the title (before the
+    /// blank line the previous renderer's header already had), styled Dim —
+    /// distinct from the bold, colorless `Title` line above it.
+    #[test]
+    fn reading_time_header_line_appears_under_the_title() {
+        let words: String = (0..500).map(|_| "word ").collect();
+        let doc = parse_article_html("Test", &format!("<html><body><p>{words}</p></body></html>"));
+        let layout = layout_document(&doc, 80, LayoutOptions::default());
+        assert_eq!(
+            line_text(&layout.lines[0]),
+            "Test",
+            "title is the first line"
+        );
+        let minutes = crate::doc::reading_minutes(crate::doc::word_count(&doc), 230);
+        assert!(minutes > 0, "fixture must have enough words to read >0 min");
+        assert_eq!(line_text(&layout.lines[1]), format!("{minutes} min read"));
+        assert!(
+            layout.lines[1]
+                .spans
+                .iter()
+                .all(|s| s.kind == SpanKind::Dim),
+            "the reading-time line must be styled Dim"
+        );
+    }
+
+    /// An empty document (0 words) has nothing to estimate — no reading-time
+    /// line at all, not a nonsensical "0 min read".
+    #[test]
+    fn reading_time_header_line_is_absent_for_an_empty_document() {
+        let doc = parse_article_html("Empty", "<html><body></body></html>");
+        let layout = layout_document(&doc, 80, LayoutOptions::default());
+        assert_eq!(line_text(&layout.lines[0]), "Empty");
+        assert_eq!(
+            line_text(&layout.lines[1]),
+            "",
+            "no reading-time line: the blank line follows the title directly"
+        );
+    }
+
+    /// Changing `reading_wpm` changes the estimate — proving `LayoutOptions`
+    /// actually threads it through, and that it participates in the L1 cache
+    /// key (it derives `PartialEq`, so two options differing only here are
+    /// unequal — the same guarantee `layout_cache_hits_on_an_identical_key_
+    /// and_misses_on_any_field_change` locks for the other fields).
+    #[test]
+    fn reading_wpm_option_changes_the_estimate() {
+        let words: String = (0..300).map(|_| "word ").collect();
+        let doc = parse_article_html("Test", &format!("<html><body><p>{words}</p></body></html>"));
+        let slow = layout_document(
+            &doc,
+            80,
+            LayoutOptions {
+                reading_wpm: 100,
+                ..LayoutOptions::default()
+            },
+        );
+        let fast = layout_document(
+            &doc,
+            80,
+            LayoutOptions {
+                reading_wpm: 1000,
+                ..LayoutOptions::default()
+            },
+        );
+        assert_ne!(line_text(&slow.lines[1]), line_text(&fast.lines[1]));
+    }
+
+    // ---- FR-RD-7: math passthrough rendering ------------------------------
+
+    /// Inline math renders as ⟨normalized TeX⟩, styled `SpanKind::Math`, and
+    /// a trivial superscript (`^2`) converts to its Unicode digit.
+    #[test]
+    fn inline_math_renders_delimited_and_normalized() {
+        let html = r#"<html><body><p>Energy: <span typeof="mw:Extension/math">
+            <math alttext="E=mc^2"></math></span> is famous.</p></body></html>"#;
+        let doc = parse_article_html("Test", html);
+        let layout = layout_document(&doc, 80, LayoutOptions::default());
+        let full: String = layout
+            .lines
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            full.contains("⟨E=mc²⟩"),
+            "expected the delimited, superscript-normalized form in: {full:?}"
+        );
+        let math_span_found = layout
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .any(|s| s.kind == SpanKind::Math && s.text.contains('²'));
+        assert!(math_span_found, "the math text must carry SpanKind::Math");
+    }
+
+    /// A display equation (`Block::Math { display: true, .. }`) lays out on
+    /// its own line with a nonzero centering pad, distinct from an ordinary
+    /// left-aligned paragraph.
+    #[test]
+    fn display_math_block_centers_on_its_own_line() {
+        let html = r#"<html><body><p>Intro.</p>
+            <dl><dd><span typeof="mw:Extension/math">
+                <math display="block" alttext="F = m a"></math>
+            </span></dd></dl>
+            <p>Outro.</p></body></html>"#;
+        let doc = parse_article_html("Test", html);
+        let layout = layout_document(&doc, 80, LayoutOptions::default());
+        let math_line = layout
+            .lines
+            .iter()
+            .find(|l| line_text(l).contains("⟨F = m a⟩"))
+            .expect("display equation must appear on its own line");
+        let leading_spaces = math_line
+            .spans
+            .first()
+            .map(|s| s.text.chars().take_while(|c| *c == ' ').count())
+            .unwrap_or(0);
+        assert!(
+            leading_spaces > 0,
+            "a short display equation on an 80-wide line should have a centering pad, got {leading_spaces}"
+        );
     }
 }

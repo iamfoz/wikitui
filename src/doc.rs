@@ -60,6 +60,24 @@ pub enum SpanStyle {
     Italic,
     Superscript,
     Link(String),
+    /// PRD FR-DL-5: a link Parsoid itself pre-marked as pointing at a
+    /// nonexistent article (`class="new"` on the `<a>` — the cheapest
+    /// redlink signal, checked first; see `collect_inline`'s `"a"` arm).
+    /// Carries the href, same as `Link`. A link *not* pre-marked this way
+    /// can still turn out to be a redlink — the batched `generator=links&
+    /// prop=info` check (`api::WikiClient::fetch_missing_links`) catches
+    /// those after the fact via `App::confirmed_redlinks`, layered on at
+    /// paint time exactly like visited-link coloring rather than mutating
+    /// the span.
+    RedLink(String),
+    /// PRD FR-RD-7: inline TeX passthrough, extracted from a Parsoid math
+    /// node (see `extract_math`). Carries the raw TeX source — the same
+    /// string as this span's own `text` (mirroring how `Link`'s payload and
+    /// a link's visible text are two separate things but happen to start
+    /// from the same node); kept on the style, not just the text, so paint
+    /// code can apply `normalize_trivial_math` without re-deriving "is this
+    /// a math span" from content.
+    Math(String),
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +129,21 @@ pub enum Block {
     /// strips or lists"). Rendered as a captioned horizontal strip when the
     /// width allows, else a vertical list of `[image: caption]`.
     Gallery(Vec<GalleryItem>),
+    /// A standalone display equation (PRD FR-RD-7): a math node that appeared
+    /// on its own at block-scanning level (Parsoid's usual `<dl><dd>`
+    /// indentation for a leading-colon display equation), rather than inline
+    /// within a paragraph's running text — see `walk_blocks`'s `"span"` arm.
+    /// `display` is the source `<math>`'s own `display="block"` MathML
+    /// attribute (or, lacking a `<math>` element at all, the fallback image's
+    /// `-display` vs `-inline` class); `layout.rs` centers the line when
+    /// true. `tex` is raw TeX passthrough (v1.0 scope, FR-RD-7); rendering
+    /// applies `normalize_trivial_math` at paint time only, so `--dump`
+    /// (`render_plain`) and every other consumer of the document model still
+    /// see the exact source string.
+    Math {
+        tex: String,
+        display: bool,
+    },
 }
 
 /// One entry of a [`Block::Gallery`] (PRD FR-RD-8). `caption` is the
@@ -262,6 +295,13 @@ pub struct LinkRef {
     pub href: String,
     pub text: String,
     pub internal_title: Option<String>,
+    /// PRD FR-DL-5: Parsoid pre-marked this link as a redlink (`class="new"`)
+    /// — the cheapest of the two detection paths, always known at parse
+    /// time. `false` does not mean "definitely exists": a link not pre-marked
+    /// can still turn out missing via the batched info check (see
+    /// `App::confirmed_redlinks`), which paint code consults as a second,
+    /// independent signal rather than something this field tries to capture.
+    pub redlink: bool,
 }
 
 fn internal_title_from_href(href: &str) -> Option<String> {
@@ -294,13 +334,17 @@ pub fn collect_links(doc: &Document) -> Vec<LinkRef> {
     let mut links = Vec::new();
     let mut visit = |spans: &[Span]| {
         for s in spans {
-            if let SpanStyle::Link(href) = &s.style {
-                links.push(LinkRef {
-                    href: href.clone(),
-                    text: s.text.clone(),
-                    internal_title: internal_title_from_href(href),
-                });
-            }
+            let (href, redlink) = match &s.style {
+                SpanStyle::Link(href) => (href, false),
+                SpanStyle::RedLink(href) => (href, true),
+                _ => continue,
+            };
+            links.push(LinkRef {
+                href: href.clone(),
+                text: s.text.clone(),
+                internal_title: internal_title_from_href(href),
+                redlink,
+            });
         }
     };
     for block in &doc.blocks {
@@ -382,6 +426,399 @@ fn has_class(el: &scraper::node::Element, needle: &str) -> bool {
                 .any(|c| c == needle || c.contains(needle))
         })
         .unwrap_or(false)
+}
+
+/// Parsoid's RDFa `typeof` attribute is space-separated and can carry more
+/// than one type (e.g. a transclusion that is also a math extension node),
+/// so this checks membership the same way `has_class` does, over the
+/// separate `typeof` attribute.
+fn has_typeof(el: &scraper::node::Element, needle: &str) -> bool {
+    el.attr("typeof")
+        .map(|t| t.split_whitespace().any(|t| t == needle))
+        .unwrap_or(false)
+}
+
+/// Whether `el` is a Parsoid math extension node — either the `<span
+/// typeof="mw:Extension/math">` wrapper Parsoid emits, or a bare `<math>`
+/// element some legacy-parser/third-party output uses directly with no
+/// wrapping span (PRD §6.2 rule 3, Appendix A "Math (optional)").
+fn is_math_node(el: &scraper::node::Element) -> bool {
+    el.name() == "math" || (el.name() == "span" && has_typeof(el, "mw:Extension/math"))
+}
+
+/// One math node's extracted content (PRD FR-RD-7): the TeX source and
+/// whether it is a display (own-line) equation vs. inline with surrounding
+/// text.
+struct MathNode {
+    tex: String,
+    display: bool,
+}
+
+/// Extracts a math node's TeX and display-vs-inline flag from a Parsoid math
+/// span (or bare `<math>` — see `is_math_node`). Walks with `.descendants()`
+/// (pointer-following, like `flatten_deep_subtree` — see its doc comment for
+/// why that can't stack-overflow) rather than recursion; math subtrees are a
+/// handful of nodes in practice, so no separate SEC-3 depth cap is needed
+/// here the way the block/inline walkers need `MAX_DOM_DEPTH`.
+///
+/// TeX precedence (PRD §6.2 rule 3, "math nodes carry TeX in alttext"): the
+/// `<math>` element's own `alttext` attribute wins when present — the PRD
+/// names it as the primary source, and it is exactly the TeX MediaWiki's math
+/// extension stored, with no MathML-rendering round-trip. The `<annotation
+/// encoding="application/x-tex">` child (MathML's own "here is the source
+/// markup that generated this" convention) is the fallback for a renderer
+/// that omitted `alttext`. If there is no `<math>` element at all (a
+/// stripped-down or accessible-only rendering), or it has neither `alttext`
+/// nor a matching `annotation`, the last resort is the math extension's own
+/// accessible fallback `<img alt="{\displaystyle ...}">` — present precisely
+/// so a non-MathML-aware reader still has *some* text — with the
+/// `\displaystyle`/`\textstyle` rendering-mode wrapper stripped. A node with
+/// none of the three yields `None`: nothing is invented (the "missing-tex
+/// graceful" case — the caller simply emits no span/block for it).
+fn extract_math(node: NodeRef<Node>) -> Option<MathNode> {
+    let math_el = node.descendants().find_map(|n| match n.value() {
+        Node::Element(el) if el.name() == "math" => Some((n, el)),
+        _ => None,
+    });
+
+    let Some((math_node, el)) = math_el else {
+        // No `<math>` element at all: the fallback image's own class is the
+        // only display-vs-inline signal left.
+        let display = node.descendants().any(|n| {
+            matches!(n.value(), Node::Element(el) if el.name() == "img" && has_class(el, "mwe-math-fallback-image-display"))
+        });
+        return fallback_image_tex(node).map(|tex| MathNode { tex, display });
+    };
+
+    let display = el.attr("display") == Some("block");
+    if let Some(alttext) = el.attr("alttext").map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(MathNode {
+            tex: alttext.to_string(),
+            display,
+        });
+    }
+    let annotation_tex = math_node.descendants().find_map(|n| match n.value() {
+        Node::Element(el)
+            if el.name() == "annotation" && el.attr("encoding") == Some("application/x-tex") =>
+        {
+            let text: String = n
+                .descendants()
+                .filter_map(|d| match d.value() {
+                    Node::Text(t) => Some(t.text.as_ref()),
+                    _ => None,
+                })
+                .collect();
+            Some(text)
+        }
+        _ => None,
+    });
+    if let Some(tex) = annotation_tex
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(MathNode {
+            tex: tex.to_string(),
+            display,
+        });
+    }
+    // Neither `alttext` nor a usable annotation: fall back to the image, but
+    // keep this `<math>`'s own `display` attribute (more reliable than the
+    // fallback image's class, which some renderers omit).
+    fallback_image_tex(node).map(|tex| MathNode { tex, display })
+}
+
+/// The math extension's accessible fallback `<img alt="{\displaystyle ...}">`
+/// text, with MediaWiki's `\displaystyle`/`\textstyle` rendering-mode wrapper
+/// stripped — that wrapper marks how the fallback image was rasterized, not
+/// part of the TeX a reader would recognize as the formula.
+fn fallback_image_tex(node: NodeRef<Node>) -> Option<String> {
+    let alt = node.descendants().find_map(|n| match n.value() {
+        Node::Element(el) if el.name() == "img" => el.attr("alt"),
+        _ => None,
+    })?;
+    let trimmed = alt.trim();
+    let unwrapped = trimmed
+        .strip_prefix("{\\displaystyle")
+        .or_else(|| trimmed.strip_prefix("{\\textstyle"))
+        .and_then(|s| s.strip_suffix('}'))
+        .map(str::trim)
+        .unwrap_or(trimmed);
+    (!unwrapped.is_empty()).then(|| unwrapped.to_string())
+}
+
+/// FR-RD-7's "Unicode superscript/subscript normalization for simple cases":
+/// a small, deliberately incomplete table — superscript/subscript digits
+/// (plus the punctuation marks Unicode also defines alongside them) and the
+/// Greek letters LaTeX's macros commonly spell out. A `^`/`_` argument that
+/// isn't entirely covered by that table (a multi-token exponent, an
+/// unrecognized macro, a mix of letters this table doesn't have a subscript
+/// glyph for) is left exactly as raw TeX — FR-RD-7 v1.0 scope is passthrough
+/// plus *only* the trivial cases; general math typesetting is the v1.x
+/// Unicode-layout upgrade this deliberately doesn't attempt.
+pub fn normalize_trivial_math(tex: &str) -> String {
+    let chars: Vec<char> = tex.chars().collect();
+    let mut out = String::with_capacity(tex.len());
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' {
+            let start = i + 1;
+            let mut j = start;
+            while j < chars.len() && chars[j].is_ascii_alphabetic() {
+                j += 1;
+            }
+            let name: String = chars[start..j].iter().collect();
+            if let Some(g) = greek_letter(&name) {
+                out.push(g);
+                i = j;
+                continue;
+            }
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if (c == '^' || c == '_')
+            && let Some((converted, next)) = trivial_script(&chars, i + 1, c == '^')
+        {
+            out.push_str(&converted);
+            i = next;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// Reads one `^`/`_` argument starting at `start` in `chars` (a `{...}`
+/// group, or — matching real TeX's own "only the next single token" rule —
+/// one bare character when there's no brace) and converts it to Unicode
+/// super/subscript form, or returns `None` if any character in the argument
+/// has no glyph in the (deliberately small) table — the caller then leaves
+/// the original `^`/`_` and its argument untouched.
+fn trivial_script(chars: &[char], start: usize, sup: bool) -> Option<(String, usize)> {
+    let (arg, next): (&[char], usize) = if chars.get(start) == Some(&'{') {
+        let close = chars[start + 1..].iter().position(|&c| c == '}')? + start + 1;
+        (&chars[start + 1..close], close + 1)
+    } else if start < chars.len() {
+        (&chars[start..start + 1], start + 1)
+    } else {
+        return None;
+    };
+    if arg.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(arg.len());
+    for &c in arg {
+        out.push(if sup {
+            superscript_char(c)?
+        } else {
+            subscript_char(c)?
+        });
+    }
+    Some((out, next))
+}
+
+fn superscript_char(c: char) -> Option<char> {
+    Some(match c {
+        '0' => '⁰',
+        '1' => '¹',
+        '2' => '²',
+        '3' => '³',
+        '4' => '⁴',
+        '5' => '⁵',
+        '6' => '⁶',
+        '7' => '⁷',
+        '8' => '⁸',
+        '9' => '⁹',
+        '+' => '⁺',
+        '-' => '⁻',
+        '=' => '⁼',
+        '(' => '⁽',
+        ')' => '⁾',
+        'n' => 'ⁿ',
+        'i' => 'ⁱ',
+        _ => return None,
+    })
+}
+
+fn subscript_char(c: char) -> Option<char> {
+    Some(match c {
+        '0' => '₀',
+        '1' => '₁',
+        '2' => '₂',
+        '3' => '₃',
+        '4' => '₄',
+        '5' => '₅',
+        '6' => '₆',
+        '7' => '₇',
+        '8' => '₈',
+        '9' => '₉',
+        '+' => '₊',
+        '-' => '₋',
+        '=' => '₌',
+        '(' => '₍',
+        ')' => '₎',
+        'a' => 'ₐ',
+        'e' => 'ₑ',
+        'h' => 'ₕ',
+        'k' => 'ₖ',
+        'l' => 'ₗ',
+        'm' => 'ₘ',
+        'n' => 'ₙ',
+        'o' => 'ₒ',
+        'p' => 'ₚ',
+        's' => 'ₛ',
+        't' => 'ₜ',
+        'x' => 'ₓ',
+        _ => return None,
+    })
+}
+
+/// LaTeX's standard one-word Greek-letter macros (the 24 lowercase letters
+/// plus the 11 uppercase ones that actually have a command — the rest of the
+/// uppercase alphabet is identical to Latin, so LaTeX defines no macro for
+/// it). Matched on the *maximal* run of ASCII letters after a `\`
+/// (`normalize_trivial_math`'s caller), so a longer word like `\alphabet`
+/// never partially matches `\alpha` — it simply isn't a key in this table.
+fn greek_letter(name: &str) -> Option<char> {
+    Some(match name {
+        "alpha" => 'α',
+        "beta" => 'β',
+        "gamma" => 'γ',
+        "delta" => 'δ',
+        "epsilon" => 'ε',
+        "zeta" => 'ζ',
+        "eta" => 'η',
+        "theta" => 'θ',
+        "iota" => 'ι',
+        "kappa" => 'κ',
+        "lambda" => 'λ',
+        "mu" => 'μ',
+        "nu" => 'ν',
+        "xi" => 'ξ',
+        "omicron" => 'ο',
+        "pi" => 'π',
+        "rho" => 'ρ',
+        "sigma" => 'σ',
+        "tau" => 'τ',
+        "upsilon" => 'υ',
+        "phi" => 'φ',
+        "chi" => 'χ',
+        "psi" => 'ψ',
+        "omega" => 'ω',
+        "Gamma" => 'Γ',
+        "Delta" => 'Δ',
+        "Theta" => 'Θ',
+        "Lambda" => 'Λ',
+        "Xi" => 'Ξ',
+        "Pi" => 'Π',
+        "Sigma" => 'Σ',
+        "Upsilon" => 'Υ',
+        "Phi" => 'Φ',
+        "Psi" => 'Ψ',
+        "Omega" => 'Ω',
+        _ => return None,
+    })
+}
+
+/// True for scripts wrapped per-character rather than counted as
+/// whitespace-split "words" (PRD FR-RD-11's word-count heuristic) — the same
+/// Han/kana/Hangul/fullwidth ranges `layout::is_cjk` uses for line-wrapping,
+/// duplicated rather than imported: `doc` is the lower-level document model
+/// that `layout` builds on, and word-counting has no other reason to depend
+/// upward on the layout engine.
+fn is_cjk_word_char(c: char) -> bool {
+    let u = c as u32;
+    (0x3000..=0x303F).contains(&u)
+        || (0x3040..=0x309F).contains(&u)
+        || (0x30A0..=0x30FF).contains(&u)
+        || (0x31F0..=0x31FF).contains(&u)
+        || (0x3400..=0x4DBF).contains(&u)
+        || (0x4E00..=0x9FFF).contains(&u)
+        || (0xF900..=0xFAFF).contains(&u)
+        || (0xAC00..=0xD7A3).contains(&u)
+        || (0x1100..=0x11FF).contains(&u)
+        || (0xFF00..=0xFFEF).contains(&u)
+}
+
+/// PRD FR-RD-11: how many Latin-script "words" one CJK character counts as
+/// for reading-time purposes. CJK text has no space separators, so counting
+/// whitespace-split tokens (as the Latin path does) would treat whole
+/// sentences as "one word" and wildly undercount; this instead weights each
+/// CJK codepoint as a fraction of a word, calibrated so a CJK article reads
+/// at a plausible pace rather than "0 min" or an inflated one. A documented
+/// heuristic, not a segmenter — real reading speed varies by character
+/// density and register, and this is deliberately a single constant, not a
+/// per-language model.
+pub const CJK_CHARS_PER_WORD: f64 = 2.5;
+
+/// The word count contributed by one run of spans (PRD FR-RD-11): ordinary
+/// Latin-script text counts whitespace-split tokens; a token containing any
+/// CJK character is instead counted by character, weighted by
+/// `CJK_CHARS_PER_WORD` (mixed-script tokens are rare enough in practice that
+/// treating a token as "CJK" the moment it contains any CJK character, rather
+/// than splitting it further, is an acceptable simplification). Math spans
+/// are skipped entirely: raw TeX source isn't prose a reader reads at word
+/// pace, and counting it would skew the estimate on a math-heavy article.
+fn count_words_in_spans(spans: &[Span]) -> f64 {
+    let mut total = 0.0;
+    for span in spans {
+        if matches!(span.style, SpanStyle::Math(_)) {
+            continue;
+        }
+        for word in span.text.split_whitespace() {
+            if word.chars().any(is_cjk_word_char) {
+                total += word.chars().filter(|c| is_cjk_word_char(*c)).count() as f64
+                    / CJK_CHARS_PER_WORD;
+            } else {
+                total += 1.0;
+            }
+        }
+    }
+    total
+}
+
+/// PRD FR-RD-11's word-count pass over the document model — the same model
+/// that feeds `--dump`/FTS, so this walks exactly what a reader actually
+/// reads: headings, paragraphs, list items, and blockquotes. Deliberately
+/// skips table/infobox cells (label/data text reads at a different pace than
+/// prose, and would skew "N min read" toward nonsense on a table-heavy
+/// article), code blocks (source text, not prose), and image/gallery
+/// captions (usually a few words that would round the estimate up
+/// disproportionately on an image-heavy page) — the same "what counts as
+/// reading" boundary `render_plain`'s structure suggests, just narrower.
+pub fn word_count(doc: &Document) -> u32 {
+    let mut total = 0.0f64;
+    for block in &doc.blocks {
+        match block {
+            Block::Heading { spans, .. }
+            | Block::Paragraph(spans)
+            | Block::ListItem { spans, .. }
+            | Block::Blockquote(spans) => total += count_words_in_spans(spans),
+            Block::Table(_)
+            | Block::Infobox(_)
+            | Block::Code(_)
+            | Block::Image { .. }
+            | Block::Gallery(_)
+            | Block::Rule
+            | Block::Math { .. } => {}
+        }
+    }
+    total.round() as u32
+}
+
+/// PRD FR-RD-11: word count ÷ configurable WPM (`reading_wpm`, default 230),
+/// rounded *up* so a short article reads "1 min" rather than "0 min" — a
+/// reader seeing "0 min read" would reasonably wonder if the estimate is
+/// broken, not "instant." An empty/wordless document is the one genuine "0
+/// min" case (there is nothing to round up from).
+pub fn reading_minutes(words: u32, wpm: u32) -> u32 {
+    if words == 0 {
+        return 0;
+    }
+    words.div_ceil(wpm.max(1))
 }
 
 /// True for elements whose entire subtree should be dropped: edit-section
@@ -545,12 +982,33 @@ fn collect_inline(node: NodeRef<Node>, style: &SpanStyle, spans: &mut Vec<Span>,
                     });
                     continue;
                 }
+                // PRD FR-RD-7: a math node found inline (the common case —
+                // Parsoid math almost always sits inside running prose)
+                // becomes one Math span and is never descended into: its
+                // children are MathML presentation markup and a fallback
+                // `<img>`, neither of which `collect_inline`'s ordinary tag
+                // handling below should ever see as "text"/"an image block".
+                if is_math_node(el) {
+                    if let Some(math) = extract_math(child) {
+                        spans.push(Span {
+                            text: math.tex.clone(),
+                            style: SpanStyle::Math(math.tex),
+                        });
+                    }
+                    continue;
+                }
                 // Once inside a link, keep treating the whole run as a link
                 // (a bold word inside a link stays a link for our purposes).
-                let child_style = if matches!(style, SpanStyle::Link(_)) {
+                let child_style = if matches!(style, SpanStyle::Link(_) | SpanStyle::RedLink(_)) {
                     style.clone()
                 } else {
                     match tag {
+                        // PRD FR-DL-5: Parsoid's own redlink pre-marking
+                        // (`class="new"`) is the cheapest detection path,
+                        // checked here at parse time — see `SpanStyle::RedLink`.
+                        "a" if has_class(el, "new") => {
+                            SpanStyle::RedLink(el.attr("href").unwrap_or("").to_string())
+                        }
                         "a" => SpanStyle::Link(el.attr("href").unwrap_or("").to_string()),
                         "b" | "strong" => SpanStyle::Bold,
                         "i" | "em" => SpanStyle::Italic,
@@ -1093,6 +1551,23 @@ fn walk_blocks(node: NodeRef<Node>, blocks: &mut Vec<Block>, list_depth: u8, dep
                     caption: None,
                 });
             }
+            // PRD FR-RD-7: a math node encountered directly at block-scanning
+            // level rather than inside a `<p>`'s inline run — Parsoid's usual
+            // shape for a leading-colon display equation (`<dl><dd><span
+            // typeof="mw:Extension/math">...`), reached here via the `_`
+            // wildcard's plain recursion through the intervening `<dl>`/`<dd>`
+            // (neither is block-tag-handled on its own, so this arm is what
+            // actually stops the descent once it reaches the math span
+            // itself — without it, the wildcard would recurse straight into
+            // the math node's MathML/fallback-image internals instead).
+            "span" if is_math_node(el) => {
+                if let Some(math) = extract_math(child) {
+                    blocks.push(Block::Math {
+                        tex: math.tex,
+                        display: math.display,
+                    });
+                }
+            }
             _ => walk_blocks(child, blocks, list_depth, depth + 1),
         }
     }
@@ -1363,6 +1838,9 @@ fn sanitize_document(doc: &mut Document) {
                 }
             }
             Block::Rule => {}
+            Block::Math { tex, .. } => {
+                *tex = sanitize::sanitize_and_cap_multiline(tex, sanitize::MAX_SPAN_CHARS);
+            }
         }
     }
 
@@ -1388,8 +1866,18 @@ fn sanitize_document(doc: &mut Document) {
 fn sanitize_spans(spans: &mut [Span]) {
     for span in spans {
         span.text = sanitize::sanitize_and_cap_multiline(&span.text, sanitize::MAX_SPAN_CHARS);
-        if let SpanStyle::Link(href) = &mut span.style {
-            *href = sanitize::sanitize_and_cap_single_line(href, sanitize::MAX_SPAN_CHARS);
+        match &mut span.style {
+            SpanStyle::Link(href) | SpanStyle::RedLink(href) => {
+                *href = sanitize::sanitize_and_cap_single_line(href, sanitize::MAX_SPAN_CHARS);
+            }
+            // The span's own `text` (sanitized just above) and this payload
+            // started from the same raw TeX; sanitize the copy on the style
+            // too so the two can never diverge into "text sanitized, style
+            // payload not" — see `SpanStyle::Math`'s doc comment.
+            SpanStyle::Math(tex) => {
+                *tex = sanitize::sanitize_and_cap_multiline(tex, sanitize::MAX_SPAN_CHARS);
+            }
+            SpanStyle::Plain | SpanStyle::Bold | SpanStyle::Italic | SpanStyle::Superscript => {}
         }
     }
 }
@@ -1526,6 +2014,15 @@ pub fn render_plain(doc: &Document) -> String {
                     out.push_str(&format!("[image: {}]\n", item.caption));
                 }
                 out.push('\n');
+            }
+            // PRD FR-RD-7: `--dump` shows the raw TeX plainly — no ⟨⟩
+            // delimiters, no Unicode sup/sub normalization, no escaping.
+            // Those are interactive-rendering choices (`layout.rs`); the
+            // document model's own plain-text form is the source string
+            // untouched, exactly like every other block above.
+            Block::Math { tex, .. } => {
+                out.push_str(tex);
+                out.push_str("\n\n");
             }
         }
     }
@@ -2445,6 +2942,268 @@ mod tests {
         );
     }
 
+    // ---- FR-RD-7: math passthrough ---------------------------------------
+
+    /// The `alttext` attribute wins over an `<annotation>` child when both
+    /// are present — PRD §6.2 rule 3's "math nodes carry TeX in alttext" is
+    /// this parser's stated precedence (see `extract_math`'s doc comment).
+    #[test]
+    fn math_alttext_wins_over_annotation_when_both_present() {
+        let html = r#"<html><body><p>Energy: <span typeof="mw:Extension/math">
+            <math alttext="E=mc^2"><semantics><mrow></mrow>
+            <annotation encoding="application/x-tex">E = m c^2 (from annotation)</annotation>
+            </semantics></math></span>.</p></body></html>"#;
+        let doc = parse_article_html("Test", html);
+        let math_tex: Vec<&str> = doc
+            .blocks
+            .iter()
+            .flat_map(|b| match b {
+                Block::Paragraph(spans) => spans.as_slice(),
+                _ => &[],
+            })
+            .filter_map(|s| match &s.style {
+                SpanStyle::Math(tex) => Some(tex.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(math_tex, vec!["E=mc^2"]);
+    }
+
+    /// With no `alttext`, the `<annotation encoding="application/x-tex">`
+    /// child is the fallback source.
+    #[test]
+    fn math_falls_back_to_annotation_when_alttext_is_absent() {
+        let html = r#"<html><body><p><span typeof="mw:Extension/math">
+            <math><semantics><mrow></mrow>
+            <annotation encoding="application/x-tex">\alpha + \beta</annotation>
+            </semantics></math></span></p></body></html>"#;
+        let doc = parse_article_html("Test", html);
+        let tex = first_math_tex(&doc);
+        assert_eq!(tex.as_deref(), Some("\\alpha + \\beta"));
+    }
+
+    /// With no `<math>` element at all, the accessible fallback image's own
+    /// `alt` (with its `\displaystyle`/`\textstyle` wrapper stripped) is the
+    /// last resort.
+    #[test]
+    fn math_falls_back_to_the_fallback_image_alt_when_no_math_element_exists() {
+        let html = r#"<html><body><p><span typeof="mw:Extension/math">
+            <img class="mwe-math-fallback-image-inline" alt="{\displaystyle x^2+y^2=z^2}"/>
+            </span></p></body></html>"#;
+        let doc = parse_article_html("Test", html);
+        let tex = first_math_tex(&doc);
+        assert_eq!(tex.as_deref(), Some("x^2+y^2=z^2"));
+    }
+
+    /// A math node with no `alttext`, no usable annotation, and no fallback
+    /// image at all yields nothing — the "missing-tex graceful" case: no
+    /// span is produced, and parsing doesn't panic or invent a placeholder.
+    #[test]
+    fn math_node_with_no_extractable_tex_produces_no_span_and_does_not_panic() {
+        let html = r#"<html><body><p>before <span typeof="mw:Extension/math">
+            <span class="mwe-math-mathml-inline"></span>
+            </span> after</p></body></html>"#;
+        let doc = parse_article_html("Test", html);
+        assert_eq!(
+            first_math_tex(&doc),
+            None,
+            "no math span should exist when nothing extractable was found"
+        );
+        // The surrounding plain text must still have made it through.
+        let flattened: String = doc
+            .blocks
+            .iter()
+            .flat_map(|b| match b {
+                Block::Paragraph(spans) => spans.iter().map(|s| s.text.as_str()).collect(),
+                _ => vec![],
+            })
+            .collect();
+        assert!(flattened.contains("before"));
+        assert!(flattened.contains("after"));
+    }
+
+    /// A display equation (Parsoid's `<dl><dd>`-wrapped shape for a
+    /// leading-colon indented equation, `<math display="block">`) becomes a
+    /// standalone `Block::Math { display: true, .. }`, distinct from inline
+    /// math within running prose.
+    #[test]
+    fn display_math_in_dl_dd_becomes_a_standalone_display_block() {
+        let html = r#"<html><body><p>Intro text.</p>
+            <dl><dd><span typeof="mw:Extension/math">
+                <math display="block" alttext="F = m a"><semantics><mrow></mrow>
+                <annotation encoding="application/x-tex">F = m a</annotation></semantics></math>
+            </span></dd></dl>
+            <p>Trailing text.</p></body></html>"#;
+        let doc = parse_article_html("Test", html);
+        let math_blocks: Vec<(&str, bool)> = doc
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Math { tex, display } => Some((tex.as_str(), *display)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(math_blocks, vec![("F = m a", true)]);
+    }
+
+    /// Helper: the TeX of the first `SpanStyle::Math` span found anywhere in
+    /// the document's paragraph blocks.
+    fn first_math_tex(doc: &Document) -> Option<String> {
+        doc.blocks.iter().find_map(|b| match b {
+            Block::Paragraph(spans) => spans.iter().find_map(|s| match &s.style {
+                SpanStyle::Math(tex) => Some(tex.clone()),
+                _ => None,
+            }),
+            _ => None,
+        })
+    }
+
+    /// FR-RD-7's trivial-case table: superscript/subscript digits and the
+    /// documented punctuation, both bare and brace-grouped.
+    #[test]
+    fn normalize_trivial_math_converts_digit_sup_and_sub() {
+        assert_eq!(normalize_trivial_math("E=mc^2"), "E=mc²");
+        assert_eq!(normalize_trivial_math("x_n"), "xₙ");
+        assert_eq!(normalize_trivial_math("a^{23}"), "a²³");
+        assert_eq!(normalize_trivial_math("a^{-1}"), "a⁻¹");
+        assert_eq!(normalize_trivial_math("H_2O"), "H₂O");
+    }
+
+    /// The 24 lowercase Greek letters plus the uppercase ones LaTeX actually
+    /// defines a macro for; a longer word starting with a valid macro name
+    /// (`\alphabet`) must not partially match `\alpha`.
+    #[test]
+    fn normalize_trivial_math_converts_greek_letters_and_never_partial_matches() {
+        assert_eq!(normalize_trivial_math("\\alpha + \\beta"), "α + β");
+        assert_eq!(normalize_trivial_math("\\Gamma\\Omega"), "ΓΩ");
+        assert_eq!(
+            normalize_trivial_math("\\alphabet"),
+            "\\alphabet",
+            "a longer word must not partially match a shorter macro name"
+        );
+    }
+
+    /// Anything the trivial sup/sub table doesn't cover — a multi-character
+    /// exponent mixing a letter with no superscript glyph — leaves the `^`/
+    /// `_` and its braces exactly as raw TeX passthrough (FR-RD-7 v1.0
+    /// scope). Greek-letter substitution is a separate, independent rule
+    /// (any `\alpha`-style macro anywhere in the string, brace-nested or
+    /// not, is unambiguous on its own), so it still applies *inside* an
+    /// otherwise-non-trivial exponent — `x^{i\pi}`'s braces stay literal
+    /// (no superscript glyph for `i`+`π` together) but `\pi` itself still
+    /// becomes `π`.
+    #[test]
+    fn normalize_trivial_math_leaves_non_trivial_cases_raw() {
+        assert_eq!(normalize_trivial_math("x^{i\\pi}"), "x^{iπ}");
+        assert_eq!(normalize_trivial_math("\\frac{1}{2}"), "\\frac{1}{2}");
+        assert_eq!(normalize_trivial_math("y^{2x}"), "y^{2x}");
+        assert_eq!(
+            normalize_trivial_math("plain text, no math at all"),
+            "plain text, no math at all"
+        );
+    }
+
+    // ---- FR-RD-11: reading time -------------------------------------------
+
+    fn doc_with_paragraph(text: &str) -> Document {
+        parse_article_html("Test", &format!("<html><body><p>{text}</p></body></html>"))
+    }
+
+    #[test]
+    fn word_count_counts_whitespace_split_latin_words() {
+        let doc = doc_with_paragraph("The quick brown fox jumps over the lazy dog");
+        assert_eq!(word_count(&doc), 9);
+    }
+
+    #[test]
+    fn word_count_is_zero_for_an_empty_document() {
+        let doc = parse_article_html("Test", "<html><body></body></html>");
+        assert_eq!(word_count(&doc), 0);
+        assert_eq!(reading_minutes(0, 230), 0);
+    }
+
+    /// CJK text has no space separators; each CJK character is weighted as
+    /// `1 / CJK_CHARS_PER_WORD` of a word rather than the whole run counting
+    /// as a single whitespace-split "word".
+    #[test]
+    fn word_count_weights_cjk_characters_by_the_documented_heuristic() {
+        let ten_chars = "計算機科学は情報の学問"; // 11 CJK characters
+        let doc = doc_with_paragraph(ten_chars);
+        let chars = ten_chars.chars().count() as f64;
+        let expected = (chars / CJK_CHARS_PER_WORD).round() as u32;
+        assert_eq!(word_count(&doc), expected);
+        assert!(
+            word_count(&doc) > 0,
+            "a dense CJK paragraph must not read as 0 words"
+        );
+    }
+
+    /// Table/infobox/code content is excluded from the word count — a
+    /// table-heavy stub with almost no prose shouldn't inflate "N min read"
+    /// with cell text a reader skims rather than reads linearly.
+    #[test]
+    fn word_count_skips_table_infobox_and_code_blocks() {
+        let html = r#"<html><body>
+            <p>one two three</p>
+            <table class="infobox"><tbody><tr><th>Label</th><td>four five six seven</td></tr></tbody></table>
+            <table class="wikitable"><tbody><tr><td>eight nine ten eleven</td></tr></tbody></table>
+            <pre>twelve thirteen fourteen</pre>
+        </body></html>"#;
+        let doc = parse_article_html("Test", html);
+        assert!(
+            doc.blocks
+                .iter()
+                .any(|b| matches!(b, Block::Infobox(_) | Block::Table(_) | Block::Code(_))),
+            "fixture must actually produce the excluded block kinds"
+        );
+        assert_eq!(
+            word_count(&doc),
+            3,
+            "only the paragraph's 3 words should count"
+        );
+    }
+
+    /// FR-RD-11's WPM division, rounded up so a short article never reads
+    /// "0 min" (only a truly empty document does).
+    #[test]
+    fn reading_minutes_rounds_up_and_respects_wpm() {
+        assert_eq!(reading_minutes(230, 230), 1);
+        assert_eq!(reading_minutes(231, 230), 2, "one word over rounds up");
+        assert_eq!(reading_minutes(460, 230), 2);
+        assert_eq!(reading_minutes(100, 100), 1);
+        assert_eq!(
+            reading_minutes(50, 100),
+            1,
+            "any nonzero count rounds up to at least 1"
+        );
+        assert_eq!(reading_minutes(1000, 500), 2);
+    }
+
+    // ---- FR-DL-5: redlink detection (parse-time signal) -------------------
+
+    /// Parsoid's own `class="new"` pre-marking is the cheapest redlink
+    /// signal, recognized at parse time with no network involved.
+    #[test]
+    fn class_new_link_parses_as_a_redlink_and_ordinary_link_does_not() {
+        let html = concat!(
+            "<html><body><p>See <a href=\"./Nonexistent_Concept_X\" class=\"new\">",
+            "the concept</a> and <a href=\"./Computer_science\">computer science</a>.</p>",
+            "</body></html>"
+        );
+        let doc = parse_article_html("Test", html);
+        let links = collect_links(&doc);
+        assert_eq!(links.len(), 2);
+        assert!(links[0].redlink, "class=\"new\" link must be a redlink");
+        assert_eq!(
+            links[0].internal_title.as_deref(),
+            Some("Nonexistent Concept X")
+        );
+        assert!(
+            !links[1].redlink,
+            "an ordinary link must not be marked a redlink"
+        );
+    }
+
     /// PRD §9's assertion, checked against every string a `Document`
     /// exposes: no C0 control other than `\n`/`\t`, no DEL, no C1, no bidi
     /// override/isolate character.
@@ -2476,8 +3235,17 @@ mod tests {
                 | Block::Blockquote(spans) => {
                     for span in spans {
                         assert_terminal_safe(&span.text, &format!("{context} (span)"));
-                        if let SpanStyle::Link(href) = &span.style {
-                            assert_terminal_safe(href, &format!("{context} (href)"));
+                        match &span.style {
+                            SpanStyle::Link(href) | SpanStyle::RedLink(href) => {
+                                assert_terminal_safe(href, &format!("{context} (href)"));
+                            }
+                            SpanStyle::Math(tex) => {
+                                assert_terminal_safe(tex, &format!("{context} (math)"));
+                            }
+                            SpanStyle::Plain
+                            | SpanStyle::Bold
+                            | SpanStyle::Italic
+                            | SpanStyle::Superscript => {}
                         }
                     }
                 }
@@ -2505,6 +3273,7 @@ mod tests {
                     }
                 }
                 Block::Rule => {}
+                Block::Math { tex, .. } => assert_terminal_safe(tex, &format!("{context} (math)")),
             }
         }
         for citation in &doc.citations {

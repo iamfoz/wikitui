@@ -46,6 +46,24 @@ Random article / quality fixtures (PRD FR-SR-5 / FR-DL-3):
   `RANDOM_TITLES`' six entries reach GA+, so any 10-title `:random good`
   batch (`RANDOM_TITLES`' rotation period is 6) is guaranteed to include one.
 
+Math and redlink fixtures (PRD FR-RD-7, FR-DL-5):
+
+- `Math_Showcase` — two inline math nodes (one with a superscript, `E=mc^2`;
+  one with two Greek-letter macros, `\alpha + \beta = \gamma`), both with
+  `alttext` on the `<math>` element, plus a `<dl><dd>`-wrapped display
+  equation (`display="block"`, no `alttext` — exercising the `annotation`
+  fallback tier). Real Parsoid math markup is far more verbose (a full MathML
+  presentation tree, an accessible fallback `<img>`); this fixture keeps only
+  what `doc::extract_math` actually reads.
+- `Redlink_Showcase` — one link Parsoid pre-marks `class="new"` (the cheap,
+  parse-time redlink signal), one link that looks ordinary in the HTML but
+  isn't fetchable, and one real link. `GET /w/api.php?action=query&
+  generator=links&prop=info&titles=` (`PAGE_LINKS`, keyed by source title
+  like `LINK_PAGEVIEWS` below) is the batched check that catches the second
+  one: any linked title that isn't a real `PAGES` key comes back
+  `"missing": true`, the same technique a real wiki's `generator=links&
+  prop=info` responds with.
+
 Two-layer cache / stale-while-revalidate fixtures (PRD FR-OFF-1/2):
 
 - `GET /w/rest.php/v1/page/{title}/html` also sends an `ETag: W/"{revid}/mock-etag"`

@@ -145,7 +145,7 @@ pub enum SaveSpec {
 /// parse-time constant so `command` doesn't depend on the render module.
 const SAVE_EXPORT_FORMATS: [&str; 3] = ["md", "txt", "html"];
 
-pub const USAGE: &str = "commands: open <title>, lang [<code>], theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, prefetch-log, start, today, random [good], related, set theme=<name>|images=on|off|prefetch=on|off|measure=N|ambiguous_width=1|2, config reload, help, quit";
+pub const USAGE: &str = "commands: open <title>, lang [<code>], theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, prefetch-log, start, today, random [good], related, set theme=<name>|images=on|off|prefetch=on|off|measure=N|ambiguous_width=1|2|reading_wpm=N, config reload, help, quit";
 
 pub fn parse(input: &str) -> Result<Command, String> {
     let input = input.trim();
@@ -431,8 +431,27 @@ pub fn parse(input: &str) -> Result<Command, String> {
                         Err(format!("ambiguous_width must be 1 or 2 (got {value:?})"))
                     }
                 }
+                // PRD FR-RD-11: reading-time WPM divisor, same
+                // config-default-plus-runtime-override split as `measure`.
+                "reading_wpm" => match value.parse::<u32>() {
+                    Ok(n)
+                        if (crate::config::READING_WPM_MIN..=crate::config::READING_WPM_MAX)
+                            .contains(&n) =>
+                    {
+                        Ok(Command::Set {
+                            key: "reading_wpm".to_string(),
+                            value: n.to_string(),
+                        })
+                    }
+                    Ok(n) => Err(format!(
+                        "reading_wpm must be {}..={} (got {n})",
+                        crate::config::READING_WPM_MIN,
+                        crate::config::READING_WPM_MAX
+                    )),
+                    Err(_) => Err(format!("reading_wpm must be an integer (got {value:?})")),
+                },
                 other => Err(format!(
-                    "unknown :set key {other:?} — try: theme, images=on|off, prefetch=on|off, measure=N, ambiguous_width=1|2"
+                    "unknown :set key {other:?} — try: theme, images=on|off, prefetch=on|off, measure=N, ambiguous_width=1|2, reading_wpm=N"
                 )),
             }
         }
@@ -680,6 +699,25 @@ mod tests {
             })
         );
         assert!(parse("set ambiguous_width=3").is_err());
+    }
+
+    /// PRD FR-RD-11: `:set reading_wpm=N`, same bounds-shared-with-the-config-
+    /// loader pattern as `measure`.
+    #[test]
+    fn set_reading_wpm_parses_and_validates() {
+        assert_eq!(
+            parse("set reading_wpm=300"),
+            Ok(Command::Set {
+                key: "reading_wpm".to_string(),
+                value: "300".to_string()
+            })
+        );
+        assert!(parse("set reading_wpm=1").is_err(), "below the floor");
+        assert!(
+            parse("set reading_wpm=999999").is_err(),
+            "above the ceiling"
+        );
+        assert!(parse("set reading_wpm=fast").is_err(), "non-integer");
     }
 
     #[test]
