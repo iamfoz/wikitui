@@ -156,6 +156,18 @@ struct RelatedOutcome {
     result: std::result::Result<Vec<SearchResult>, String>,
 }
 
+/// One completed (or failed) langlinks fetch (PRD FR-ML-1/2), delivered off
+/// the event loop exactly like `RelatedOutcome` — see `fire_langlinks`.
+/// Tagged with the *source* article's `(lang, title)` so a result for an
+/// article the reader has since navigated away from still lands in the
+/// session cache (`App::deliver_langlinks`) without touching whatever is on
+/// screen now.
+struct LangLinksOutcome {
+    lang: String,
+    title: String,
+    result: std::result::Result<Vec<api::LangLink>, String>,
+}
+
 enum RevalidationResult {
     /// The bare-metadata call reported the same revid already cached:
     /// nothing to fetch, just extend the TTL window silently.
@@ -307,6 +319,7 @@ async fn main() -> Result<()> {
         &page_cache,
         cli,
         resolved.lang.value,
+        resolved.languages.value.clone(),
         theme,
         no_color,
         accessible,
@@ -1477,6 +1490,7 @@ async fn run(
     cache: &PageCache,
     cli: Cli,
     lang: String,
+    languages: Vec<String>,
     theme: Theme,
     no_color: bool,
     accessible: bool,
@@ -1494,6 +1508,7 @@ async fn run(
     reload_flag: Arc<AtomicBool>,
 ) -> Result<()> {
     let mut app = App::new(lang, theme, no_color);
+    app.languages = languages;
     app.accessible = accessible;
     app.measure = measure;
     app.ambiguous_wide = ambiguous_wide;
@@ -1536,6 +1551,10 @@ async fn run(
     // PRD FR-SR-6: lazy `morelike:` fetches for the Related panel — never
     // blocking, same idiom as `typeahead_tx`/`image_tx` above.
     let (related_tx, mut related_rx) = mpsc::unbounded_channel::<RelatedOutcome>();
+    // PRD FR-ML-1/2: lazy langlinks fetches (the picker, and the automatic
+    // "available in your preferred language" check after every fresh open)
+    // — same idiom again.
+    let (langlinks_tx, mut langlinks_rx) = mpsc::unbounded_channel::<LangLinksOutcome>();
 
     // PRD §5.8 / NF-NET-1: the one background substrate. A single serial
     // worker drains its priority queue; revalidation (FR-OFF-2) is migrated
@@ -1564,7 +1583,15 @@ async fn run(
         app.search_input = query;
         run_search(client, &mut app).await;
     } else if let Some(title) = cli.title {
-        open_title(client, cache, &mut app, &title, &revalidate_tx).await;
+        open_title(
+            client,
+            cache,
+            &mut app,
+            &title,
+            &revalidate_tx,
+            &langlinks_tx,
+        )
+        .await;
     } else if app.startpage_config == startpage::StartPageConfig::Resume {
         // PRD FR-DL-1's `startpage = resume`: proper session restore is a
         // later chunk (B18) — until then this resolves to the single
@@ -1577,7 +1604,15 @@ async fn run(
         // explanation.
         if let Some(visit) = app.history.recent(1).into_iter().next() {
             app.lang = visit.lang.clone();
-            open_title(client, cache, &mut app, &visit.title, &revalidate_tx).await;
+            open_title(
+                client,
+                cache,
+                &mut app,
+                &visit.title,
+                &revalidate_tx,
+                &langlinks_tx,
+            )
+            .await;
         }
     }
 
@@ -1665,6 +1700,15 @@ async fn run(
             // completes and redraws without a keypress, mirroring the other
             // lazy-fetch cases above.
             || app.related_loading
+            // PRD FR-ML-1/2: same for any in-flight langlinks fetch — the
+            // picker's own, and the automatic one fired after every fresh
+            // open. Both must gate this condition: without it, the
+            // automatic fetch (which powers the preferred-language hint,
+            // not just the picker) would only ever surface on the reader's
+            // *next* keystroke, since nothing else here is guaranteed to be
+            // true right after opening a plain article with no other
+            // background activity.
+            || app.pending_langlinks > 0
         {
             let poll_interval = if app.mode == Mode::Search {
                 TYPEAHEAD_POLL
@@ -1685,6 +1729,7 @@ async fn run(
                     &open_tx,
                     &save_tx,
                     &related_tx,
+                    &langlinks_tx,
                     terminal,
                 )
                 .await;
@@ -1744,10 +1789,21 @@ async fn run(
                     &open_tx,
                     &save_tx,
                     &related_tx,
+                    &langlinks_tx,
                     terminal,
                 )
                 .await;
             }
+        }
+
+        // PRD FR-ML-1/2: drained every iteration (not only inside the
+        // scoped-poll branch above) — harmless when nothing is pending
+        // (`try_recv` returns immediately) and means a result is picked up
+        // the moment it lands rather than waiting for the next full pass
+        // through the scoped-poll branch specifically.
+        while let Ok(outcome) = langlinks_rx.try_recv() {
+            app.pending_langlinks = app.pending_langlinks.saturating_sub(1);
+            app.deliver_langlinks(outcome.lang, outcome.title, outcome.result);
         }
 
         if app.should_quit {
@@ -1831,6 +1887,110 @@ fn open_related(app: &mut App, client: &WikiClient, tx: &UnboundedSender<Related
     }
 }
 
+/// Spawns the `prop=langlinks` fetch (PRD FR-ML-1/2) so neither the picker
+/// nor the automatic preferred-language check ever blocks the event loop —
+/// mirrors `fire_related`'s pattern exactly, down to the `(lang, title)`
+/// tag the result carries back so a slow response for an article the reader
+/// has since left still lands in the session cache.
+fn fire_langlinks(
+    client: &WikiClient,
+    lang: &str,
+    title: &str,
+    tx: &UnboundedSender<LangLinksOutcome>,
+) {
+    let lang = lang.to_string();
+    let title = title.to_string();
+    let client = client.clone();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let result = client
+            .fetch_langlinks(&lang, &title)
+            .await
+            .map_err(|e| e.to_string());
+        let _ = tx.send(LangLinksOutcome {
+            lang,
+            title,
+            result,
+        });
+    });
+}
+
+/// `:lang` (bare, PRD FR-ML-1): opens the picker, firing the langlinks fetch
+/// only when `App::open_lang_picker` says the session cache doesn't already
+/// have this article's editions — mirrors `open_related` exactly.
+fn open_lang_picker(app: &mut App, client: &WikiClient, tx: &UnboundedSender<LangLinksOutcome>) {
+    if app.open_lang_picker() {
+        let tab = app.active_tab();
+        let lang = tab.lang.clone();
+        let title = tab
+            .doc
+            .as_ref()
+            .expect("open_lang_picker guarantees a document")
+            .title
+            .clone();
+        fire_langlinks(client, &lang, &title, tx);
+        app.pending_langlinks += 1;
+    }
+}
+
+/// Enter on a language-picker row, and `:lang <code>`'s switch branch (PRD
+/// FR-ML-1): opens `title` in `lang` as a fresh navigation in the active
+/// tab — pushes the tab's current article onto its back stack (so `H`
+/// returns), the same as following any other link. Delegates to
+/// `open_title` rather than duplicating its fetch/install logic; the
+/// fallback chain that function also runs is harmless here (it only ever
+/// engages if `lang` itself turns up nothing, in which case falling back is
+/// still better than an error card).
+async fn switch_to_langlink(
+    client: &WikiClient,
+    cache: &PageCache,
+    app: &mut App,
+    lang: &str,
+    title: &str,
+    revalidate_tx: &UnboundedSender<RevalidationOutcome>,
+    langlinks_tx: &UnboundedSender<LangLinksOutcome>,
+) {
+    app.lang = lang.to_string();
+    open_title(client, cache, app, title, revalidate_tx, langlinks_tx).await;
+}
+
+/// `:lang <code>`'s disambiguation (PRD FR-ML-2): if the active tab's
+/// article has a *cached* langlink for `code`, this is a language switch —
+/// delegates to `switch_to_langlink`. Otherwise (the langlinks haven't
+/// loaded yet, a network failure cached an empty list, or this article
+/// simply has no edition in `code`) this keeps `:lang`'s original meaning:
+/// set `code` as the default for new searches/opens. Both branches notify,
+/// so which one applied is never ambiguous to the reader.
+async fn set_or_switch_lang(
+    client: &WikiClient,
+    cache: &PageCache,
+    app: &mut App,
+    code: String,
+    revalidate_tx: &UnboundedSender<RevalidationOutcome>,
+    langlinks_tx: &UnboundedSender<LangLinksOutcome>,
+) {
+    match app.lang_link_title_for_code(&code) {
+        Some(title) => {
+            switch_to_langlink(
+                client,
+                cache,
+                app,
+                &code,
+                &title,
+                revalidate_tx,
+                langlinks_tx,
+            )
+            .await
+        }
+        None => {
+            app.lang = code.clone();
+            app.notice = Some(format!(
+                "Language: {code} — searches and new articles use {code}.wikipedia.org"
+            ));
+        }
+    }
+}
+
 /// `gr` / `:random` (PRD FR-SR-5): opens a random main-namespace article.
 /// A single quick round trip, so — like `run_search`/`open_title` — this
 /// blocks the event loop for its duration rather than going through the
@@ -1841,13 +2001,14 @@ async fn open_random_article(
     cache: &PageCache,
     app: &mut App,
     revalidate_tx: &UnboundedSender<RevalidationOutcome>,
+    langlinks_tx: &UnboundedSender<LangLinksOutcome>,
 ) {
     app.loading = true;
     let lang = app.lang.clone();
     match client.random_titles(&lang, 1).await {
         Ok(mut titles) => match titles.pop() {
             Some(title) => {
-                open_title(client, cache, app, &title, revalidate_tx).await;
+                open_title(client, cache, app, &title, revalidate_tx, langlinks_tx).await;
                 return;
             }
             None => app.status = "Random article: the wiki returned nothing".to_string(),
@@ -1867,16 +2028,17 @@ async fn open_random_good_article(
     cache: &PageCache,
     app: &mut App,
     revalidate_tx: &UnboundedSender<RevalidationOutcome>,
+    langlinks_tx: &UnboundedSender<LangLinksOutcome>,
 ) {
     app.loading = true;
     let lang = app.lang.clone();
     match random::pick_random_good(client, &lang).await {
         Ok(random::RandomGood::Found(title)) => {
-            open_title(client, cache, app, &title, revalidate_tx).await;
+            open_title(client, cache, app, &title, revalidate_tx, langlinks_tx).await;
             return;
         }
         Ok(random::RandomGood::Fallback(title)) => {
-            open_title(client, cache, app, &title, revalidate_tx).await;
+            open_title(client, cache, app, &title, revalidate_tx, langlinks_tx).await;
             app.notice = Some(
                 "no good article found in this batch — opened a random article instead".to_string(),
             );
@@ -1983,6 +2145,10 @@ fn apply_config_reload(app: &mut App) {
     app.measure = resolved.measure.value;
     app.ambiguous_wide = resolved.ambiguous_wide.value;
     app.readlater_auto_dequeue = resolved.readlater_auto_dequeue.value;
+    // PRD FR-ML-2: the fallback chain and picker-pinning both read this
+    // live, like measure/ambiguous_wide above — no restart needed to pick
+    // up an edited `languages = [...]`.
+    app.languages = resolved.languages.value;
     // PRD FR-TH-7: a reload can flip the `images` config override; a `:set`
     // made this session is a per-run override that the config file's value
     // does not silently undo, so only take the file's value when it set one.
@@ -2010,77 +2176,107 @@ fn apply_config_reload(app: &mut App) {
 /// CLI title, search results, and following a link. When the fetch served a
 /// stale-but-within-backstop cache hit, spawns the PRD FR-OFF-2 background
 /// revalidation `revalidate_tx` will eventually report back.
+///
+/// PRD FR-ML-2's fallback chain: tries `app.lang` first — whatever brought
+/// us here, an explicit `lang:Title`/`--lang` override, a bookmark's own
+/// recorded language, or just the session default — then any other
+/// configured `languages` in their order, each only if the one before it
+/// came back with nothing (a network error or a missing article). A reader
+/// who never set `languages` gets exactly one attempt, identical to
+/// pre-FR-ML-2 behavior. On success `app.lang` becomes whichever edition
+/// actually resolved, so the tab/history/status all reflect it truthfully
+/// rather than the language that was originally asked for.
+///
+/// PRD FR-ML-1/2: once the article installs, fires a langlinks fetch for it
+/// off the event loop (`fire_langlinks`) — never blocking this navigation —
+/// so the `:lang` picker is warm and the "available in your preferred
+/// language" hint can surface without the reader pressing anything first.
 async fn open_title(
     client: &WikiClient,
     cache: &PageCache,
     app: &mut App,
     title: &str,
     revalidate_tx: &UnboundedSender<RevalidationOutcome>,
+    langlinks_tx: &UnboundedSender<LangLinksOutcome>,
 ) {
     app.loading = true;
-    let lang = app.lang.clone();
-    // NF-NET-1: hold the foreground gate across this interactive fetch so the
-    // background worker yields — a prefetch already draining never delays the
-    // article the reader is waiting on.
-    let outcome = {
-        let _fg = app
-            .prefetch
-            .as_ref()
-            .map(netqueue::SubstrateHandle::foreground_guard);
-        fetch_page(client, cache, &lang, title).await
-    };
-    match outcome {
-        Ok(outcome) => {
-            // PRD §5.7: a pinned saved copy is the intended offline artifact,
-            // so it takes precedence over a stale cache serve — but never over
-            // a live/fresh copy, which is genuinely newer.
-            if matches!(outcome.source, PageSource::Offline { .. })
-                && app.saved.is_saved(&lang, title)
-            {
+    let chain = app::fallback_chain(&app.lang, &app.languages);
+
+    let mut last_err = None;
+    for lang in &chain {
+        // NF-NET-1: hold the foreground gate across this interactive fetch
+        // so the background worker yields — a prefetch already draining
+        // never delays the article the reader is waiting on.
+        let outcome = {
+            let _fg = app
+                .prefetch
+                .as_ref()
+                .map(netqueue::SubstrateHandle::foreground_guard);
+            fetch_page(client, cache, lang, title).await
+        };
+        match outcome {
+            Ok(outcome) => {
+                // PRD §5.7: a pinned saved copy is the intended offline
+                // artifact, so it takes precedence over a stale cache serve
+                // — but never over a live/fresh copy, which is genuinely
+                // newer.
+                if matches!(outcome.source, PageSource::Offline { .. })
+                    && app.saved.is_saved(lang, title)
+                {
+                    app.loading = false;
+                    open_saved(app, lang, title);
+                    return;
+                }
+                let document = doc::parse_article_html(title, &outcome.html);
+                app.lang = lang.clone();
+                {
+                    let tab = app.active_tab_mut();
+                    tab.page_source = outcome.source;
+                    tab.current_revid = outcome.revid;
+                }
+                app.open_document(document);
+                if let Some(cached_revid) = outcome.revalidate {
+                    let tab_id = app.active_tab().id;
+                    if fire_revalidation(
+                        app,
+                        client,
+                        tab_id,
+                        lang.clone(),
+                        title.to_string(),
+                        cached_revid,
+                        revalidate_tx,
+                    ) {
+                        app.pending_revalidations += 1;
+                    }
+                }
+                // PRD FR-PF-1: with the article shown, rank its links and
+                // prefetch the top-N bodies into L2 (gated on the kill
+                // switch + incognito).
+                schedule_link_prefetch(app);
+                fire_langlinks(client, lang, title, langlinks_tx);
+                app.pending_langlinks += 1;
                 app.loading = false;
-                open_saved(app, &lang, title);
                 return;
             }
-            let document = doc::parse_article_html(title, &outcome.html);
-            {
-                let tab = app.active_tab_mut();
-                tab.page_source = outcome.source;
-                tab.current_revid = outcome.revid;
-            }
-            app.open_document(document);
-            if let Some(cached_revid) = outcome.revalidate {
-                let tab_id = app.active_tab().id;
-                if fire_revalidation(
-                    app,
-                    client,
-                    tab_id,
-                    lang,
-                    title.to_string(),
-                    cached_revid,
-                    revalidate_tx,
-                ) {
-                    app.pending_revalidations += 1;
-                }
-            }
-            // PRD FR-PF-1: with the article shown, rank its links and prefetch
-            // the top-N bodies into L2 (gated on the kill switch + incognito).
-            schedule_link_prefetch(app);
-        }
-        Err(e) => {
-            // §7's "Offline, uncached link": the network failed and nothing is
-            // cached. If the page is pinned, serve that (▣); otherwise offer
-            // the queue-for-fetch / search-saved card (FR-OFF-6).
-            app.loading = false;
-            if app.saved.is_saved(&lang, title) {
-                open_saved(app, &lang, title);
-            } else {
-                app.status = format!("Error: {e}");
-                app.show_offline_card(lang, title.to_string());
-            }
-            return;
+            Err(e) => last_err = Some(e),
         }
     }
+    // Every language in the chain came back with nothing.
     app.loading = false;
+    let lang = chain.first().cloned().unwrap_or_else(|| app.lang.clone());
+    if app.saved.is_saved(&lang, title) {
+        open_saved(app, &lang, title);
+    } else {
+        // §7's "Offline, uncached link": the network failed and nothing is
+        // cached, in every language tried. Offer the queue-for-fetch /
+        // search-saved card (FR-OFF-6) for the chain's first (primary)
+        // language, same as the pre-fallback-chain error path.
+        app.status = format!(
+            "Error: {}",
+            last_err.expect("the chain always has at least one entry")
+        );
+        app.show_offline_card(lang, title.to_string());
+    }
 }
 
 /// Fetch and install a back/forward (or `gb`-jump) history entry into the
@@ -2151,6 +2347,7 @@ async fn handle_key(
     open_tx: &UnboundedSender<TabLoadOutcome>,
     save_tx: &UnboundedSender<SaveOutcome>,
     related_tx: &UnboundedSender<RelatedOutcome>,
+    langlinks_tx: &UnboundedSender<LangLinksOutcome>,
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
 ) {
     // `Q`'s one-keypress quit confirmation (PRD Appendix B) is intercepted
@@ -2223,7 +2420,7 @@ async fn handle_key(
                     let title = suggestion.title;
                     app.typeahead.clear();
                     app.search_debounce_at = None;
-                    open_title(client, cache, app, &title, revalidate_tx).await;
+                    open_title(client, cache, app, &title, revalidate_tx, langlinks_tx).await;
                 } else {
                     app.status = "No suggestion selected — Tab searches full text".to_string();
                 }
@@ -2274,8 +2471,17 @@ async fn handle_key(
                 app.mode = Mode::Reading;
                 match command::parse(&input) {
                     Ok(cmd) => {
-                        execute_command(client, cache, app, cmd, revalidate_tx, save_tx, related_tx)
-                            .await
+                        execute_command(
+                            client,
+                            cache,
+                            app,
+                            cmd,
+                            revalidate_tx,
+                            save_tx,
+                            related_tx,
+                            langlinks_tx,
+                        )
+                        .await
                     }
                     Err(message) => app.notice = Some(message),
                 }
@@ -2322,7 +2528,8 @@ async fn handle_key(
                     app.exit_hint_mode();
                     match action {
                         Some(app::HintFollowAction::Foreground(title)) => {
-                            open_title(client, cache, app, &title, revalidate_tx).await;
+                            open_title(client, cache, app, &title, revalidate_tx, langlinks_tx)
+                                .await;
                         }
                         Some(app::HintFollowAction::Background(title)) => {
                             let lang = app.lang.clone();
@@ -2378,7 +2585,15 @@ async fn handle_key(
             }
             KeyCode::Enter => {
                 if let Some(result) = app.results.get(app.selected_result).cloned() {
-                    open_title(client, cache, app, &result.title, revalidate_tx).await;
+                    open_title(
+                        client,
+                        cache,
+                        app,
+                        &result.title,
+                        revalidate_tx,
+                        langlinks_tx,
+                    )
+                    .await;
                 } else if let Some(suggestion) = app.search_suggestion.clone() {
                     // PRD FR-SR-4 / §7's zero-results row: "Did you mean X?
                     // (Enter to search)" — re-runs the search with the
@@ -2401,12 +2616,59 @@ async fn handle_key(
             KeyCode::Char('k') | KeyCode::Up => app.related_move(-1),
             KeyCode::Enter => {
                 if let Some(title) = app.related_open_target() {
-                    open_title(client, cache, app, &title, revalidate_tx).await;
+                    open_title(client, cache, app, &title, revalidate_tx, langlinks_tx).await;
                 }
             }
             KeyCode::Char('?') => {
                 app.prior_mode = app.mode;
                 app.mode = Mode::Help;
+            }
+            _ => {}
+        },
+        // PRD FR-ML-1's language switcher: a selectable list of the current
+        // article's langlinks, same j/k/Enter/Esc grammar as every other
+        // picker in this match; `/` enters the live fuzzy filter.
+        Mode::LangPicker => match code {
+            KeyCode::Esc => app.close_lang_picker(),
+            KeyCode::Char('j') | KeyCode::Down => app.cycle_lang(true),
+            KeyCode::Char('k') | KeyCode::Up => app.cycle_lang(false),
+            KeyCode::Char('/') => app.mode = Mode::LangFilter,
+            KeyCode::Enter => {
+                if let Some((lang, title)) = app.lang_picker_target() {
+                    switch_to_langlink(
+                        client,
+                        cache,
+                        app,
+                        &lang,
+                        &title,
+                        revalidate_tx,
+                        langlinks_tx,
+                    )
+                    .await;
+                }
+            }
+            KeyCode::Char('?') => {
+                app.prior_mode = app.mode;
+                app.mode = Mode::Help;
+            }
+            _ => {}
+        },
+        // The picker's `/` filter (PRD FR-ML-1): every keystroke narrows the
+        // live row list the draw already reads from `app.lang_filter_input`;
+        // Enter/Esc both just return to navigating the (already-filtered)
+        // picker — mirrors `Mode::BookmarkFilter`.
+        Mode::LangFilter => match code {
+            KeyCode::Esc | KeyCode::Enter => {
+                app.mode = Mode::LangPicker;
+                app.selected_lang = 0;
+            }
+            KeyCode::Backspace => {
+                app.lang_filter_input.pop();
+                app.selected_lang = 0;
+            }
+            KeyCode::Char(c) => {
+                app.lang_filter_input.push(c);
+                app.selected_lang = 0;
             }
             _ => {}
         },
@@ -2501,7 +2763,15 @@ async fn handle_key(
             KeyCode::Enter => {
                 if let Some(bookmark) = app.selected_bookmark_entry().cloned() {
                     app.lang = bookmark.lang.clone();
-                    open_title(client, cache, app, &bookmark.title, revalidate_tx).await;
+                    open_title(
+                        client,
+                        cache,
+                        app,
+                        &bookmark.title,
+                        revalidate_tx,
+                        langlinks_tx,
+                    )
+                    .await;
                 }
             }
             KeyCode::Char('?') => {
@@ -2553,7 +2823,15 @@ async fn handle_key(
             KeyCode::Enter => {
                 if let Some(entry) = app.take_selected_readlater() {
                     app.lang = entry.lang.clone();
-                    open_title(client, cache, app, &entry.title, revalidate_tx).await;
+                    open_title(
+                        client,
+                        cache,
+                        app,
+                        &entry.title,
+                        revalidate_tx,
+                        langlinks_tx,
+                    )
+                    .await;
                 }
             }
             KeyCode::Char('?') => {
@@ -2579,7 +2857,15 @@ async fn handle_key(
                     .cloned()
                 {
                     app.lang = visit.lang.clone();
-                    open_title(client, cache, app, &visit.title, revalidate_tx).await;
+                    open_title(
+                        client,
+                        cache,
+                        app,
+                        &visit.title,
+                        revalidate_tx,
+                        langlinks_tx,
+                    )
+                    .await;
                 }
             }
             KeyCode::Char('?') => {
@@ -2652,7 +2938,7 @@ async fn handle_key(
             KeyCode::BackTab | KeyCode::Char('h') | KeyCode::Left => app.otd_prev_tab(),
             KeyCode::Enter => {
                 if let Some(title) = app.otd_open_target() {
-                    open_title(client, cache, app, &title, revalidate_tx).await;
+                    open_title(client, cache, app, &title, revalidate_tx, langlinks_tx).await;
                 } else {
                     app.status = "This entry links no article".to_string();
                 }
@@ -2701,7 +2987,8 @@ async fn handle_key(
                             return;
                         }
                         app::GPrefixAction::Random => {
-                            open_random_article(client, cache, app, revalidate_tx).await;
+                            open_random_article(client, cache, app, revalidate_tx, langlinks_tx)
+                                .await;
                             return;
                         }
                         app::GPrefixAction::Related => {
@@ -2854,7 +3141,8 @@ async fn handle_key(
                             if let Some(lang) = lang {
                                 app.lang = lang;
                             }
-                            open_title(client, cache, app, &title, revalidate_tx).await;
+                            open_title(client, cache, app, &title, revalidate_tx, langlinks_tx)
+                                .await;
                         }
                         None => app.status = "Nothing focused to open".to_string(),
                     }
@@ -2886,7 +3174,8 @@ async fn handle_key(
                     if let Some(link) = link {
                         match link.internal_title {
                             Some(title) => {
-                                open_title(client, cache, app, &title, revalidate_tx).await
+                                open_title(client, cache, app, &title, revalidate_tx, langlinks_tx)
+                                    .await
                             }
                             None => app.status = format!("External link: {}", link.href),
                         }
@@ -3032,6 +3321,7 @@ async fn execute_command(
     revalidate_tx: &UnboundedSender<RevalidationOutcome>,
     save_tx: &UnboundedSender<SaveOutcome>,
     related_tx: &UnboundedSender<RelatedOutcome>,
+    langlinks_tx: &UnboundedSender<LangLinksOutcome>,
 ) {
     use command::{Command, RandomSpec, SaveSpec};
     match cmd {
@@ -3042,14 +3332,15 @@ async fn execute_command(
             if let Some(lang) = target.lang {
                 app.lang = lang;
             }
-            open_title(client, cache, app, &target.title, revalidate_tx).await;
-        }
-        Command::Lang(code) => {
-            app.lang = code;
-            app.notice = Some(format!(
-                "Language: {} — searches and new articles use {}.wikipedia.org",
-                app.lang, app.lang
-            ));
+            open_title(
+                client,
+                cache,
+                app,
+                &target.title,
+                revalidate_tx,
+                langlinks_tx,
+            )
+            .await;
         }
         Command::Theme(name) => {
             if let Some(theme) = Theme::by_name(&name) {
@@ -3117,7 +3408,15 @@ async fn execute_command(
                 if let Some(lang) = target.lang {
                     app.lang = lang;
                 }
-                open_title(client, cache, app, &target.title, revalidate_tx).await;
+                open_title(
+                    client,
+                    cache,
+                    app,
+                    &target.title,
+                    revalidate_tx,
+                    langlinks_tx,
+                )
+                .await;
             } else {
                 app.notice = Some("New tab".to_string());
             }
@@ -3183,13 +3482,18 @@ async fn execute_command(
         Command::Today => fetch_on_this_day(client, app).await,
         // PRD FR-SR-5: same actions as the `gr` keybinding.
         Command::Random(RandomSpec::Any) => {
-            open_random_article(client, cache, app, revalidate_tx).await
+            open_random_article(client, cache, app, revalidate_tx, langlinks_tx).await
         }
         Command::Random(RandomSpec::Good) => {
-            open_random_good_article(client, cache, app, revalidate_tx).await
+            open_random_good_article(client, cache, app, revalidate_tx, langlinks_tx).await
         }
         // PRD FR-SR-6: same action as the `gR` keybinding.
         Command::Related => open_related(app, client, related_tx),
+        // PRD FR-ML-1/2.
+        Command::Lang(None) => open_lang_picker(app, client, langlinks_tx),
+        Command::Lang(Some(code)) => {
+            set_or_switch_lang(client, cache, app, code, revalidate_tx, langlinks_tx).await
+        }
         Command::Quit => app.should_quit = true,
     }
 }

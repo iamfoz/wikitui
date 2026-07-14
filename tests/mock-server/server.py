@@ -248,6 +248,66 @@ PAGES["計算機科学"] = """<html><head><title>計算機科学</title></head><
   <p>計算機科学は、情報と計算の理論的基礎、およびそのコンピュータ上への実装と応用に関する研究分野である。</p>
 </body></html>"""
 
+# PRD FR-ML-1/2 (Appendix A "Langlinks") fixture: `action=query&
+# prop=langlinks&llprop=autonym|langname|url`, keyed by the display title
+# (spaces, matching how `titles=` arrives after this file's usual `_`->` `
+# normalisation). Each entry's own `title` is independently fetchable: ja's
+# is a real, distinct PAGES key (the existing アラン・チューリング CJK
+# fixture); de/fr keep the same spelling as the English title, matching how
+# the real German and French Wikipedias title this article too — fetching
+# them resolves to the en PAGES entry, same as an untranslated interwiki
+# link really would.
+LANGLINKS = {
+    "Alan Turing": [
+        {
+            "lang": "de",
+            "autonym": "Deutsch",
+            "langname": "German",
+            "title": "Alan Turing",
+            "url": "https://de.wikipedia.org/wiki/Alan_Turing",
+        },
+        {
+            "lang": "ja",
+            "autonym": "日本語",
+            "langname": "Japanese",
+            "title": "アラン・チューリング",
+            "url": "https://ja.wikipedia.org/wiki/%E3%82%A2%E3%83%A9%E3%83%B3%E3%83%BB%E3%83%81%E3%83%A5%E3%83%BC%E3%83%AA%E3%83%B3%E3%82%B0",
+        },
+        {
+            "lang": "fr",
+            "autonym": "Français",
+            "langname": "French",
+            "title": "Alan Turing",
+            "url": "https://fr.wikipedia.org/wiki/Alan_Turing",
+        },
+    ],
+}
+
+# PRD FR-ML-2 fallback-chain fixture: pointing WIKITUI_BASE_URL at this mock
+# with a literal `{lang}` path segment (e.g.
+# "http://127.0.0.1:8943/{lang}") makes `_lang_prefix` below see which
+# language a request came in on; titles listed here are simulated as
+# *absent* on that one language edition even though the flat PAGES dict has
+# them — "xx" never has Alan_Turing, so a `languages = ["xx", "en"]`
+# fallback chain must fall through to "en" (api::WikiClient::
+# fetch_article_html / fetch_bare_metadata both 404). A request with no
+# lang segment (every pre-existing fixture path, and every other language)
+# is completely unaffected.
+LANG_MISSING = {
+    "xx": {"Alan_Turing"},
+}
+
+# Path roots this server actually routes on (see do_GET) — never a language
+# code, so a request's first segment is only ever treated as a `{lang}`
+# prefix when it is none of these.
+_NON_LANG_PATH_ROOTS = {"w", "api", "media", "debug"}
+
+
+def _lang_prefix(parts):
+    if len(parts) > 1 and parts[1] and parts[1] not in _NON_LANG_PATH_ROOTS:
+        return parts[1]
+    return None
+
 # Typeahead fixtures (FR-SR-1): title + a Wikidata-style one-line
 # description, matched by case-insensitive prefix. Every title here is also
 # a real key in PAGES, so "Enter opens the suggestion" always resolves to a
@@ -598,6 +658,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 pages.append({"title": t, "pageassessments": assessments})
             self._send_json({"query": {"pages": pages}})
             return
+        # PRD FR-ML-1/2 (Appendix A "Langlinks"): `prop=langlinks&
+        # llprop=autonym|langname|url`, one queried title, its LANGLINKS
+        # entry (or an empty list for a title this fixture has none for —
+        # matching a real unfixtured/stub article, not an error).
+        if action == 'query' and prop == 'langlinks':
+            title = params.get('titles', [''])[0].replace('_', ' ')
+            links = LANGLINKS.get(title, [])
+            self._send_json({"query": {"pages": [{"title": title, "langlinks": links}]}})
+            return
         self.send_response(404)
         self.end_headers()
 
@@ -614,6 +683,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _serve_article(self, parts):
         title = urllib.parse.unquote(parts[-2])
+        lang = _lang_prefix(parts)
+        # PRD FR-ML-2: this one language edition doesn't have this one
+        # title, even though the flat PAGES dict does — see LANG_MISSING.
+        if lang and title in LANG_MISSING.get(lang, ()):
+            self.send_response(404)
+            self.end_headers()
+            return
         html = PAGES.get(title)
         if html is None:
             self.send_response(404)
@@ -640,7 +716,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # within the same terminal frame on loopback-fast localhost.
         time.sleep(0.4)
         title = urllib.parse.unquote(parts[-2])
-        if title not in PAGES:
+        lang = _lang_prefix(parts)
+        if title not in PAGES or (lang and title in LANG_MISSING.get(lang, ())):
             self.send_response(404)
             self.end_headers()
             return

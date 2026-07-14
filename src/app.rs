@@ -114,6 +114,18 @@ pub enum Mode {
     /// reopening the panel for the same article — or switching back to a
     /// tab that already showed it — costs no second request.
     Related,
+    /// `:lang` (bare) — PRD FR-ML-1's language switcher: a fuzzy picker of
+    /// the article on screen's langlinks, preferred languages pinned to the
+    /// top. Enter switches the active tab to that edition (a real
+    /// navigation, pushing history); `/` enters [`Mode::LangFilter`]; Esc
+    /// closes. Fetched lazily and session-cached, same idiom as
+    /// [`Mode::Related`] — see `App::open_lang_picker`.
+    LangPicker,
+    /// The language picker's `/` live filter — mirrors
+    /// [`Mode::BookmarkFilter`]'s split: every keystroke narrows
+    /// `App::lang_filter_input`; Enter/Esc both return to
+    /// [`Mode::LangPicker`] with the filter still applied.
+    LangFilter,
 }
 
 /// Where the currently open article's content came from (PRD FR-OFF-6's
@@ -520,6 +532,48 @@ pub struct App {
     /// spawns it off the event loop and `App::deliver_related` clears this
     /// once the result (or failure) lands.
     pub related_loading: bool,
+
+    // -- Language switcher & fallback chain (PRD FR-ML-1/2) -----------------
+    /// The reader's preferred languages, in configured order (`config
+    /// languages = [...]`) — pins the `:lang` picker's matching rows to the
+    /// top (FR-ML-1) and is the fallback chain `main::open_title` walks when
+    /// a plain-title open's own language turns up nothing (FR-ML-2). Empty
+    /// when unconfigured, in which case both features are simply inert: one
+    /// attempt, nothing pinned, same as before this chunk.
+    pub languages: Vec<String>,
+    /// An article's langlinks, session-cached per `(lang, title)` — the
+    /// *source* article's identity, not the target edition's — mirroring
+    /// `related_cache`'s shape and reasoning: switching tabs, reopening the
+    /// picker, or revisiting the article later are all cache hits. Never
+    /// persisted.
+    pub langlinks_cache: HashMap<(String, String), Vec<crate::api::LangLink>>,
+    /// Selection cursor into `App::lang_picker_rows()`.
+    pub selected_lang: usize,
+    /// The mode `open_lang_picker` was entered from, restored on close.
+    pub lang_prior_mode: Mode,
+    /// The picker's live `/` filter input, matched against autonym, English
+    /// langname, or code (PRD FR-ML-1).
+    pub lang_filter_input: String,
+    /// A langlinks fetch for the picker's current article is in flight,
+    /// mirroring `related_loading`.
+    pub lang_loading: bool,
+    /// How many langlinks fetches are currently in flight — both the
+    /// picker's own (`lang_loading` is the UI-facing subset of this) and
+    /// the automatic one `main::open_title` fires after every fresh open to
+    /// power the preferred-language hint below. Unlike `lang_loading`, this
+    /// counter is what keeps the event loop's scoped-poll path awake (PRD
+    /// FR-ML-2's hint must still land without a keypress) — mirrors
+    /// `pending_revalidations`/`pending_saves` exactly: incremented at each
+    /// fetch's dispatch site in `main.rs`, decremented where its result is
+    /// drained.
+    pub pending_langlinks: u32,
+    /// PRD FR-ML-2's "available in your preferred language" hint: set by
+    /// `refresh_language_hint` whenever fresh langlinks land for whatever is
+    /// currently on screen; `None` when nothing to suggest (no preferred
+    /// languages configured, the article is already in one, or none of its
+    /// langlinks point at one). Rendered as a low-priority status-bar
+    /// suffix — see `ui::draw_status_bar` — never a takeover notice.
+    pub language_hint: Option<String>,
 }
 
 /// A confirmed-and-resolved bulk save (PRD FR-OFF-5): the human label for the
@@ -628,6 +682,14 @@ impl App {
             selected_related: 0,
             related_prior_mode: Mode::Reading,
             related_loading: false,
+            languages: Vec::new(),
+            langlinks_cache: HashMap::new(),
+            selected_lang: 0,
+            lang_prior_mode: Mode::Reading,
+            lang_filter_input: String::new(),
+            lang_loading: false,
+            pending_langlinks: 0,
+            language_hint: None,
         }
     }
 
@@ -789,6 +851,7 @@ impl App {
         self.selected_citation = 0;
         self.mode = Mode::Reading;
         self.layout = None;
+        self.language_hint = None;
         self.status = "Press / to search, ? for help, q to quit".to_string();
     }
 
@@ -846,9 +909,11 @@ impl App {
 
     // -- Related panel (PRD FR-SR-6) -----------------------------------------
 
-    /// The session-cache key for the active tab's article, or `None` when
-    /// no document is open (the panel has nothing to be "related to" then).
-    fn related_key(&self) -> Option<(String, String)> {
+    /// The active tab's `(lang, title)` session-cache key, or `None` when no
+    /// document is open — shared by the Related panel (nothing to be
+    /// "related to" then) and the language picker (nothing to fetch
+    /// langlinks for).
+    fn current_article_key(&self) -> Option<(String, String)> {
         let tab = self.active_tab();
         tab.doc
             .as_ref()
@@ -866,7 +931,7 @@ impl App {
         self.related_prior_mode = self.mode;
         self.mode = Mode::Related;
         self.selected_related = 0;
-        match self.related_key() {
+        match self.current_article_key() {
             None => {
                 self.related_loading = false;
                 self.status = "Open an article first".to_string();
@@ -898,7 +963,7 @@ impl App {
     /// the active tab's article, or empty if nothing has arrived (or
     /// there's no article open at all).
     pub fn related_items(&self) -> &[SearchResult] {
-        match self.related_key() {
+        match self.current_article_key() {
             Some(key) => self
                 .related_cache
                 .get(&key)
@@ -935,7 +1000,7 @@ impl App {
     /// network failure caches an empty list rather than nothing at all, so
     /// a flaky request doesn't get silently retried every time the panel
     /// reopens — the reader sees "no related articles found" once and that
-    /// stands for the rest of the session (mirroring how `related_key`
+    /// stands for the rest of the session (mirroring how `current_article_key`
     /// treats "no entry yet" as "still loading" only via `related_loading`,
     /// never by falling through to a repeat fetch). Applied even if the
     /// reader has since navigated away from `title` — it's still cached for
@@ -948,8 +1013,8 @@ impl App {
         result: Result<Vec<SearchResult>, String>,
     ) {
         let items = result.unwrap_or_default();
-        let is_current_and_open =
-            self.mode == Mode::Related && self.related_key() == Some((lang.clone(), title.clone()));
+        let is_current_and_open = self.mode == Mode::Related
+            && self.current_article_key() == Some((lang.clone(), title.clone()));
         self.related_cache.insert((lang, title), items);
         if is_current_and_open {
             self.related_loading = false;
@@ -959,6 +1024,156 @@ impl App {
                 "Related articles — Enter: open   Esc: close".to_string()
             };
         }
+    }
+
+    // -- Language switcher & fallback chain (PRD FR-ML-1/2) ------------------
+
+    /// Raw cached langlinks for the active tab's article, unfiltered and in
+    /// the server's own order — empty while still loading, with no article
+    /// open, or genuinely nothing cached yet.
+    pub fn lang_links(&self) -> &[crate::api::LangLink] {
+        match self.current_article_key() {
+            Some(key) => self
+                .langlinks_cache
+                .get(&key)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+            None => &[],
+        }
+    }
+
+    /// `:lang` (bare): opens the picker for the active tab's article.
+    /// Returns whether the caller must fire a fetch (`main::open_lang_picker`
+    /// does so only when this is `true`) — mirrors `open_related`'s split
+    /// exactly: a session-cache hit needs no round trip, and "no article
+    /// open" is `false` too (the picker still opens, showing its own status
+    /// message, rather than refusing the keypress).
+    pub fn open_lang_picker(&mut self) -> bool {
+        self.lang_prior_mode = self.mode;
+        self.mode = Mode::LangPicker;
+        self.selected_lang = 0;
+        self.lang_filter_input.clear();
+        match self.current_article_key() {
+            None => {
+                self.lang_loading = false;
+                self.status = "Open an article first".to_string();
+                false
+            }
+            Some(key) if self.langlinks_cache.contains_key(&key) => {
+                self.lang_loading = false;
+                self.refresh_lang_picker_status();
+                false
+            }
+            Some(_) => {
+                self.lang_loading = true;
+                self.status = "Loading language editions…".to_string();
+                true
+            }
+        }
+    }
+
+    /// Closes the picker, restoring the prior mode — mirrors
+    /// `close_related`.
+    pub fn close_lang_picker(&mut self) {
+        self.mode = self.lang_prior_mode;
+        self.status = match &self.active_tab().doc {
+            Some(doc) => doc.title.clone(),
+            None => "Press / to search, ? for help, q to quit".to_string(),
+        };
+    }
+
+    /// The picker's live row list: cached langlinks, preferred-pinned and
+    /// fuzzy-filtered by `lang_filter_input` — see [`order_and_filter_langlinks`].
+    pub fn lang_picker_rows(&self) -> Vec<crate::api::LangLink> {
+        order_and_filter_langlinks(self.lang_links(), &self.languages, &self.lang_filter_input)
+    }
+
+    /// Moves the picker's selection, wrapping over the filtered row list —
+    /// a no-op with nothing visible.
+    pub fn cycle_lang(&mut self, forward: bool) {
+        let len = self.lang_picker_rows().len();
+        if len == 0 {
+            self.selected_lang = 0;
+            return;
+        }
+        self.selected_lang = if forward {
+            (self.selected_lang + 1) % len
+        } else {
+            (self.selected_lang + len - 1) % len
+        };
+    }
+
+    /// Enter's target: the `(lang code, title in that edition)` to switch
+    /// to, or `None` on an empty/filtered-to-nothing list.
+    pub fn lang_picker_target(&self) -> Option<(String, String)> {
+        self.lang_picker_rows()
+            .get(self.selected_lang)
+            .map(|l| (l.code.clone(), l.title.clone()))
+    }
+
+    /// `:lang <code>`'s disambiguation (PRD FR-ML-2): the translated title
+    /// to switch to when the active tab's article has a *cached* langlink
+    /// for `code`, or `None` when it doesn't — not yet loaded, a failed
+    /// fetch cached an empty list, or genuinely no edition in that
+    /// language. `main::set_or_switch_lang` is the only caller; kept as a
+    /// pure `App` method (rather than inlined there) so the disambiguation
+    /// itself is testable without a network round trip.
+    pub fn lang_link_title_for_code(&self, code: &str) -> Option<String> {
+        self.lang_links()
+            .iter()
+            .find(|l| l.code == code)
+            .map(|l| l.title.clone())
+    }
+
+    /// Recomputes the picker's status line from its current (already
+    /// filtered) row list — called after a fetch lands and after the filter
+    /// text changes, so it never goes stale mid-session.
+    fn refresh_lang_picker_status(&mut self) {
+        self.status = if !self.lang_picker_rows().is_empty() {
+            "j/k: move   /: filter   Enter: switch   Esc: close".to_string()
+        } else if self.lang_filter_input.is_empty() {
+            "No language editions found — Esc to close".to_string()
+        } else {
+            "No matches — Esc to close".to_string()
+        };
+    }
+
+    /// Installs a completed (or failed) langlinks fetch into the session
+    /// cache, keyed by `(lang, title)` of the *source* article — mirrors
+    /// `deliver_related` exactly, including caching an empty list on failure
+    /// so a flaky request isn't silently retried every time the picker
+    /// reopens. Also recomputes the FR-ML-2 "available in your preferred
+    /// language" hint when this is the article currently on screen,
+    /// regardless of whether the picker itself is open — the hint is meant
+    /// to surface passively.
+    pub fn deliver_langlinks(
+        &mut self,
+        lang: String,
+        title: String,
+        result: Result<Vec<crate::api::LangLink>, String>,
+    ) {
+        let links = result.unwrap_or_default();
+        let is_current = self.current_article_key() == Some((lang.clone(), title.clone()));
+        self.langlinks_cache.insert((lang, title), links);
+        if is_current {
+            self.refresh_language_hint();
+            if self.mode == Mode::LangPicker {
+                self.lang_loading = false;
+                self.refresh_lang_picker_status();
+            }
+        }
+    }
+
+    /// PRD FR-ML-2: recomputes `language_hint` from whatever langlinks are
+    /// cached for the active tab's article right now. Called whenever fresh
+    /// langlinks land for it (`deliver_langlinks`) — not on every draw, since
+    /// the answer only ever changes when a fetch completes or the article
+    /// changes (and a fresh article's `set_document` clears it below).
+    fn refresh_language_hint(&mut self) {
+        let current_lang = self.active_tab().lang.clone();
+        self.language_hint =
+            preferred_language_hint(self.lang_links(), &current_lang, &self.languages)
+                .map(|autonym| format!("also in {autonym} — :lang"));
     }
 
     /// The tab currently on screen. `tabs` is never empty while the app runs
@@ -1501,6 +1716,12 @@ impl App {
         // (from L1 if available, else a fresh layout pass) on the next draw
         // or mapping lookup at the current width — see `ensure_layout`.
         self.layout = None;
+        // PRD FR-ML-2: whatever hint was showing belonged to the article
+        // just navigated away from — clearing it here (rather than leaving
+        // it to the new article's own langlinks fetch to overwrite) means
+        // the status bar never briefly shows a stale "also in X" for the
+        // wrong page between this install and that fetch landing.
+        self.language_hint = None;
         self.refresh_reading_status();
     }
 
@@ -2728,6 +2949,81 @@ pub fn resolve_g_prefix(second_key: char) -> GPrefixAction {
     }
 }
 
+/// PRD FR-ML-1's picker ordering: rows whose code appears in `preferred`
+/// are pinned to the top, in `preferred`'s own configured order (so a
+/// reader's first-choice language is always row 0 when the article has an
+/// edition in it); every other langlink follows in the server's original
+/// order. `filter` narrows the whole list first, by the shared subsequence
+/// matcher (`fuzzy::fuzzy_matches`) against autonym, English langname, or
+/// code — whichever the reader typed matches any of the three, so someone
+/// who can't type "日本語" can still reach it via "japan" or "ja". A pure
+/// function (no `App` access) so the pinning/filter/ordering interplay is
+/// directly testable without a session cache or a mode.
+pub fn order_and_filter_langlinks(
+    links: &[crate::api::LangLink],
+    preferred: &[String],
+    filter: &str,
+) -> Vec<crate::api::LangLink> {
+    let matches = |l: &crate::api::LangLink| {
+        crate::fuzzy::fuzzy_matches(&l.autonym, filter)
+            || crate::fuzzy::fuzzy_matches(&l.langname, filter)
+            || crate::fuzzy::fuzzy_matches(&l.code, filter)
+    };
+    let mut rows: Vec<crate::api::LangLink> = Vec::with_capacity(links.len());
+    for code in preferred {
+        if let Some(l) = links.iter().find(|l| &l.code == code && matches(l)) {
+            rows.push(l.clone());
+        }
+    }
+    for l in links {
+        if matches(l) && !preferred.iter().any(|p| p == &l.code) {
+            rows.push(l.clone());
+        }
+    }
+    rows
+}
+
+/// PRD FR-ML-2's "available in your preferred language" hint: the autonym
+/// of the earliest-configured preferred language that `links` has an
+/// edition in, or `None` when there's nothing to suggest — no preferred
+/// languages configured, `current_lang` is itself one of them (the reader
+/// is already home, matching FR-ML-2's "viewing a *non-preferred*
+/// language" trigger condition literally), or none of `links` matches any
+/// preferred code. A pure function so the surfacing rule is testable
+/// without a fetch or a picker.
+pub fn preferred_language_hint(
+    links: &[crate::api::LangLink],
+    current_lang: &str,
+    preferred: &[String],
+) -> Option<String> {
+    if preferred.is_empty() || preferred.iter().any(|p| p == current_lang) {
+        return None;
+    }
+    preferred.iter().find_map(|p| {
+        links
+            .iter()
+            .find(|l| &l.code == p)
+            .map(|l| l.autonym.clone())
+    })
+}
+
+/// PRD FR-ML-2's fallback-chain order: `primary` (whatever brought the
+/// reader here — an explicit override or just the session default) tried
+/// first, then any of `preferred`'s configured `languages` not already
+/// equal to it, in their own order, deduplicated. A reader who never set
+/// `languages` gets a single-entry chain, identical to pre-FR-ML-2
+/// behavior. A pure function — `main::open_title` is the only caller, and
+/// this is the part of it worth testing without a network round trip.
+pub fn fallback_chain(primary: &str, preferred: &[String]) -> Vec<String> {
+    let mut chain = vec![primary.to_string()];
+    for lang in preferred {
+        if !chain.contains(lang) {
+            chain.push(lang.clone());
+        }
+    }
+    chain
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3208,6 +3504,291 @@ mod tests {
         // The result is still cached: reopening needs no second fetch.
         assert!(!app.open_related());
         assert_eq!(app.related_items().len(), 1);
+    }
+
+    // -- Language switcher & fallback chain (PRD FR-ML-1/2) ------------------
+
+    fn langlink(code: &str, autonym: &str, langname: &str, title: &str) -> crate::api::LangLink {
+        crate::api::LangLink {
+            code: code.to_string(),
+            autonym: autonym.to_string(),
+            langname: langname.to_string(),
+            title: title.to_string(),
+            url: None,
+        }
+    }
+
+    /// PRD FR-ML-1: preferred languages are pinned to the top, in the
+    /// reader's own configured order — not the server's — and everything
+    /// else keeps the server's original order behind them.
+    #[test]
+    fn order_and_filter_langlinks_pins_preferred_to_top_in_configured_order() {
+        let links = vec![
+            langlink("de", "Deutsch", "German", "Alan Turing"),
+            langlink("ja", "日本語", "Japanese", "アラン・チューリング"),
+            langlink("fr", "Français", "French", "Alan Turing"),
+        ];
+        // Configured preference is ja first, then de — the reverse of the
+        // server's own de/ja/fr order — so a correct pin proves the rows
+        // follow `preferred`, not `links`.
+        let preferred = vec!["ja".to_string(), "de".to_string()];
+        let rows = order_and_filter_langlinks(&links, &preferred, "");
+        let codes: Vec<&str> = rows.iter().map(|l| l.code.as_str()).collect();
+        assert_eq!(
+            codes,
+            vec!["ja", "de", "fr"],
+            "ja and de pinned in preferred's own order; fr (unpreferred) follows"
+        );
+    }
+
+    /// No `languages` configured: nothing is pinned, and the server's own
+    /// order survives untouched.
+    #[test]
+    fn order_and_filter_langlinks_with_no_preferred_keeps_server_order() {
+        let links = vec![
+            langlink("de", "Deutsch", "German", "Alan Turing"),
+            langlink("ja", "日本語", "Japanese", "アラン・チューリング"),
+        ];
+        let rows = order_and_filter_langlinks(&links, &[], "");
+        let codes: Vec<&str> = rows.iter().map(|l| l.code.as_str()).collect();
+        assert_eq!(codes, vec!["de", "ja"]);
+    }
+
+    /// PRD FR-ML-1's fuzzy filter matches autonym, English langname, or
+    /// code — whichever the reader typed — via the shared subsequence
+    /// matcher, not a substring/prefix rule.
+    #[test]
+    fn order_and_filter_langlinks_fuzzy_filters_over_autonym_langname_and_code() {
+        let links = vec![
+            langlink("de", "Deutsch", "German", "Alan Turing"),
+            langlink("ja", "日本語", "Japanese", "アラン・チューリング"),
+            langlink("fr", "Français", "French", "Alan Turing"),
+        ];
+
+        // "germ" is a subsequence of the English langname "German" only.
+        let by_langname = order_and_filter_langlinks(&links, &[], "germ");
+        assert_eq!(
+            by_langname
+                .iter()
+                .map(|l| l.code.as_str())
+                .collect::<Vec<_>>(),
+            vec!["de"]
+        );
+
+        // "fran" is a subsequence of the autonym "Français".
+        let by_autonym = order_and_filter_langlinks(&links, &[], "fran");
+        assert_eq!(
+            by_autonym
+                .iter()
+                .map(|l| l.code.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fr"]
+        );
+
+        // The bare code itself always matches.
+        let by_code = order_and_filter_langlinks(&links, &[], "ja");
+        assert_eq!(
+            by_code.iter().map(|l| l.code.as_str()).collect::<Vec<_>>(),
+            vec!["ja"]
+        );
+
+        // No match at all: an empty result, not an error.
+        assert!(order_and_filter_langlinks(&links, &[], "xyz").is_empty());
+    }
+
+    /// PRD FR-ML-2's hint: present only when the current language is
+    /// genuinely non-preferred and a preferred edition exists; absent in
+    /// every other case (no preferred configured, already reading a
+    /// preferred edition, or no matching langlink).
+    #[test]
+    fn preferred_language_hint_surfaces_only_for_a_non_preferred_article_with_a_match() {
+        let links = vec![
+            langlink("de", "Deutsch", "German", "Alan Turing"),
+            langlink("ja", "日本語", "Japanese", "アラン・チューリング"),
+        ];
+
+        // Reading "en" (not in the langlinks at all) with ja preferred: hint.
+        assert_eq!(
+            preferred_language_hint(&links, "en", &["ja".to_string(), "fr".to_string()]),
+            Some("日本語".to_string())
+        );
+
+        // No preferred languages configured at all: nothing to suggest.
+        assert_eq!(preferred_language_hint(&links, "en", &[]), None);
+
+        // Already reading a preferred edition ("de" is itself preferred):
+        // FR-ML-2's trigger is explicitly "viewing a non-preferred language".
+        assert_eq!(
+            preferred_language_hint(&links, "de", &["de".to_string(), "ja".to_string()]),
+            None
+        );
+
+        // Preferred languages configured, but none has a langlink here.
+        assert_eq!(
+            preferred_language_hint(&links, "en", &["zh".to_string()]),
+            None
+        );
+
+        // Earliest-configured preferred match wins when more than one matches.
+        assert_eq!(
+            preferred_language_hint(&links, "en", &["ja".to_string(), "de".to_string()]),
+            Some("日本語".to_string()),
+            "ja is listed first, so it wins over de even though de also matches"
+        );
+    }
+
+    /// PRD FR-ML-2's fallback chain: primary first, then preferred
+    /// languages in their configured order, deduplicated.
+    #[test]
+    fn fallback_chain_orders_primary_first_then_preferred_deduplicated() {
+        assert_eq!(
+            fallback_chain("de", &["de".to_string(), "en".to_string()]),
+            vec!["de".to_string(), "en".to_string()],
+            "primary already equals the first preferred entry — no duplicate"
+        );
+        assert_eq!(
+            fallback_chain("xx", &["de".to_string(), "en".to_string()]),
+            vec!["xx".to_string(), "de".to_string(), "en".to_string()]
+        );
+        assert_eq!(
+            fallback_chain("en", &[]),
+            vec!["en".to_string()],
+            "no languages configured — a single-entry chain, pre-FR-ML-2 behavior"
+        );
+    }
+
+    #[test]
+    fn open_lang_picker_with_no_article_shows_a_status_and_needs_no_fetch() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        assert!(
+            !app.open_lang_picker(),
+            "no article open — nothing to fetch"
+        );
+        assert_eq!(app.mode, Mode::LangPicker);
+        assert!(app.lang_picker_rows().is_empty());
+        assert_eq!(app.status, "Open an article first");
+    }
+
+    #[test]
+    fn open_lang_picker_needs_a_fetch_the_first_time_then_hits_the_session_cache() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.open_document(doc("Alan Turing"));
+
+        assert!(
+            app.open_lang_picker(),
+            "first open for this article — nothing cached yet"
+        );
+        assert!(app.lang_loading);
+
+        app.deliver_langlinks(
+            "en".to_string(),
+            "Alan Turing".to_string(),
+            Ok(vec![langlink("de", "Deutsch", "German", "Alan Turing")]),
+        );
+        assert!(!app.lang_loading);
+        assert_eq!(app.lang_picker_rows().len(), 1);
+
+        // Close and reopen: the session cache already has this article's
+        // langlinks, so no second fetch is requested.
+        app.close_lang_picker();
+        assert!(!app.open_lang_picker(), "a cache hit needs no second fetch");
+        assert_eq!(app.lang_picker_rows()[0].code, "de");
+    }
+
+    #[test]
+    fn cycle_lang_wraps_and_lang_picker_target_reads_the_selected_row() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.open_document(doc("Alan Turing"));
+        app.open_lang_picker();
+        app.deliver_langlinks(
+            "en".to_string(),
+            "Alan Turing".to_string(),
+            Ok(vec![
+                langlink("de", "Deutsch", "German", "Alan Turing"),
+                langlink("ja", "日本語", "Japanese", "アラン・チューリング"),
+            ]),
+        );
+
+        assert_eq!(
+            app.lang_picker_target(),
+            Some(("de".to_string(), "Alan Turing".to_string()))
+        );
+        app.cycle_lang(true);
+        assert_eq!(
+            app.lang_picker_target(),
+            Some(("ja".to_string(), "アラン・チューリング".to_string()))
+        );
+        app.cycle_lang(true);
+        assert_eq!(
+            app.lang_picker_target(),
+            Some(("de".to_string(), "Alan Turing".to_string())),
+            "wraps back to the first row"
+        );
+        app.cycle_lang(false);
+        assert_eq!(
+            app.lang_picker_target(),
+            Some(("ja".to_string(), "アラン・チューリング".to_string()))
+        );
+    }
+
+    #[test]
+    fn lang_picker_gracefully_handles_an_empty_or_failed_fetch() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.open_document(doc("Alan Turing"));
+        app.open_lang_picker();
+        app.deliver_langlinks(
+            "en".to_string(),
+            "Alan Turing".to_string(),
+            Err("network error".to_string()),
+        );
+        assert!(!app.lang_loading);
+        assert!(
+            app.lang_picker_rows().is_empty(),
+            "a failed fetch caches an empty list, not nothing"
+        );
+        assert_eq!(app.lang_picker_target(), None);
+        assert_eq!(app.status, "No language editions found — Esc to close");
+    }
+
+    /// PRD FR-ML-2's `:lang <code>` disambiguation: a code with a cached
+    /// langlink resolves to its translated title; a code without one (not
+    /// yet loaded, an empty cache entry, or genuinely absent) is `None` —
+    /// the signal `main::set_or_switch_lang` uses to fall back to setting
+    /// the default language instead of switching.
+    #[test]
+    fn lang_link_title_for_code_resolves_present_codes_and_is_none_otherwise() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.open_document(doc("Alan Turing"));
+
+        // Not loaded yet: no cache entry at all.
+        assert_eq!(app.lang_link_title_for_code("de"), None);
+
+        app.langlinks_cache.insert(
+            ("en".to_string(), "Alan Turing".to_string()),
+            vec![langlink("ja", "日本語", "Japanese", "アラン・チューリング")],
+        );
+        assert_eq!(
+            app.lang_link_title_for_code("ja"),
+            Some("アラン・チューリング".to_string())
+        );
+        assert_eq!(
+            app.lang_link_title_for_code("de"),
+            None,
+            "cached, but this article has no de edition"
+        );
+    }
+
+    /// A fresh document (a real navigation, or `go_home`) clears whatever
+    /// hint belonged to the article just left — PRD FR-ML-2's hint must
+    /// never survive onto a different page's status line.
+    #[test]
+    fn a_fresh_document_clears_any_stale_language_hint() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.open_document(doc("Alan Turing"));
+        app.language_hint = Some("also in Deutsch — :lang".to_string());
+
+        app.open_document(doc("Enigma machine"));
+        assert_eq!(app.language_hint, None);
     }
 
     #[test]

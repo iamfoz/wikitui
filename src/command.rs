@@ -12,9 +12,13 @@ pub enum Command {
     /// `:open <title>` / `:o` — open an article (also accepts URLs and
     /// lang-prefixed titles, same grammar as the CLI TITLE argument).
     Open(String),
-    /// `:lang <code>` — switch the language edition for searches and new
-    /// articles.
-    Lang(String),
+    /// `:lang` (bare) — opens the language-switcher picker for the article
+    /// on screen (PRD FR-ML-1). `:lang <code>` disambiguates (PRD FR-ML-2):
+    /// if the current article has a cached langlink for `code`, switches
+    /// straight to it (a real navigation — see `main::set_or_switch_lang`);
+    /// otherwise sets `code` as the default language for new
+    /// searches/opens, this command's pre-FR-ML-1 meaning.
+    Lang(Option<String>),
     /// `:theme <name>` — switch the color theme.
     Theme(String),
     /// `:style <name>` — switch the citation style.
@@ -141,7 +145,7 @@ pub enum SaveSpec {
 /// parse-time constant so `command` doesn't depend on the render module.
 const SAVE_EXPORT_FORMATS: [&str; 3] = ["md", "txt", "html"];
 
-pub const USAGE: &str = "commands: open <title>, lang <code>, theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, prefetch-log, start, today, random [good], related, set images=on|off|prefetch=on|off, config reload, help, quit";
+pub const USAGE: &str = "commands: open <title>, lang [<code>], theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, prefetch-log, start, today, random [good], related, set images=on|off|prefetch=on|off, config reload, help, quit";
 
 pub fn parse(input: &str) -> Result<Command, String> {
     let input = input.trim();
@@ -160,13 +164,17 @@ pub fn parse(input: &str) -> Result<Command, String> {
 
     match name {
         "open" | "o" => Ok(Command::Open(require_arg("title")?)),
+        // Bare `:lang` opens the switcher picker (PRD FR-ML-1); `:lang
+        // <code>` keeps the code-shape validation the picker's own Enter
+        // key bypasses (it already knows the code is real, from a langlink).
         "lang" => {
-            let code = require_arg("code")?;
-            if crate::target::is_lang_code(&code) {
-                Ok(Command::Lang(code))
+            if arg.is_empty() {
+                Ok(Command::Lang(None))
+            } else if crate::target::is_lang_code(arg) {
+                Ok(Command::Lang(Some(arg.to_string())))
             } else {
                 Err(format!(
-                    "{code:?} doesn't look like a language code (e.g. en, de, zh-yue)"
+                    "{arg:?} doesn't look like a language code (e.g. en, de, zh-yue)"
                 ))
             }
         }
@@ -423,13 +431,20 @@ mod tests {
 
     #[test]
     fn lang_validates_the_code_shape() {
-        assert_eq!(parse("lang de"), Ok(Command::Lang("de".to_string())));
+        assert_eq!(parse("lang de"), Ok(Command::Lang(Some("de".to_string()))));
         assert_eq!(
             parse("lang zh-yue"),
-            Ok(Command::Lang("zh-yue".to_string()))
+            Ok(Command::Lang(Some("zh-yue".to_string())))
         );
         assert!(parse("lang DE!").is_err());
-        assert!(parse("lang").is_err());
+    }
+
+    /// PRD FR-ML-1: bare `:lang` (no code) is the switcher-picker trigger,
+    /// not an error — the pre-FR-ML-1 behavior required an argument.
+    #[test]
+    fn bare_lang_opens_the_picker() {
+        assert_eq!(parse("lang"), Ok(Command::Lang(None)));
+        assert_eq!(parse("lang   "), Ok(Command::Lang(None)));
     }
 
     #[test]

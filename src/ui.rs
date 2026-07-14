@@ -436,6 +436,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Mode::OfflineCard => draw_reading(frame, app, content_area),
         Mode::OnThisDay => draw_on_this_day(frame, app, content_area),
         Mode::Related => draw_related(frame, app, content_area),
+        // The `/` filter draws over the same picker view; only the status
+        // line changes to show the live prompt.
+        Mode::LangPicker | Mode::LangFilter => draw_lang_picker(frame, app, content_area),
     }
 
     draw_status_bar(frame, app, status_area);
@@ -1850,6 +1853,71 @@ fn draw_related(frame: &mut Frame, app: &App, area: Rect) {
     render_selectable_list(frame, list, area, app.selected_related);
 }
 
+/// PRD FR-ML-1's `:lang` picker: the article on screen's langlinks,
+/// preferred-pinned and fuzzy-filtered (`App::lang_picker_rows`). Each row
+/// shows the autonym plus the English langname in parentheses ("Deutsch
+/// (German)") so a reader who can't read the target script still knows
+/// which edition a row is, with the short code dimmed alongside it and a
+/// `*` marking a pinned (preferred) row.
+fn draw_lang_picker(frame: &mut Frame, app: &App, area: Rect) {
+    let heading = match &app.active_tab().doc {
+        Some(doc) => format!("Language editions of \"{}\"", doc.title),
+        None => "Language editions".to_string(),
+    };
+    if app.lang_loading {
+        let text = Text::from(vec![
+            Line::from(""),
+            Line::from("Loading language editions…"),
+        ]);
+        frame.render_widget(
+            Paragraph::new(text)
+                .style(base_style(&app.theme, app.no_color))
+                .block(UiBlock::default().borders(Borders::ALL).title(heading)),
+            area,
+        );
+        return;
+    }
+    let rows = app.lang_picker_rows();
+    if rows.is_empty() {
+        let text = Text::from(vec![Line::from(""), Line::from(app.status.clone())]);
+        frame.render_widget(
+            Paragraph::new(text)
+                .style(base_style(&app.theme, app.no_color))
+                .block(UiBlock::default().borders(Borders::ALL).title(heading)),
+            area,
+        );
+        return;
+    }
+    let items: Vec<ListItem> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            let pinned = app.languages.iter().any(|p| p == &l.code);
+            let marker = if pinned { "* " } else { "  " };
+            let line = Line::from(vec![
+                RSpan::styled(
+                    format!("{marker}{} ({})", l.autonym, l.langname),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                RSpan::styled(
+                    format!("   [{}]", l.code),
+                    colored(app.no_color, app.theme.dim),
+                ),
+            ]);
+            let style = if i == app.selected_lang {
+                colored_bg(app.no_color, app.theme.selected_fg, app.theme.selected_bg)
+            } else {
+                Style::default()
+            };
+            ListItem::new(line).style(style)
+        })
+        .collect();
+    let list = List::new(items)
+        .style(base_style(&app.theme, app.no_color))
+        .block(UiBlock::default().borders(Borders::ALL).title(heading));
+    render_selectable_list(frame, list, area, app.selected_lang);
+}
+
 /// §7's "Offline, uncached link" card: a centered overlay offering the two
 /// documented choices (queue for fetch when online / search saved pages).
 fn draw_offline_card(frame: &mut Frame, app: &App, area: Rect) {
@@ -1952,6 +2020,8 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         Mode::PrefetchLog => app.status.clone(),
         Mode::OnThisDay => app.status.clone(),
         Mode::Related => app.status.clone(),
+        Mode::LangPicker => app.status.clone(),
+        Mode::LangFilter => format!("filter: {}   Esc: apply", app.lang_filter_input),
         Mode::Help => "Press any key to close help".to_string(),
         Mode::Reading if app.loading => "Loading…".to_string(),
         // Command feedback outranks the focused-link line until the next
@@ -1978,35 +2048,53 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         // links (nearly all of them), so the page-source indicator must
         // prefix it too or ◐/○ would never actually be seen (app.status
         // already carries the prefix via set_document).
-        Mode::Reading => match tab.focused_link.and_then(|i| tab.links.get(i)) {
-            Some(link) if link.internal_title.is_some() => {
-                format!(
-                    "{}→ {} ({}/{})   Tab/S-Tab: cycle   Enter: open   H: back   L: forward",
+        Mode::Reading => {
+            // PRD FR-ML-2's "available in your preferred language" hint: a
+            // low-priority suffix appended to *every* branch below, not
+            // just the least-common one (a focused link — nearly always
+            // true, since a fresh document focuses link 0 whenever it has
+            // any — would otherwise hide the hint for as long as the
+            // reader was looking at any article with links at all).
+            // `notice`/find above still outrank it — those are transient,
+            // explicit feedback, so they still win outright — but among
+            // Reading's own "what's on screen" segments the hint always
+            // gets a spot.
+            let hint = app
+                .language_hint
+                .as_deref()
+                .map(|h| format!("   {h}"))
+                .unwrap_or_default();
+            match tab.focused_link.and_then(|i| tab.links.get(i)) {
+                Some(link) if link.internal_title.is_some() => {
+                    format!(
+                        "{}→ {} ({}/{})   Tab/S-Tab: cycle   Enter: open   H: back   L: forward{hint}",
+                        tab.page_source.prefix(),
+                        link.text,
+                        tab.focused_link.unwrap() + 1,
+                        tab.links.len()
+                    )
+                }
+                Some(link) => format!(
+                    "{}→ {} (external, not yet followable){hint}",
                     tab.page_source.prefix(),
-                    link.text,
-                    tab.focused_link.unwrap() + 1,
-                    tab.links.len()
-                )
-            }
-            Some(link) => format!(
-                "{}→ {} (external, not yet followable)",
-                tab.page_source.prefix(),
-                link.text
-            ),
-            // FR-NV-7: with no notice, find, or focused link to show, the
-            // default segment is the active tab's breadcrumb trail; falls
-            // back to the plain status line before any history has built up.
-            None => {
-                let titles = app.breadcrumb_titles();
-                if titles.len() > 1 {
-                    let prefix = tab.page_source.prefix();
-                    let budget = (area.width as usize).saturating_sub(display_width(&prefix));
-                    format!("{prefix}{}", build_breadcrumb(&titles, budget))
-                } else {
-                    app.status.clone()
+                    link.text
+                ),
+                // FR-NV-7: with no notice, find, or focused link to show,
+                // the default segment is the active tab's breadcrumb
+                // trail; falls back to the plain status line before any
+                // history has built up.
+                None => {
+                    let titles = app.breadcrumb_titles();
+                    if titles.len() > 1 {
+                        let prefix = tab.page_source.prefix();
+                        let budget = (area.width as usize).saturating_sub(display_width(&prefix));
+                        format!("{prefix}{}{hint}", build_breadcrumb(&titles, budget))
+                    } else {
+                        format!("{}{hint}", app.status)
+                    }
                 }
             }
-        },
+        }
     };
     let style = if matches!(
         app.mode,
@@ -2016,6 +2104,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             | Mode::Hint
             | Mode::BookmarkFilter
             | Mode::BookmarkTagEdit
+            | Mode::LangFilter
     ) {
         colored_bg(app.no_color, app.theme.focus_fg, app.theme.focus_bg)
     } else {
@@ -2054,6 +2143,7 @@ fn draw_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
         Line::from("gt / gT      next / previous tab"),
         Line::from("gr           random article   :random good  (assessment ≥ GA)"),
         Line::from("gR           related articles (morelike:)   :related"),
+        Line::from(":lang        language editions of this article (autonym/langname)"),
         Line::from("bb           tab picker    u  reopen closed tab"),
         Line::from("t            table of contents"),
         Line::from("[ / ]        scroll wide tables left / right"),

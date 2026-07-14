@@ -196,6 +196,45 @@ struct SummaryResponse {
     extract: String,
 }
 
+/// One interwiki language edition of an article (PRD FR-ML-1/2, Appendix A
+/// "Langlinks"): the language code, its own name for itself (`autonym`,
+/// e.g. "Deutsch"), the English name (`langname`, e.g. "German") FR-ML-1's
+/// picker rows show alongside it ("Deutsch (German)"), the article's title
+/// in that edition, and — when the server sends it — the interwiki URL.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct LangLink {
+    #[serde(rename = "lang")]
+    pub code: String,
+    #[serde(default)]
+    pub autonym: String,
+    #[serde(default)]
+    pub langname: String,
+    pub title: String,
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+/// `prop=langlinks`'s response shape (formatversion=2): a single queried
+/// page carrying its own `langlinks` array, empty or absent for an article
+/// with none (a stub, or a title this wiki has no interwiki record for).
+#[derive(Debug, Deserialize, Default)]
+struct LangLinksResponse {
+    #[serde(default)]
+    query: Option<LangLinksQuery>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LangLinksQuery {
+    #[serde(default)]
+    pages: Vec<LangLinksPage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LangLinksPage {
+    #[serde(default)]
+    langlinks: Vec<LangLink>,
+}
+
 /// The subset of `list=categorymembers` (formatversion=2) this client reads.
 #[derive(Debug, Deserialize)]
 struct CategoryMembersResponse {
@@ -500,6 +539,60 @@ impl WikiClient {
         let parsed: SummaryResponse =
             serde_json::from_slice(&bytes).context("parsing summary response")?;
         Ok(crate::sanitize::sanitize_single_line(&parsed.extract).into_owned())
+    }
+
+    /// PRD FR-ML-1/2 (Appendix A "Langlinks"): an article's interwiki
+    /// language editions. Built against the Action API's `prop=langlinks&
+    /// llprop=autonym|langname|url` rather than Appendix A's other listed
+    /// primary, the core REST `/page/{title}/links/language` endpoint: that
+    /// REST shape carries only `name` (the autonym), never an English
+    /// `langname` — and FR-ML-1's picker rows need both ("Deutsch
+    /// (German)") — so the Action API call is the one that actually
+    /// satisfies the requirement here, not a fallback-of-convenience.
+    /// One title per call (never a fanout): unlike `page_assessments`/
+    /// `fetch_link_pageviews`, there is exactly one article's langlinks to
+    /// ask for at a time — the article on screen — so there is nothing to
+    /// batch across titles; `lllimit=500` only bounds the *number of
+    /// editions* one article can return, per §6.2 rule 10's batching cap.
+    /// A foreground, interactive fetch — the reader pressed `:lang`, or an
+    /// article just opened and the app wants FR-ML-2's "available in your
+    /// preferred language" hint for it — so, like `search`/
+    /// `fetch_onthisday_feed`, it carries no `maxlag` (NF-NET-3 reserves
+    /// that for the non-interactive `_bg` methods); NF-NET-2's User-Agent
+    /// still rides every request via the client's own `reqwest::Client`.
+    pub async fn fetch_langlinks(&self, lang: &str, title: &str) -> Result<Vec<LangLink>> {
+        let url = format!(
+            "{}/w/api.php?action=query&format=json&formatversion=2&prop=langlinks&llprop=autonym|langname|url&lllimit=500&titles={}",
+            self.host(lang),
+            urlencoding::encode(&title.replace(' ', "_"))
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("requesting language links for {title:?}"))?
+            .error_for_status()
+            .context("language links request failed")?;
+        let bytes = read_capped(resp, MAX_SEARCH_RESPONSE_BYTES)
+            .await
+            .context("reading language links response body")?;
+        let parsed: LangLinksResponse =
+            serde_json::from_slice(&bytes).context("parsing language links response")?;
+        let mut links: Vec<LangLink> = parsed
+            .query
+            .map(|q| q.pages)
+            .unwrap_or_default()
+            .into_iter()
+            .flat_map(|p| p.langlinks)
+            .collect();
+        // PRD SEC-1: this module's choke point for langlinks — every field
+        // the picker displays (autonym/langname/title/code) is sanitized
+        // here, once, mirroring `sanitize_search_result`.
+        for link in &mut links {
+            sanitize_langlink(link);
+        }
+        Ok(links)
     }
 
     /// FR-DL-2's `:today` panel: one Wikifeeds `feed/onthisday/{type}/{m}/{d}`
@@ -949,6 +1042,22 @@ fn sanitize_title_suggestion(suggestion: &mut TitleSuggestion) {
     suggestion.title = crate::sanitize::sanitize_single_line(&suggestion.title).into_owned();
     if let Some(description) = &mut suggestion.description {
         *description = crate::sanitize::sanitize_single_line(description).into_owned();
+    }
+}
+
+/// PRD SEC-1: the langlinks counterpart of `sanitize_search_result` — every
+/// field FR-ML-1's picker can put on screen (autonym, English langname,
+/// translated title, and the short code shown in `[brackets]`) comes out
+/// free of control/bidi/zero-width bytes. `url` isn't rendered by this
+/// chunk's UI, but is sanitized too so a later "open in browser" doesn't
+/// have to remember to add it here.
+fn sanitize_langlink(link: &mut LangLink) {
+    link.code = crate::sanitize::sanitize_single_line(&link.code).into_owned();
+    link.autonym = crate::sanitize::sanitize_single_line(&link.autonym).into_owned();
+    link.langname = crate::sanitize::sanitize_single_line(&link.langname).into_owned();
+    link.title = crate::sanitize::sanitize_single_line(&link.title).into_owned();
+    if let Some(url) = &mut link.url {
+        *url = crate::sanitize::sanitize_single_line(url).into_owned();
     }
 }
 
@@ -1603,5 +1712,135 @@ mod tests {
         assert!(!QualityClass::Start.is_good_or_better());
         assert!(!QualityClass::Stub.is_good_or_better());
         assert!(QualityClass::Fa > QualityClass::Ga, "FA outranks GA");
+    }
+
+    /// PRD FR-ML-1/2: `LangLinksResponse`'s full parse table — autonym,
+    /// English langname, translated title, and url all round-trip; a
+    /// page with no `langlinks` key at all (never invented as an empty
+    /// array explicitly by every deployment) degrades to an empty `Vec`,
+    /// not an error.
+    #[test]
+    fn langlinks_response_parses_autonym_langname_title_and_url() {
+        let json = r#"{"query":{"pages":[{"title":"Alan Turing","langlinks":[
+            {"lang":"de","autonym":"Deutsch","langname":"German","title":"Alan Turing","url":"https://de.wikipedia.org/wiki/Alan_Turing"},
+            {"lang":"ja","autonym":"日本語","langname":"Japanese","title":"アラン・チューリング"}
+        ]}]}}"#;
+        let parsed: LangLinksResponse = serde_json::from_slice(json.as_bytes()).unwrap();
+        let pages = parsed.query.unwrap().pages;
+        assert_eq!(pages[0].langlinks.len(), 2);
+        assert_eq!(pages[0].langlinks[0].code, "de");
+        assert_eq!(pages[0].langlinks[0].autonym, "Deutsch");
+        assert_eq!(pages[0].langlinks[0].langname, "German");
+        assert_eq!(pages[0].langlinks[0].title, "Alan Turing");
+        assert_eq!(
+            pages[0].langlinks[0].url.as_deref(),
+            Some("https://de.wikipedia.org/wiki/Alan_Turing")
+        );
+        assert_eq!(pages[0].langlinks[1].code, "ja");
+        assert_eq!(pages[0].langlinks[1].autonym, "日本語");
+        assert_eq!(pages[0].langlinks[1].title, "アラン・チューリング");
+        assert_eq!(
+            pages[0].langlinks[1].url, None,
+            "a langlink with no url field degrades to None, not an error"
+        );
+
+        let empty = br#"{"query":{"pages":[{"title":"Stub"}]}}"#;
+        let parsed: LangLinksResponse = serde_json::from_slice(empty).unwrap();
+        assert!(parsed.query.unwrap().pages[0].langlinks.is_empty());
+
+        let no_query = br#"{}"#;
+        let parsed: LangLinksResponse = serde_json::from_slice(no_query).unwrap();
+        assert!(parsed.query.is_none());
+    }
+
+    /// End-to-end `fetch_langlinks`: parses a real HTTP response, including
+    /// ordinary CJK autonym/title text, which must survive sanitization
+    /// untouched (only control/bidi/zero-width bytes are ever stripped —
+    /// see `sanitize_langlink_strips_control_bytes_but_keeps_plain_text`
+    /// below for the hostile-input half of that claim).
+    #[tokio::test]
+    async fn fetch_langlinks_parses_a_real_response() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut discard = [0u8; 4096];
+                let _ = stream.read(&mut discard);
+                let body = r#"{"query":{"pages":[{"title":"Alan Turing","langlinks":[
+                    {"lang":"de","autonym":"Deutsch","langname":"German","title":"Alan Turing","url":"https://de.wikipedia.org/wiki/Alan_Turing"},
+                    {"lang":"ja","autonym":"日本語","langname":"Japanese","title":"アラン・チューリング"}
+                ]}]}}"#;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body.as_bytes());
+            }
+        });
+
+        let client = WikiClient::new(format!("http://127.0.0.1:{port}")).unwrap();
+        let links = client.fetch_langlinks("en", "Alan Turing").await.unwrap();
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].code, "de");
+        assert_eq!(links[0].autonym, "Deutsch");
+        assert_eq!(links[0].langname, "German");
+        assert_eq!(
+            links[0].url.as_deref(),
+            Some("https://de.wikipedia.org/wiki/Alan_Turing")
+        );
+        assert_eq!(links[1].code, "ja");
+        assert_eq!(links[1].autonym, "日本語");
+        assert_eq!(links[1].title, "アラン・チューリング");
+    }
+
+    /// PRD SEC-1: `sanitize_langlink`'s choke point — a hostile autonym/
+    /// langname/title/url comes out free of control bytes, mirroring
+    /// `sanitize_search_result_strips_control_bytes_but_keeps_searchmatch_markup`.
+    #[test]
+    fn sanitize_langlink_strips_control_bytes() {
+        let mut link = LangLink {
+            code: "de".to_string(),
+            autonym: "Deu\x1btsch".to_string(),
+            langname: "Ger\x07man".to_string(),
+            title: "Evil\x1b[31mTitle".to_string(),
+            url: Some("https://de.wikipedia.org/wiki/Evil\x1bTitle".to_string()),
+        };
+        sanitize_langlink(&mut link);
+        assert!(!link.autonym.contains('\x1b'));
+        assert!(!link.langname.contains('\x07'));
+        assert!(!link.title.contains('\x1b'));
+        assert!(!link.url.unwrap().contains('\x1b'));
+    }
+
+    /// An article with no langlinks at all (a stub, or a title this wiki
+    /// has no interwiki record for) is an empty list, not an error — the
+    /// picker's own "no language editions found" empty state depends on
+    /// being able to tell this apart from a network failure.
+    #[tokio::test]
+    async fn fetch_langlinks_with_no_langlinks_is_empty_not_error() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut discard = [0u8; 4096];
+                let _ = stream.read(&mut discard);
+                let body = br#"{"query":{"pages":[{"title":"Some Stub"}]}}"#;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+
+        let client = WikiClient::new(format!("http://127.0.0.1:{port}")).unwrap();
+        let links = client.fetch_langlinks("en", "Some Stub").await.unwrap();
+        assert!(links.is_empty());
     }
 }

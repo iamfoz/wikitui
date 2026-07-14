@@ -82,6 +82,27 @@ It also serves link-target summaries (`GET /api/rest_v1/page/summary/{title}`,
 implements only what article rendering, search, the page cache, and the
 start-page/on-this-day features need — not a general MediaWiki stand-in.
 
+Language switcher / fallback-chain fixtures (PRD FR-ML-1/2):
+
+- `GET /w/api.php?action=query&prop=langlinks&llprop=autonym|langname|url` —
+  `LANGLINKS`, keyed by display title: Alan Turing's de/ja/fr editions, each
+  with an autonym, English langname, and (for ja) a genuinely different
+  title (the existing `アラン・チューリング` CJK fixture) — de/fr keep the
+  same spelling as English, matching how the real German/French Wikipedias
+  title this article too. A title with no entry gets an empty `langlinks`
+  list, not an error.
+- `_lang_prefix`/`LANG_MISSING`: this mock is otherwise one flat namespace —
+  every language request lands on the same `PAGES` dict regardless of
+  `lang` (see "Pointing wikitui at it" below). Testing FR-ML-2's fallback
+  chain needs at least one language that's missing an article the flat
+  namespace does have, so `WIKITUI_BASE_URL`'s optional `{lang}` path
+  segment is read back here: a request whose first path segment isn't one
+  of this server's own route roots (`w`/`api`/`media`/`debug`) is treated as
+  a language code, and `LANG_MISSING["xx"]` lists `Alan_Turing` as absent
+  specifically on `xx` — so `languages = ["xx", "en"]` must fall through to
+  `en`. A request with no `{lang}` segment (every other fixture path, and
+  every language not listed in `LANG_MISSING`) is unaffected.
+
 ## Running it
 
 ```sh
