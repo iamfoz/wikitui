@@ -425,6 +425,45 @@ DID_YOU_MEAN = {
     "enigma mahcine": "Enigma machine",
 }
 
+# PRD FR-SR-5 / Appendix A "Random": `list=random` rotates through this fixed
+# list (real PAGES titles, so `gr`/`:random` always opens something real)
+# instead of using actual randomness — deterministic-testable, per a pty/CI
+# run that wants to assert *something specific* opened. RANDOM_INDEX is a
+# single-element list (not a bare int) so `_serve_random` can mutate it
+# through a module-level `global`-free closure-friendly reference.
+RANDOM_TITLES = [
+    "Alan_Turing",
+    "Enigma_machine",
+    "Computer_science",
+    "Rendering_Showcase",
+    "Image_Showcase",
+    "Terminal_Injection_Test",
+]
+RANDOM_INDEX = [0]
+
+# PRD FR-DL-3 / FR-SR-5 "Quality" fixture: `prop=pageassessments` classes,
+# keyed by display title (spaces, matching `list=random`'s own title form).
+# Two titles reach GA/FA — since RANDOM_TITLES cycles with period 6, any
+# batch of 10 consecutive draws (`:random good`'s GOOD_BATCH) necessarily
+# includes at least one of them, so the pty "no good article found" fallback
+# path is reachable only by deliberately shrinking this dict, not by chance.
+ASSESSMENTS = {
+    "Alan Turing": "FA",
+    "Enigma machine": "GA",
+}
+
+# PRD FR-SR-6 fixture: `morelike:{title}` results, keyed by the display
+# title the Related panel searches for. Shaped like `SEARCH_PAGES` entries
+# (minus size/wordcount/timestamp, which `morelike:` results don't carry any
+# more reliably than a real deployment's do) so `_serve_search_page` can
+# return them through the same response shape full-text search uses.
+RELATED_ARTICLES = {
+    "Alan Turing": [
+        {"title": "Enigma machine", "description": "German electro-mechanical rotor cipher machine"},
+        {"title": "Computer science", "description": "study of computation, automation, and information"},
+    ],
+}
+
 
 def make_excerpt(text, query):
     """Wraps the first case-insensitive occurrence of `query` in `text` with
@@ -533,6 +572,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
             ]
             self._send_json({"query": {"pages": pages}})
             return
+        # PRD FR-SR-5 / Appendix A "Random": rotates through RANDOM_TITLES
+        # (real PAGES titles, display form) instead of true randomness — see
+        # RANDOM_TITLES's own comment for why this is deterministic-testable.
+        if action == 'query' and listing == 'random':
+            limit = int(params.get('rnlimit', ['1'])[0])
+            picks = []
+            for _ in range(limit):
+                picks.append(RANDOM_TITLES[RANDOM_INDEX[0] % len(RANDOM_TITLES)])
+                RANDOM_INDEX[0] += 1
+            self._send_json({
+                "query": {"random": [{"title": t.replace('_', ' ')} for t in picks]}
+            })
+            return
+        # PRD FR-DL-3 / FR-SR-5 "Quality": the batched prop=pageassessments
+        # call, one WikiProject class per title. A title absent from
+        # ASSESSMENTS is returned with no pageassessments at all (never
+        # invented), matching a real unassessed page.
+        if action == 'query' and prop == 'pageassessments':
+            titles = urllib.parse.unquote(params.get('titles', [''])[0]).split('|')
+            pages = []
+            for t in titles:
+                cls = ASSESSMENTS.get(t)
+                assessments = {"WikiProject Mock": {"class": cls}} if cls else {}
+                pages.append({"title": t, "pageassessments": assessments})
+            self._send_json({"query": {"pages": pages}})
+            return
         self.send_response(404)
         self.end_headers()
 
@@ -593,9 +658,53 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._send_json({"pages": pages})
 
     def _serve_search_page(self, params):
+        # PRD FR-SR-3: CirrusSearch operators are query-*string* syntax this
+        # endpoint itself is meant to interpret — `intitle:`/`morelike:` get
+        # minimal real handling here (enough to prove the client's passthrough
+        # actually reaches the server unmangled); the other five documented
+        # operators (`incategory:`, `insource:`, `hastemplate:`, `deepcat:`,
+        # `articletopic:`, `prefix:`) fall through to the plain substring
+        # match below like any other query text, which is fine for proving
+        # passthrough (asserted at the wire level, not against this mock's
+        # interpretation of them).
         q = params.get('q', [''])[0]
         limit = int(params.get('limit', ['20'])[0])
         ql = q.lower().strip()
+
+        if ql.startswith('morelike:'):
+            # PRD FR-SR-6: the Related panel's substrate. The argument may
+            # carry underscores (a title fetched with them) or spaces; both
+            # normalise to the RELATED_ARTICLES keys' space form.
+            target = q[len('morelike:'):].strip().replace('_', ' ')
+            related = RELATED_ARTICLES.get(target, [])
+            pages = [
+                {"title": r["title"], "description": r["description"]}
+                for r in related[:limit]
+            ]
+            self._send_json({"pages": pages})
+            return
+
+        if ql.startswith('intitle:'):
+            # PRD FR-SR-3: title-only match, proving the operator changed
+            # what the mock matched against (title, never the body text) —
+            # not just that some substring of the raw query survived.
+            term = ql[len('intitle:'):].strip()
+            hits = [p for p in SEARCH_PAGES if term and term in p["title"].lower()]
+            hits = hits[:limit]
+            pages = [
+                {
+                    "title": p["title"],
+                    "description": p["description"],
+                    "excerpt": make_excerpt(p["text"], term),
+                    "size": p["size"],
+                    "wordcount": p["wordcount"],
+                    "timestamp": p["timestamp"],
+                }
+                for p in hits
+            ]
+            self._send_json({"pages": pages})
+            return
+
         hits = [
             p for p in SEARCH_PAGES
             if ql and (ql in p["title"].lower() or ql in p["text"].lower())

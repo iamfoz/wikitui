@@ -213,6 +213,93 @@ struct CategoryMember {
     title: String,
 }
 
+/// `list=random` (formatversion=2), PRD FR-SR-5 / Appendix A "Random".
+#[derive(Debug, Deserialize, Default)]
+struct RandomResponse {
+    #[serde(default)]
+    query: Option<RandomQuery>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RandomQuery {
+    #[serde(default)]
+    random: Vec<RandomPage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RandomPage {
+    title: String,
+}
+
+/// `prop=pageassessments` (formatversion2), PRD FR-DL-3 / Appendix A
+/// "Quality". A page can carry a different class per WikiProject; only the
+/// per-project `class` string is read.
+#[derive(Debug, Deserialize, Default)]
+struct PageAssessmentsResponse {
+    #[serde(default)]
+    query: Option<PageAssessmentsQuery>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PageAssessmentsQuery {
+    #[serde(default)]
+    pages: Vec<PageAssessmentsPage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PageAssessmentsPage {
+    title: String,
+    #[serde(default)]
+    pageassessments: HashMap<String, ProjectAssessment>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ProjectAssessment {
+    #[serde(default)]
+    class: String,
+}
+
+/// PRD FR-DL-3's quality classes as `prop=pageassessments` reports them
+/// (Appendix A "Quality"), ordered low→high so `Ord`/`>=` express "at least
+/// as good as" directly — FR-SR-5's "random good article" filter is exactly
+/// `>= Ga`. Only the six classes the PRD names are recognized; anything
+/// else a real wiki reports (`FL`, `A`, `Disambig`, `List`, `NA`,
+/// `Redirect`, …) parses to `None` rather than inventing a rank for it —
+/// full quality-badge classification (FR-DL-3's `★FA/+GA/B/C/Start/Stub`
+/// display) is a separate, unshipped feature; this enum only needs to
+/// answer "good or better" for the random-good filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum QualityClass {
+    Stub,
+    Start,
+    C,
+    B,
+    Ga,
+    Fa,
+}
+
+impl QualityClass {
+    /// Parses one WikiProject's `class` string. Case-sensitive (the real
+    /// API's values are consistently these exact tokens); an unrecognized
+    /// or empty string is `None`, not a guess.
+    pub fn parse(class: &str) -> Option<Self> {
+        match class.trim() {
+            "FA" => Some(Self::Fa),
+            "GA" => Some(Self::Ga),
+            "B" => Some(Self::B),
+            "C" => Some(Self::C),
+            "Start" => Some(Self::Start),
+            "Stub" => Some(Self::Stub),
+            _ => None,
+        }
+    }
+
+    /// PRD FR-SR-5's "random good article" filter: assessment ≥ GA.
+    pub fn is_good_or_better(self) -> bool {
+        self >= Self::Ga
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct BareResponse {
     latest: BareLatest,
@@ -488,6 +575,87 @@ impl WikiClient {
             .into_iter()
             .map(|m| crate::sanitize::sanitize_single_line(&m.title).into_owned())
             .collect())
+    }
+
+    /// PRD FR-SR-5 / Appendix A "Random": `list=random` restricted to the
+    /// main namespace (`rnnamespace=0` — never talk/category/user pages).
+    /// `limit` is 1 for the plain `gr`/`:random` binding and
+    /// [`crate::random::GOOD_BATCH`] for `:random good`'s batched pick
+    /// (§6.2 rule 10: one call for the whole batch, never per-title
+    /// fanout). Titles are sanitized (SEC-1): they become both a display
+    /// title and a fetch target.
+    pub async fn random_titles(&self, lang: &str, limit: u32) -> Result<Vec<String>> {
+        let url = format!(
+            "{}/w/api.php?action=query&format=json&formatversion=2&list=random&rnnamespace=0&rnlimit={limit}",
+            self.host(lang)
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .context("requesting a random article")?
+            .error_for_status()
+            .context("random article request failed")?;
+        let bytes = read_capped(resp, MAX_SEARCH_RESPONSE_BYTES)
+            .await
+            .context("reading random article response body")?;
+        let parsed: RandomResponse =
+            serde_json::from_slice(&bytes).context("parsing random article response")?;
+        Ok(parsed
+            .query
+            .map(|q| q.random)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| crate::sanitize::sanitize_single_line(&p.title).into_owned())
+            .collect())
+    }
+
+    /// PRD FR-DL-3/FR-SR-5 (Appendix A "Quality"): the batched
+    /// `prop=pageassessments` call — every title from one `:random good`
+    /// batch in a single request (NF-NET-5), never per-article fanout.
+    /// Returns the *best* class per title (max across whichever WikiProjects
+    /// assessed it); a title absent from the response, or present with no
+    /// class this client recognizes, is simply absent from the map — the
+    /// caller (`random::pick_first_good`) treats "no entry" as "not good
+    /// enough" either way.
+    pub async fn page_assessments(
+        &self,
+        lang: &str,
+        titles: &[String],
+    ) -> Result<HashMap<String, QualityClass>> {
+        let joined = titles.join("|");
+        let url = format!(
+            "{}/w/api.php?action=query&format=json&formatversion=2&prop=pageassessments&titles={}",
+            self.host(lang),
+            urlencoding::encode(&joined)
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .context("requesting page assessments")?
+            .error_for_status()
+            .context("page assessments request failed")?;
+        let bytes = read_capped(resp, MAX_SEARCH_RESPONSE_BYTES)
+            .await
+            .context("reading page assessments response body")?;
+        let parsed: PageAssessmentsResponse =
+            serde_json::from_slice(&bytes).context("parsing page assessments response")?;
+        let mut best = HashMap::new();
+        for page in parsed.query.map(|q| q.pages).unwrap_or_default() {
+            let title = crate::sanitize::sanitize_single_line(&page.title).into_owned();
+            let top = page
+                .pageassessments
+                .values()
+                .filter_map(|p| QualityClass::parse(&p.class))
+                .max();
+            if let Some(class) = top {
+                best.insert(title, class);
+            }
+        }
+        Ok(best)
     }
 
     /// The cheap revalidation call (PRD FR-OFF-2 / Appendix A's "Page
@@ -1249,5 +1417,191 @@ mod tests {
         }
         assert_eq!(totals.get("Enigma machine"), Some(&150));
         assert_eq!(totals.get("Computer science"), Some(&10));
+    }
+
+    /// PRD FR-SR-3: CirrusSearch operator syntax is just query *string*
+    /// syntax the server interprets — this client must never rewrite or
+    /// strip it. A raw socket captures the request line so the assertion is
+    /// on the actual bytes sent, not on a client-side round trip through its
+    /// own encoder: the query arrives on the wire percent-encoded but
+    /// otherwise byte-for-byte the operator string the caller passed in.
+    #[tokio::test]
+    async fn search_passes_cirrus_operators_through_unmangled() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let cap2 = captured.clone();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                *cap2.lock().unwrap() = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let body = br#"{"pages": []}"#;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+        let client = WikiClient::new(format!("http://127.0.0.1:{port}")).unwrap();
+        let query = "intitle:Turing morelike:Enigma_machine";
+        let _ = client.search("en", query, 20).await;
+        let head = captured.lock().unwrap().clone();
+        let request_line = head.lines().next().unwrap_or_default();
+        let encoded_query = urlencoding::encode(query);
+        assert!(
+            request_line.contains(encoded_query.as_ref()),
+            "operator query must reach the wire unmangled: {request_line:?}"
+        );
+        // Round-trip through the same decoder a server would use, proving
+        // the bytes on the wire decode back to exactly what was typed —
+        // not just that some substring survived.
+        let q_param = request_line
+            .split_once("q=")
+            .and_then(|(_, rest)| rest.split(['&', ' ']).next())
+            .unwrap_or_default();
+        assert_eq!(
+            urlencoding::decode(q_param).unwrap().as_ref(),
+            query,
+            "decoded query must equal the original operator string exactly"
+        );
+    }
+
+    /// PRD FR-SR-5 / Appendix A "Random": the endpoint shape — main
+    /// namespace only, the requested limit, and the response's titles
+    /// parsed out.
+    #[tokio::test]
+    async fn random_titles_requests_the_documented_endpoint_shape() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let cap2 = captured.clone();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                *cap2.lock().unwrap() = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let body =
+                    br#"{"query":{"random":[{"title":"Alan Turing"},{"title":"Enigma machine"}]}}"#;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+        let client = WikiClient::new(format!("http://127.0.0.1:{port}")).unwrap();
+        let titles = client.random_titles("en", 10).await.unwrap();
+        assert_eq!(titles, vec!["Alan Turing", "Enigma machine"]);
+        let head = captured.lock().unwrap().clone();
+        assert!(head.contains("list=random"), "{head:?}");
+        assert!(head.contains("rnnamespace=0"), "{head:?}");
+        assert!(head.contains("rnlimit=10"), "{head:?}");
+    }
+
+    /// PRD §6.2 rule 10 / NF-NET-5: `page_assessments` sends every title in
+    /// **one** request, not one per title — a raw listener that only ever
+    /// `accept()`s once would hang (not fail) if the client made a second
+    /// connection, so the test additionally proves the batching by checking
+    /// all titles landed in that single captured request.
+    #[tokio::test]
+    async fn page_assessments_batches_every_title_into_one_request() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let cap2 = captured.clone();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                *cap2.lock().unwrap() = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let body = br#"{"query":{"pages":[
+                    {"title":"Alan Turing","pageassessments":{"Biography":{"class":"FA"}}}
+                ]}}"#;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+        let client = WikiClient::new(format!("http://127.0.0.1:{port}")).unwrap();
+        let titles: Vec<String> = (0..10).map(|i| format!("Title {i}")).collect();
+        let result = client.page_assessments("en", &titles).await.unwrap();
+        assert_eq!(result.get("Alan Turing"), Some(&QualityClass::Fa));
+        let head = captured.lock().unwrap().clone();
+        let request_line = head.lines().next().unwrap_or_default();
+        for title in &titles {
+            let encoded = urlencoding::encode(title);
+            assert!(
+                request_line.contains(encoded.as_ref()),
+                "every batched title must appear in the one request: {title:?} missing from {request_line:?}"
+            );
+        }
+    }
+
+    /// A page can carry a different class per WikiProject; `page_assessments`
+    /// must keep the best (highest-ranked) one, not the first or an
+    /// arbitrary one — parsed directly against the private response shape,
+    /// mirroring `pageviews_response_sums_daily_counts_per_title`'s style.
+    #[test]
+    fn page_assessments_response_keeps_the_best_class_across_projects() {
+        let json = br#"{"query":{"pages":[
+            {"title":"Alan Turing","pageassessments":{"Biography":{"class":"B"},"Computing":{"class":"FA"}}},
+            {"title":"Some Stub","pageassessments":{"WikiProject X":{"class":"Stub"}}},
+            {"title":"Unassessed","pageassessments":{}}
+        ]}}"#;
+        let parsed: PageAssessmentsResponse = serde_json::from_slice(json).unwrap();
+        let mut best = HashMap::new();
+        for page in parsed.query.unwrap().pages {
+            let top = page
+                .pageassessments
+                .values()
+                .filter_map(|p| QualityClass::parse(&p.class))
+                .max();
+            if let Some(class) = top {
+                best.insert(page.title, class);
+            }
+        }
+        assert_eq!(best.get("Alan Turing"), Some(&QualityClass::Fa));
+        assert_eq!(best.get("Some Stub"), Some(&QualityClass::Stub));
+        assert_eq!(
+            best.get("Unassessed"),
+            None,
+            "no recognized assessment at all must leave the title absent, not a default rank"
+        );
+    }
+
+    /// PRD FR-SR-5's "assessment ≥ GA" filter is exactly `QualityClass`'s
+    /// ordering; this locks the parse table and the ordering it implies.
+    #[test]
+    fn quality_class_parse_and_ordering() {
+        assert_eq!(QualityClass::parse("FA"), Some(QualityClass::Fa));
+        assert_eq!(QualityClass::parse("GA"), Some(QualityClass::Ga));
+        assert_eq!(QualityClass::parse("B"), Some(QualityClass::B));
+        assert_eq!(QualityClass::parse("C"), Some(QualityClass::C));
+        assert_eq!(QualityClass::parse("Start"), Some(QualityClass::Start));
+        assert_eq!(QualityClass::parse("Stub"), Some(QualityClass::Stub));
+        assert_eq!(
+            QualityClass::parse("FL"),
+            None,
+            "unrecognized classes parse to None"
+        );
+        assert_eq!(QualityClass::parse(""), None);
+
+        assert!(QualityClass::Fa.is_good_or_better());
+        assert!(QualityClass::Ga.is_good_or_better());
+        assert!(!QualityClass::B.is_good_or_better());
+        assert!(!QualityClass::C.is_good_or_better());
+        assert!(!QualityClass::Start.is_good_or_better());
+        assert!(!QualityClass::Stub.is_good_or_better());
+        assert!(QualityClass::Fa > QualityClass::Ga, "FA outranks GA");
     }
 }

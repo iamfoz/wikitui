@@ -21,10 +21,12 @@ mod jsonl;
 mod layout;
 mod netqueue;
 mod prefetch;
+mod random;
 mod research;
 mod sanitize;
 mod saved;
 mod saved_export;
+mod search_ops;
 mod startpage;
 mod tab;
 mod target;
@@ -42,7 +44,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
-use api::{TitleSuggestion, WikiClient};
+use api::{SearchResult, TitleSuggestion, WikiClient};
 use app::{App, BulkSaveRequest, Mode, PageSource, PendingReload};
 use bookmarks::ReadLaterEntry;
 use cache::{PageCache, RevalidateAction, SwrDecision};
@@ -140,6 +142,18 @@ struct SaveFetched {
     /// Link-target summaries for T2 (empty otherwise).
     summaries: Vec<LinkSummary>,
     source_note: String,
+}
+
+/// One completed (or failed) `morelike:` fetch for the Related panel (PRD
+/// FR-SR-6), delivered off the event loop like every other lazy fetch (see
+/// `fire_related`) so opening the panel never blocks. Tagged with the
+/// `(lang, title)` it answers so a result for an article the reader has
+/// since navigated away from is still cache-worthy (`App::deliver_related`)
+/// without pretending to update a panel that's no longer showing it.
+struct RelatedOutcome {
+    lang: String,
+    title: String,
+    result: std::result::Result<Vec<SearchResult>, String>,
 }
 
 enum RevalidationResult {
@@ -1519,6 +1533,9 @@ async fn run(
     let (image_tx, mut image_rx) = mpsc::unbounded_channel::<ImageOutcome>();
     // PRD FR-OFF-4..5: background saved-page fetch results (serial, non-blocking).
     let (save_tx, mut save_rx) = mpsc::unbounded_channel::<SaveOutcome>();
+    // PRD FR-SR-6: lazy `morelike:` fetches for the Related panel — never
+    // blocking, same idiom as `typeahead_tx`/`image_tx` above.
+    let (related_tx, mut related_rx) = mpsc::unbounded_channel::<RelatedOutcome>();
 
     // PRD §5.8 / NF-NET-1: the one background substrate. A single serial
     // worker drains its priority queue; revalidation (FR-OFF-2) is migrated
@@ -1644,6 +1661,10 @@ async fn run(
             // Reading with an article open still blocks on input. Uses the
             // pre-`draw` snapshot above, not a fresh read — see its comment.
             || start_page_still_loading
+            // PRD FR-SR-6: the Related panel's lazy `morelike:` fetch
+            // completes and redraws without a keypress, mirroring the other
+            // lazy-fetch cases above.
+            || app.related_loading
         {
             let poll_interval = if app.mode == Mode::Search {
                 TYPEAHEAD_POLL
@@ -1663,6 +1684,7 @@ async fn run(
                     &revalidate_tx,
                     &open_tx,
                     &save_tx,
+                    &related_tx,
                     terminal,
                 )
                 .await;
@@ -1702,6 +1724,12 @@ async fn run(
             while let Ok(outcome) = save_rx.try_recv() {
                 apply_save_outcome(&mut app, outcome);
             }
+            // PRD FR-SR-6: install a completed `morelike:` fetch into the
+            // session cache (and, if the panel is still open on the same
+            // article, the live view too).
+            while let Ok(outcome) = related_rx.try_recv() {
+                app.deliver_related(outcome.lang, outcome.title, outcome.result);
+            }
         } else if let Event::Key(key) = event::read()? {
             // Block until an event arrives instead of redrawing on a timer —
             // an idle reader shouldn't spin the CPU or spam hide-cursor codes.
@@ -1715,6 +1743,7 @@ async fn run(
                     &revalidate_tx,
                     &open_tx,
                     &save_tx,
+                    &related_tx,
                     terminal,
                 )
                 .await;
@@ -1750,6 +1779,115 @@ fn fire_typeahead(client: &WikiClient, app: &App, tx: &UnboundedSender<Typeahead
             .map_err(|e| e.to_string());
         let _ = tx.send(TypeaheadOutcome { query, result });
     });
+}
+
+/// Spawns the `morelike:{title}` search behind the Related panel (PRD
+/// FR-SR-6) so opening it never blocks — mirrors `fire_typeahead`'s pattern.
+/// The panel shows its own "loading" status (`App::open_related`) until the
+/// result lands via `related_rx` and `App::deliver_related` installs it.
+const RELATED_LIMIT: u32 = 10;
+
+fn fire_related(
+    client: &WikiClient,
+    lang: &str,
+    title: &str,
+    tx: &UnboundedSender<RelatedOutcome>,
+) {
+    let lang = lang.to_string();
+    let title = title.to_string();
+    let client = client.clone();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let query = format!("morelike:{title}");
+        let result = client
+            .search(&lang, &query, RELATED_LIMIT)
+            .await
+            .map(|outcome| outcome.results)
+            .map_err(|e| e.to_string());
+        let _ = tx.send(RelatedOutcome {
+            lang,
+            title,
+            result,
+        });
+    });
+}
+
+/// Opens the Related panel (PRD FR-SR-6: `gR` / `:related`), firing the
+/// `morelike:` fetch only when `App::open_related` says the session cache
+/// doesn't already have this article's results.
+fn open_related(app: &mut App, client: &WikiClient, tx: &UnboundedSender<RelatedOutcome>) {
+    if app.open_related() {
+        let tab = app.active_tab();
+        let lang = tab.lang.clone();
+        // `open_related` only returns `true` when the active tab has a
+        // document — see its own doc comment.
+        let title = tab
+            .doc
+            .as_ref()
+            .expect("open_related guarantees a document")
+            .title
+            .clone();
+        fire_related(client, &lang, &title, tx);
+    }
+}
+
+/// `gr` / `:random` (PRD FR-SR-5): opens a random main-namespace article.
+/// A single quick round trip, so — like `run_search`/`open_title` — this
+/// blocks the event loop for its duration rather than going through the
+/// lazy channel pattern; `app.loading` drives the same "Loading…" status
+/// those already show.
+async fn open_random_article(
+    client: &WikiClient,
+    cache: &PageCache,
+    app: &mut App,
+    revalidate_tx: &UnboundedSender<RevalidationOutcome>,
+) {
+    app.loading = true;
+    let lang = app.lang.clone();
+    match client.random_titles(&lang, 1).await {
+        Ok(mut titles) => match titles.pop() {
+            Some(title) => {
+                open_title(client, cache, app, &title, revalidate_tx).await;
+                return;
+            }
+            None => app.status = "Random article: the wiki returned nothing".to_string(),
+        },
+        Err(e) => app.status = format!("Random article failed: {e}"),
+    }
+    app.loading = false;
+}
+
+/// `:random good` (PRD FR-SR-5): batches 10 random titles against one
+/// `pageassessments` query (`random::pick_random_good`) and opens the first
+/// title assessed ≥ GA, falling back to opening the batch's own first title
+/// (with a notice) when none qualify — §7's "graceful degradation, never an
+/// error screen" posture.
+async fn open_random_good_article(
+    client: &WikiClient,
+    cache: &PageCache,
+    app: &mut App,
+    revalidate_tx: &UnboundedSender<RevalidationOutcome>,
+) {
+    app.loading = true;
+    let lang = app.lang.clone();
+    match random::pick_random_good(client, &lang).await {
+        Ok(random::RandomGood::Found(title)) => {
+            open_title(client, cache, app, &title, revalidate_tx).await;
+            return;
+        }
+        Ok(random::RandomGood::Fallback(title)) => {
+            open_title(client, cache, app, &title, revalidate_tx).await;
+            app.notice = Some(
+                "no good article found in this batch — opened a random article instead".to_string(),
+            );
+            return;
+        }
+        Ok(random::RandomGood::Empty) => {
+            app.status = "Random good article: the wiki returned nothing".to_string();
+        }
+        Err(e) => app.status = format!("Random good article failed: {e}"),
+    }
+    app.loading = false;
 }
 
 /// Lazily fetch+decode inline images the active document references (PRD
@@ -2012,6 +2150,7 @@ async fn handle_key(
     revalidate_tx: &UnboundedSender<RevalidationOutcome>,
     open_tx: &UnboundedSender<TabLoadOutcome>,
     save_tx: &UnboundedSender<SaveOutcome>,
+    related_tx: &UnboundedSender<RelatedOutcome>,
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
 ) {
     // `Q`'s one-keypress quit confirmation (PRD Appendix B) is intercepted
@@ -2063,6 +2202,15 @@ async fn handle_key(
         // two are deliberately separate actions, not Enter-falls-back-to-
         // search, so the dropdown and full-text results never fight over
         // what Enter means.
+        // PRD FR-SR-3b: the operator cheat-sheet overlay takes over the whole
+        // prompt while it's up — only `?`/Esc close it, every other key is
+        // swallowed rather than typed into `search_input` (unlike the
+        // generic `Mode::Help`'s "any key closes", which doesn't fit a
+        // prompt still mid-edit).
+        Mode::Search if app.search_operator_help => match code {
+            KeyCode::Char('?') | KeyCode::Esc => app.search_operator_help = false,
+            _ => {}
+        },
         Mode::Search => match code {
             KeyCode::Esc => {
                 app.mode = Mode::Reading;
@@ -2080,8 +2228,15 @@ async fn handle_key(
                     app.status = "No suggestion selected — Tab searches full text".to_string();
                 }
             }
+            // PRD FR-SR-3c: Tab first tries operator-*name* completion
+            // (`morel` -> `morelike:`); only when the last word isn't an
+            // unambiguous operator prefix does Tab keep its other meaning,
+            // full-text search (FR-SR-2).
             KeyCode::Tab => {
-                if !app.search_input.trim().is_empty() {
+                if let Some(completed) = search_ops::complete_operator_name(&app.search_input) {
+                    app.search_input = completed;
+                    app.queue_typeahead();
+                } else if !app.search_input.trim().is_empty() {
                     run_search(client, app).await;
                 }
             }
@@ -2097,6 +2252,11 @@ async fn handle_key(
                 app.search_input.pop();
                 app.queue_typeahead();
             }
+            // PRD FR-SR-3b: `?` opens the operator cheat-sheet instead of
+            // being typed — CirrusSearch operators never need a literal `?`
+            // in the query, so reserving it (lazygit-style, PRD §2.2) costs
+            // nothing real queries would use.
+            KeyCode::Char('?') => app.search_operator_help = true,
             KeyCode::Char(c) => {
                 app.search_input.push(c);
                 app.queue_typeahead();
@@ -2114,7 +2274,8 @@ async fn handle_key(
                 app.mode = Mode::Reading;
                 match command::parse(&input) {
                     Ok(cmd) => {
-                        execute_command(client, cache, app, cmd, revalidate_tx, save_tx).await
+                        execute_command(client, cache, app, cmd, revalidate_tx, save_tx, related_tx)
+                            .await
                     }
                     Err(message) => app.notice = Some(message),
                 }
@@ -2224,6 +2385,23 @@ async fn handle_key(
                     // suggested spelling.
                     app.search_input = suggestion;
                     run_search(client, app).await;
+                }
+            }
+            KeyCode::Char('?') => {
+                app.prior_mode = app.mode;
+                app.mode = Mode::Help;
+            }
+            _ => {}
+        },
+        // PRD FR-SR-6's Related panel: a selectable `morelike:` list, same
+        // j/k/Enter/Esc grammar as every other picker in this match.
+        Mode::Related => match code {
+            KeyCode::Esc => app.close_related(),
+            KeyCode::Char('j') | KeyCode::Down => app.related_move(1),
+            KeyCode::Char('k') | KeyCode::Up => app.related_move(-1),
+            KeyCode::Enter => {
+                if let Some(title) = app.related_open_target() {
+                    open_title(client, cache, app, &title, revalidate_tx).await;
                 }
             }
             KeyCode::Char('?') => {
@@ -2488,38 +2666,50 @@ async fn handle_key(
         Mode::Reading => {
             // g-prefix chords (PRD Appendix B): the g-latch's second key.
             // `gg` top, `gt`/`gT` next/prev tab (FR-TB-1), `gb` back-stack
-            // picker (FR-NV-7), `gh` home / start page (FR-DL-1). An
-            // unrecognized second key falls through to its normal binding
-            // (matching how `gj` still scrolls).
+            // picker (FR-NV-7), `gh` home / start page (FR-DL-1), `gr`
+            // random article (FR-SR-5), `gR` the Related panel (FR-SR-6).
+            // An unrecognized second key falls through to its normal
+            // binding (matching how `gj` still scrolls) — `resolve_g_prefix`
+            // makes that dispatch decision testably without a live terminal.
             if app.pending_g {
                 app.pending_g = false;
-                match code {
-                    KeyCode::Char('g') => {
-                        app.scroll_to_top();
-                        return;
-                    }
-                    KeyCode::Char('t') => {
-                        app.next_tab();
-                        return;
-                    }
-                    KeyCode::Char('T') => {
-                        app.prev_tab();
-                        return;
-                    }
-                    KeyCode::Char('b') => {
-                        if app.active_tab().back_stack.is_empty() {
-                            app.status = "No history to show in this tab".to_string();
-                        } else {
-                            app.selected_history = app.active_tab().back_stack.len() - 1;
-                            app.mode = Mode::HistoryPicker;
+                if let KeyCode::Char(c) = code {
+                    match app::resolve_g_prefix(c) {
+                        app::GPrefixAction::Top => {
+                            app.scroll_to_top();
+                            return;
                         }
-                        return;
+                        app::GPrefixAction::NextTab => {
+                            app.next_tab();
+                            return;
+                        }
+                        app::GPrefixAction::PrevTab => {
+                            app.prev_tab();
+                            return;
+                        }
+                        app::GPrefixAction::BackStack => {
+                            if app.active_tab().back_stack.is_empty() {
+                                app.status = "No history to show in this tab".to_string();
+                            } else {
+                                app.selected_history = app.active_tab().back_stack.len() - 1;
+                                app.mode = Mode::HistoryPicker;
+                            }
+                            return;
+                        }
+                        app::GPrefixAction::Home => {
+                            app.go_home();
+                            return;
+                        }
+                        app::GPrefixAction::Random => {
+                            open_random_article(client, cache, app, revalidate_tx).await;
+                            return;
+                        }
+                        app::GPrefixAction::Related => {
+                            open_related(app, client, related_tx);
+                            return;
+                        }
+                        app::GPrefixAction::PassThrough => {} // handle this key normally below.
                     }
-                    KeyCode::Char('h') => {
-                        app.go_home();
-                        return;
-                    }
-                    _ => {} // dead prefix — handle this key normally below.
                 }
             }
             // b-prefix chord: `bb` opens the tab picker (FR-TB-1), `ba`
@@ -2833,6 +3023,7 @@ async fn handle_key(
 /// Executes a parsed `:` command. Parsing already validated arguments
 /// (theme/style/lang names), so the arms here mostly delegate to existing
 /// features.
+#[allow(clippy::too_many_arguments)]
 async fn execute_command(
     client: &WikiClient,
     cache: &PageCache,
@@ -2840,8 +3031,9 @@ async fn execute_command(
     cmd: command::Command,
     revalidate_tx: &UnboundedSender<RevalidationOutcome>,
     save_tx: &UnboundedSender<SaveOutcome>,
+    related_tx: &UnboundedSender<RelatedOutcome>,
 ) {
-    use command::{Command, SaveSpec};
+    use command::{Command, RandomSpec, SaveSpec};
     match cmd {
         Command::Open(raw) => {
             // Same grammar as the CLI TITLE argument: URLs and
@@ -2989,6 +3181,15 @@ async fn execute_command(
         Command::Start => app.go_home(),
         // PRD FR-DL-2.
         Command::Today => fetch_on_this_day(client, app).await,
+        // PRD FR-SR-5: same actions as the `gr` keybinding.
+        Command::Random(RandomSpec::Any) => {
+            open_random_article(client, cache, app, revalidate_tx).await
+        }
+        Command::Random(RandomSpec::Good) => {
+            open_random_good_article(client, cache, app, revalidate_tx).await
+        }
+        // PRD FR-SR-6: same action as the `gR` keybinding.
+        Command::Related => open_related(app, client, related_tx),
         Command::Quit => app.should_quit = true,
     }
 }

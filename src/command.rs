@@ -84,8 +84,25 @@ pub enum Command {
     Start,
     /// `:today` (PRD FR-DL-2) — open the on-this-day panel.
     Today,
+    /// `:random` / `:random good` (PRD FR-SR-5) — open a random article, or
+    /// one filtered to assessment ≥ GA. Same action as `gr` (Appendix B);
+    /// the `good` variant has no dedicated keybinding, `:random good` only.
+    Random(RandomSpec),
+    /// `:related` (PRD FR-SR-6) — open the Related panel for the current
+    /// article (`morelike:{title}`). Same action as `gR`.
+    Related,
     /// `:q` / `:quit` — exit.
     Quit,
+}
+
+/// `:random`'s two documented forms (PRD FR-SR-5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RandomSpec {
+    /// Bare `:random` (and `gr`): any article in the main namespace.
+    Any,
+    /// `:random good`: filtered to assessment ≥ GA, batching 10 candidates
+    /// against one `pageassessments` query.
+    Good,
 }
 
 /// `:history clear`'s two documented scopes (PRD FR-HS-4). Kept separate
@@ -124,7 +141,7 @@ pub enum SaveSpec {
 /// parse-time constant so `command` doesn't depend on the render module.
 const SAVE_EXPORT_FORMATS: [&str; 3] = ["md", "txt", "html"];
 
-pub const USAGE: &str = "commands: open <title>, lang <code>, theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, prefetch-log, start, today, set images=on|off|prefetch=on|off, config reload, help, quit";
+pub const USAGE: &str = "commands: open <title>, lang <code>, theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, prefetch-log, start, today, random [good], related, set images=on|off|prefetch=on|off, config reload, help, quit";
 
 pub fn parse(input: &str) -> Result<Command, String> {
     let input = input.trim();
@@ -372,6 +389,17 @@ pub fn parse(input: &str) -> Result<Command, String> {
         // PRD FR-DL-1/2.
         "start" => Ok(Command::Start),
         "today" => Ok(Command::Today),
+        // PRD FR-SR-5: bare `:random` is any article; `:random good` filters
+        // by assessment ≥ GA.
+        "random" => match arg {
+            "" => Ok(Command::Random(RandomSpec::Any)),
+            "good" => Ok(Command::Random(RandomSpec::Good)),
+            other => Err(format!(
+                "unknown :random argument {other:?} — try: random, random good"
+            )),
+        },
+        // PRD FR-SR-6.
+        "related" => Ok(Command::Related),
         "help" | "h" => Ok(Command::Help),
         "q" | "quit" => Ok(Command::Quit),
         "" => Err(USAGE.to_string()),
@@ -665,5 +693,18 @@ mod tests {
         assert_eq!(parse("saved"), Ok(Command::Saved));
         assert_eq!(parse("fetch-queue"), Ok(Command::FetchQueue));
         assert_eq!(parse("fetchqueue"), Ok(Command::FetchQueue));
+    }
+
+    #[test]
+    fn random_parses_bare_and_good_and_rejects_other_arguments() {
+        assert_eq!(parse("random"), Ok(Command::Random(RandomSpec::Any)));
+        assert_eq!(parse("random good"), Ok(Command::Random(RandomSpec::Good)));
+        assert!(parse("random bad").is_err());
+        assert!(parse("random good extra").is_err());
+    }
+
+    #[test]
+    fn related_parses_bare() {
+        assert_eq!(parse("related"), Ok(Command::Related));
     }
 }

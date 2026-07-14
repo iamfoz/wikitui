@@ -12,6 +12,7 @@ use crate::doc::LinkRef;
 use crate::layout::{
     FLOOR_MIN_HEIGHT, FLOOR_MIN_WIDTH, LaidLine, MatchSpan, SizeTier, SpanKind, size_tier,
 };
+use crate::search_ops;
 use crate::startpage::{self, StartPageConfig, StartPageModel};
 use crate::theme::Theme;
 
@@ -434,6 +435,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         // bar below, like the help overlay).
         Mode::OfflineCard => draw_reading(frame, app, content_area),
         Mode::OnThisDay => draw_on_this_day(frame, app, content_area),
+        Mode::Related => draw_related(frame, app, content_area),
     }
 
     draw_status_bar(frame, app, status_area);
@@ -442,10 +444,18 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_offline_card(frame, app, area);
     }
 
-    // The typeahead dropdown floats over the reading view, anchored just
-    // above the prompt it belongs to (PRD FR-SR-1) — drawn after the status
-    // bar so it layers on top, same ordering as the help overlay below.
-    if app.mode == Mode::Search && !app.typeahead.is_empty() {
+    // PRD FR-SR-3b: the operator cheat-sheet takes priority over the
+    // typeahead dropdown below — showing both at once would be clutter, and
+    // the cheat-sheet's own key handling (`main::handle_key`) already
+    // swallows every key but `?`/Esc while it's up, so the dropdown
+    // wouldn't be interactive underneath it anyway.
+    if app.mode == Mode::Search && app.search_operator_help {
+        draw_operator_cheatsheet(frame, app, content_area);
+    } else if app.mode == Mode::Search && !app.typeahead.is_empty() {
+        // The typeahead dropdown floats over the reading view, anchored
+        // just above the prompt it belongs to (PRD FR-SR-1) — drawn after
+        // the status bar so it layers on top, same ordering as the help
+        // overlay below.
         draw_search_suggestions(frame, app, content_area);
     }
 
@@ -1145,6 +1155,54 @@ fn draw_search_suggestions(frame: &mut Frame, app: &App, content_area: Rect) {
     render_selectable_list(frame, list, popup, app.selected_suggestion);
 }
 
+/// PRD FR-SR-3b: the search prompt's operator cheat-sheet, toggled by `?`.
+/// A static overlay (no selection state) listing every operator
+/// `search_ops::OPERATORS` documents, one line each — argument completion
+/// (category names, template names, …) is out of scope, noted via the
+/// operators' own descriptions rather than a separate caveat line.
+fn draw_operator_cheatsheet(frame: &mut Frame, app: &App, area: Rect) {
+    let width = 64.min(area.width.saturating_sub(4)).max(20);
+    let height = (search_ops::OPERATORS.len() as u16 + 5)
+        .min(area.height.saturating_sub(2))
+        .max(8);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+
+    let mut lines = vec![
+        Line::from(RSpan::styled(
+            "Search operators",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    for op in search_ops::OPERATORS {
+        lines.push(Line::from(vec![
+            RSpan::styled(
+                format!("{}:", op.name),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            RSpan::raw(format!(" {}", op.about)),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(RSpan::styled(
+        "Tab completes an operator name   ?/Esc: close",
+        colored(app.no_color, app.theme.dim),
+    )));
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .style(base_style(&app.theme, app.no_color))
+            .block(UiBlock::default().borders(Borders::ALL).title("Operators")),
+        popup,
+    );
+}
+
 fn draw_toc(frame: &mut Frame, app: &App, area: Rect) {
     let tab = app.active_tab();
     let items: Vec<ListItem> = tab
@@ -1731,6 +1789,67 @@ fn draw_on_this_day(frame: &mut Frame, app: &App, area: Rect) {
     render_selectable_list(frame, list, chunks[1], app.otd_selected);
 }
 
+/// PRD FR-SR-6's Related panel: `morelike:{title}` results for the article
+/// on screen, mirroring `draw_results`'s title+description list styling.
+/// Distinct empty states for "still fetching" (`related_loading`) vs.
+/// "fetched, nothing came back" — never the same blank list for both.
+fn draw_related(frame: &mut Frame, app: &App, area: Rect) {
+    let heading = match &app.active_tab().doc {
+        Some(doc) => format!("Related to \"{}\"", doc.title),
+        None => "Related".to_string(),
+    };
+    if app.related_loading {
+        let text = Text::from(vec![
+            Line::from(""),
+            Line::from("Loading related articles…"),
+        ]);
+        frame.render_widget(
+            Paragraph::new(text)
+                .style(base_style(&app.theme, app.no_color))
+                .block(UiBlock::default().borders(Borders::ALL).title(heading)),
+            area,
+        );
+        return;
+    }
+    let items_data = app.related_items();
+    if items_data.is_empty() {
+        let text = Text::from(vec![Line::from(""), Line::from(app.status.clone())]);
+        frame.render_widget(
+            Paragraph::new(text)
+                .style(base_style(&app.theme, app.no_color))
+                .block(UiBlock::default().borders(Borders::ALL).title(heading)),
+            area,
+        );
+        return;
+    }
+    let items: Vec<ListItem> = items_data
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let mut lines = vec![Line::from(RSpan::styled(
+                r.title.clone(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ))];
+            if let Some(desc) = &r.description {
+                lines.push(Line::from(RSpan::styled(
+                    desc.clone(),
+                    colored(app.no_color, app.theme.dim),
+                )));
+            }
+            let style = if i == app.selected_related {
+                colored_bg(app.no_color, app.theme.selected_fg, app.theme.selected_bg)
+            } else {
+                Style::default()
+            };
+            ListItem::new(lines).style(style)
+        })
+        .collect();
+    let list = List::new(items)
+        .style(base_style(&app.theme, app.no_color))
+        .block(UiBlock::default().borders(Borders::ALL).title(heading));
+    render_selectable_list(frame, list, area, app.selected_related);
+}
+
 /// §7's "Offline, uncached link" card: a centered overlay offering the two
 /// documented choices (queue for fetch when online / search saved pages).
 fn draw_offline_card(frame: &mut Frame, app: &App, area: Rect) {
@@ -1771,6 +1890,9 @@ fn draw_offline_card(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let tab = app.active_tab();
     let text = match app.mode {
+        Mode::Search if app.search_operator_help => {
+            "Search operators — ?/Esc: close   Tab: complete operator name".to_string()
+        }
         Mode::Search if app.typeahead.is_empty() => format!(
             "/{}   Tab: full-text search   Esc: cancel",
             app.search_input
@@ -1829,6 +1951,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         }
         Mode::PrefetchLog => app.status.clone(),
         Mode::OnThisDay => app.status.clone(),
+        Mode::Related => app.status.clone(),
         Mode::Help => "Press any key to close help".to_string(),
         Mode::Reading if app.loading => "Loading…".to_string(),
         // Command feedback outranks the focused-link line until the next
@@ -1929,6 +2052,8 @@ fn draw_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
         Line::from("gb           back-stack picker (breadcrumb trail)"),
         Line::from("Ctrl-h       reading history (persistent)   :history clear today|all"),
         Line::from("gt / gT      next / previous tab"),
+        Line::from("gr           random article   :random good  (assessment ≥ GA)"),
+        Line::from("gR           related articles (morelike:)   :related"),
         Line::from("bb           tab picker    u  reopen closed tab"),
         Line::from("t            table of contents"),
         Line::from("[ / ]        scroll wide tables left / right"),
@@ -1944,6 +2069,8 @@ fn draw_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
         Line::from("rl           read later (focused link, else article)"),
         Line::from(":readlater   read-later queue   :bookmarks[ export md|html|json|netscape]"),
         Line::from("/            search: type for suggestions, Enter opens, Tab full-text"),
+        Line::from("  in search  ?: operator cheat-sheet (intitle:, morelike:, ...)"),
+        Line::from("             Tab on a partial operator name completes it"),
         Line::from("Ctrl-f       find in this page (smart-case), n/N: cycle matches"),
         Line::from("Esc          cancel / close"),
         Line::from("?            toggle this help"),

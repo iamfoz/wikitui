@@ -25,6 +25,26 @@ corpus can stay small and readable:
   `timestamp`. A query with zero hits that's in `DID_YOU_MEAN` gets a
   `suggestion` field instead (see `api::SearchOutcome`'s doc comment for why
   that field rides this response rather than a second Action-API request).
+  Two CirrusSearch operators (PRD FR-SR-3) get minimal real interpretation,
+  enough to prove the client's passthrough actually reaches the server
+  unmangled — the rest fall through to the plain substring match, which is
+  fine since passthrough itself is asserted at the wire level, not against
+  this mock's interpretation of every operator:
+  - `intitle:<term>` — matches `SEARCH_PAGES` by title only, never body text.
+  - `morelike:<title>` — PRD FR-SR-6's Related panel substrate; looks
+    `<title>` up in `RELATED_ARTICLES` (underscores normalised to spaces).
+
+Random article / quality fixtures (PRD FR-SR-5 / FR-DL-3):
+
+- `GET /w/api.php?action=query&list=random&rnnamespace=0&rnlimit=` —
+  rotates through `RANDOM_TITLES` (real `PAGES` keys) instead of true
+  randomness, so `gr`/`:random` is deterministic-testable: sequential
+  requests draw sequential titles, wrapping every 6.
+- `GET /w/api.php?action=query&prop=pageassessments&titles=` — one class
+  per title from `ASSESSMENTS` (`FA`/`GA`); a title with no entry comes back
+  with no `pageassessments` at all, matching a real unassessed page. Two of
+  `RANDOM_TITLES`' six entries reach GA+, so any 10-title `:random good`
+  batch (`RANDOM_TITLES`' rotation period is 6) is guaranteed to include one.
 
 Two-layer cache / stale-while-revalidate fixtures (PRD FR-OFF-1/2):
 

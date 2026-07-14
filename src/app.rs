@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -105,6 +106,14 @@ pub enum Mode {
     /// start page's own condensed on-this-day strip (FR-DL-1), which reuses
     /// the bundled feed rather than this panel's dedicated per-type fetch.
     OnThisDay,
+    /// `gR` / `:related` (PRD FR-SR-6): the Related panel for the article
+    /// on screen, powered by `morelike:{title}` — a selectable list of
+    /// related titles with descriptions; Enter opens one, Esc closes.
+    /// Fetched lazily off the event loop (see `main::fire_related`) and
+    /// cached per (lang, title) for the session (`App::related_cache`), so
+    /// reopening the panel for the same article — or switching back to a
+    /// tab that already showed it — costs no second request.
+    Related,
 }
 
 /// Where the currently open article's content came from (PRD FR-OFF-6's
@@ -225,6 +234,12 @@ pub struct App {
     /// search, shown by the zero-results view; `None` when the search had
     /// results or hasn't run yet.
     pub search_suggestion: Option<String>,
+    /// PRD FR-SR-3b: the operator cheat-sheet overlay, toggled by `?` while
+    /// in `Mode::Search` — deliberately not the generic `Mode::Help` (whose
+    /// "any key closes" doesn't fit a prompt still being typed into): only
+    /// `?` or Esc close it, every other key is swallowed rather than typed
+    /// into `search_input` while the sheet is up.
+    pub search_operator_help: bool,
     pub should_quit: bool,
     /// The app-global "current" language for new searches and opens (PRD
     /// FR-ML-1/2, MVP slice). Kept in sync with the active tab's `lang` when
@@ -489,6 +504,22 @@ pub struct App {
     pub otd_selected: usize,
     /// The mode `open_on_this_day` was entered from, restored on close.
     pub otd_prior_mode: Mode,
+
+    // -- Related panel (PRD FR-SR-6) ----------------------------------------
+    /// `morelike:{title}` results, session-cached per `(lang, title)` so the
+    /// panel never re-fetches for an article it has already shown this
+    /// session (switching tabs, reopening the panel, revisiting the
+    /// article). Never persisted — a fresh launch starts empty.
+    pub related_cache: HashMap<(String, String), Vec<SearchResult>>,
+    /// Selection cursor into `App::related_items()`.
+    pub selected_related: usize,
+    /// The mode `open_related` was entered from, restored on close.
+    pub related_prior_mode: Mode,
+    /// A `morelike:` fetch for the panel's current article is in flight
+    /// (PRD FR-SR-6's "fetched lazily... don't block"): `main::fire_related`
+    /// spawns it off the event loop and `App::deliver_related` clears this
+    /// once the result (or failure) lands.
+    pub related_loading: bool,
 }
 
 /// A confirmed-and-resolved bulk save (PRD FR-OFF-5): the human label for the
@@ -524,6 +555,7 @@ impl App {
             selected_suggestion: 0,
             search_debounce_at: None,
             search_suggestion: None,
+            search_operator_help: false,
             should_quit: false,
             lang,
             loading: false,
@@ -592,6 +624,10 @@ impl App {
             otd_tab: OtdType::default(),
             otd_selected: 0,
             otd_prior_mode: Mode::Reading,
+            related_cache: HashMap::new(),
+            selected_related: 0,
+            related_prior_mode: Mode::Reading,
+            related_loading: false,
         }
     }
 
@@ -806,6 +842,123 @@ impl App {
         self.otd
             .open_target(self.otd_tab, self.otd_selected)
             .map(str::to_string)
+    }
+
+    // -- Related panel (PRD FR-SR-6) -----------------------------------------
+
+    /// The session-cache key for the active tab's article, or `None` when
+    /// no document is open (the panel has nothing to be "related to" then).
+    fn related_key(&self) -> Option<(String, String)> {
+        let tab = self.active_tab();
+        tab.doc
+            .as_ref()
+            .map(|doc| (tab.lang.clone(), doc.title.clone()))
+    }
+
+    /// Opens the Related panel for the active tab's article. Returns
+    /// whether the caller must kick off a `morelike:` fetch
+    /// (`main::open_related` does so only when this is `true`): a session
+    /// cache hit needs no network round trip at all, which is exactly what
+    /// "cached per-article for the session" (PRD FR-SR-6) means. `false`
+    /// also covers "no article open" — the panel still opens (showing its
+    /// own empty/`status` message) rather than refusing the keypress.
+    pub fn open_related(&mut self) -> bool {
+        self.related_prior_mode = self.mode;
+        self.mode = Mode::Related;
+        self.selected_related = 0;
+        match self.related_key() {
+            None => {
+                self.related_loading = false;
+                self.status = "Open an article first".to_string();
+                false
+            }
+            Some(key) if self.related_cache.contains_key(&key) => {
+                self.related_loading = false;
+                self.status = "Related articles — Enter: open   Esc: close".to_string();
+                false
+            }
+            Some(_) => {
+                self.related_loading = true;
+                self.status = "Loading related articles…".to_string();
+                true
+            }
+        }
+    }
+
+    /// Closes the Related panel, restoring the prior mode.
+    pub fn close_related(&mut self) {
+        self.mode = self.related_prior_mode;
+        self.status = match &self.active_tab().doc {
+            Some(doc) => doc.title.clone(),
+            None => "Press / to search, ? for help, q to quit".to_string(),
+        };
+    }
+
+    /// The panel's current item list: whatever the session cache holds for
+    /// the active tab's article, or empty if nothing has arrived (or
+    /// there's no article open at all).
+    pub fn related_items(&self) -> &[SearchResult] {
+        match self.related_key() {
+            Some(key) => self
+                .related_cache
+                .get(&key)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+            None => &[],
+        }
+    }
+
+    /// Moves the panel's selection by `delta`, wrapping — a no-op (stays 0)
+    /// on an empty list.
+    pub fn related_move(&mut self, delta: i32) {
+        let len = self.related_items().len();
+        if len == 0 {
+            self.selected_related = 0;
+            return;
+        }
+        let cur = (self.selected_related as i32).rem_euclid(len as i32);
+        self.selected_related = (cur + delta).rem_euclid(len as i32) as usize;
+    }
+
+    /// The title Enter should open for the focused related item, or `None`
+    /// on an empty list.
+    pub fn related_open_target(&self) -> Option<String> {
+        self.related_items()
+            .get(self.selected_related)
+            .map(|r| r.title.clone())
+    }
+
+    /// Installs a completed (or failed) `morelike:` fetch into the session
+    /// cache, keyed by `(lang, title)` — PRD FR-SR-6's "cached per-article
+    /// for the session": switching tabs, reopening the panel, or revisiting
+    /// the same article later all become cache hits from here on. A
+    /// network failure caches an empty list rather than nothing at all, so
+    /// a flaky request doesn't get silently retried every time the panel
+    /// reopens — the reader sees "no related articles found" once and that
+    /// stands for the rest of the session (mirroring how `related_key`
+    /// treats "no entry yet" as "still loading" only via `related_loading`,
+    /// never by falling through to a repeat fetch). Applied even if the
+    /// reader has since navigated away from `title` — it's still cached for
+    /// when they come back — but the loading flag and status line only
+    /// update if the panel is still showing exactly this article.
+    pub fn deliver_related(
+        &mut self,
+        lang: String,
+        title: String,
+        result: Result<Vec<SearchResult>, String>,
+    ) {
+        let items = result.unwrap_or_default();
+        let is_current_and_open =
+            self.mode == Mode::Related && self.related_key() == Some((lang.clone(), title.clone()));
+        self.related_cache.insert((lang, title), items);
+        if is_current_and_open {
+            self.related_loading = false;
+            self.status = if self.related_items().is_empty() {
+                "No related articles found — Esc to close".to_string()
+            } else {
+                "Related articles — Enter: open   Esc: close".to_string()
+            };
+        }
     }
 
     /// The tab currently on screen. `tabs` is never empty while the app runs
@@ -2533,6 +2686,48 @@ pub fn resolve_r_prefix(second_key: char) -> RPrefixAction {
     }
 }
 
+/// What the `g`-prefix chord's second key means (PRD Appendix B: `gg`,
+/// `gt`/`gT`, `gb`, `gh`, plus FR-SR-5's `gr` and FR-SR-6's `gR` added
+/// here). A pure decision like `resolve_b_prefix`/`resolve_r_prefix`, so
+/// `main.rs`'s `handle_key` only has to turn the answer into the actual
+/// mode change/fetch, not decide it inline where a test can't reach it
+/// without a live terminal — this one was inline in `handle_key` before
+/// `gr`/`gR` needed adding, and factoring it out here now is what makes
+/// those two additions (and the untouched five) equally testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GPrefixAction {
+    /// `gg`: scroll to the top.
+    Top,
+    /// `gt`: next tab.
+    NextTab,
+    /// `gT`: previous tab.
+    PrevTab,
+    /// `gb`: the back-stack picker.
+    BackStack,
+    /// `gh`: home / start page.
+    Home,
+    /// `gr` (PRD FR-SR-5): open a random article.
+    Random,
+    /// `gR` (PRD FR-SR-6): open the Related panel for the current article.
+    Related,
+    /// Any other second key: dead prefix — `handle_key` processes it as if
+    /// `g` had never been typed (e.g. `gj` still scrolls).
+    PassThrough,
+}
+
+pub fn resolve_g_prefix(second_key: char) -> GPrefixAction {
+    match second_key {
+        'g' => GPrefixAction::Top,
+        't' => GPrefixAction::NextTab,
+        'T' => GPrefixAction::PrevTab,
+        'b' => GPrefixAction::BackStack,
+        'h' => GPrefixAction::Home,
+        'r' => GPrefixAction::Random,
+        'R' => GPrefixAction::Related,
+        _ => GPrefixAction::PassThrough,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2886,6 +3081,133 @@ mod tests {
 
         app.otd_prev_tab();
         assert_eq!(app.otd_tab, OtdType::Events);
+    }
+
+    // ---- Related panel (PRD FR-SR-6) --------------------------------------
+
+    fn related_result(title: &str, description: &str) -> SearchResult {
+        SearchResult {
+            title: title.to_string(),
+            description: Some(description.to_string()),
+            excerpt: None,
+            size: None,
+            wordcount: None,
+            timestamp: None,
+        }
+    }
+
+    #[test]
+    fn open_related_with_no_article_shows_a_status_and_needs_no_fetch() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        assert!(!app.open_related(), "no article open — nothing to fetch");
+        assert_eq!(app.mode, Mode::Related);
+        assert_eq!(app.related_items().len(), 0);
+        assert_eq!(app.status, "Open an article first");
+    }
+
+    #[test]
+    fn open_related_needs_a_fetch_the_first_time_then_hits_the_session_cache() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.open_document(doc("Alan Turing"));
+
+        assert!(
+            app.open_related(),
+            "first open for this article — nothing cached yet"
+        );
+        assert!(app.related_loading);
+
+        app.deliver_related(
+            "en".to_string(),
+            "Alan Turing".to_string(),
+            Ok(vec![related_result("Enigma machine", "cipher device")]),
+        );
+        assert!(!app.related_loading);
+        assert_eq!(app.related_items().len(), 1);
+
+        // Close and reopen: the session cache already has this article's
+        // results, so no second fetch is requested (PRD FR-SR-6 "cached
+        // per-article for the session").
+        app.close_related();
+        assert!(!app.open_related(), "a cache hit needs no second fetch");
+        assert_eq!(app.related_items()[0].title, "Enigma machine");
+    }
+
+    #[test]
+    fn related_move_wraps_and_enter_target_reads_the_selected_title() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.open_document(doc("Alan Turing"));
+        app.open_related();
+        app.deliver_related(
+            "en".to_string(),
+            "Alan Turing".to_string(),
+            Ok(vec![
+                related_result("Enigma machine", "a"),
+                related_result("Computer science", "b"),
+            ]),
+        );
+
+        assert_eq!(
+            app.related_open_target(),
+            Some("Enigma machine".to_string())
+        );
+        app.related_move(1);
+        assert_eq!(
+            app.related_open_target(),
+            Some("Computer science".to_string())
+        );
+        app.related_move(1);
+        assert_eq!(
+            app.related_open_target(),
+            Some("Enigma machine".to_string()),
+            "wraps back to the first item"
+        );
+        app.related_move(-1);
+        assert_eq!(
+            app.related_open_target(),
+            Some("Computer science".to_string())
+        );
+    }
+
+    #[test]
+    fn related_gracefully_handles_an_empty_or_failed_fetch() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.open_document(doc("Alan Turing"));
+        app.open_related();
+        app.deliver_related(
+            "en".to_string(),
+            "Alan Turing".to_string(),
+            Err("network error".to_string()),
+        );
+        assert!(!app.related_loading);
+        assert_eq!(
+            app.related_items().len(),
+            0,
+            "a failed fetch caches an empty list, not nothing"
+        );
+        assert_eq!(app.related_open_target(), None);
+        assert_eq!(app.status, "No related articles found — Esc to close");
+    }
+
+    /// A result that lands after the reader has already backed out of the
+    /// panel (or navigated elsewhere) must not touch the live status/loading
+    /// state — but it's still worth caching for when they come back.
+    #[test]
+    fn a_late_related_result_after_closing_the_panel_is_cached_but_does_not_touch_live_state() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.open_document(doc("Alan Turing"));
+        app.open_related();
+        app.close_related(); // reader backed out before the fetch landed
+
+        app.deliver_related(
+            "en".to_string(),
+            "Alan Turing".to_string(),
+            Ok(vec![related_result("Enigma machine", "cipher device")]),
+        );
+        assert_eq!(app.mode, Mode::Reading, "closing the panel is not undone");
+
+        // The result is still cached: reopening needs no second fetch.
+        assert!(!app.open_related());
+        assert_eq!(app.related_items().len(), 1);
     }
 
     #[test]
@@ -4609,6 +4931,22 @@ mod tests {
         assert_eq!(resolve_r_prefix('l'), RPrefixAction::ReadLater);
         assert_eq!(resolve_r_prefix('r'), RPrefixAction::OpenResearch);
         assert_eq!(resolve_r_prefix('j'), RPrefixAction::OpenResearch);
+    }
+
+    /// PRD Appendix B's `g`-prefix chords, plus FR-SR-5's `gr` and
+    /// FR-SR-6's `gR` added by this change — every recognized second key
+    /// dispatches correctly, and an unrecognized one is a dead prefix
+    /// (PassThrough), matching `gj` still scrolling.
+    #[test]
+    fn g_prefix_dispatches_every_chord_including_random_and_related() {
+        assert_eq!(resolve_g_prefix('g'), GPrefixAction::Top);
+        assert_eq!(resolve_g_prefix('t'), GPrefixAction::NextTab);
+        assert_eq!(resolve_g_prefix('T'), GPrefixAction::PrevTab);
+        assert_eq!(resolve_g_prefix('b'), GPrefixAction::BackStack);
+        assert_eq!(resolve_g_prefix('h'), GPrefixAction::Home);
+        assert_eq!(resolve_g_prefix('r'), GPrefixAction::Random);
+        assert_eq!(resolve_g_prefix('R'), GPrefixAction::Related);
+        assert_eq!(resolve_g_prefix('j'), GPrefixAction::PassThrough);
     }
 
     // ---- Reading history (PRD FR-HS-1/2/4) --------------------------------
