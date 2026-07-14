@@ -100,6 +100,16 @@ It also serves link-target summaries (`GET /api/rest_v1/page/summary/{title}`,
 implements only what article rendering, search, the page cache, and the
 start-page/on-this-day features need — not a general MediaWiki stand-in.
 
+Terminal-integration fixtures (PRD FR-NV-9, FR-RD-2, SEC-2):
+
+- `Hyperlink_Scheme_Test` — one paragraph mixing an internal link, an
+  already-`https://` external link, and two hostile-scheme hrefs
+  (`javascript:`, `data:`) the HTML parser stores verbatim (it does no
+  scheme filtering of its own). A pty session reading this article is an
+  end-to-end check of the OSC 8 emission gate (`src/hyperlink.rs::
+  sanitize_uri`): only the two `https://` targets may ever appear wrapped in
+  an OSC 8 escape in the raw terminal output.
+
 Language switcher / fallback-chain fixtures (PRD FR-ML-1/2):
 
 - `GET /w/api.php?action=query&prop=langlinks&llprop=autonym|langname|url` —

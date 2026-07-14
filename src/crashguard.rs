@@ -35,6 +35,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode};
 use ratatui::Terminal;
@@ -81,6 +82,22 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         restore_terminal_best_effort();
+    }
+}
+
+/// PRD FR-NV-9: turns real terminal mouse capture on or off. A free function
+/// rather than a `TerminalGuard` method because it needs only a raw write to
+/// stdout (`EnableMouseCapture`/`DisableMouseCapture` are themselves plain
+/// escape sequences, same as every other crossterm terminal command here) —
+/// both the one-time startup toggle (`main::run`, from config) and the
+/// runtime `:set mouse=on|off` toggle (`main::execute_command`, from
+/// mid-session) call this directly rather than threading a `TerminalGuard`
+/// reference through the whole event loop for one escape sequence.
+pub fn set_mouse_capture(enabled: bool) -> io::Result<()> {
+    if enabled {
+        execute!(io::stdout(), EnableMouseCapture)
+    } else {
+        execute!(io::stdout(), DisableMouseCapture)
     }
 }
 
@@ -138,6 +155,21 @@ fn restore_terminal_best_effort() {
     let _ = disable_raw_mode();
     let _ = execute!(io::stdout(), LeaveAlternateScreen);
     let _ = execute!(io::stdout(), crossterm::cursor::Show);
+    // PRD FR-NV-9: unconditionally attempt to release mouse capture,
+    // regardless of whether this session ever enabled it — idempotent and
+    // harmless on a terminal that never received `EnableMouseCapture` (it is
+    // simply an escape sequence the terminal either recognizes and undoes,
+    // or silently ignores), and the panic hook has no way to know this
+    // process's `mouse` setting at panic time anyway (see this function's
+    // own "best-effort and idempotent" contract above).
+    let _ = execute!(io::stdout(), crossterm::event::DisableMouseCapture);
+    // PRD FR-TH-4: same reasoning for DEC 2031 color-scheme-change
+    // notifications — best-effort disabled on every restore, whether or not
+    // `auto_theme` ever enabled them.
+    let _ = execute!(
+        io::stdout(),
+        crossterm::style::Print(crate::autotheme::DISABLE_COLOR_SCHEME_NOTIFICATIONS)
+    );
 }
 
 /// Installs a panic hook that restores the terminal, writes a local crash

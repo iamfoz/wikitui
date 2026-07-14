@@ -1,6 +1,7 @@
 mod api;
 mod app;
 mod attribution;
+mod autotheme;
 mod bookmark_export;
 mod bookmarks;
 mod cache;
@@ -17,6 +18,7 @@ mod fuzzy;
 mod graphics;
 mod hints;
 mod history;
+mod hyperlink;
 mod image;
 mod jsonl;
 mod layout;
@@ -38,10 +40,12 @@ mod ui;
 
 use anyhow::Result;
 use clap::Parser;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use std::io::{self, Stdout};
+use std::io::{self, IsTerminal, Stdout, Write as _};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -55,6 +59,7 @@ use cite::CiteStyle;
 use cli::{Cli, Commands, ConfigAction};
 use config::ConfigContext;
 use crashguard::{SuspendedTerminal, TerminalGuard};
+use hyperlink::HyperlinkMode;
 use saved::{LinkSummary, Tier};
 use tab::{HistoryEntry, TabId};
 use theme::Theme;
@@ -210,7 +215,8 @@ async fn main() -> Result<()> {
         let env_overrides = config::EnvOverrides::from_process_env();
         let config_path =
             config::resolve_config_path(cli.config.clone(), std::env::var("WIKITUI_CONFIG").ok());
-        let resolved = config::resolve(&cli_overrides, &env_overrides, config_path.as_deref());
+        let mut resolved = config::resolve(&cli_overrides, &env_overrides, config_path.as_deref());
+        config::apply_accessible_bundle(&mut resolved, accessible_active());
         std::process::exit(doctor::run(&resolved));
     }
 
@@ -273,7 +279,13 @@ async fn main() -> Result<()> {
     let env_overrides = config::EnvOverrides::from_process_env();
     let config_path =
         config::resolve_config_path(cli.config.clone(), std::env::var("WIKITUI_CONFIG").ok());
-    let resolved = config::resolve(&cli_overrides, &env_overrides, config_path.as_deref());
+    let mut resolved = config::resolve(&cli_overrides, &env_overrides, config_path.as_deref());
+    // PRD FR-ACS-6: ACCESSIBLE=1 implies the no-motion/plain-link bundle for
+    // whichever of `animations`/`hyperlinks` the reader didn't already pin
+    // explicitly. Applied once, here, before anything downstream (including
+    // `--dump`, which reads `resolved.terminal.hyperlinks` for its own
+    // `[link: target]` fallback) sees the resolved config.
+    config::apply_accessible_bundle(&mut resolved, accessible_active());
 
     // §6.7: unknown keys and rejected values warn, never crash — printed
     // once, before any terminal state change (raw mode/the alternate
@@ -347,7 +359,7 @@ async fn main() -> Result<()> {
         // (fresh cache, or a network round trip on a stale/missing one).
         let outcome = fetch_page(&client, &page_cache, &resolved.lang.value, &title).await?;
         let document = doc::parse_article_html(&title, &outcome.html);
-        print!("{}", doc::render_plain(&document));
+        print!("{}", doc::render_plain(&document, &resolved.lang.value));
         // `--dump` never reaches `run`'s own end-of-session wipe below, so it
         // does its own — a one-shot process is still a "session" for FR-PR-3's
         // purposes.
@@ -358,7 +370,10 @@ async fn main() -> Result<()> {
     // Already validated during resolution (unknown names fall back to the
     // default with a warning above), so these can't fail here — the
     // `unwrap_or_else` is a belt-and-braces guard, not an expected path.
-    let theme = Theme::by_name(&resolved.theme.value).unwrap_or_else(Theme::terminal);
+    // `mut`: PRD FR-TH-4's auto light/dark may override this pick below,
+    // once the terminal is in raw mode and only when the reader hasn't
+    // pinned an explicit theme of their own (see the `auto_theme` block).
+    let mut theme = Theme::by_name(&resolved.theme.value).unwrap_or_else(Theme::terminal);
     let cite_style = CiteStyle::by_name(&resolved.cite_style.value).unwrap_or(CiteStyle::Apa);
     let no_color = no_color_active();
     let accessible = accessible_active();
@@ -389,6 +404,38 @@ async fn main() -> Result<()> {
     // can't guarantee. See `crashguard`'s module doc comment for why the
     // panic hook above is still separately necessary.
     let mut guard = TerminalGuard::enter()?;
+
+    // PRD FR-NV-9: opt-in mouse capture, toggled on before the event loop
+    // ever reads an event so every input turn from the first draw onward is
+    // subject to it. Best-effort (`?` would abort startup over a cosmetic
+    // terminal-capability failure) — a terminal that rejects the escape
+    // simply never delivers `Event::Mouse` and behaves as if `mouse=off`.
+    if resolved.terminal.mouse.value {
+        let _ = crashguard::set_mouse_capture(true);
+    }
+
+    // PRD FR-TH-4: query the terminal's background color, guarded by DA1 so
+    // an unsupporting terminal can't hang startup, and only when the reader
+    // both opted into `auto_theme` AND left `theme` itself unset — an
+    // explicit `theme` (CLI/env/config file) always wins over auto-detection
+    // (§6.7's general precedence: something more specific beats a blanket
+    // auto-behavior). Raw mode is required to read the reply without local
+    // echo/line-buffering, hence why this runs only now, after
+    // `TerminalGuard::enter` — see `query_terminal_bg`'s own doc comment for
+    // exactly what is and isn't verifiable about the live round trip.
+    if resolved.terminal.auto_theme.value && resolved.theme.source == config::Source::Default {
+        const AUTO_THEME_TIMEOUT: Duration = Duration::from_millis(200);
+        if let Some(mode) = query_terminal_bg(AUTO_THEME_TIMEOUT) {
+            let picked_name = match mode {
+                autotheme::BgMode::Light => &resolved.terminal.theme_light.value,
+                autotheme::BgMode::Dark => &resolved.terminal.theme_dark.value,
+            };
+            if let Some(picked) = Theme::by_name(picked_name) {
+                theme = picked;
+            }
+        }
+    }
+
     run(
         guard.terminal(),
         &client,
@@ -399,6 +446,7 @@ async fn main() -> Result<()> {
         theme,
         no_color,
         accessible,
+        resolved.terminal.clone(),
         resolved.measure.value,
         resolved.ambiguous_wide.value,
         resolved.reading_wpm.value,
@@ -468,6 +516,49 @@ pub(crate) fn no_color_active() -> bool {
 /// PRD honors alongside `NO_COLOR`/`CLICOLOR_FORCE` (§6.7 precedence).
 pub(crate) fn accessible_active() -> bool {
     std::env::var("ACCESSIBLE").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
+/// PRD FR-TH-4: attempts the guarded OSC 11 + DA1 query against the real
+/// terminal on `stdin`/`stdout`, bounded by `timeout` no matter how the
+/// terminal behaves.
+///
+/// `autotheme::resolve_via_io` alone cannot bound a `read()` call that blocks
+/// forever (see its own doc comment) — a real `io::stdin()` read has exactly
+/// that failure mode when the terminal never sends anything more, so the
+/// actual read runs on a detached background thread and this function waits
+/// for it over a channel with `recv_timeout`, giving up (and abandoning that
+/// thread) once `timeout` elapses.
+///
+/// **Documented residual risk, and why this path is opt-in only
+/// (`auto_theme` defaults to `false`)**: the abandoned thread may still be
+/// blocked inside `io::stdin().read()` past this function's return. If the
+/// terminal eventually does reply, late-arriving bytes are consumed by
+/// *that* thread's read, not by this process's normal `crossterm::event::
+/// read()` loop — so they cannot land as garbled keystrokes, but they are
+/// also simply lost (never retried). Kept bounded and low-risk by (a)
+/// `timeout` being short — a real OSC-11-capable terminal answers in
+/// single-digit milliseconds, so a reply arriving any later is already an
+/// unusual/unhealthy terminal — and (b) this function only ever running when
+/// the reader explicitly opted into `auto_theme`.
+///
+/// **Unverified in this environment**: no terminal emulator in this build's
+/// pty/test harness answers a real OSC 11 query (the harness's "terminal" is
+/// a scripted test driver, not a real emulator) — the exact same limitation
+/// `graphics.rs` documents for its kitty/iTerm2 escape emitters. The guarded
+/// read loop, the parsing, and the luminance classification are exercised
+/// directly in `autotheme`'s own unit tests against in-memory mock replies
+/// instead.
+fn query_terminal_bg(timeout: Duration) -> Option<autotheme::BgMode> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut stdin = io::stdin();
+        let mut stdout = io::stdout();
+        let outcome = autotheme::resolve_via_io(&mut stdin, &mut stdout, timeout);
+        let _ = tx.send(outcome);
+    });
+    rx.recv_timeout(timeout + Duration::from_millis(50))
+        .ok()
+        .flatten()
 }
 
 /// PRD FR-PR-3's crash-recovery sweep: deletes any cache entries a *previous*
@@ -1167,7 +1258,6 @@ fn osc52_clipboard_sequence(text: &str) -> String {
 /// Terminals without OSC 52 support silently ignore the sequence — the
 /// status line still reports what was yanked so the user can tell.
 fn yank_to_clipboard(text: &str) -> std::io::Result<()> {
-    use std::io::Write as _;
     let mut out = io::stdout();
     write!(out, "{}", osc52_clipboard_sequence(text))?;
     out.flush()
@@ -1617,6 +1707,7 @@ async fn run(
     theme: Theme,
     no_color: bool,
     accessible: bool,
+    terminal_cfg: config::ResolvedTerminal,
     measure: u16,
     ambiguous_wide: bool,
     reading_wpm: u32,
@@ -1637,6 +1728,15 @@ async fn run(
     app.keymap = keymap;
     app.languages = languages;
     app.accessible = accessible;
+    // PRD FR-NV-9 / FR-ACS-4 / FR-RD-2: the terminal-integration settings
+    // this chunk adds. `mouse_enabled` mirrors the real
+    // `EnableMouseCapture`/`DisableMouseCapture` state `main` already
+    // toggled (or didn't) before this function was ever called — see that
+    // call site's own comment.
+    app.mouse_enabled = terminal_cfg.mouse.value;
+    app.no_motion = terminal_cfg.animations.value == "none";
+    app.hyperlinks_mode =
+        HyperlinkMode::parse(&terminal_cfg.hyperlinks.value).unwrap_or(HyperlinkMode::Auto);
     app.measure = measure;
     app.ambiguous_wide = ambiguous_wide;
     app.reading_wpm = reading_wpm;
@@ -1645,10 +1745,7 @@ async fn run(
     // PRD FR-RD-8/§6.3: terminal graphics capability snapshot, taken once.
     // The `no_color`/`images_enabled` decision is layered on live in
     // `App::graphics_protocol`.
-    app.graphics_env = {
-        use std::io::IsTerminal;
-        graphics::GraphicsEnv::from_process_env(std::io::stdout().is_terminal())
-    };
+    app.graphics_env = graphics::GraphicsEnv::from_process_env(std::io::stdout().is_terminal());
     app.images_override = images_config;
     app.include_nonfree = include_nonfree;
     // Already validated during resolution (an invalid value fell back to
@@ -1790,6 +1887,13 @@ async fn run(
 
         terminal.draw(|f| ui::draw(f, &mut app))?;
 
+        // PRD FR-RD-2 / SEC-2: overlay OSC 8 hyperlinks on top of the frame
+        // ratatui just painted — see `emit_hyperlinks`'s own doc comment for
+        // why this runs as a distinct pass *after* `draw` rather than being
+        // folded into it. Best-effort: a write failure here (e.g. stdout
+        // gone) is no worse than the plain styled text already on screen.
+        let _ = emit_hyperlinks(&app);
+
         // PRD FR-RD-8: after each draw, lazily kick off fetches for any
         // not-yet-loaded images the active document references (a no-op when
         // images are off / no graphics protocol / a text theme). Idempotent —
@@ -1856,25 +1960,46 @@ async fn run(
             } else {
                 REVALIDATE_POLL
             };
-            if event::poll(poll_interval)?
-                && let Event::Key(key) = event::read()?
-                && key.kind == KeyEventKind::Press
-            {
-                handle_key(
-                    client,
-                    cache,
-                    &mut app,
-                    key.code,
-                    key.modifiers,
-                    &revalidate_tx,
-                    &open_tx,
-                    &save_tx,
-                    &related_tx,
-                    &langlinks_tx,
-                    &summary_tx,
-                    terminal,
-                )
-                .await;
+            if event::poll(poll_interval)? {
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        handle_key(
+                            client,
+                            cache,
+                            &mut app,
+                            key.code,
+                            key.modifiers,
+                            &revalidate_tx,
+                            &open_tx,
+                            &save_tx,
+                            &related_tx,
+                            &langlinks_tx,
+                            &summary_tx,
+                            terminal,
+                        )
+                        .await;
+                    }
+                    // PRD FR-NV-9: only ever arrives when `mouse` is on (see
+                    // `main`'s `EnableMouseCapture` toggle) — off means this
+                    // arm is simply never reached, keyboard input untouched.
+                    Event::Mouse(mouse) => {
+                        handle_mouse(
+                            client,
+                            cache,
+                            &mut app,
+                            mouse,
+                            &revalidate_tx,
+                            &open_tx,
+                            &save_tx,
+                            &related_tx,
+                            &langlinks_tx,
+                            &summary_tx,
+                            terminal,
+                        )
+                        .await;
+                    }
+                    _ => {}
+                }
             }
             if app.mode == Mode::Search {
                 if let Some(deadline) = app.search_debounce_at
@@ -1922,25 +2047,44 @@ async fn run(
             while let Ok(outcome) = summary_rx.try_recv() {
                 app.deliver_summary(outcome.lang, outcome.title, outcome.result);
             }
-        } else if let Event::Key(key) = event::read()? {
+        } else {
             // Block until an event arrives instead of redrawing on a timer —
             // an idle reader shouldn't spin the CPU or spam hide-cursor codes.
-            if key.kind == KeyEventKind::Press {
-                handle_key(
-                    client,
-                    cache,
-                    &mut app,
-                    key.code,
-                    key.modifiers,
-                    &revalidate_tx,
-                    &open_tx,
-                    &save_tx,
-                    &related_tx,
-                    &langlinks_tx,
-                    &summary_tx,
-                    terminal,
-                )
-                .await;
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    handle_key(
+                        client,
+                        cache,
+                        &mut app,
+                        key.code,
+                        key.modifiers,
+                        &revalidate_tx,
+                        &open_tx,
+                        &save_tx,
+                        &related_tx,
+                        &langlinks_tx,
+                        &summary_tx,
+                        terminal,
+                    )
+                    .await;
+                }
+                Event::Mouse(mouse) => {
+                    handle_mouse(
+                        client,
+                        cache,
+                        &mut app,
+                        mouse,
+                        &revalidate_tx,
+                        &open_tx,
+                        &save_tx,
+                        &related_tx,
+                        &langlinks_tx,
+                        &summary_tx,
+                        terminal,
+                    )
+                    .await;
+                }
+                _ => {}
             }
         }
 
@@ -3828,6 +3972,316 @@ async fn handle_key(
     }
 }
 
+/// How many lines one mouse-wheel notch scrolls the reading view or moves a
+/// picker's selection (PRD FR-NV-9) — implemented by synthesizing that many
+/// `Down`/`Up` keypresses through `handle_key` itself (see `handle_mouse`),
+/// so wheel scrolling behaves identically, in every mode, to holding the
+/// arrow key: no separate scroll-amount logic to keep in sync with whatever
+/// `j`/`k`/`Down`/`Up` already do there.
+const MOUSE_WHEEL_STEP: u8 = 3;
+
+/// PRD FR-NV-9's mouse dispatch, mirroring `handle_key`'s own shape and
+/// parameter list. Every action here is implemented by literally reusing an
+/// existing keyboard action (a synthesized `Down`/`Up`/`Enter` through
+/// `handle_key`, or the same `App::switch_to_tab` the tab picker's own Enter
+/// calls) — never a second, mouse-only code path — which is what makes PRD
+/// FR-ACS-3's "every mouse action has a keyboard equivalent" true by
+/// construction rather than by convention.
+#[allow(clippy::too_many_arguments)]
+async fn handle_mouse(
+    client: &WikiClient,
+    cache: &PageCache,
+    app: &mut App,
+    mouse: MouseEvent,
+    revalidate_tx: &UnboundedSender<RevalidationOutcome>,
+    open_tx: &UnboundedSender<TabLoadOutcome>,
+    save_tx: &UnboundedSender<SaveOutcome>,
+    related_tx: &UnboundedSender<RelatedOutcome>,
+    langlinks_tx: &UnboundedSender<LangLinksOutcome>,
+    summary_tx: &UnboundedSender<SummaryOutcome>,
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+) {
+    // Defense in depth, not the real gate: the real gate is that
+    // `Event::Mouse` is never produced at all unless `main` sent
+    // `EnableMouseCapture`, which it only does when `mouse` is on (PRD
+    // FR-ACS-3: mouse support must be strictly additive, never load-bearing).
+    if !app.mouse_enabled {
+        return;
+    }
+
+    match mouse.kind {
+        MouseEventKind::ScrollDown => {
+            for _ in 0..MOUSE_WHEEL_STEP {
+                handle_key(
+                    client,
+                    cache,
+                    app,
+                    KeyCode::Down,
+                    KeyModifiers::NONE,
+                    revalidate_tx,
+                    open_tx,
+                    save_tx,
+                    related_tx,
+                    langlinks_tx,
+                    summary_tx,
+                    terminal,
+                )
+                .await;
+            }
+        }
+        MouseEventKind::ScrollUp => {
+            for _ in 0..MOUSE_WHEEL_STEP {
+                handle_key(
+                    client,
+                    cache,
+                    app,
+                    KeyCode::Up,
+                    KeyModifiers::NONE,
+                    revalidate_tx,
+                    open_tx,
+                    save_tx,
+                    related_tx,
+                    langlinks_tx,
+                    summary_tx,
+                    terminal,
+                )
+                .await;
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            handle_left_click(
+                client,
+                cache,
+                app,
+                mouse.column,
+                mouse.row,
+                revalidate_tx,
+                open_tx,
+                save_tx,
+                related_tx,
+                langlinks_tx,
+                summary_tx,
+                terminal,
+            )
+            .await;
+        }
+        // Right/middle click, drag, and plain movement carry no meaning here
+        // (PRD FR-NV-9 names scroll, link-follow, TOC entries, and the tab
+        // bar — nothing else) and are silently ignored, exactly like an
+        // unbound key.
+        _ => {}
+    }
+}
+
+/// A left click's dispatch (PRD FR-NV-9): the tab bar first (clickable
+/// regardless of the current mode — there is no picker selection state for
+/// it, so a hit switches tabs directly), then whatever the click landed on
+/// inside the content area, scoped to the views this chunk wires up (the
+/// reading view's links, the TOC, and full-text search results — see
+/// `ui::results_row_to_index`/`ui::single_line_list_row_to_index`'s own doc
+/// comments for exactly why the long tail of other pickers isn't included:
+/// a click on a *scrolled* list can't be safely mapped to an entry without
+/// ratatui exposing the scroll offset it chose, so those stay keyboard-only
+/// for now — never a regression, since the keyboard path already covers
+/// every one of them).
+#[allow(clippy::too_many_arguments)]
+async fn handle_left_click(
+    client: &WikiClient,
+    cache: &PageCache,
+    app: &mut App,
+    col: u16,
+    row: u16,
+    revalidate_tx: &UnboundedSender<RevalidationOutcome>,
+    open_tx: &UnboundedSender<TabLoadOutcome>,
+    save_tx: &UnboundedSender<SaveOutcome>,
+    related_tx: &UnboundedSender<RelatedOutcome>,
+    langlinks_tx: &UnboundedSender<LangLinksOutcome>,
+    summary_tx: &UnboundedSender<SummaryOutcome>,
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+) {
+    if let Some(bar) = app.last_tab_bar_area
+        && row == bar.y
+        && col >= bar.x
+        && col < bar.x.saturating_add(bar.width)
+    {
+        let labels: Vec<ui::TabLabel> = app
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(i, t)| ui::TabLabel {
+                number: i + 1,
+                title: t.display_title(),
+                loading: t.loading,
+                active: i == app.active,
+            })
+            .collect();
+        if let Some(idx) = ui::tab_bar_hit_test(&labels, bar.width as usize, (col - bar.x) as usize)
+        {
+            app.switch_to_tab(idx); // same call the tab picker's own Enter makes.
+        }
+        return;
+    }
+
+    let area = app.last_content_area;
+    let inside = row >= area.y
+        && row < area.y.saturating_add(area.height)
+        && col >= area.x
+        && col < area.x.saturating_add(area.width);
+    if !inside {
+        return; // clicking outside every known clickable region is a no-op.
+    }
+
+    // "Select the clicked entry, then synthesize Enter" reuses each mode's
+    // existing Enter handling verbatim (`follow_internal_link`'s branch for
+    // Reading, `App::jump_to_section` for Toc, `open_title` for Results) —
+    // see this function's own doc comment for why that's deliberate.
+    match app.mode {
+        Mode::Reading => {
+            let Some(link_idx) = app.layout.as_ref().and_then(|layout| {
+                let scroll = app.active_tab().scroll as usize;
+                let line_index = scroll + (row - area.y) as usize;
+                let col_in_line = (col - area.x) as usize;
+                layout.link_at(line_index, col_in_line, app.ambiguous_wide)
+            }) else {
+                return; // clicked on plain text, not a link — no-op.
+            };
+            app.active_tab_mut().focused_link = Some(link_idx);
+            handle_key(
+                client,
+                cache,
+                app,
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+                revalidate_tx,
+                open_tx,
+                save_tx,
+                related_tx,
+                langlinks_tx,
+                summary_tx,
+                terminal,
+            )
+            .await;
+        }
+        Mode::Toc => {
+            let len = app.active_tab().sections.len();
+            let Some(idx) = ui::single_line_list_row_to_index(area, len, row) else {
+                return;
+            };
+            app.active_tab_mut().selected_section = idx;
+            handle_key(
+                client,
+                cache,
+                app,
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+                revalidate_tx,
+                open_tx,
+                save_tx,
+                related_tx,
+                langlinks_tx,
+                summary_tx,
+                terminal,
+            )
+            .await;
+        }
+        Mode::Results => {
+            let Some(idx) = ui::results_row_to_index(app, area, row) else {
+                return;
+            };
+            app.selected_result = idx;
+            handle_key(
+                client,
+                cache,
+                app,
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+                revalidate_tx,
+                open_tx,
+                save_tx,
+                related_tx,
+                langlinks_tx,
+                summary_tx,
+                terminal,
+            )
+            .await;
+        }
+        _ => {}
+    }
+}
+
+/// PRD FR-RD-2 / SEC-2: overlays OSC 8 hyperlinks directly onto the terminal
+/// for every visible link in the active tab's reading view, immediately
+/// after `terminal.draw` has painted the frame — see `hyperlink`'s module doc
+/// comment for exactly why this must be a distinct pass rather than escape
+/// bytes injected into a `ratatui::text::Span`'s own content (ratatui's own
+/// width accounting would corrupt on the latter). Nothing here writes
+/// through `Frame`/`Buffer`/`Span` at all: a `MoveTo` positions the terminal
+/// cursor (hidden throughout — this app never calls `Frame::set_cursor_position`)
+/// at a link's first cell, the zero-width OSC 8 open sequence is printed,
+/// then the same for one past its last cell with the close sequence — never
+/// touching a single visible glyph ratatui already placed.
+fn emit_hyperlinks(app: &App) -> io::Result<()> {
+    if app.mode != Mode::Reading {
+        return Ok(());
+    }
+    let env = hyperlink::HyperlinkEnv {
+        is_tty: std::io::stdout().is_terminal(),
+        accessible: app.accessible,
+    };
+    if !hyperlink::active(app.hyperlinks_mode, env) {
+        return Ok(());
+    }
+    let Some(layout) = app.layout.as_ref() else {
+        return Ok(());
+    };
+    let area = app.last_content_area;
+    if area.width == 0 || area.height == 0 {
+        return Ok(());
+    }
+    let tab = app.active_tab();
+    let scroll = tab.scroll as usize;
+    let top = scroll;
+    let bottom = (scroll + area.height as usize).min(layout.lines.len());
+    if top >= bottom {
+        return Ok(());
+    }
+
+    use crossterm::cursor::MoveTo;
+    use crossterm::queue;
+    use crossterm::style::Print;
+    let mut out = io::stdout();
+    for (row_offset, line_index) in (top..bottom).enumerate() {
+        let line = &layout.lines[line_index];
+        let row = area.y + row_offset as u16;
+        let mut col = 0usize;
+        for span in &line.spans {
+            let w = layout::display_width(&span.text, app.ambiguous_wide);
+            if let layout::SpanKind::Link(occ) = span.kind
+                && let Some(link) = tab.links.get(occ)
+            {
+                let url = doc::resolve_link_url(&link.href, &tab.lang);
+                // SEC-2: only a validated https(s) target ever becomes an
+                // OSC 8 escape — anything else keeps its plain styled text,
+                // already painted, completely untouched.
+                if let Some(safe) = hyperlink::sanitize_uri(&url) {
+                    let start_col = area.x + col as u16;
+                    let end_col = area.x + (col + w) as u16;
+                    if end_col <= area.x + area.width {
+                        queue!(
+                            out,
+                            MoveTo(start_col, row),
+                            Print(hyperlink::osc8_open(safe))
+                        )?;
+                        queue!(out, MoveTo(end_col, row), Print(hyperlink::OSC8_CLOSE))?;
+                    }
+                }
+            }
+            col += w;
+        }
+    }
+    out.flush()
+}
+
 /// The modes `Ctrl-p` opens the command palette from (PRD FR-CS-1). The
 /// reading view only: from there the palette's commands (search, toc, random,
 /// theme, ...) are all meaningful, and `Ctrl-p` was previously unbound, so
@@ -4152,9 +4606,30 @@ async fn execute_command(
                     app.notice = Some(format!("reading_wpm={n}"));
                 }
             }
+            // PRD FR-NV-9: toggles both the app-side flag (which every
+            // mouse-handling call site reads) and the real terminal mouse-
+            // capture state, so the two never drift apart — see
+            // `App::set_mouse`'s own doc comment. Best-effort: a terminal
+            // that rejects the escape just never delivers `Event::Mouse`,
+            // same as `mouse=off`.
+            "mouse" => {
+                let on = value == "on";
+                let _ = crashguard::set_mouse_capture(on);
+                app.set_mouse(on);
+            }
+            // PRD FR-ACS-4: no-motion mode (value already validated by the
+            // parser to be `full`/`none`).
+            "animations" => app.set_no_motion(value == "none"),
+            // PRD FR-RD-2 / SEC-2: OSC 8 hyperlink emission mode (value
+            // already validated by the parser).
+            "hyperlinks" => {
+                if let Some(mode) = HyperlinkMode::parse(&value) {
+                    app.set_hyperlinks_mode(mode);
+                }
+            }
             other => {
                 app.notice = Some(format!(
-                    "unknown :set key {other:?} (try: theme, images, prefetch, measure, ambiguous_width, reading_wpm)"
+                    "unknown :set key {other:?} (try: theme, images, prefetch, measure, ambiguous_width, reading_wpm, mouse, animations, hyperlinks)"
                 ));
             }
         },

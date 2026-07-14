@@ -266,7 +266,11 @@ fn channel_luminance(c: u8) -> f64 {
     }
 }
 
-fn relative_luminance((r, g, b): (u8, u8, u8)) -> f64 {
+/// WCAG 2.x relative luminance of an sRGB triple, 0.0 (black) to 1.0
+/// (white). `pub(crate)` rather than test-only: `autotheme`'s OSC 11
+/// light/dark classification (PRD FR-TH-4) reuses this exact formula rather
+/// than a second copy that could drift from FR-TH-6's own contrast lint.
+pub(crate) fn relative_luminance((r, g, b): (u8, u8, u8)) -> f64 {
     0.2126 * channel_luminance(r) + 0.7152 * channel_luminance(g) + 0.0722 * channel_luminance(b)
 }
 

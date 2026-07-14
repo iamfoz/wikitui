@@ -52,7 +52,7 @@ pub fn render(
     thumbs: &[EmbeddableThumb],
 ) -> Option<String> {
     match format {
-        "txt" => Some(render_txt(doc)),
+        "txt" => Some(render_txt(doc, lang)),
         "md" => Some(render_md(doc, lang)),
         "html" => Some(render_html(doc, lang, include_nonfree, thumbs)),
         _ => None,
@@ -96,8 +96,8 @@ fn resolve_href(href: &str, lang: &str) -> String {
 
 // ---- Plain text ----------------------------------------------------------
 
-fn render_txt(doc: &Document) -> String {
-    let mut out = crate::doc::render_plain(doc);
+fn render_txt(doc: &Document, lang: &str) -> String {
+    let mut out = crate::doc::render_plain(doc, lang);
     out.push_str("\n----\n\n");
     out.push_str(&footer());
     out.push('\n');
@@ -480,7 +480,7 @@ mod tests {
 
     #[test]
     fn txt_export_uses_the_plain_renderer_plus_footer() {
-        let txt = render_txt(&fixture_doc());
+        let txt = render_txt(&fixture_doc(), "en");
         assert!(txt.contains("Alan Turing"));
         assert!(txt.contains("[image: A portrait]"));
         assert!(txt.trim_end().ends_with("article text.") || txt.contains("CC BY-SA 4.0"));

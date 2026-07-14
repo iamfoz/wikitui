@@ -450,8 +450,37 @@ pub fn parse(input: &str) -> Result<Command, String> {
                     )),
                     Err(_) => Err(format!("reading_wpm must be an integer (got {value:?})")),
                 },
+                // PRD FR-NV-9: opt-in mouse capture.
+                "mouse" => Ok(Command::Set {
+                    key: "mouse".to_string(),
+                    value: on_off(value)?,
+                }),
+                // PRD FR-ACS-4: no-motion mode.
+                "animations" => {
+                    if value == "full" || value == "none" {
+                        Ok(Command::Set {
+                            key: "animations".to_string(),
+                            value: value.to_string(),
+                        })
+                    } else {
+                        Err(format!("animations must be full or none (got {value:?})"))
+                    }
+                }
+                // PRD FR-RD-2 / SEC-2: OSC 8 hyperlink emission.
+                "hyperlinks" => {
+                    if crate::hyperlink::HyperlinkMode::parse(value).is_some() {
+                        Ok(Command::Set {
+                            key: "hyperlinks".to_string(),
+                            value: value.to_string(),
+                        })
+                    } else {
+                        Err(format!(
+                            "hyperlinks must be auto, on, or off (got {value:?})"
+                        ))
+                    }
+                }
                 other => Err(format!(
-                    "unknown :set key {other:?} — try: theme, images=on|off, prefetch=on|off, measure=N, ambiguous_width=1|2, reading_wpm=N"
+                    "unknown :set key {other:?} — try: theme, images=on|off, prefetch=on|off, measure=N, ambiguous_width=1|2, reading_wpm=N, mouse=on|off, animations=full|none, hyperlinks=auto|on|off"
                 )),
             }
         }
@@ -737,6 +766,61 @@ mod tests {
             })
         );
         assert!(parse("set prefetch=maybe").is_err());
+    }
+
+    /// PRD FR-NV-9: `:set mouse=on|off`, same on/off grammar as `images`.
+    #[test]
+    fn set_mouse_toggles_and_rejects_other_values() {
+        assert_eq!(
+            parse("set mouse=on"),
+            Ok(Command::Set {
+                key: "mouse".to_string(),
+                value: "on".to_string()
+            })
+        );
+        assert_eq!(
+            parse("set mouse=off"),
+            Ok(Command::Set {
+                key: "mouse".to_string(),
+                value: "off".to_string()
+            })
+        );
+        assert!(parse("set mouse=maybe").is_err());
+    }
+
+    /// PRD FR-ACS-4: `:set animations=full|none`.
+    #[test]
+    fn set_animations_parses_full_and_none() {
+        assert_eq!(
+            parse("set animations=none"),
+            Ok(Command::Set {
+                key: "animations".to_string(),
+                value: "none".to_string()
+            })
+        );
+        assert_eq!(
+            parse("set animations=full"),
+            Ok(Command::Set {
+                key: "animations".to_string(),
+                value: "full".to_string()
+            })
+        );
+        assert!(parse("set animations=smooth").is_err());
+    }
+
+    /// PRD FR-RD-2 / SEC-2: `:set hyperlinks=auto|on|off`.
+    #[test]
+    fn set_hyperlinks_parses_the_closed_set() {
+        for value in ["auto", "on", "off"] {
+            assert_eq!(
+                parse(&format!("set hyperlinks={value}")),
+                Ok(Command::Set {
+                    key: "hyperlinks".to_string(),
+                    value: value.to_string()
+                })
+            );
+        }
+        assert!(parse("set hyperlinks=sometimes").is_err());
     }
 
     #[test]

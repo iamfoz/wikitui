@@ -1927,9 +1927,31 @@ fn extract_citations(parsed: &Html) -> Vec<Citation> {
         .collect()
 }
 
+/// Resolves a Parsoid-style href to the absolute URL it targets: the
+/// canonical article URL for an internal link (`./Title`/`/wiki/Title`,
+/// via [`internal_title_from_href`] + `research::article_url` — always
+/// `https://`), or the href itself for anything else (external URL,
+/// interwiki, `mailto:`, ...). Shared by `render_plain`'s `[link: target]`
+/// fallback (PRD FR-ACS-1) and OSC 8 emission's own resolution step
+/// (`main::emit_hyperlinks`) so the two paths can never disagree about what a
+/// link "goes to" — SEC-2's scheme gate for OSC 8 is applied by that caller,
+/// not here: printing an arbitrary scheme as plain informative text (this
+/// function's other use) is harmless in a way emitting it as a terminal
+/// escape is not.
+pub fn resolve_link_url(href: &str, lang: &str) -> String {
+    match internal_title_from_href(href) {
+        Some(title) => crate::research::article_url(&title, lang),
+        None => href.to_string(),
+    }
+}
+
 /// Render a document as plain text (FR-RD-12, the `--dump` linear mode and
-/// the honest screen-reader path). No color, no cursor addressing.
-pub fn render_plain(doc: &Document) -> String {
+/// the honest screen-reader path). No color, no cursor addressing. `lang`
+/// resolves internal links to their canonical URL (PRD FR-ACS-1's `[link:
+/// target]` — the only way a link is "followable" from a plain stdout dump,
+/// which has no clickable escape and no interactive focus/Enter to follow
+/// one).
+pub fn render_plain(doc: &Document, lang: &str) -> String {
     let mut out = String::new();
     out.push_str(&doc.title);
     out.push('\n');
@@ -1939,7 +1961,12 @@ pub fn render_plain(doc: &Document) -> String {
     let flatten = |spans: &[Span]| -> String {
         spans
             .iter()
-            .map(|s| s.text.as_str())
+            .map(|s| match &s.style {
+                SpanStyle::Link(href) | SpanStyle::RedLink(href) => {
+                    format!("{}[link: {}]", s.text, resolve_link_url(href, lang))
+                }
+                _ => s.text.clone(),
+            })
             .collect::<Vec<_>>()
             .join("")
     };
@@ -2238,7 +2265,7 @@ mod tests {
           <ul class="gallery"><li class="gallerybox"><img src="https://ex.org/g.png" alt="g"/><div class="gallerytext">Gallery one</div></li></ul>
         </body></html>"#;
         let doc = parse_article_html("T", html);
-        let dump = render_plain(&doc);
+        let dump = render_plain(&doc, "en");
         assert!(dump.contains("[image: An owl]"), "alt in dump: {dump:?}");
         assert!(dump.contains("An owl at night"), "caption in dump");
         assert!(
@@ -2365,12 +2392,61 @@ mod tests {
     #[test]
     fn plain_render_contains_all_sections() {
         let doc = parse_article_html("Test Article", FIXTURE);
-        let plain = render_plain(&doc);
+        let plain = render_plain(&doc, "en");
         assert!(plain.contains("Test Article"));
         assert!(plain.contains("History"));
         assert!(plain.contains("First item"));
         assert!(plain.contains("[infobox]"));
         assert!(plain.contains("[image: A test picture]"));
+    }
+
+    /// PRD FR-ACS-1: `--dump`/the screen-reader path has no clickable escape
+    /// and no interactive focus/Enter to follow a link, so the plain-text
+    /// render must print the link's resolved target right after its text —
+    /// the canonical article URL for an internal link.
+    #[test]
+    fn render_plain_prints_link_target_urls() {
+        let html =
+            r#"<html><body><p>See <a href="./Other_Article">this</a> for more.</p></body></html>"#;
+        let doc = parse_article_html("T", html);
+        let plain = render_plain(&doc, "en");
+        assert!(
+            plain.contains("this[link: https://en.wikipedia.org/wiki/Other_Article]"),
+            "got: {plain:?}"
+        );
+    }
+
+    #[test]
+    fn render_plain_prints_external_link_targets_as_is() {
+        let html =
+            r#"<html><body><p>See <a href="https://example.com/x">this</a>.</p></body></html>"#;
+        let doc = parse_article_html("T", html);
+        let plain = render_plain(&doc, "en");
+        assert!(
+            plain.contains("this[link: https://example.com/x]"),
+            "got: {plain:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_link_url_builds_the_canonical_article_url_for_internal_links() {
+        assert_eq!(
+            resolve_link_url("./Alan_Turing", "en"),
+            "https://en.wikipedia.org/wiki/Alan_Turing"
+        );
+        assert_eq!(
+            resolve_link_url("/wiki/Bletchley_Park", "de"),
+            "https://de.wikipedia.org/wiki/Bletchley_Park"
+        );
+        // A non-internal href passes through unchanged.
+        assert_eq!(
+            resolve_link_url("https://example.com/x", "en"),
+            "https://example.com/x"
+        );
+        assert_eq!(
+            resolve_link_url("mailto:x@example.com", "en"),
+            "mailto:x@example.com"
+        );
     }
 
     /// Extracts the single `Block::Table` from a one-table fixture.
@@ -2527,7 +2603,7 @@ mod tests {
             <tr><td>1950</td><td>Turing test proposed</td></tr>
             </tbody></table></body></html>"##,
         );
-        let plain = render_plain(&doc);
+        let plain = render_plain(&doc, "en");
         assert!(plain.contains("Year: 1950"), "got: {plain:?}");
         assert!(plain.contains("Event: Turing test proposed"));
         assert!(
@@ -2928,7 +3004,7 @@ mod tests {
             &format!("<html><body><p>Family: {family_emoji} together</p></body></html>"),
         );
         assert!(
-            render_plain(&family_doc).contains(family_emoji),
+            render_plain(&family_doc, "en").contains(family_emoji),
             "ZWJ emoji family must survive sanitization intact"
         );
 
@@ -2937,7 +3013,7 @@ mod tests {
             &format!("<html><body><p>IPA: {ipa}</p></body></html>"),
         );
         assert!(
-            render_plain(&ipa_doc).contains(ipa),
+            render_plain(&ipa_doc, "en").contains(ipa),
             "IPA combining marks must survive sanitization intact"
         );
     }

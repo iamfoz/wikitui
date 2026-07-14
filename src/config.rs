@@ -135,6 +135,8 @@ pub struct EnvOverrides {
     pub prefetch: Option<String>,
     /// PRD NF-NET-2 User-Agent contact channel via env (`WIKITUI_CONTACT`).
     pub contact: Option<String>,
+    /// PRD FR-ACS-4's `WIKITUI_ANIMATIONS=none` no-motion override.
+    pub animations: Option<String>,
 }
 
 impl EnvOverrides {
@@ -155,6 +157,7 @@ impl EnvOverrides {
             images: get("WIKITUI_IMAGES"),
             prefetch: get("WIKITUI_PREFETCH"),
             contact: get("WIKITUI_CONTACT"),
+            animations: get("WIKITUI_ANIMATIONS"),
         }
     }
 }
@@ -231,6 +234,10 @@ pub struct ResolvedConfig {
     pub prefetch: ResolvedPrefetch,
     /// PRD NF-NET-2 User-Agent contact channel (`[network] contact`).
     pub network_contact: Valued<String>,
+    /// PRD FR-NV-9 (mouse), FR-ACS-4 (no-motion), FR-TH-4 (auto light/dark),
+    /// FR-RD-2 (OSC 8 hyperlinks) — the terminal-integration settings this
+    /// chunk adds, grouped the way `[prefetch]` groups its own table.
+    pub terminal: ResolvedTerminal,
     /// Parse errors, unknown keys, and rejected values — never fatal, but
     /// `doctor` reports them and exits 1 if any is `IssueLevel::Error`.
     pub issues: Vec<Issue>,
@@ -266,6 +273,46 @@ pub struct ResolvedPrefetch {
     pub weight_lead: Valued<f64>,
     pub weight_pageviews: Valued<f64>,
     pub weight_affinity: Valued<f64>,
+}
+
+/// The terminal-integration settings (PRD FR-NV-9, FR-ACS-4/6, FR-TH-4,
+/// FR-RD-2). Each field carries its provenance like every other resolved
+/// value, so `doctor` and `App::config_ctx`-driven reload agree on where a
+/// value came from.
+#[derive(Debug, Clone)]
+pub struct ResolvedTerminal {
+    /// FR-NV-9: opt-in mouse support. Default **off** — enabling mouse
+    /// capture (`crossterm::event::EnableMouseCapture`) claims the terminal's
+    /// own click/drag handling, which is also how a user's terminal emulator
+    /// normally does text selection and copy. A reader who never asks for
+    /// mouse support keeps that native selection/copy working exactly as
+    /// before wikitui existed; `:set mouse=on` (or this config key) is the
+    /// explicit, informed opt-in — never the default, per FR-ACS-3's
+    /// keyboard-only-guarantee ethos ("mouse strictly optional" reads most
+    /// safely as "and off unless asked for").
+    pub mouse: Valued<bool>,
+    /// FR-ACS-4: `full` (the default) or `none`. There is no actual
+    /// smooth-scroll/spinner/blink in this codebase to disable today (see
+    /// `main.rs`'s no-motion audit note) — this is a forward-compatible
+    /// guard rail plus the config/env/ACCESSIBLE-precedence surface itself,
+    /// which is real, wired, and tested regardless of whether anything
+    /// currently animates.
+    pub animations: Valued<String>,
+    /// FR-TH-4: query OSC 11 at startup and auto-pick `theme_light`/
+    /// `theme_dark`. Default **off** — an explicit `theme` always wins
+    /// unless this is turned on, and even then only when `theme` itself was
+    /// never explicitly set (see `main::resolve_auto_theme_pick`).
+    pub auto_theme: Valued<bool>,
+    /// FR-TH-4's light-background pick when `auto_theme` fires. Default
+    /// `paper` — the PRD's own light theme.
+    pub theme_light: Valued<String>,
+    /// FR-TH-4's dark-background pick when `auto_theme` fires. Default
+    /// `terminal` — the app's own overall default theme, so a dark terminal
+    /// auto-resolves to exactly what an unconfigured install already shows.
+    pub theme_dark: Valued<String>,
+    /// FR-RD-2 / SEC-2: `auto` (the default), `on`, or `off` — see
+    /// `hyperlink::HyperlinkMode`.
+    pub hyperlinks: Valued<String>,
 }
 
 /// A schema migration from `from` to `from + 1`, run over the raw table
@@ -349,6 +396,27 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = "\
 # Page cache (FR-OFF-*).
 # [cache]
 # max_mb = 500
+
+# Mouse support (FR-NV-9): off by default so the terminal's own native text
+# selection/copy keeps working untouched; `:set mouse=on` to enable scroll
+# wheel, click-to-follow-link, TOC-entry, and tab-bar clicks. Every mouse
+# action stays keyboard-reachable regardless (FR-ACS-3).
+# mouse = false
+
+# No-motion mode (FR-ACS-4): full | none. Also honors WIKITUI_ANIMATIONS and
+# ACCESSIBLE=1 (which implies none unless overridden here).
+# animations = \"full\"
+
+# Auto light/dark (FR-TH-4): query the terminal's background color at
+# startup and pick theme_light/theme_dark accordingly. Off by default; an
+# explicit theme above always wins over this when both are set.
+# auto_theme = false
+# theme_light = \"paper\"
+# theme_dark = \"terminal\"
+
+# OSC 8 terminal hyperlinks (FR-RD-2): auto | on | off. ACCESSIBLE=1 implies
+# off (plain link text) unless overridden here.
+# hyperlinks = \"auto\"
 ";
 
 /// Write [`DEFAULT_CONFIG_TEMPLATE`] to `config_path`, creating parent
@@ -403,6 +471,12 @@ pub fn resolve(
         "reading_wpm",
         "prefetch",
         "network",
+        "mouse",
+        "animations",
+        "auto_theme",
+        "theme_light",
+        "theme_dark",
+        "hyperlinks",
     ]
     .into_iter()
     .collect();
@@ -486,6 +560,7 @@ pub fn resolve(
     let reading_wpm = resolve_reading_wpm(&table, &mut issues);
     let prefetch = resolve_prefetch(env, &table, &mut issues);
     let network_contact = resolve_network_contact(env, &table, &mut issues);
+    let terminal = resolve_terminal(env, &table, &mut issues);
 
     ResolvedConfig {
         config_version: Valued {
@@ -517,6 +592,7 @@ pub fn resolve(
         reading_wpm,
         prefetch,
         network_contact,
+        terminal,
         migration_summary: config_version.1,
         issues,
         config_path: config_path.map(Path::to_path_buf),
@@ -1282,6 +1358,209 @@ fn resolve_network_contact(
         }
     }
     default
+}
+
+/// PRD FR-NV-9 / FR-ACS-4 / FR-TH-4 / FR-RD-2: resolves every terminal-
+/// integration key. Each is file-only except `animations` (which also honors
+/// `WIKITUI_ANIMATIONS` per FR-ACS-4's explicit wording) — mirroring
+/// `startpage`/`include_nonfree`'s own "set once in config.toml" scope; `:set`
+/// covers the in-session override for the ones that make sense to flip live
+/// (mouse, animations, hyperlinks — not `auto_theme`, which only matters at
+/// the one-shot startup query).
+fn resolve_terminal(
+    env: &EnvOverrides,
+    table: &toml::Table,
+    issues: &mut Vec<Issue>,
+) -> ResolvedTerminal {
+    ResolvedTerminal {
+        mouse: resolve_bool_field("mouse", None, table.get("mouse"), false, issues),
+        animations: resolve_closed_string_field(
+            "animations",
+            env.animations.as_deref(),
+            table.get("animations"),
+            "full",
+            &["full", "none"],
+            issues,
+        ),
+        auto_theme: resolve_bool_field("auto_theme", None, table.get("auto_theme"), false, issues),
+        theme_light: resolve_string_field(
+            "theme_light",
+            None,
+            None,
+            table.get("theme_light"),
+            "paper",
+            |s| {
+                if Theme::by_name(s).is_some() {
+                    Ok(s.to_string())
+                } else {
+                    Err(format!(
+                        "unknown theme {s:?} — one of: {}",
+                        Theme::NAMES.join(", ")
+                    ))
+                }
+            },
+            issues,
+        ),
+        theme_dark: resolve_string_field(
+            "theme_dark",
+            None,
+            None,
+            table.get("theme_dark"),
+            "terminal",
+            |s| {
+                if Theme::by_name(s).is_some() {
+                    Ok(s.to_string())
+                } else {
+                    Err(format!(
+                        "unknown theme {s:?} — one of: {}",
+                        Theme::NAMES.join(", ")
+                    ))
+                }
+            },
+            issues,
+        ),
+        hyperlinks: resolve_closed_string_field(
+            "hyperlinks",
+            None,
+            table.get("hyperlinks"),
+            "auto",
+            &["auto", "on", "off"],
+            issues,
+        ),
+    }
+}
+
+/// A plain `key = true|false` file setting with no CLI/env layer (today) —
+/// shared shape for `mouse`/`auto_theme` so both validate identically.
+fn resolve_bool_field(
+    field_name: &str,
+    env: Option<&str>,
+    file: Option<&toml::Value>,
+    default: bool,
+    issues: &mut Vec<Issue>,
+) -> Valued<bool> {
+    let fallback = Valued {
+        value: default,
+        source: Source::Default,
+    };
+    if let Some(raw) = env {
+        return match parse_bool_ish(raw) {
+            Some(value) => Valued {
+                value,
+                source: Source::Env,
+            },
+            None => {
+                issues.push(Issue::warning(format!(
+                    "{field_name}: {raw:?} (from environment) is not a boolean; using default {default}"
+                )));
+                fallback
+            }
+        };
+    }
+    match file {
+        None => fallback,
+        Some(v) => match v.as_bool() {
+            Some(value) => Valued {
+                value,
+                source: Source::File,
+            },
+            None => {
+                issues.push(Issue::warning(format!(
+                    "{field_name} must be a boolean; using default {default}"
+                )));
+                fallback
+            }
+        },
+    }
+}
+
+/// A string field restricted to a fixed, small set of spellings (mirrors
+/// `resolve_metered`'s shape, generalized so `animations`/`hyperlinks` share
+/// one implementation instead of two near-duplicates) — env then file, each
+/// validated against `allowed`; an invalid or wrong-typed value falls
+/// straight back to `default` rather than the next layer down, matching
+/// `resolve_string_field`'s own "first present layer wins outright" rule.
+fn resolve_closed_string_field(
+    field_name: &str,
+    env: Option<&str>,
+    file: Option<&toml::Value>,
+    default: &str,
+    allowed: &[&str],
+    issues: &mut Vec<Issue>,
+) -> Valued<String> {
+    let fallback = Valued {
+        value: default.to_string(),
+        source: Source::Default,
+    };
+    if let Some(raw) = env {
+        return if allowed.contains(&raw) {
+            Valued {
+                value: raw.to_string(),
+                source: Source::Env,
+            }
+        } else {
+            issues.push(Issue::warning(format!(
+                "{field_name}: {raw:?} (from environment) must be one of: {} — using default {default:?}",
+                allowed.join(", ")
+            )));
+            fallback
+        };
+    }
+    match file {
+        None => fallback,
+        Some(v) => match v.as_str() {
+            Some(s) if allowed.contains(&s) => Valued {
+                value: s.to_string(),
+                source: Source::File,
+            },
+            Some(s) => {
+                issues.push(Issue::warning(format!(
+                    "{field_name}: {s:?} must be one of: {} — using default {default:?}",
+                    allowed.join(", ")
+                )));
+                fallback
+            }
+            None => {
+                issues.push(Issue::warning(format!(
+                    "{field_name} must be a string; using default {default:?}"
+                )));
+                fallback
+            }
+        },
+    }
+}
+
+/// PRD FR-ACS-6: `ACCESSIBLE=1` implies a bundle of accessibility-leaning
+/// defaults — here, no-motion (`animations=none`) and plain link URLs
+/// (`hyperlinks=off`) — **unless** the reader's own config file or
+/// `WIKITUI_ANIMATIONS` already set that key explicitly, in which case the
+/// explicit setting stands (§6.7's general precedence rule: something more
+/// specific than a blanket environment standard always wins).
+///
+/// Applied as a post-processing step over `resolve`'s plain output — rather
+/// than threading an `accessible: bool` through `resolve`'s own signature —
+/// so this bundle's precedence logic is independently testable without
+/// touching every existing `resolve()` call site and test (`ACCESSIBLE` is
+/// itself an environment variable, but a "standard" one honored the same way
+/// regardless of the `WIKITUI_*`/file/CLI layering `resolve` already
+/// implements — see `main::accessible_active`, mirroring `NO_COLOR`'s own
+/// always-on-when-set treatment).
+pub fn apply_accessible_bundle(resolved: &mut ResolvedConfig, accessible: bool) {
+    if !accessible {
+        return;
+    }
+    if resolved.terminal.animations.source == Source::Default {
+        resolved.terminal.animations = Valued {
+            value: "none".to_string(),
+            source: Source::Env,
+        };
+    }
+    if resolved.terminal.hyperlinks.source == Source::Default {
+        resolved.terminal.hyperlinks = Valued {
+            value: "off".to_string(),
+            source: Source::Env,
+        };
+    }
 }
 
 /// PRD FR-HS-4's `[history] retention_days`: file-only, like `cache.*` —
@@ -2605,5 +2884,234 @@ mod tests {
         // Platform-default branch just needs to not panic; its value
         // depends on the real environment, which tests must not assert on.
         let _ = resolve_config_path(None, None);
+    }
+
+    // -- Terminal integration (PRD FR-NV-9, FR-ACS-4/6, FR-TH-4, FR-RD-2) ----
+
+    #[test]
+    fn terminal_settings_default_when_unset() {
+        let resolved = resolve(&CliOverrides::default(), &EnvOverrides::default(), None);
+        let t = resolved.terminal;
+        assert_eq!(
+            t.mouse,
+            Valued {
+                value: false,
+                source: Source::Default
+            },
+            "PRD FR-NV-9: mouse defaults off so native terminal selection/copy stays untouched"
+        );
+        assert_eq!(t.animations.value, "full");
+        assert_eq!(t.animations.source, Source::Default);
+        assert!(!t.auto_theme.value);
+        assert_eq!(t.theme_light.value, "paper");
+        assert_eq!(t.theme_dark.value, "terminal");
+        assert_eq!(t.hyperlinks.value, "auto");
+    }
+
+    #[test]
+    fn mouse_and_auto_theme_read_from_the_config_file() {
+        let path = temp_config("mouse = true\nauto_theme = true\n");
+        let resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(
+            resolved.terminal.mouse,
+            Valued {
+                value: true,
+                source: Source::File
+            }
+        );
+        assert_eq!(
+            resolved.terminal.auto_theme,
+            Valued {
+                value: true,
+                source: Source::File
+            }
+        );
+        assert!(resolved.issues.is_empty(), "{:?}", resolved.issues);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn mouse_rejects_a_non_boolean_and_falls_back() {
+        let path = temp_config("mouse = \"yes\"\n");
+        let resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert!(!resolved.terminal.mouse.value);
+        assert_eq!(resolved.terminal.mouse.source, Source::Default);
+        assert!(resolved.issues.iter().any(|i| i.message.contains("mouse")));
+        cleanup(&path);
+    }
+
+    /// PRD FR-ACS-4: `WIKITUI_ANIMATIONS=none` beats a config file value —
+    /// same env-over-file precedence every other overridable key follows.
+    #[test]
+    fn animations_env_beats_file() {
+        let path = temp_config("animations = \"full\"\n");
+        let env = EnvOverrides {
+            animations: Some("none".to_string()),
+            ..Default::default()
+        };
+        let resolved = resolve(&CliOverrides::default(), &env, Some(&path));
+        assert_eq!(
+            resolved.terminal.animations,
+            Valued {
+                value: "none".to_string(),
+                source: Source::Env
+            }
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn animations_rejects_unknown_values() {
+        let path = temp_config("animations = \"smooth\"\n");
+        let resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(resolved.terminal.animations.value, "full");
+        assert_eq!(resolved.terminal.animations.source, Source::Default);
+        assert!(
+            resolved
+                .issues
+                .iter()
+                .any(|i| i.message.contains("animations"))
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn hyperlinks_reads_and_validates_the_closed_set() {
+        let path = temp_config("hyperlinks = \"off\"\n");
+        let resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(
+            resolved.terminal.hyperlinks,
+            Valued {
+                value: "off".to_string(),
+                source: Source::File
+            }
+        );
+        cleanup(&path);
+
+        let path = temp_config("hyperlinks = \"sometimes\"\n");
+        let resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(resolved.terminal.hyperlinks.value, "auto");
+        assert_eq!(resolved.terminal.hyperlinks.source, Source::Default);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn theme_light_and_dark_validate_against_known_theme_names() {
+        let path = temp_config("theme_light = \"contrast\"\ntheme_dark = \"night\"\n");
+        let resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(resolved.terminal.theme_light.value, "contrast");
+        assert_eq!(resolved.terminal.theme_dark.value, "night");
+        cleanup(&path);
+
+        let path = temp_config("theme_light = \"sepia\"\n");
+        let resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        // Invalid falls back to the default rather than an empty/garbage value.
+        assert_eq!(resolved.terminal.theme_light.value, "paper");
+        assert!(
+            resolved
+                .issues
+                .iter()
+                .any(|i| i.message.contains("theme_light"))
+        );
+        cleanup(&path);
+    }
+
+    /// PRD FR-ACS-6: `ACCESSIBLE=1` implies the no-motion/plain-link bundle,
+    /// but only for keys the reader didn't already pin explicitly.
+    #[test]
+    fn accessible_bundle_overrides_defaults_but_not_explicit_config() {
+        // Nothing set explicitly: ACCESSIBLE flips both to their accessible
+        // defaults, tagged as coming from the environment.
+        let mut resolved = resolve(&CliOverrides::default(), &EnvOverrides::default(), None);
+        apply_accessible_bundle(&mut resolved, true);
+        assert_eq!(
+            resolved.terminal.animations,
+            Valued {
+                value: "none".to_string(),
+                source: Source::Env
+            }
+        );
+        assert_eq!(
+            resolved.terminal.hyperlinks,
+            Valued {
+                value: "off".to_string(),
+                source: Source::Env
+            }
+        );
+
+        // An explicit config file value stands even under ACCESSIBLE.
+        let path = temp_config("animations = \"full\"\nhyperlinks = \"on\"\n");
+        let mut resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        apply_accessible_bundle(&mut resolved, true);
+        assert_eq!(resolved.terminal.animations.value, "full");
+        assert_eq!(resolved.terminal.animations.source, Source::File);
+        assert_eq!(resolved.terminal.hyperlinks.value, "on");
+        assert_eq!(resolved.terminal.hyperlinks.source, Source::File);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn accessible_bundle_is_a_noop_when_accessible_is_false() {
+        let mut resolved = resolve(&CliOverrides::default(), &EnvOverrides::default(), None);
+        apply_accessible_bundle(&mut resolved, false);
+        assert_eq!(resolved.terminal.animations.value, "full");
+        assert_eq!(resolved.terminal.animations.source, Source::Default);
+        assert_eq!(resolved.terminal.hyperlinks.value, "auto");
+        assert_eq!(resolved.terminal.hyperlinks.source, Source::Default);
+    }
+
+    /// The first-run template's new terminal-integration lines must stay
+    /// commented out (a clean load must produce zero issues and every
+    /// default), mirroring `write_default_config_writes_a_clean_loadable_file_once`.
+    #[test]
+    fn default_config_template_terminal_keys_are_commented_and_load_clean() {
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("# mouse = false"));
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("# animations = "));
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("# auto_theme = false"));
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("# hyperlinks = "));
+
+        let path = absent_config_path();
+        write_default_config(Some(&path)).expect("write ok");
+        let resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert!(resolved.issues.is_empty(), "{:?}", resolved.issues);
+        assert!(!resolved.terminal.mouse.value);
+        assert_eq!(resolved.terminal.animations.value, "full");
+        cleanup(&path);
     }
 }

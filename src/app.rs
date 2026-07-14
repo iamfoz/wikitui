@@ -12,6 +12,7 @@ use crate::config::ConfigContext;
 use crate::doc::{Citation, Document};
 use crate::fetch_queue::FetchQueue;
 use crate::hints::{self, HintTarget};
+use crate::hyperlink::HyperlinkMode;
 use crate::layout::{self, Layout, LayoutCache, LayoutOptions};
 use crate::prefetch::FeedCache;
 use crate::registry;
@@ -309,6 +310,40 @@ pub struct App {
     /// at startup from the `ACCESSIBLE` environment variable; part of
     /// `layout_options`, so toggling it invalidates cached layouts.
     pub accessible: bool,
+    /// PRD FR-NV-9: whether mouse capture is currently active. Off by
+    /// default (see `config::ResolvedTerminal::mouse`'s doc comment) — set
+    /// from config/`:set mouse=on|off` at the same two call sites
+    /// (`main::run`, `main::execute_command`) that also toggle the real
+    /// `crossterm::event::EnableMouseCapture`/`DisableMouseCapture` terminal
+    /// state, so this flag and the terminal's actual capture state can never
+    /// drift apart. Every mouse action this flag gates has a keyboard
+    /// equivalent that works whether this is true or false (PRD FR-ACS-3's
+    /// keyboard-only guarantee: mouse support may only ever be *additive*).
+    pub mouse_enabled: bool,
+    /// PRD FR-ACS-4: no-motion mode (`animations = none`, `WIKITUI_ANIMATIONS
+    /// =none`, or implied by `ACCESSIBLE=1`). There is no smooth-scroll,
+    /// spinner, or blink anywhere in this codebase today for this to actually
+    /// disable (confirmed: no `Modifier::SLOW_BLINK`/`RAPID_BLINK` use, no
+    /// per-frame animation state — loading already renders the static
+    /// "Loading…"/"…" text FR-ACS-2 requires) — this flag is nonetheless
+    /// real, wired end to end, and is the guard rail any future animation
+    /// must check before this flag can be called decorative.
+    pub no_motion: bool,
+    /// PRD FR-RD-2 / SEC-2: whether/when to emit OSC 8 hyperlinks for links
+    /// (`hyperlink::active` resolves `Auto` against the live terminal/
+    /// ACCESSIBLE state at emission time in `main::emit_hyperlinks`).
+    pub hyperlinks_mode: HyperlinkMode,
+    /// PRD FR-NV-9: the reading/content area's rect as of the most recent
+    /// draw, so a mouse click's absolute terminal `(row, col)` can be
+    /// translated into the reading view's own line/column coordinate space.
+    /// One-frame-stale by construction, exactly like `layout_width`/
+    /// `viewport_height` above (set during `ui::draw`, consulted by the next
+    /// input event) — never the other way around.
+    pub last_content_area: ratatui::layout::Rect,
+    /// The tab bar's rect as of the most recent draw, or `None` when it isn't
+    /// shown (a single open tab never renders one). Same one-frame-stale
+    /// contract as `last_content_area`.
+    pub last_tab_bar_area: Option<ratatui::layout::Rect>,
     /// Research mode's candidate list for the *active tab's* article: element
     /// 0 is always the article's own citation (`research::self_citation`);
     /// the rest are its extracted References entries, in document order.
@@ -747,6 +782,11 @@ impl App {
             theme,
             no_color,
             accessible: false,
+            mouse_enabled: false,
+            no_motion: false,
+            hyperlinks_mode: HyperlinkMode::Auto,
+            last_content_area: ratatui::layout::Rect::default(),
+            last_tab_bar_area: None,
             citations: Vec::new(),
             selected_citation: 0,
             research: ResearchStore::load(),
@@ -915,6 +955,37 @@ impl App {
             handle.set_enabled(on);
         }
         self.notice = Some(format!("prefetch={}", if on { "on" } else { "off" }));
+    }
+
+    /// PRD FR-NV-9: flip the app-side mouse flag (`:set mouse=on|off`). The
+    /// caller (`main::execute_command`) is responsible for also toggling the
+    /// real terminal mouse-capture state via `crashguard::set_mouse_capture`
+    /// — this method only updates the flag every mouse-handling call site
+    /// reads, so the two can never independently drift, but it never touches
+    /// the terminal itself (this module has no I/O of its own, by design).
+    pub fn set_mouse(&mut self, on: bool) {
+        self.mouse_enabled = on;
+        self.notice = Some(format!(
+            "mouse={} (terminal selection/copy {})",
+            if on { "on" } else { "off" },
+            if on {
+                "off while mouse is on"
+            } else {
+                "restored"
+            }
+        ));
+    }
+
+    /// PRD FR-ACS-4: `:set animations=full|none`.
+    pub fn set_no_motion(&mut self, none: bool) {
+        self.no_motion = none;
+        self.notice = Some(format!("animations={}", if none { "none" } else { "full" }));
+    }
+
+    /// PRD FR-RD-2 / SEC-2: `:set hyperlinks=auto|on|off`.
+    pub fn set_hyperlinks_mode(&mut self, mode: HyperlinkMode) {
+        self.hyperlinks_mode = mode;
+        self.notice = Some(format!("hyperlinks={}", mode.as_str()));
     }
 
     /// Whether prefetch is currently active for *this* session: the kill
@@ -5482,7 +5553,7 @@ mod tests {
         assert_eq!(app.active_tab().current_revid, 2);
         assert_eq!(app.active_tab().page_source, PageSource::Live);
         assert!(
-            crate::doc::render_plain(app.active_tab().doc.as_ref().unwrap())
+            crate::doc::render_plain(app.active_tab().doc.as_ref().unwrap(), "en")
                 .contains("updated body"),
             "the new content must actually be what's rendered"
         );

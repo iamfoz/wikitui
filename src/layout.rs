@@ -268,6 +268,39 @@ pub struct Layout {
     pub continuation: Vec<bool>,
 }
 
+impl Layout {
+    /// PRD FR-NV-9's click-to-follow: which link occurrence (if any) sits
+    /// under `(line_index, col)`, both already in the laid-out document's own
+    /// coordinate space — `line_index` an index into `lines`, `col` a
+    /// **display-cell** offset from that line's own start (`main::
+    /// link_at_click` is responsible for turning an absolute terminal
+    /// `(row, col)` mouse position into these units first, by subtracting the
+    /// content area's origin and adding the current scroll offset).
+    ///
+    /// Deliberately does *not* reuse `link_cols`/`link_lines` (grapheme-
+    /// cluster units, per their own doc comments): a mouse click's column is
+    /// a display-cell offset, and the two units only coincide for narrow
+    /// text. Scanning the line's spans by cumulative display width instead
+    /// keeps this correct for exactly the wide/CJK content FR-RD-10 cares
+    /// about, at the cost of an O(spans-per-line) scan instead of an O(1)
+    /// index — cheap either way for one click.
+    pub fn link_at(&self, line_index: usize, col: usize, ambiguous_wide: bool) -> Option<usize> {
+        let line = self.lines.get(line_index)?;
+        let mut acc = 0usize;
+        for span in &line.spans {
+            let w = display_width(&span.text, ambiguous_wide);
+            if col >= acc && col < acc + w {
+                return match span.kind {
+                    SpanKind::Link(idx) => Some(idx),
+                    _ => None,
+                };
+            }
+            acc += w;
+        }
+        None
+    }
+}
+
 /// Display width of a string, one grapheme cluster is measured as a unit.
 /// `unicode-width` sums per-character widths, so this is exactly additive
 /// over clusters — the invariant the no-overflow property test relies on.
@@ -2602,6 +2635,62 @@ mod tests {
                 "link_cols[{occ}] must bound exactly the link's own text"
             );
         }
+    }
+
+    /// PRD FR-NV-9: `Layout::link_at` must find the right link occurrence by
+    /// display-cell column, including on a line whose link sits after wide
+    /// (CJK) text where grapheme count and display width diverge — the exact
+    /// case `link_cols` (grapheme units) would get wrong if reused directly
+    /// for a mouse click's column.
+    #[test]
+    fn link_at_finds_the_right_occurrence_past_wide_characters() {
+        let doc = parse_article_html("アラン・チューリング", JA_FIXTURE);
+        let links = collect_links(&doc);
+        let layout = layout_document(&doc, 40, LayoutOptions::default());
+        for (occ, _) in links.iter().enumerate() {
+            let line_index = layout.link_lines[occ];
+            let line = &layout.lines[line_index];
+            // Find the display-cell start of this occurrence's own span by
+            // walking the line the same way `link_at` does, independently of
+            // `link_cols`'s grapheme units.
+            let mut acc = 0usize;
+            let mut start = None;
+            for span in &line.spans {
+                if let SpanKind::Link(o) = span.kind
+                    && o == occ
+                {
+                    start = Some(acc);
+                    break;
+                }
+                acc += display_width(&span.text, true);
+            }
+            let start = start.expect("occurrence must appear on its own link_lines entry");
+            assert_eq!(
+                layout.link_at(line_index, start, true),
+                Some(occ),
+                "clicking the first cell of occurrence {occ}'s own span must resolve to it"
+            );
+        }
+    }
+
+    /// A click that lands on plain text (not any link's span) resolves to
+    /// `None` — mouse click-to-follow must never guess.
+    #[test]
+    fn link_at_returns_none_off_any_link() {
+        let doc = parse_article_html("T", "<p>Plain text with no links at all.</p>");
+        let layout = layout_document(&doc, 80, LayoutOptions::default());
+        assert_eq!(layout.link_at(0, 0, false), None);
+        assert_eq!(layout.link_at(0, 5, false), None);
+    }
+
+    /// A click past the end of the line, or on a line index beyond the
+    /// document, is a no-op rather than a panic.
+    #[test]
+    fn link_at_is_bounds_safe() {
+        let doc = parse_article_html("T", "<p>Short.</p>");
+        let layout = layout_document(&doc, 80, LayoutOptions::default());
+        assert_eq!(layout.link_at(0, 10_000, false), None);
+        assert_eq!(layout.link_at(10_000, 0, false), None);
     }
 
     /// A multi-word link must lay out as one contiguous `Link` span (the

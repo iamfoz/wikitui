@@ -16,6 +16,7 @@ REVIDS = {
     "Image_Showcase": 1008,
     "Math_Showcase": 1009,
     "Redlink_Showcase": 1010,
+    "Hyperlink_Scheme_Test": 1011,
 }
 
 # PRD FR-RD-8 media fixture: build a real, tiny PNG at import time (stdlib
@@ -154,6 +155,20 @@ PAGES = {
       and now a right-to-left override spoofing attempt: ‮evil-looking-reversed-text‬ end.
       A family emoji that must survive intact: \U0001F468‍\U0001F469‍\U0001F467 (zero-width-joiner joined).
       An IPA word built from combining marks that must survive: t͡ʃɔːñ (a nasalized vowel).</p>
+    </body></html>""",
+
+    # PRD FR-RD-2 / SEC-2 pty verification fixture: a mix of link schemes so a
+    # pty session reading this article is a genuine end-to-end check of the
+    # OSC 8 hyperlink emission gate (src/hyperlink.rs::sanitize_uri) — an
+    # internal link (canonical https URL), an already-https external link,
+    # and two hostile-scheme hrefs the HTML parser stores verbatim
+    # (doc.rs::collect_inline does no scheme filtering of its own) that must
+    # still never reach the terminal as an OSC 8 escape.
+    "Hyperlink_Scheme_Test": """<html><head><title>Hyperlink Scheme Test</title></head><body>
+      <p>An internal link to <a href="./Computer_science">computer science</a>, an external
+      <a href="https://example.com/safe">safe https link</a>, a
+      <a href="javascript:alert(1)">javascript link</a>, and a
+      <a href="data:text/html,evil">data link</a> end this paragraph.</p>
     </body></html>""",
 
 }

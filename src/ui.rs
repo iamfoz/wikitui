@@ -452,6 +452,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         (None, chunks[0], chunks[1])
     };
 
+    // PRD FR-NV-9: stashed so a mouse event arriving on the *next* input
+    // turn can translate its absolute terminal coordinates into these areas'
+    // own space — one-frame-stale like `layout_width`/`viewport_height`
+    // (see `App::last_content_area`'s doc comment).
+    app.last_content_area = content_area;
+    app.last_tab_bar_area = tab_bar_area;
+
     // Paint the whole frame in the theme's background/foreground first so
     // areas a widget doesn't explicitly style (e.g. the empty tail of a
     // short article) still match the theme, not the terminal default.
@@ -680,6 +687,33 @@ fn render_tab_segment(label: &TabLabel, max_title: usize) -> String {
 /// compact `[3/17] Alan Turing` indicator and as many neighbors as fit are
 /// added outward from it, then everything is ordered left-to-right by index.
 pub fn build_tab_bar(labels: &[TabLabel], width: usize) -> Vec<TabBarSegment> {
+    build_tab_bar_indexed(labels, width)
+        .into_iter()
+        .map(|(_, seg)| seg)
+        .collect()
+}
+
+/// PRD FR-NV-9: which tab (original index into `labels`) sits under column
+/// `col` of a tab bar built at `width` — shares `build_tab_bar_indexed` with
+/// the painter above so a click can never disagree with what's actually
+/// drawn. `None` past the last rendered segment (clicking blank tab-bar
+/// space is a no-op, not a guess).
+pub fn tab_bar_hit_test(labels: &[TabLabel], width: usize, col: usize) -> Option<usize> {
+    let mut acc = 0usize;
+    for (idx, seg) in build_tab_bar_indexed(labels, width) {
+        let w = display_width(&seg.text);
+        if col >= acc && col < acc + w {
+            return Some(idx);
+        }
+        acc += w;
+    }
+    None
+}
+
+/// The shared implementation behind `build_tab_bar`/`tab_bar_hit_test`: same
+/// segments, paired with each one's original index into `labels` so a hit
+/// test can report *which tab* a column belongs to, not just its text.
+fn build_tab_bar_indexed(labels: &[TabLabel], width: usize) -> Vec<(usize, TabBarSegment)> {
     if labels.is_empty() {
         return Vec::new();
     }
@@ -689,9 +723,15 @@ pub fn build_tab_bar(labels: &[TabLabel], width: usize) -> Vec<TabBarSegment> {
         return labels
             .iter()
             .zip(full)
-            .map(|(l, text)| TabBarSegment {
-                text,
-                active: l.active,
+            .enumerate()
+            .map(|(i, (l, text))| {
+                (
+                    i,
+                    TabBarSegment {
+                        text,
+                        active: l.active,
+                    },
+                )
             })
             .collect();
     }
@@ -764,7 +804,7 @@ pub fn build_tab_bar(labels: &[TabLabel], width: usize) -> Vec<TabBarSegment> {
     }
 
     chosen.sort_by_key(|(i, _)| *i);
-    chosen.into_iter().map(|(_, seg)| seg).collect()
+    chosen
 }
 
 /// Build the active tab's breadcrumb string (PRD FR-NV-7): the trail titles
@@ -1146,6 +1186,85 @@ fn draw_results(frame: &mut Frame, app: &App, area: Rect) {
         .style(base_style(&app.theme, app.no_color))
         .block(UiBlock::default().borders(Borders::ALL).title(title));
     render_selectable_list(frame, list, area, app.selected_result);
+}
+
+/// PRD FR-NV-9: row→result-index hit test for a mouse click on the Results
+/// list. Mirrors `draw_results`'s own per-item line count exactly (title,
+/// optional description, optional highlighted excerpt, optional meta line)
+/// so the two can never drift apart — see `result_item_line_count`.
+///
+/// Returns `None` when the click falls outside every rendered item,
+/// including whenever the results don't all fit the viewport at once:
+/// ratatui's stateful `List` auto-scrolls internally in that case and does
+/// not expose the scroll offset it chose back to the caller, so a click on a
+/// scrolled list cannot be mapped to a specific entry without risking
+/// selecting the wrong one. The keyboard (`j`/`k`) remains the reliable way
+/// to reach an off-screen entry — mouse support stays strictly additive
+/// (PRD FR-ACS-3).
+pub fn results_row_to_index(app: &App, area: Rect, row: u16) -> Option<usize> {
+    if app.results.is_empty() {
+        return None;
+    }
+    let inner_top = area.y + 1;
+    let inner_height = area.height.saturating_sub(2);
+    let heights: Vec<u16> = app
+        .results
+        .iter()
+        .map(|r| result_item_line_count(r, app.reading_wpm) as u16)
+        .collect();
+    let total: u16 = heights.iter().sum();
+    if total > inner_height || row < inner_top {
+        return None;
+    }
+    let mut acc = inner_top;
+    for (i, h) in heights.iter().enumerate() {
+        if row < acc + h {
+            return Some(i);
+        }
+        acc += h;
+    }
+    None
+}
+
+/// The exact number of lines `draw_results` renders for one result — title
+/// (always), description (iff present), a highlighted excerpt (iff present
+/// and not all-whitespace, matching `draw_results`'s own filter), and the
+/// size/wordcount/date meta line (iff `result_meta_line` has anything to
+/// show).
+fn result_item_line_count(r: &crate::api::SearchResult, reading_wpm: u32) -> usize {
+    let mut n = 1;
+    if r.description.is_some() {
+        n += 1;
+    }
+    if let Some(excerpt) = &r.excerpt {
+        let runs = parse_searchmatch(excerpt);
+        if runs.iter().any(|(text, _)| !text.trim().is_empty()) {
+            n += 1;
+        }
+    }
+    if result_meta_line(r, reading_wpm).is_some() {
+        n += 1;
+    }
+    n
+}
+
+/// PRD FR-NV-9: row→index hit test for any single-line-per-item selectable
+/// list built via `render_selectable_list` (TOC, tab picker, bookmark
+/// picker, ...) — every one of them renders exactly one line per entry
+/// inside a `Borders::ALL` block, so the mapping is the same arithmetic
+/// everywhere. Same "only when it fits the viewport" limitation as
+/// `results_row_to_index` — see its doc comment.
+pub fn single_line_list_row_to_index(area: Rect, item_count: usize, row: u16) -> Option<usize> {
+    if item_count == 0 {
+        return None;
+    }
+    let inner_top = area.y + 1;
+    let inner_height = area.height.saturating_sub(2);
+    if item_count as u16 > inner_height || row < inner_top {
+        return None;
+    }
+    let idx = (row - inner_top) as usize;
+    (idx < item_count).then_some(idx)
 }
 
 /// FR-SR-2's "size, wordcount, last-edit date" line, plus FR-RD-11's reading
@@ -3188,6 +3307,143 @@ mod tests {
             "a loading tab shows a static ellipsis: {:?}",
             loading_seg.text
         );
+    }
+
+    /// PRD FR-NV-9: clicking anywhere inside a tab's own rendered segment
+    /// resolves to that tab's index, agreeing with what `build_tab_bar`
+    /// actually painted at every column.
+    #[test]
+    fn tab_bar_hit_test_agrees_with_the_painted_segments() {
+        let labels = vec![
+            label(1, "Alan Turing", false, true),
+            label(2, "Enigma", false, false),
+            label(3, "Bletchley Park", false, false),
+        ];
+        let width = 80;
+        let segments = build_tab_bar(&labels, width);
+        let mut col = 0usize;
+        for (i, seg) in segments.iter().enumerate() {
+            let w = display_width(&seg.text);
+            for c in col..col + w {
+                assert_eq!(
+                    tab_bar_hit_test(&labels, width, c),
+                    Some(i),
+                    "column {c} should hit tab {i} ({:?})",
+                    seg.text
+                );
+            }
+            col += w;
+        }
+        // Past the end of the bar (or its own painted content) is a no-op.
+        assert_eq!(tab_bar_hit_test(&labels, width, width + 5), None);
+    }
+
+    /// The overflow (collapsed) tab bar still resolves clicks to the correct
+    /// *original* tab index, not the compacted position.
+    #[test]
+    fn tab_bar_hit_test_resolves_the_original_index_on_overflow() {
+        let mut labels: Vec<TabLabel> = (1..=17)
+            .map(|n| label(n, "Article With A Fairly Long Title", false, false))
+            .collect();
+        labels[2].active = true; // the 3rd tab (index 2)
+        let width = 30;
+        let segments = build_tab_bar(&labels, width);
+        // The first segment is the compact `[3/17] ...` indicator for tab
+        // index 2 (0-based) — clicking its first column must resolve to 2,
+        // not to whatever position it occupies in the compacted bar.
+        assert!(segments[0].text.contains("[3/17]"));
+        assert_eq!(tab_bar_hit_test(&labels, width, 0), Some(2));
+    }
+
+    #[test]
+    fn tab_bar_hit_test_is_none_when_there_are_no_tabs() {
+        assert_eq!(tab_bar_hit_test(&[], 80, 0), None);
+    }
+
+    // ---- Mouse click hit-testing for single-line/multi-line pickers -------
+
+    fn area(x: u16, y: u16, w: u16, h: u16) -> Rect {
+        Rect::new(x, y, w, h)
+    }
+
+    #[test]
+    fn single_line_list_row_to_index_maps_rows_inside_the_border() {
+        let a = area(0, 0, 20, 7); // 1 border row top+bottom -> 5 usable rows
+        assert_eq!(single_line_list_row_to_index(a, 5, 0), None, "top border");
+        assert_eq!(single_line_list_row_to_index(a, 5, 1), Some(0));
+        assert_eq!(single_line_list_row_to_index(a, 5, 3), Some(2));
+        assert_eq!(single_line_list_row_to_index(a, 5, 5), Some(4));
+        assert_eq!(
+            single_line_list_row_to_index(a, 5, 6),
+            None,
+            "bottom border"
+        );
+    }
+
+    #[test]
+    fn single_line_list_row_to_index_is_none_when_scrolled_or_empty() {
+        let a = area(0, 0, 20, 7); // 5 usable rows
+        assert_eq!(
+            single_line_list_row_to_index(a, 6, 1),
+            None,
+            "6 items don't fit 5 usable rows — scrolled, so no-op"
+        );
+        assert_eq!(single_line_list_row_to_index(a, 0, 1), None, "empty list");
+    }
+
+    fn search_result(title: &str) -> crate::api::SearchResult {
+        crate::api::SearchResult {
+            title: title.to_string(),
+            description: None,
+            excerpt: None,
+            size: None,
+            wordcount: None,
+            timestamp: None,
+        }
+    }
+
+    #[test]
+    fn results_row_to_index_maps_single_line_results() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.results = vec![
+            search_result("Alan Turing"),
+            search_result("Enigma"),
+            search_result("Bletchley Park"),
+        ];
+        let a = area(0, 0, 40, 6); // 4 usable rows, 3 one-line items fit
+        assert_eq!(results_row_to_index(&app, a, 0), None, "top border");
+        assert_eq!(results_row_to_index(&app, a, 1), Some(0));
+        assert_eq!(results_row_to_index(&app, a, 2), Some(1));
+        assert_eq!(results_row_to_index(&app, a, 3), Some(2));
+        assert_eq!(results_row_to_index(&app, a, 4), None, "past the last item");
+    }
+
+    #[test]
+    fn results_row_to_index_accounts_for_multi_line_items() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        let mut with_desc = search_result("Alan Turing");
+        with_desc.description = Some("English mathematician".to_string());
+        app.results = vec![with_desc, search_result("Enigma")];
+        let a = area(0, 0, 40, 6); // 4 usable rows: item 0 takes 2, item 1 takes 1
+        assert_eq!(results_row_to_index(&app, a, 1), Some(0), "title line");
+        assert_eq!(
+            results_row_to_index(&app, a, 2),
+            Some(0),
+            "description line"
+        );
+        assert_eq!(results_row_to_index(&app, a, 3), Some(1), "second result");
+    }
+
+    #[test]
+    fn results_row_to_index_is_none_when_scrolled_or_empty() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.results = (0..10)
+            .map(|i| search_result(&format!("Result {i}")))
+            .collect();
+        let a = area(0, 0, 40, 6); // only 4 usable rows for 10 items
+        assert_eq!(results_row_to_index(&app, a, 1), None, "scrolled — no-op");
+        app.results.clear();
+        assert_eq!(results_row_to_index(&app, a, 1), None, "empty results");
     }
 
     #[test]

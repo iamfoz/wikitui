@@ -147,6 +147,28 @@ fn print_resolved_config(resolved: &ResolvedConfig) {
         "  startpage = {:?} ({})",
         resolved.startpage.value, resolved.startpage.source
     );
+    let t = &resolved.terminal;
+    println!(
+        "  mouse = {} ({}) -- FR-NV-9, off means native terminal selection/copy is untouched",
+        t.mouse.value, t.mouse.source
+    );
+    println!(
+        "  animations = {:?} ({})",
+        t.animations.value, t.animations.source
+    );
+    println!(
+        "  auto_theme = {} ({}); theme_light = {:?} ({}); theme_dark = {:?} ({})",
+        t.auto_theme.value,
+        t.auto_theme.source,
+        t.theme_light.value,
+        t.theme_light.source,
+        t.theme_dark.value,
+        t.theme_dark.source
+    );
+    println!(
+        "  hyperlinks = {:?} ({})",
+        t.hyperlinks.value, t.hyperlinks.source
+    );
 }
 
 fn print_problems(resolved: &ResolvedConfig) {
@@ -216,4 +238,21 @@ fn print_capabilities() {
         Ok((cols, rows)) => println!("  detected size: {cols}x{rows}"),
         Err(_) => println!("  detected size: unknown (not a tty)"),
     }
+    let accessible = crate::accessible_active();
+    println!("  ACCESSIBLE active: {accessible}");
+    // PRD FR-RD-2 / §6.7: `auto`'s own heuristic (a real tty, not
+    // ACCESSIBLE) — not a true capability probe (no terminal in the wild
+    // reliably self-reports OSC 8 support), but the same rule the reading
+    // view itself uses at `hyperlinks = auto`.
+    let hyperlink_env = crate::hyperlink::HyperlinkEnv {
+        is_tty: stdout_is_tty,
+        accessible,
+    };
+    println!(
+        "  OSC 8 hyperlinks (auto heuristic): {}",
+        crate::hyperlink::active(crate::hyperlink::HyperlinkMode::Auto, hyperlink_env)
+    );
+    println!(
+        "  clipboard (OSC 52 on yank): attempted unconditionally; silently ignored by a terminal that doesn't support it"
+    );
 }
