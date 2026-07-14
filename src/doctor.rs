@@ -100,6 +100,32 @@ fn print_resolved_config(resolved: &ResolvedConfig) {
             ""
         }
     );
+    let pf = &resolved.prefetch;
+    println!(
+        "  prefetch.enabled = {} ({})",
+        pf.enabled.value, pf.enabled.source
+    );
+    println!(
+        "  prefetch.daily_mb = {} ({}), hourly_requests = {} ({}), metered = {:?} ({})",
+        pf.daily_mb.value,
+        pf.daily_mb.source,
+        pf.hourly_requests.value,
+        pf.hourly_requests.source,
+        pf.metered.value,
+        pf.metered.source
+    );
+    println!(
+        "  prefetch.top_n = {} ({}), weights = lead {} / pageviews {} / affinity {}",
+        pf.top_n.value,
+        pf.top_n.source,
+        pf.weight_lead.value,
+        pf.weight_pageviews.value,
+        pf.weight_affinity.value
+    );
+    println!(
+        "  network.contact = {:?} ({})",
+        resolved.network_contact.value, resolved.network_contact.source
+    );
 }
 
 fn print_problems(resolved: &ResolvedConfig) {

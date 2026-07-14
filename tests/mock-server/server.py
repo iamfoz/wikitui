@@ -47,6 +47,15 @@ QUAD_PNG = _make_png(2, 2, [
 # so a plain global is race-free. Exposed at /debug/media-hits.
 MEDIA_HITS = 0
 
+# PRD §5.8 / NF-NET-2 verification: a log of every non-debug request's path
+# and User-Agent header. A pty test asserts that (a) opening an article
+# triggers the batched pageviews call + the ranked link-body prefetches, (b)
+# a prefetch=off / --incognito run makes NO such background request, and (c)
+# every request carries the mandated User-Agent. Single-threaded server, so a
+# plain global list is race-free. Exposed at /debug/requests; /debug/reset
+# clears it between phases.
+REQUEST_LOG = []
+
 # Simulates a wiki edit for exactly one fixture, for stale-while-revalidate
 # pty verification: when set to a PAGES key, that title's revid is reported
 # one higher than its REVIDS entry (on both the html ETag and the bare
@@ -311,6 +320,35 @@ CATEGORIES = {
     "computing": ["Computer science", "Alan Turing"],
 }
 
+# PRD FR-PF-1 link-ranking fixture (§6.2 rule 7): the outgoing links of a
+# source article joined with pageviews, served as the ONE batched
+# generator=links + prop=pageviews response. Keyed by the source's display
+# title (underscores normalised to spaces, as the request's titles= arrives).
+# Titles here match what the client parses out of the fixture HTML's ./Links,
+# so link ranking has real view counts to sort by. Enigma outranks Computer
+# science on views, so the top-N order is verifiable.
+LINK_PAGEVIEWS = {
+    "Alan Turing": [
+        {"title": "Enigma machine", "views": 12000},
+        {"title": "Computer science", "views": 5000},
+    ],
+}
+
+# PRD FR-PF-2 trending fixture: the Wikifeeds featured-content payload served
+# at /api/rest_v1/feed/featured/{y}/{m}/{d}. TFA + most-read titles are all
+# real PAGES keys so their prefetched bodies resolve, not 404.
+FEATURED_FEED = {
+    "tfa": {"title": "Alan_Turing", "normalizedtitle": "Alan Turing"},
+    "mostread": {
+        "articles": [
+            {"title": "Enigma_machine", "normalizedtitle": "Enigma machine", "views": 90000, "rank": 1},
+            {"title": "Computer_science", "normalizedtitle": "Computer science", "views": 40000, "rank": 2},
+        ]
+    },
+    "image": {"title": "File:Sample.jpg"},
+    "onthisday": [{"text": "An event."}],
+}
+
 # Did-you-mean corrections (FR-SR-4 / §7's zero-results row) for queries
 # that hit no SEARCH_PAGES text at all. Keyed lowercase; see
 # `api::SearchOutcome`'s doc comment for why this rides the REST
@@ -344,8 +382,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
         parts = parsed.path.split('/')
         params = urllib.parse.parse_qs(parsed.query)
 
-        if '/page/summary/' in parsed.path:
+        # PRD NF-NET-2 verification: record every real request's path + UA.
+        if not parsed.path.startswith('/debug/'):
+            REQUEST_LOG.append({
+                "path": self.path,
+                "ua": self.headers.get('User-Agent', ''),
+            })
+
+        if parsed.path == '/debug/media-hits':
+            self._send_json({"hits": MEDIA_HITS})
+        elif parsed.path == '/debug/requests':
+            self._send_json({"requests": REQUEST_LOG})
+        elif parsed.path == '/debug/reset':
+            REQUEST_LOG.clear()
+            self._send_json({"ok": True})
+        elif '/page/summary/' in parsed.path:
             self._serve_summary(parts)
+        elif '/feed/featured/' in parsed.path:
+            self._serve_featured_feed()
         elif '/page/' in parsed.path and parsed.path.endswith('/html'):
             self._serve_article(parts)
         elif '/page/' in parsed.path and parsed.path.endswith('/bare'):
@@ -358,11 +412,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._serve_search_page(params)
         elif parsed.path.startswith('/media/'):
             self._serve_media()
-        elif parsed.path == '/debug/media-hits':
-            self._send_json({"hits": MEDIA_HITS})
         else:
             self.send_response(404)
             self.end_headers()
+
+    def _serve_featured_feed(self):
+        # PRD FR-PF-2 / FR-DL-1: the one daily Wikifeeds featured-content call.
+        self._send_json(FEATURED_FEED)
 
     def _serve_summary(self, parts):
         # PRD Appendix A "Summary" (FR-OFF-4 T2): plain-text extract for a
@@ -373,9 +429,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._send_json({"title": title.replace('_', ' '), "extract": extract})
 
     def _serve_action_api(self, params):
-        # PRD FR-OFF-5 bulk-save-by-category: list=categorymembers, depth 1.
         action = params.get('action', [''])[0]
         listing = params.get('list', [''])[0]
+        generator = params.get('generator', [''])[0]
+        prop = params.get('prop', [''])[0]
+        # PRD FR-OFF-5 bulk-save-by-category: list=categorymembers, depth 1.
         if action == 'query' and listing == 'categorymembers':
             cmtitle = params.get('cmtitle', [''])[0]
             name = cmtitle.split(':', 1)[-1].strip().lower()
@@ -383,6 +441,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_json({
                 "query": {"categorymembers": [{"title": t} for t in members]}
             })
+            return
+        # PRD FR-PF-1: the ONE batched generator=links + prop=pageviews call.
+        # `pvipdays` day keys are synthesised so the client's per-title sum
+        # reproduces the fixture view counts.
+        if action == 'query' and generator == 'links' and 'pageviews' in prop:
+            source = params.get('titles', [''])[0].replace('_', ' ')
+            links = LINK_PAGEVIEWS.get(source, [])
+            pages = [
+                {"title": link["title"], "pageviews": {"2026-07-13": link["views"]}}
+                for link in links
+            ]
+            self._send_json({"query": {"pages": pages}})
             return
         self.send_response(404)
         self.end_headers()

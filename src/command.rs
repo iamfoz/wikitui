@@ -71,11 +71,14 @@ pub enum Command {
     /// `:fetch-queue` — drain the offline "queue for fetch when online" list
     /// (PRD FR-OFF-6): fetch every queued title into the cache now.
     FetchQueue,
-    /// `:set <key>=<value>` — runtime render override. Today handles
-    /// `images=on|off` (PRD FR-TH-7); this is the seed for FR-PC-4's broader
-    /// per-tab `:set` (width/justify/images), which will extend the accepted
-    /// keys here.
+    /// `:set <key>=<value>` — runtime render override. Handles `images=on|off`
+    /// (PRD FR-TH-7) and `prefetch=on|off` (FR-PF-6 kill switch); this is the
+    /// seed for FR-PC-4's broader per-tab `:set` (width/justify/images), which
+    /// will extend the accepted keys here.
     Set { key: String, value: String },
+    /// `:prefetch-log` (PRD FR-PF-4): open the transparency/debug panel of
+    /// recent prefetch actions, their reasons, status, and budget state.
+    PrefetchLog,
     /// `:q` / `:quit` — exit.
     Quit,
 }
@@ -116,7 +119,7 @@ pub enum SaveSpec {
 /// parse-time constant so `command` doesn't depend on the render module.
 const SAVE_EXPORT_FORMATS: [&str; 3] = ["md", "txt", "html"];
 
-pub const USAGE: &str = "commands: open <title>, lang <code>, theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, set images=on|off, config reload, help, quit";
+pub const USAGE: &str = "commands: open <title>, lang <code>, theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, prefetch-log, set images=on|off|prefetch=on|off, config reload, help, quit";
 
 pub fn parse(input: &str) -> Result<Command, String> {
     let input = input.trim();
@@ -344,9 +347,23 @@ pub fn parse(input: &str) -> Result<Command, String> {
                         Err(format!("images must be on or off (got {value:?})"))
                     }
                 }
-                other => Err(format!("unknown :set key {other:?} — try: images=on|off")),
+                // PRD FR-PF-6 kill switch.
+                "prefetch" => {
+                    if value == "on" || value == "off" {
+                        Ok(Command::Set {
+                            key: "prefetch".to_string(),
+                            value: value.to_string(),
+                        })
+                    } else {
+                        Err(format!("prefetch must be on or off (got {value:?})"))
+                    }
+                }
+                other => Err(format!(
+                    "unknown :set key {other:?} — try: images=on|off, prefetch=on|off"
+                )),
             }
         }
+        "prefetch-log" | "prefetchlog" => Ok(Command::PrefetchLog),
         "help" | "h" => Ok(Command::Help),
         "q" | "quit" => Ok(Command::Quit),
         "" => Err(USAGE.to_string()),
@@ -525,9 +542,34 @@ mod tests {
             })
         );
         assert!(parse("set images=maybe").is_err());
-        assert!(parse("set width=90").is_err(), "only images is wired today");
+        assert!(parse("set width=90").is_err(), "width is not wired yet");
         assert!(parse("set images").is_err(), "needs key=value");
         assert!(parse("set").is_err());
+    }
+
+    #[test]
+    fn set_prefetch_toggles_the_kill_switch() {
+        assert_eq!(
+            parse("set prefetch=off"),
+            Ok(Command::Set {
+                key: "prefetch".to_string(),
+                value: "off".to_string()
+            })
+        );
+        assert_eq!(
+            parse("set prefetch=on"),
+            Ok(Command::Set {
+                key: "prefetch".to_string(),
+                value: "on".to_string()
+            })
+        );
+        assert!(parse("set prefetch=maybe").is_err());
+    }
+
+    #[test]
+    fn prefetch_log_parses() {
+        assert_eq!(parse("prefetch-log"), Ok(Command::PrefetchLog));
+        assert_eq!(parse("prefetchlog"), Ok(Command::PrefetchLog));
     }
 
     #[test]

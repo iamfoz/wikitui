@@ -121,6 +121,10 @@ pub struct EnvOverrides {
     pub readlater_auto_dequeue: Option<String>,
     /// PRD FR-TH-7's `images` override of the theme default (`WIKITUI_IMAGES`).
     pub images: Option<String>,
+    /// PRD FR-PF-6 kill switch via env (`WIKITUI_PREFETCH`).
+    pub prefetch: Option<String>,
+    /// PRD NF-NET-2 User-Agent contact channel via env (`WIKITUI_CONTACT`).
+    pub contact: Option<String>,
 }
 
 impl EnvOverrides {
@@ -139,6 +143,8 @@ impl EnvOverrides {
             base_url: get("WIKITUI_BASE_URL"),
             readlater_auto_dequeue: get("WIKITUI_READLATER_AUTO_DEQUEUE"),
             images: get("WIKITUI_IMAGES"),
+            prefetch: get("WIKITUI_PREFETCH"),
+            contact: get("WIKITUI_CONTACT"),
         }
     }
 }
@@ -189,6 +195,10 @@ pub struct ResolvedConfig {
     /// Default false. Today a policy flag with a documented seam (saved-page
     /// image persistence, which must exclude non-free, isn't built yet).
     pub include_nonfree: Valued<bool>,
+    /// PRD §5.8 / FR-PF-1..6 prefetch settings (the `[prefetch]` table).
+    pub prefetch: ResolvedPrefetch,
+    /// PRD NF-NET-2 User-Agent contact channel (`[network] contact`).
+    pub network_contact: Valued<String>,
     /// Parse errors, unknown keys, and rejected values — never fatal, but
     /// `doctor` reports them and exits 1 if any is `IssueLevel::Error`.
     pub issues: Vec<Issue>,
@@ -203,6 +213,27 @@ impl ResolvedConfig {
     pub fn has_errors(&self) -> bool {
         self.issues.iter().any(|i| i.level == IssueLevel::Error)
     }
+}
+
+/// The resolved `[prefetch]` table (PRD §5.8, FR-PF-1/5/6). Each field carries
+/// its provenance so `doctor` can show where a value came from.
+#[derive(Debug, Clone)]
+pub struct ResolvedPrefetch {
+    /// FR-PF-6 kill switch. Default on (the product intent — prefetch is the
+    /// differentiator); `main` still forces it off under `--incognito`.
+    pub enabled: Valued<bool>,
+    /// FR-PF-5 per-day byte budget in MB (default 20).
+    pub daily_mb: Valued<u64>,
+    /// FR-PF-5 per-hour background request budget (default 100).
+    pub hourly_requests: Valued<u64>,
+    /// FR-PF-5 `never|reduced|always` (default `reduced`).
+    pub metered: Valued<String>,
+    /// FR-PF-1 top-N article bodies per page (default 5).
+    pub top_n: Valued<u64>,
+    /// FR-PF-1 ranking weights (`w1·lead + w2·log(views) + w3·affinity`).
+    pub weight_lead: Valued<f64>,
+    pub weight_pageviews: Valued<f64>,
+    pub weight_affinity: Valued<f64>,
 }
 
 /// A schema migration from `from` to `from + 1`, run over the raw table
@@ -259,6 +290,8 @@ pub fn resolve(
         "history",
         "images",
         "include_nonfree",
+        "prefetch",
+        "network",
     ]
     .into_iter()
     .collect();
@@ -324,6 +357,8 @@ pub fn resolve(
     let history_retention_days = resolve_history(&table, &mut issues);
     let images = resolve_images(env, &table, &mut issues);
     let include_nonfree = resolve_include_nonfree(&table, &mut issues);
+    let prefetch = resolve_prefetch(env, &table, &mut issues);
+    let network_contact = resolve_network_contact(env, &table, &mut issues);
 
     ResolvedConfig {
         config_version: Valued {
@@ -349,6 +384,8 @@ pub fn resolve(
         history_retention_days,
         images,
         include_nonfree,
+        prefetch,
+        network_contact,
         migration_summary: config_version.1,
         issues,
         config_path: config_path.map(Path::to_path_buf),
@@ -833,6 +870,220 @@ fn resolve_include_nonfree(table: &toml::Table, issues: &mut Vec<Issue>) -> Valu
         },
         None => default,
     }
+}
+
+/// PRD §5.8 / FR-PF-1..6: the `[prefetch]` table. Budgets and weights are
+/// preferences set once (file/env), like `cache.*` — no CLI flag. The runtime
+/// kill switch is `:set prefetch=off` (FR-PF-6), separate from this resolved
+/// default.
+fn resolve_prefetch(
+    env: &EnvOverrides,
+    table: &toml::Table,
+    issues: &mut Vec<Issue>,
+) -> ResolvedPrefetch {
+    let pt: Option<&toml::Table> = table.get("prefetch").and_then(toml::Value::as_table);
+    if table.contains_key("prefetch") && pt.is_none() {
+        issues.push(Issue::warning(
+            "prefetch must be a table (use [prefetch] with enabled/daily_mb/hourly_requests/metered/top_n/weight_lead/weight_pageviews/weight_affinity); ignoring",
+        ));
+    }
+    if let Some(t) = pt {
+        let known: BTreeSet<&str> = [
+            "enabled",
+            "daily_mb",
+            "hourly_requests",
+            "metered",
+            "top_n",
+            "weight_lead",
+            "weight_pageviews",
+            "weight_affinity",
+        ]
+        .into_iter()
+        .collect();
+        for key in t.keys() {
+            if !known.contains(key.as_str()) {
+                issues.push(Issue::warning(format!(
+                    "unknown config key 'prefetch.{key}' — ignored"
+                )));
+            }
+        }
+    }
+    let field = |k: &str| pt.and_then(|t| t.get(k));
+
+    ResolvedPrefetch {
+        enabled: resolve_prefetch_enabled(env, field("enabled"), issues),
+        daily_mb: resolve_positive_int(field("daily_mb"), "prefetch.daily_mb", 20, issues),
+        hourly_requests: resolve_positive_int(
+            field("hourly_requests"),
+            "prefetch.hourly_requests",
+            100,
+            issues,
+        ),
+        metered: resolve_metered(field("metered"), issues),
+        top_n: resolve_positive_int(field("top_n"), "prefetch.top_n", 5, issues),
+        weight_lead: resolve_weight(field("weight_lead"), "prefetch.weight_lead", 1.0, issues),
+        weight_pageviews: resolve_weight(
+            field("weight_pageviews"),
+            "prefetch.weight_pageviews",
+            1.0,
+            issues,
+        ),
+        weight_affinity: resolve_weight(
+            field("weight_affinity"),
+            "prefetch.weight_affinity",
+            0.0,
+            issues,
+        ),
+    }
+}
+
+/// FR-PF-6 `prefetch.enabled`: env (`WIKITUI_PREFETCH`) then file, default on.
+fn resolve_prefetch_enabled(
+    env: &EnvOverrides,
+    raw: Option<&toml::Value>,
+    issues: &mut Vec<Issue>,
+) -> Valued<bool> {
+    const DEFAULT: bool = true;
+    let default = Valued {
+        value: DEFAULT,
+        source: Source::Default,
+    };
+    if let Some(raw) = &env.prefetch {
+        return match parse_bool_ish(raw) {
+            Some(value) => Valued {
+                value,
+                source: Source::Env,
+            },
+            None => {
+                issues.push(Issue::warning(format!(
+                    "prefetch: {raw:?} (from environment) is not a boolean; using default {DEFAULT}"
+                )));
+                default
+            }
+        };
+    }
+    match raw {
+        Some(v) => match v.as_bool() {
+            Some(value) => Valued {
+                value,
+                source: Source::File,
+            },
+            None => {
+                issues.push(Issue::warning(format!(
+                    "prefetch.enabled must be a boolean; using default {DEFAULT}"
+                )));
+                default
+            }
+        },
+        None => default,
+    }
+}
+
+/// FR-PF-5 `prefetch.metered`: `never|reduced|always`, default `reduced`.
+fn resolve_metered(raw: Option<&toml::Value>, issues: &mut Vec<Issue>) -> Valued<String> {
+    const DEFAULT: &str = "reduced";
+    let default = Valued {
+        value: DEFAULT.to_string(),
+        source: Source::Default,
+    };
+    match raw {
+        None => default,
+        Some(v) => match v.as_str() {
+            Some(s) if matches!(s, "never" | "reduced" | "always") => Valued {
+                value: s.to_string(),
+                source: Source::File,
+            },
+            _ => {
+                issues.push(Issue::warning(format!(
+                    "prefetch.metered must be one of never|reduced|always; using default {DEFAULT}"
+                )));
+                default
+            }
+        },
+    }
+}
+
+/// FR-PF-1 ranking weight: a non-negative float, `default` when absent or
+/// invalid. Accepts integers too (TOML `1` as well as `1.0`).
+fn resolve_weight(
+    raw: Option<&toml::Value>,
+    field_name: &str,
+    default: f64,
+    issues: &mut Vec<Issue>,
+) -> Valued<f64> {
+    let fallback = Valued {
+        value: default,
+        source: Source::Default,
+    };
+    match raw {
+        None => fallback,
+        Some(v) => {
+            let parsed = v
+                .as_float()
+                .or_else(|| v.as_integer().map(|n| n as f64))
+                .filter(|f| *f >= 0.0 && f.is_finite());
+            match parsed {
+                Some(value) => Valued {
+                    value,
+                    source: Source::File,
+                },
+                None => {
+                    issues.push(Issue::warning(format!(
+                        "{field_name} must be a non-negative number; using default {default}"
+                    )));
+                    fallback
+                }
+            }
+        }
+    }
+}
+
+/// PRD NF-NET-2 `[network] contact`: env (`WIKITUI_CONTACT`) then file, default
+/// the project issue tracker. Feeds the User-Agent's `{contact}` token.
+fn resolve_network_contact(
+    env: &EnvOverrides,
+    table: &toml::Table,
+    issues: &mut Vec<Issue>,
+) -> Valued<String> {
+    let default = Valued {
+        value: crate::api::DEFAULT_CONTACT.to_string(),
+        source: Source::Default,
+    };
+    if let Some(c) = &env.contact {
+        return Valued {
+            value: c.clone(),
+            source: Source::Env,
+        };
+    }
+    let nt: Option<&toml::Table> = table.get("network").and_then(toml::Value::as_table);
+    if table.contains_key("network") && nt.is_none() {
+        issues.push(Issue::warning(
+            "network must be a table (use [network] with contact); ignoring",
+        ));
+    }
+    if let Some(t) = nt {
+        for key in t.keys() {
+            if key != "contact" {
+                issues.push(Issue::warning(format!(
+                    "unknown config key 'network.{key}' — ignored"
+                )));
+            }
+        }
+        if let Some(v) = t.get("contact") {
+            match v.as_str() {
+                Some(s) if !s.trim().is_empty() => {
+                    return Valued {
+                        value: s.to_string(),
+                        source: Source::File,
+                    };
+                }
+                _ => issues.push(Issue::warning(
+                    "network.contact must be a non-empty string; using default",
+                )),
+            }
+        }
+    }
+    default
 }
 
 /// PRD FR-HS-4's `[history] retention_days`: file-only, like `cache.*` —
@@ -1340,6 +1591,100 @@ mod tests {
         let from_env = resolve(&CliOverrides::default(), &env, None);
         assert!(!from_env.readlater_auto_dequeue.value);
         assert_eq!(from_env.readlater_auto_dequeue.source, Source::Env);
+    }
+
+    #[test]
+    fn prefetch_defaults_match_the_prd() {
+        let d = resolve(&CliOverrides::default(), &EnvOverrides::default(), None);
+        assert!(d.prefetch.enabled.value, "FR-PF-6: default on");
+        assert_eq!(d.prefetch.daily_mb.value, 20, "FR-PF-5 default 20 MB");
+        assert_eq!(d.prefetch.hourly_requests.value, 100, "FR-PF-5 default 100");
+        assert_eq!(d.prefetch.metered.value, "reduced");
+        assert_eq!(d.prefetch.top_n.value, 5, "FR-PF-1 default top-5");
+        assert_eq!(d.prefetch.weight_lead.value, 1.0);
+        assert_eq!(d.prefetch.weight_pageviews.value, 1.0);
+        assert_eq!(d.prefetch.weight_affinity.value, 0.0);
+        assert_eq!(d.network_contact.value, crate::api::DEFAULT_CONTACT);
+    }
+
+    #[test]
+    fn prefetch_table_is_honored_and_validated() {
+        let path = temp_config(
+            "[prefetch]\nenabled = false\ndaily_mb = 5\nhourly_requests = 40\nmetered = \"always\"\ntop_n = 8\nweight_lead = 2.0\nweight_pageviews = 0.5\nweight_affinity = 0.25\n",
+        );
+        let r = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert!(!r.prefetch.enabled.value);
+        assert_eq!(r.prefetch.enabled.source, Source::File);
+        assert_eq!(r.prefetch.daily_mb.value, 5);
+        assert_eq!(r.prefetch.hourly_requests.value, 40);
+        assert_eq!(r.prefetch.metered.value, "always");
+        assert_eq!(r.prefetch.top_n.value, 8);
+        assert_eq!(r.prefetch.weight_lead.value, 2.0);
+        assert_eq!(r.prefetch.weight_pageviews.value, 0.5);
+        assert_eq!(r.prefetch.weight_affinity.value, 0.25);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn prefetch_rejects_bad_values_with_warnings_and_falls_back() {
+        let path =
+            temp_config("[prefetch]\nmetered = \"sometimes\"\ntop_n = 0\nweight_lead = -1.0\n");
+        let r = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(
+            r.prefetch.metered.value, "reduced",
+            "bad metered falls back"
+        );
+        assert_eq!(r.prefetch.top_n.value, 5, "0 top_n falls back");
+        assert_eq!(
+            r.prefetch.weight_lead.value, 1.0,
+            "negative weight falls back"
+        );
+        assert!(
+            r.issues
+                .iter()
+                .any(|i| i.message.contains("prefetch.metered"))
+        );
+        assert!(
+            r.issues
+                .iter()
+                .any(|i| i.message.contains("prefetch.weight_lead"))
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn prefetch_env_kill_switch_and_contact_are_honored() {
+        let env = EnvOverrides {
+            prefetch: Some("off".to_string()),
+            contact: Some("mailto:ops@example.org".to_string()),
+            ..Default::default()
+        };
+        let r = resolve(&CliOverrides::default(), &env, None);
+        assert!(!r.prefetch.enabled.value, "WIKITUI_PREFETCH=off disables");
+        assert_eq!(r.prefetch.enabled.source, Source::Env);
+        assert_eq!(r.network_contact.value, "mailto:ops@example.org");
+        assert_eq!(r.network_contact.source, Source::Env);
+    }
+
+    #[test]
+    fn network_contact_from_file_is_honored() {
+        let path = temp_config("[network]\ncontact = \"mailto:me@example.com\"\n");
+        let r = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(r.network_contact.value, "mailto:me@example.com");
+        assert_eq!(r.network_contact.source, Source::File);
+        cleanup(&path);
     }
 
     #[test]

@@ -92,6 +92,10 @@ pub enum Mode {
     /// a followed link is neither cached nor saved. `f` queues it for fetch
     /// when online, `s` opens the saved-pages browser, Esc dismisses.
     OfflineCard,
+    /// `:prefetch-log` (PRD FR-PF-4): the prefetch transparency/debug panel —
+    /// recent prefetch actions with their reason strings, status, and bytes,
+    /// plus the live budget state. Read-only; any key / Esc closes it.
+    PrefetchLog,
 }
 
 /// Where the currently open article's content came from (PRD FR-OFF-6's
@@ -436,6 +440,15 @@ pub struct App {
     /// Export-overwrite confirmation for `:save export`, mirroring
     /// `pending_bookmark_export_overwrite`.
     pub pending_saved_export_overwrite: Option<std::path::PathBuf>,
+
+    // -- Prefetch (PRD §5.8, FR-PF-1..6) -----------------------------------
+    /// The background substrate handle (PRD §5.8). `None` in tests and any
+    /// path that never spins the runtime; `main::run` installs the real one.
+    /// The app reads it for the `:prefetch-log` panel (FR-PF-4) and toggles it
+    /// for the `:set prefetch` kill switch (FR-PF-6).
+    pub prefetch: Option<crate::netqueue::SubstrateHandle>,
+    /// The mode `open_prefetch_log` was entered from, restored on close.
+    pub prefetch_prior_mode: Mode,
 }
 
 /// A confirmed-and-resolved bulk save (PRD FR-OFF-5): the human label for the
@@ -529,7 +542,46 @@ impl App {
             pending_bulk_save: None,
             pending_saves: 0,
             pending_saved_export_overwrite: None,
+            prefetch: None,
+            prefetch_prior_mode: Mode::Reading,
         }
+    }
+
+    /// PRD FR-PF-4: open the `:prefetch-log` transparency panel.
+    pub fn open_prefetch_log(&mut self) {
+        self.prefetch_prior_mode = self.mode;
+        self.mode = Mode::PrefetchLog;
+        self.status = "Prefetch log — Esc to close".to_string();
+    }
+
+    /// Close the prefetch-log panel, restoring the prior mode.
+    pub fn close_prefetch_log(&mut self) {
+        self.mode = self.prefetch_prior_mode;
+        self.status = match &self.active_tab().doc {
+            Some(doc) => doc.title.clone(),
+            None => "Press / to search, ? for help, q to quit".to_string(),
+        };
+    }
+
+    /// PRD FR-PF-6 kill switch: flip the substrate's enabled flag (if a
+    /// substrate is installed) and report. Prefetch off never breaks anything —
+    /// scheduling simply stops enqueueing.
+    pub fn set_prefetch(&mut self, on: bool) {
+        if let Some(handle) = &self.prefetch {
+            handle.set_enabled(on);
+        }
+        self.notice = Some(format!("prefetch={}", if on { "on" } else { "off" }));
+    }
+
+    /// Whether prefetch is currently active for *this* session: the kill
+    /// switch is on AND we're not incognito (FR-PR-3 forces it off). The single
+    /// gate every prefetch-scheduling decision consults.
+    pub fn prefetch_active(&self) -> bool {
+        !self.incognito
+            && self
+                .prefetch
+                .as_ref()
+                .is_some_and(crate::netqueue::SubstrateHandle::is_enabled)
     }
 
     /// The tab currently on screen. `tabs` is never empty while the app runs
@@ -2396,6 +2448,24 @@ mod tests {
         // full (images) -> homebrew (text) flips images_enabled, so relayout.
         app.set_theme(Theme::homebrew());
         assert!(app.layout.is_none(), "text/image theme swap relayouts");
+    }
+
+    #[test]
+    fn prefetch_active_respects_kill_switch_and_incognito() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        assert!(!app.prefetch_active(), "no substrate installed yet");
+        app.prefetch = Some(crate::netqueue::SubstrateHandle::new(
+            crate::netqueue::SubstrateConfig::default(),
+        ));
+        assert!(app.prefetch_active(), "installed, enabled, not incognito");
+        app.set_prefetch(false);
+        assert!(!app.prefetch_active(), "FR-PF-6 kill switch off");
+        app.set_prefetch(true);
+        app.incognito = true;
+        assert!(
+            !app.prefetch_active(),
+            "FR-PR-3 incognito forces prefetch off"
+        );
     }
 
     #[test]

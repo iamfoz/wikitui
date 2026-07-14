@@ -19,6 +19,8 @@ mod history;
 mod image;
 mod jsonl;
 mod layout;
+mod netqueue;
+mod prefetch;
 mod research;
 mod sanitize;
 mod saved;
@@ -216,7 +218,16 @@ async fn main() -> Result<()> {
         eprintln!("wikitui: config: {summary}");
     }
 
-    let client = WikiClient::new(resolved.base_url_template.value.clone())?;
+    // NF-NET-2: the default contact needs no rebuild of the UA string; only a
+    // configured `[network] contact` takes the `with_contact` path.
+    let client = if resolved.network_contact.source == config::Source::Default {
+        WikiClient::new(resolved.base_url_template.value.clone())?
+    } else {
+        WikiClient::with_contact(
+            resolved.base_url_template.value.clone(),
+            &resolved.network_contact.value,
+        )?
+    };
     let page_cache = PageCache::open(
         resolved.cache_max_mb.value.saturating_mul(1024 * 1024),
         resolved.cache_fresh_ttl_hours.value.saturating_mul(3600),
@@ -291,10 +302,36 @@ async fn main() -> Result<()> {
         resolved.history_retention_days.value,
         resolved.images.value,
         resolved.include_nonfree.value,
+        prefetch_config_from(&resolved.prefetch),
+        resolved.prefetch.enabled.value,
         config_ctx,
         reload_flag,
     )
     .await
+}
+
+/// Build the [`netqueue::SubstrateConfig`] from resolved `[prefetch]` config
+/// (PRD §5.8 / FR-PF-1/5). The jitter seed is time-derived in production so
+/// two processes' backoff schedules don't synchronize (tests pin their own).
+fn prefetch_config_from(pf: &config::ResolvedPrefetch) -> netqueue::SubstrateConfig {
+    let jitter_seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x5EED_1234)
+        | 1;
+    netqueue::SubstrateConfig {
+        daily_byte_budget: pf.daily_mb.value.saturating_mul(1024 * 1024),
+        hourly_request_budget: pf.hourly_requests.value.min(u32::MAX as u64) as u32,
+        metered: netqueue::Metered::parse(&pf.metered.value).unwrap_or(netqueue::Metered::Reduced),
+        top_n: pf.top_n.value as usize,
+        weights: netqueue::RankWeights {
+            lead: pf.weight_lead.value,
+            pageviews: pf.weight_pageviews.value,
+            affinity: pf.weight_affinity.value,
+        },
+        jitter_seed,
+        ..netqueue::SubstrateConfig::default()
+    }
 }
 
 /// The CLI-flag layer of PRD §6.7's precedence chain, read off the parsed
@@ -454,14 +491,29 @@ async fn fetch_page(
 /// HTML re-fetch. Mirrors `fire_typeahead`'s shape (never runs inline in
 /// the loop) but has no debounce timer to wait on; it fires right after the
 /// stale-cache-hit fetch that requested it.
+/// Returns whether a revalidation was newly enqueued (`false` = coalesced with
+/// an identical in-flight one, NF-NET-5) so the caller only bumps
+/// `pending_revalidations` when a completion is actually coming.
 fn fire_revalidation(
+    app: &App,
     client: &WikiClient,
     tab_id: TabId,
     lang: String,
     title: String,
     cached_revid: u64,
     tx: &UnboundedSender<RevalidationOutcome>,
-) {
+) -> bool {
+    // PRD FR-OFF-2 migrated onto the substrate (NF-NET-1): the worker runs it
+    // at revalidation priority, after the foreground gate, serially. The
+    // `BgExecutor` still delivers the `RevalidationOutcome` over `tx`, so the
+    // loop applies it exactly as before. Two tabs revalidating the same
+    // (lang, title) coalesce to one fetch — the outcome routes to the first
+    // requester's tab; the cache write benefits both (documented limitation).
+    if let Some(handle) = &app.prefetch {
+        return handle.enqueue_revalidation(tab_id, lang, title, cached_revid);
+    }
+    // Fallback for any path with no substrate installed (unit tests, `--dump`):
+    // the original ad-hoc spawn, so behavior is unchanged there.
     let client = client.clone();
     let tx = tx.clone();
     tokio::spawn(async move {
@@ -473,6 +525,7 @@ fn fire_revalidation(
             result,
         });
     });
+    true
 }
 
 /// Spawns the fetch for a background tab (PRD FR-TB-3): runs the full
@@ -525,6 +578,344 @@ async fn revalidate(
             })
         }
     }
+}
+
+// -- The background substrate's executor (PRD §5.8, NF-NET-*) ---------------
+
+/// The HTTP-doing half of the substrate ([`netqueue::Executor`]): it holds the
+/// shared client/cache and turns each queued [`netqueue::Job`] into real work.
+/// The substrate itself owns the respectful-client policy (gate, serial order,
+/// budgets, breaker, backoff); this type only performs the request the policy
+/// has already cleared, classifies the result for the breaker, and — for seed
+/// jobs — hands back the follow-up article bodies to prefetch.
+struct BgExecutor {
+    client: WikiClient,
+    cache: PageCache,
+    revalidate_tx: UnboundedSender<RevalidationOutcome>,
+    feed_cache: Arc<std::sync::Mutex<prefetch::FeedCache>>,
+    weights: netqueue::RankWeights,
+    top_n: usize,
+}
+
+impl netqueue::Executor for BgExecutor {
+    fn execute(
+        &self,
+        job: netqueue::Job,
+    ) -> impl std::future::Future<Output = netqueue::ExecResult> + Send {
+        let client = self.client.clone();
+        let cache = self.cache.clone();
+        let tx = self.revalidate_tx.clone();
+        let feed_cache = self.feed_cache.clone();
+        let weights = self.weights;
+        let top_n = self.top_n;
+        async move {
+            match job {
+                netqueue::Job::Revalidate {
+                    tab_id,
+                    lang,
+                    title,
+                    cached_revid,
+                } => execute_revalidation(&client, &tx, tab_id, lang, title, cached_revid).await,
+                netqueue::Job::PrefetchArticle { lang, title, .. } => {
+                    execute_prefetch_article(&client, &cache, &lang, &title).await
+                }
+                netqueue::Job::RankLinks {
+                    lang,
+                    article_title,
+                    candidates,
+                } => {
+                    execute_rank_links(&client, &lang, &article_title, &candidates, weights, top_n)
+                        .await
+                }
+                netqueue::Job::Featured { lang, date } => {
+                    execute_featured(&client, &feed_cache, &lang, &date).await
+                }
+            }
+        }
+    }
+}
+
+/// Map an `api` background failure onto the substrate's outcome vocabulary so
+/// the circuit breaker and Retry-After handling react correctly (NF-NET-4).
+fn bg_failure_to_outcome(e: api::BgFailure) -> netqueue::Outcome {
+    match e {
+        api::BgFailure::RateLimited { retry_after } => {
+            netqueue::Outcome::RateLimited { retry_after }
+        }
+        api::BgFailure::ServerError => netqueue::Outcome::ServerError,
+        api::BgFailure::Network => netqueue::Outcome::Failed,
+    }
+}
+
+/// FR-PF-1/2: fetch one article body into L2. Already-cached targets are
+/// skipped without a request (the byte/request budget is never spent twice).
+async fn execute_prefetch_article(
+    client: &WikiClient,
+    cache: &PageCache,
+    lang: &str,
+    title: &str,
+) -> netqueue::ExecResult {
+    if cache.get(lang, title).is_some() {
+        return netqueue::ExecResult {
+            outcome: netqueue::Outcome::Skipped {
+                note: "already cached".to_string(),
+            },
+            follow_ups: Vec::new(),
+        };
+    }
+    match client.fetch_article_html_bg(lang, title).await {
+        Ok(a) => {
+            // Prefetch fills L2 only — no L1 render, no images (PRD §5.8).
+            cache.put(lang, title, &a.html, a.revid, a.etag.as_deref());
+            netqueue::ExecResult {
+                outcome: netqueue::Outcome::Done { bytes: a.bytes },
+                follow_ups: Vec::new(),
+            }
+        }
+        Err(e) => netqueue::ExecResult {
+            outcome: bg_failure_to_outcome(e),
+            follow_ups: Vec::new(),
+        },
+    }
+}
+
+/// FR-PF-1 seed: the one batched `generator=links` + `prop=pageviews` call,
+/// then rank and hand back the top-N bodies as follow-up jobs (§6.2 rule 7:
+/// never a per-article fanout).
+async fn execute_rank_links(
+    client: &WikiClient,
+    lang: &str,
+    article_title: &str,
+    candidates: &[netqueue::LinkCandidate],
+    weights: netqueue::RankWeights,
+    top_n: usize,
+) -> netqueue::ExecResult {
+    match client.fetch_link_pageviews(lang, article_title).await {
+        Ok((pageviews, bytes)) => {
+            let ranked =
+                prefetch::rank_links(article_title, candidates, &pageviews, weights, top_n);
+            let follow_ups = ranked
+                .into_iter()
+                .map(|r| netqueue::Job::PrefetchArticle {
+                    lang: lang.to_string(),
+                    title: r.title,
+                    reason: r.reason,
+                    log_id: 0,
+                })
+                .collect();
+            netqueue::ExecResult {
+                outcome: netqueue::Outcome::Done { bytes },
+                follow_ups,
+            }
+        }
+        Err(e) => netqueue::ExecResult {
+            outcome: bg_failure_to_outcome(e),
+            follow_ups: Vec::new(),
+        },
+    }
+}
+
+/// FR-PF-2 seed: the one daily featured-content call. A same-day repeat is a
+/// cache hit (no network); a fresh day fetches, parses, caches for B9's start
+/// page, and hands back the TFA + top-10 most-read bodies.
+async fn execute_featured(
+    client: &WikiClient,
+    feed_cache: &Arc<std::sync::Mutex<prefetch::FeedCache>>,
+    lang: &str,
+    date: &str,
+) -> netqueue::ExecResult {
+    if !feed_cache.lock().unwrap().should_fetch(date) {
+        return netqueue::ExecResult {
+            outcome: netqueue::Outcome::Skipped {
+                note: "feed already fetched today".to_string(),
+            },
+            follow_ups: Vec::new(),
+        };
+    }
+    let Some((y, m, d)) = parse_ymd(date) else {
+        return netqueue::ExecResult {
+            outcome: netqueue::Outcome::Failed,
+            follow_ups: Vec::new(),
+        };
+    };
+    match client.fetch_featured_feed(lang, y, m, d).await {
+        Ok((body, bytes)) => {
+            let feed = prefetch::FeaturedFeed::parse(&body).unwrap_or_default();
+            let mut follow_ups = Vec::new();
+            if let Some(tfa) = &feed.tfa {
+                follow_ups.push(netqueue::Job::PrefetchArticle {
+                    lang: lang.to_string(),
+                    title: tfa.clone(),
+                    reason: prefetch::trending_reason(None, 0),
+                    log_id: 0,
+                });
+            }
+            for (i, mr) in feed.mostread.iter().take(10).enumerate() {
+                follow_ups.push(netqueue::Job::PrefetchArticle {
+                    lang: lang.to_string(),
+                    title: mr.title.clone(),
+                    reason: prefetch::trending_reason(Some(i + 1), mr.views),
+                    log_id: 0,
+                });
+            }
+            feed_cache.lock().unwrap().store(date.to_string(), feed);
+            netqueue::ExecResult {
+                outcome: netqueue::Outcome::Done { bytes },
+                follow_ups,
+            }
+        }
+        Err(e) => netqueue::ExecResult {
+            outcome: bg_failure_to_outcome(e),
+            follow_ups: Vec::new(),
+        },
+    }
+}
+
+/// FR-OFF-2 on the substrate: the cheap bare check with `maxlag`, then a full
+/// re-fetch only if the revid changed. Always sends exactly one
+/// `RevalidationOutcome` (even on failure → silent per NF-NET-8) so the loop's
+/// `pending_revalidations` counter balances.
+async fn execute_revalidation(
+    client: &WikiClient,
+    tx: &UnboundedSender<RevalidationOutcome>,
+    tab_id: TabId,
+    lang: String,
+    title: String,
+    cached_revid: u64,
+) -> netqueue::ExecResult {
+    let none = Vec::new();
+    match client.fetch_bare_metadata_bg(&lang, &title).await {
+        Ok(latest) => match cache::revalidate_action(cached_revid, latest) {
+            RevalidateAction::Touch => {
+                let _ = tx.send(RevalidationOutcome {
+                    tab_id,
+                    lang,
+                    title,
+                    result: Some(RevalidationResult::Unchanged),
+                });
+                netqueue::ExecResult {
+                    outcome: netqueue::Outcome::Done { bytes: 0 },
+                    follow_ups: none,
+                }
+            }
+            RevalidateAction::Fetch => match client.fetch_article_html_bg(&lang, &title).await {
+                Ok(a) => {
+                    let _ = tx.send(RevalidationOutcome {
+                        tab_id,
+                        lang,
+                        title,
+                        result: Some(RevalidationResult::Changed {
+                            html: a.html,
+                            revid: a.revid,
+                            etag: a.etag,
+                        }),
+                    });
+                    netqueue::ExecResult {
+                        outcome: netqueue::Outcome::Done { bytes: a.bytes },
+                        follow_ups: none,
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(RevalidationOutcome {
+                        tab_id,
+                        lang,
+                        title,
+                        result: None,
+                    });
+                    netqueue::ExecResult {
+                        outcome: bg_failure_to_outcome(e),
+                        follow_ups: none,
+                    }
+                }
+            },
+        },
+        Err(e) => {
+            let _ = tx.send(RevalidationOutcome {
+                tab_id,
+                lang,
+                title,
+                result: None,
+            });
+            netqueue::ExecResult {
+                outcome: bg_failure_to_outcome(e),
+                follow_ups: none,
+            }
+        }
+    }
+}
+
+/// Parse a `yyyy-mm-dd` bucket into calendar parts for the feed URL.
+fn parse_ymd(date: &str) -> Option<(i32, u32, u32)> {
+    let mut parts = date.split('-');
+    let y = parts.next()?.parse().ok()?;
+    let m = parts.next()?.parse().ok()?;
+    let d = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((y, m, d))
+}
+
+/// PRD FR-PF-1: with an article on screen, enqueue a link-ranking seed for its
+/// internal links (deduped, ≤50). A no-op unless prefetch is active (kill
+/// switch on, not incognito — FR-PF-6/FR-PR-3). The cursor link is flagged so
+/// ranking always keeps it (FR-PF-1).
+fn schedule_link_prefetch(app: &App) {
+    if !app.prefetch_active() {
+        return;
+    }
+    let Some(handle) = &app.prefetch else {
+        return;
+    };
+    let tab = app.active_tab();
+    let Some(doc) = tab.doc.as_ref() else {
+        return;
+    };
+    let article_title = doc.title.clone();
+    let mut candidates = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut lead_position = 0usize;
+    for (i, link) in tab.links.iter().enumerate() {
+        let Some(title) = &link.internal_title else {
+            continue;
+        };
+        if title == &article_title || !seen.insert(title.clone()) {
+            continue;
+        }
+        candidates.push(netqueue::LinkCandidate {
+            title: title.clone(),
+            lead_position,
+            is_cursor: tab.focused_link == Some(i),
+        });
+        lead_position += 1;
+        if candidates.len() >= 50 {
+            break;
+        }
+    }
+    if candidates.is_empty() {
+        return;
+    }
+    handle.enqueue_prefetch(netqueue::Job::RankLinks {
+        lang: tab.lang.clone(),
+        article_title,
+        candidates,
+    });
+}
+
+/// PRD FR-PF-2: enqueue the once-per-day trending seed. The `date` bucket drives
+/// the feed's once-per-day cache; the substrate's gate makes it idle-only.
+fn schedule_trending_prefetch(app: &App) {
+    if !app.prefetch_active() {
+        return;
+    }
+    let Some(handle) = &app.prefetch else {
+        return;
+    };
+    let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    handle.enqueue_prefetch(netqueue::Job::Featured {
+        lang: app.lang.clone(),
+        date,
+    });
 }
 
 /// Applies a completed revalidation (PRD FR-OFF-2, FR-TB-3): writes any
@@ -606,15 +997,17 @@ fn apply_tab_load_outcome(
             if index == app.active {
                 app.layout = None;
             }
-            if let Some(cached_revid) = fetch.revalidate {
-                fire_revalidation(
+            if let Some(cached_revid) = fetch.revalidate
+                && fire_revalidation(
+                    app,
                     client,
                     outcome.tab_id,
                     outcome.lang,
                     outcome.title,
                     cached_revid,
                     revalidate_tx,
-                );
+                )
+            {
                 app.pending_revalidations += 1;
             }
         }
@@ -1078,6 +1471,8 @@ async fn run(
     history_retention_days: u64,
     images_config: Option<bool>,
     include_nonfree: bool,
+    prefetch_config: netqueue::SubstrateConfig,
+    prefetch_enabled: bool,
     config_ctx: ConfigContext,
     reload_flag: Arc<AtomicBool>,
 ) -> Result<()> {
@@ -1118,12 +1513,36 @@ async fn run(
     // PRD FR-OFF-4..5: background saved-page fetch results (serial, non-blocking).
     let (save_tx, mut save_rx) = mpsc::unbounded_channel::<SaveOutcome>();
 
+    // PRD §5.8 / NF-NET-1: the one background substrate. A single serial
+    // worker drains its priority queue; revalidation (FR-OFF-2) is migrated
+    // onto it here so there is one coherent background story with prefetch
+    // (FR-PF-1/2). Background-tab loads, saved-page fetches, and read-later
+    // warming remain ad-hoc spawns for now — documented follow-up.
+    let substrate = netqueue::SubstrateHandle::new(prefetch_config);
+    substrate.set_enabled(prefetch_enabled);
+    app.prefetch = Some(substrate.clone());
+    let feed_cache = Arc::new(std::sync::Mutex::new(prefetch::FeedCache::default()));
+    let executor = BgExecutor {
+        client: client.clone(),
+        cache: cache.clone(),
+        revalidate_tx: revalidate_tx.clone(),
+        feed_cache,
+        weights: substrate.weights(),
+        top_n: substrate.top_n(),
+    };
+    tokio::spawn(substrate.clone().run(executor));
+
     if let Some(query) = cli.search {
         app.search_input = query;
         run_search(client, &mut app).await;
     } else if let Some(title) = cli.title {
         open_title(client, cache, &mut app, &title, &revalidate_tx).await;
     }
+
+    // PRD FR-PF-2: seed trending prefetch once at startup. The foreground gate
+    // ensures it only runs while the reader is idle; the daily feed cache makes
+    // it a single call per day.
+    schedule_trending_prefetch(&app);
 
     loop {
         // Checked once per turn rather than mid-`event::read()`, which
@@ -1167,6 +1586,10 @@ async fn run(
             || app.any_tab_loading()
             || app.image_store.any_loading()
             || app.pending_saves > 0
+            // PRD FR-PF-4: keep the prefetch-log panel refreshing live while
+            // it is open (scoped to that mode only, so idle Reading still
+            // blocks on input — FR-ACS-2).
+            || app.mode == Mode::PrefetchLog
         {
             let poll_interval = if app.mode == Mode::Search {
                 TYPEAHEAD_POLL
@@ -1367,7 +1790,17 @@ async fn open_title(
 ) {
     app.loading = true;
     let lang = app.lang.clone();
-    match fetch_page(client, cache, &lang, title).await {
+    // NF-NET-1: hold the foreground gate across this interactive fetch so the
+    // background worker yields — a prefetch already draining never delays the
+    // article the reader is waiting on.
+    let outcome = {
+        let _fg = app
+            .prefetch
+            .as_ref()
+            .map(netqueue::SubstrateHandle::foreground_guard);
+        fetch_page(client, cache, &lang, title).await
+    };
+    match outcome {
         Ok(outcome) => {
             // PRD §5.7: a pinned saved copy is the intended offline artifact,
             // so it takes precedence over a stale cache serve — but never over
@@ -1388,16 +1821,21 @@ async fn open_title(
             app.open_document(document);
             if let Some(cached_revid) = outcome.revalidate {
                 let tab_id = app.active_tab().id;
-                fire_revalidation(
+                if fire_revalidation(
+                    app,
                     client,
                     tab_id,
                     lang,
                     title.to_string(),
                     cached_revid,
                     revalidate_tx,
-                );
-                app.pending_revalidations += 1;
+                ) {
+                    app.pending_revalidations += 1;
+                }
             }
+            // PRD FR-PF-1: with the article shown, rank its links and prefetch
+            // the top-N bodies into L2 (gated on the kill switch + incognito).
+            schedule_link_prefetch(app);
         }
         Err(e) => {
             // §7's "Offline, uncached link": the network failed and nothing is
@@ -1430,7 +1868,14 @@ async fn open_history_entry(
 ) {
     app.loading = true;
     app.lang = entry.lang.clone();
-    match fetch_page(client, cache, &entry.lang, &entry.title).await {
+    let outcome = {
+        let _fg = app
+            .prefetch
+            .as_ref()
+            .map(netqueue::SubstrateHandle::foreground_guard);
+        fetch_page(client, cache, &entry.lang, &entry.title).await
+    };
+    match outcome {
         Ok(outcome) => {
             let document = doc::parse_article_html(&entry.title, &outcome.html);
             {
@@ -1445,16 +1890,19 @@ async fn open_history_entry(
             app.active_tab_mut().scroll = entry.scroll;
             if let Some(cached_revid) = outcome.revalidate {
                 let tab_id = app.active_tab().id;
-                fire_revalidation(
+                if fire_revalidation(
+                    app,
                     client,
                     tab_id,
                     entry.lang,
                     entry.title,
                     cached_revid,
                     revalidate_tx,
-                );
-                app.pending_revalidations += 1;
+                ) {
+                    app.pending_revalidations += 1;
+                }
             }
+            schedule_link_prefetch(app);
         }
         Err(e) => {
             app.status = format!("Error: {e}");
@@ -1516,6 +1964,8 @@ async fn handle_key(
             // Any key closes the help overlay.
             app.mode = app.prior_mode;
         }
+        // PRD FR-PF-4: the prefetch-log panel is read-only — any key closes it.
+        Mode::PrefetchLog => app.close_prefetch_log(),
         // PRD Appendix B's search keybindings: Enter opens the highlighted
         // typeahead suggestion directly (FR-SR-1); Tab runs a full-text
         // search of the typed query instead (FR-SR-2's mode toggle) — the
@@ -2269,10 +2719,15 @@ async fn execute_command(
                 app.set_images(on);
                 app.notice = Some(format!("images={value}"));
             }
+            // PRD FR-PF-6 kill switch.
+            "prefetch" => app.set_prefetch(value == "on"),
             other => {
-                app.notice = Some(format!("unknown :set key {other:?} (try: images)"));
+                app.notice = Some(format!(
+                    "unknown :set key {other:?} (try: images, prefetch)"
+                ));
             }
         },
+        Command::PrefetchLog => app.open_prefetch_log(),
         Command::Style(name) => {
             if let Some(style) = cite::CiteStyle::by_name(&name) {
                 app.cite_style = style;

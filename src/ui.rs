@@ -428,6 +428,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             draw_reading_history_picker(frame, app, content_area)
         }
         Mode::SavedPicker => draw_saved_picker(frame, app, content_area),
+        Mode::PrefetchLog => draw_prefetch_log(frame, app, content_area),
         // The offline card overlays the reading view (drawn after the status
         // bar below, like the help overlay).
         Mode::OfflineCard => draw_reading(frame, app, content_area),
@@ -1408,6 +1409,98 @@ fn human_size(bytes: u64) -> String {
     }
 }
 
+/// PRD FR-PF-4's `:prefetch-log` panel — the prefetch transparency and debug
+/// tool. Shows the kill-switch/incognito state, the live budget (request and
+/// byte windows, metered posture, queue depth), then each recent action with
+/// its reason string, status (queued/done/failed/skipped-budget/rate-limited),
+/// and bytes. Read-only; a paint function, so it reads snapshots off the
+/// substrate handle rather than mutating anything.
+fn draw_prefetch_log(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(handle) = app.prefetch.as_ref() else {
+        let para = Paragraph::new("Prefetch substrate is not active in this session.")
+            .style(base_style(&app.theme, app.no_color))
+            .block(
+                UiBlock::default()
+                    .borders(Borders::ALL)
+                    .title("Prefetch log"),
+            );
+        frame.render_widget(para, area);
+        return;
+    };
+    let entries = handle.log_recent();
+    let budget = handle.budget_snapshot();
+    let pending = handle.pending();
+
+    let state = if app.incognito {
+        "OFF (incognito)".to_string()
+    } else if handle.is_enabled() {
+        "ON".to_string()
+    } else {
+        "OFF (:set prefetch=on to enable)".to_string()
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![
+        RSpan::styled("prefetch: ", colored(app.no_color, app.theme.dim)),
+        RSpan::styled(state, Style::default().add_modifier(Modifier::BOLD)),
+    ]));
+    lines.push(Line::from(RSpan::styled(
+        format!(
+            "budget: {}/{} req/h · {}/{} today · metered: {}{} · {pending} queued",
+            budget.requests_used,
+            budget.requests_cap,
+            human_size(budget.bytes_used),
+            human_size(budget.bytes_cap),
+            budget.metered.label(),
+            if budget.suspended { " (suspended)" } else { "" },
+        ),
+        colored(app.no_color, app.theme.dim),
+    )));
+    lines.push(Line::from(""));
+
+    if entries.is_empty() {
+        lines.push(Line::from(RSpan::styled(
+            "No prefetch actions yet — open an article to prime its links.",
+            colored(app.no_color, app.theme.dim),
+        )));
+    } else {
+        for e in &entries {
+            use crate::netqueue::LogStatus;
+            let status_style = match e.status {
+                LogStatus::Done => Style::default().add_modifier(Modifier::BOLD),
+                LogStatus::Failed | LogStatus::RateLimited => {
+                    colored(app.no_color, app.theme.match_fg).add_modifier(Modifier::BOLD)
+                }
+                LogStatus::SkippedBudget | LogStatus::Queued => {
+                    colored(app.no_color, app.theme.dim)
+                }
+            };
+            let bytes = if e.bytes > 0 {
+                format!("  ({})", human_size(e.bytes))
+            } else {
+                String::new()
+            };
+            lines.push(Line::from(vec![
+                RSpan::styled(format!("[{}] ", e.status.label()), status_style),
+                RSpan::styled(
+                    e.title.clone(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                RSpan::styled(
+                    format!("  {}{bytes}", e.reason),
+                    colored(app.no_color, app.theme.dim),
+                ),
+            ]));
+        }
+    }
+
+    let title = format!("Prefetch log ({}) — Esc: close", entries.len());
+    let para = Paragraph::new(lines)
+        .style(base_style(&app.theme, app.no_color))
+        .block(UiBlock::default().borders(Borders::ALL).title(title));
+    frame.render_widget(para, area);
+}
+
 /// §7's "Offline, uncached link" card: a centered overlay offering the two
 /// documented choices (queue for fetch when online / search saved pages).
 fn draw_offline_card(frame: &mut Frame, app: &App, area: Rect) {
@@ -1504,6 +1597,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         Mode::ReadingHistoryFilter => {
             format!("filter: {}   Esc: apply", app.history_pick_filter)
         }
+        Mode::PrefetchLog => app.status.clone(),
         Mode::Help => "Press any key to close help".to_string(),
         Mode::Reading if app.loading => "Loading…".to_string(),
         // Command feedback outranks the focused-link line until the next

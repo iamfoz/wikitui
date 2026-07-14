@@ -26,13 +26,62 @@
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::time::Duration;
 
-const USER_AGENT_BASE: &str = concat!(
-    "wikitui/",
-    env!("CARGO_PKG_VERSION"),
-    " (https://github.com/iamfoz/wikitui) reqwest"
-);
+/// The canonical project URL and HTTP-library token for the User-Agent
+/// (PRD §6.5 NF-NET-2). `HTTP_LIB` tracks the `reqwest` version pinned in
+/// `Cargo.toml` — bump it there and here together.
+const REPO_URL: &str = "https://github.com/iamfoz/wikitui";
+const HTTP_LIB: &str = "reqwest/0.13";
+
+/// Default contact channel embedded in the User-Agent when none is configured
+/// — the project's issue tracker, so a WMF operator hitting a policy problem
+/// can reach a human (the exact failure mode that 403'd wiki-tui, #267).
+/// Overridable via `[network] contact` / `WIKITUI_CONTACT` (PRD §6.2 rule 2).
+pub const DEFAULT_CONTACT: &str = "https://github.com/iamfoz/wikitui/issues";
+
+/// PRD §6.5 NF-NET-2: `wikitui/{ver} (repo; {contact}) {lib}/{ver}` on 100% of
+/// requests. Built once and handed to reqwest's `user_agent`, which stamps it
+/// on every request the client makes — foreground and background alike — so
+/// there is no code path that can omit it (the wiki-tui #267 regression).
+pub fn build_user_agent(contact: &str) -> String {
+    format!(
+        "wikitui/{} ({REPO_URL}; {contact}) {HTTP_LIB}",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+/// PRD §6.5 NF-NET-3: `maxlag=5` on every non-interactive (background)
+/// request. Interactive foreground fetches (article open, search, typeahead)
+/// deliberately do not carry it — the reader is waiting on those.
+const MAXLAG: &str = "5";
+
+/// Why a *background* request failed, classified so the substrate's circuit
+/// breaker and Retry-After handling (NF-NET-4) can react correctly. Foreground
+/// methods keep returning `anyhow::Error`; only the background variants below
+/// need this finer split.
+#[derive(Debug)]
+pub enum BgFailure {
+    /// HTTP 429, or a 503/maxlag lag signal — honor `Retry-After` and trip the
+    /// breaker (NF-NET-3/4).
+    RateLimited { retry_after: Option<Duration> },
+    /// Any other 5xx — trips the breaker; the worker backs off.
+    ServerError,
+    /// Timeout, connection error, or a body that wouldn't parse — backoff,
+    /// but not a breaker trip (NF-NET-4 reserves that for 429/5xx).
+    Network,
+}
+
+/// A background article fetch result, carrying the byte size so the queue can
+/// charge it against the daily prefetch byte budget (FR-PF-5 / NF-NET-7).
+#[derive(Debug, Clone)]
+pub struct BgArticle {
+    pub html: String,
+    pub revid: u64,
+    pub etag: Option<String>,
+    pub bytes: u64,
+}
 
 /// PRD SEC-3: search/typeahead responses are bounded by a `limit` query
 /// param (≤100 results) and are never expected to approach this size in
@@ -169,6 +218,29 @@ struct BareResponse {
     latest: BareLatest,
 }
 
+/// FR-PF-1's `generator=links` + `prop=pageviews` response (formatversion=2).
+/// Each page carries a per-day `pageviews` map (values may be null); the
+/// client sums the non-null days into a single total per title.
+#[derive(Debug, Deserialize)]
+struct PageviewsResponse {
+    #[serde(default)]
+    query: Option<PageviewsQuery>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PageviewsQuery {
+    #[serde(default)]
+    pages: Vec<PageviewsPage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PageviewsPage {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    pageviews: Option<HashMap<String, Option<u64>>>,
+}
+
 /// One freshly fetched article (PRD FR-OFF-1/2): Parsoid HTML plus whatever
 /// revision identity the REST response exposed. `revid` is `0` when the
 /// `ETag` was missing or unparseable (older mock endpoints, some
@@ -214,8 +286,14 @@ impl WikiClient {
     /// verbatim — arbitrary MediaWiki sites (FR-ML-5) aren't per-language
     /// subdomains, so a template without `{lang}` addresses one fixed host.
     pub fn new(base_url_template: String) -> Result<Self> {
+        Self::with_contact(base_url_template, DEFAULT_CONTACT)
+    }
+
+    /// Like [`new`](Self::new) but with a configured contact channel for the
+    /// User-Agent (PRD NF-NET-2 / §6.2 rule 2's config-overridable networking).
+    pub fn with_contact(base_url_template: String, contact: &str) -> Result<Self> {
         let http = reqwest::Client::builder()
-            .user_agent(USER_AGENT_BASE)
+            .user_agent(build_user_agent(contact))
             .gzip(true)
             // NF-NET-8: short timeouts with immediate cache fallback — a
             // hung request must not stall the reader (foreground fetches)
@@ -477,6 +555,175 @@ impl WikiClient {
         }
         Ok(parsed.pages)
     }
+
+    /// Background article fetch (PRD FR-PF-1/2 prefetch, FR-OFF-2 revalidation
+    /// re-fetch): Parsoid HTML with `maxlag=5` (NF-NET-3) and failures
+    /// classified for the substrate breaker (NF-NET-4). Returns the byte size
+    /// so the queue can charge it against the daily prefetch budget (FR-PF-5).
+    pub async fn fetch_article_html_bg(
+        &self,
+        lang: &str,
+        title: &str,
+    ) -> std::result::Result<BgArticle, BgFailure> {
+        let url = format!(
+            "{}/w/rest.php/v1/page/{}/html?maxlag={MAXLAG}",
+            self.host(lang),
+            Self::title_path(title)
+        );
+        let resp = self.http.get(&url).send().await.map_err(bg_send_error)?;
+        if let Some(fail) = bg_status_failure(&resp) {
+            return Err(fail);
+        }
+        let etag = resp
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let revid = etag.as_deref().and_then(parse_revid_from_etag).unwrap_or(0);
+        let bytes = read_capped(resp, crate::doc::MAX_ARTICLE_HTML_BYTES)
+            .await
+            .map_err(|_| BgFailure::Network)?;
+        let len = bytes.len() as u64;
+        let html = decode_lossy_utf8(bytes);
+        Ok(BgArticle {
+            html,
+            revid,
+            etag,
+            bytes: len,
+        })
+    }
+
+    /// Background revalidation metadata (PRD FR-OFF-2): the cheap `bare` call
+    /// with `maxlag=5`, classified for the breaker. Mirrors
+    /// [`fetch_bare_metadata`](Self::fetch_bare_metadata) but on the
+    /// background failure model.
+    pub async fn fetch_bare_metadata_bg(
+        &self,
+        lang: &str,
+        title: &str,
+    ) -> std::result::Result<u64, BgFailure> {
+        let url = format!(
+            "{}/w/rest.php/v1/page/{}/bare?maxlag={MAXLAG}",
+            self.host(lang),
+            Self::title_path(title)
+        );
+        let resp = self.http.get(&url).send().await.map_err(bg_send_error)?;
+        if let Some(fail) = bg_status_failure(&resp) {
+            return Err(fail);
+        }
+        let bytes = read_capped(resp, MAX_SEARCH_RESPONSE_BYTES)
+            .await
+            .map_err(|_| BgFailure::Network)?;
+        let parsed: BareResponse =
+            serde_json::from_slice(&bytes).map_err(|_| BgFailure::Network)?;
+        Ok(parsed.latest.id)
+    }
+
+    /// FR-PF-1's ranking primitive (§6.2 rule 7 / Appendix A): the outgoing
+    /// links of `source_title` joined with their pageviews in **one** batched
+    /// call (`generator=links` + `prop=pageviews`, ≤50 links) — never a
+    /// per-article fanout. Returns `title -> total views over the window` plus
+    /// the response byte size. Titles are sanitized (SEC-1) since they become
+    /// displayed `:prefetch-log` rows and fetch targets.
+    pub async fn fetch_link_pageviews(
+        &self,
+        lang: &str,
+        source_title: &str,
+    ) -> std::result::Result<(HashMap<String, u64>, u64), BgFailure> {
+        let url = format!(
+            "{}/w/api.php?action=query&format=json&formatversion=2&generator=links&titles={}&gpllimit=50&gplnamespace=0&prop=pageviews&pvipdays=1&maxlag={MAXLAG}",
+            self.host(lang),
+            urlencoding::encode(&source_title.replace(' ', "_"))
+        );
+        let resp = self.http.get(&url).send().await.map_err(bg_send_error)?;
+        if let Some(fail) = bg_status_failure(&resp) {
+            return Err(fail);
+        }
+        let bytes = read_capped(resp, MAX_SEARCH_RESPONSE_BYTES)
+            .await
+            .map_err(|_| BgFailure::Network)?;
+        let len = bytes.len() as u64;
+        let parsed: PageviewsResponse =
+            serde_json::from_slice(&bytes).map_err(|_| BgFailure::Network)?;
+        let mut map = HashMap::new();
+        for page in parsed.query.map(|q| q.pages).unwrap_or_default() {
+            let total: u64 = page
+                .pageviews
+                .unwrap_or_default()
+                .values()
+                .flatten()
+                .copied()
+                .sum();
+            let title = crate::sanitize::sanitize_single_line(&page.title).into_owned();
+            map.insert(title, total);
+        }
+        Ok((map, len))
+    }
+
+    /// FR-PF-2 / FR-DL-1: the one daily Wikifeeds featured-content call
+    /// (`feed/featured/{y}/{m}/{d}`), with `maxlag=5`. Returns the raw body
+    /// (parsed by [`crate::prefetch::FeaturedFeed`]) and its byte size.
+    pub async fn fetch_featured_feed(
+        &self,
+        lang: &str,
+        year: i32,
+        month: u32,
+        day: u32,
+    ) -> std::result::Result<(Vec<u8>, u64), BgFailure> {
+        let url = format!(
+            "{}/api/rest_v1/feed/featured/{year:04}/{month:02}/{day:02}?maxlag={MAXLAG}",
+            self.host(lang)
+        );
+        let resp = self.http.get(&url).send().await.map_err(bg_send_error)?;
+        if let Some(fail) = bg_status_failure(&resp) {
+            return Err(fail);
+        }
+        let bytes = read_capped(resp, MAX_SEARCH_RESPONSE_BYTES)
+            .await
+            .map_err(|_| BgFailure::Network)?;
+        let len = bytes.len() as u64;
+        Ok((bytes, len))
+    }
+}
+
+/// A reqwest send error (timeout, DNS, connection reset) is always a plain
+/// network failure — not a rate-limit — so it backs off without tripping the
+/// breaker (NF-NET-4).
+fn bg_send_error(_e: reqwest::Error) -> BgFailure {
+    BgFailure::Network
+}
+
+/// Classifies a background response's status (NF-NET-4): 429/503 are
+/// rate-limit/lag signals that honor `Retry-After` and trip the breaker; other
+/// 5xx trip the breaker on backoff; any other non-2xx (404 for a deleted link
+/// target, say) is a terminal network-class failure. `None` = success.
+fn bg_status_failure(resp: &reqwest::Response) -> Option<BgFailure> {
+    let status = resp.status();
+    if status.is_success() {
+        return None;
+    }
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+    {
+        return Some(BgFailure::RateLimited {
+            retry_after: parse_retry_after(resp.headers()),
+        });
+    }
+    if status.is_server_error() {
+        return Some(BgFailure::ServerError);
+    }
+    Some(BgFailure::Network)
+}
+
+/// PRD NF-NET-4: the `Retry-After` header as a `Duration`. Only the
+/// delta-seconds form is parsed (the HTTP-date form falls back to the
+/// substrate's default pause) — Wikimedia emits seconds.
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
 }
 
 /// PRD SEC-1: sanitizes every field of one full-text search result that the
@@ -820,5 +1067,110 @@ mod tests {
             None,
             "missing the leading integer entirely"
         );
+    }
+
+    /// PRD NF-NET-2: the User-Agent matches the mandated
+    /// `wikitui/{ver} (repo; contact) lib/ver` shape — the fix for wiki-tui's
+    /// #267 403 breakage.
+    #[test]
+    fn user_agent_matches_the_nf_net_2_shape() {
+        let ua = build_user_agent(DEFAULT_CONTACT);
+        assert!(ua.starts_with("wikitui/"));
+        assert!(ua.contains("(https://github.com/iamfoz/wikitui; "));
+        assert!(ua.contains("reqwest/"));
+        assert!(ua.contains("iamfoz/wikitui/issues"));
+    }
+
+    /// PRD NF-NET-2/NF-NET-3: a background request carries the descriptive
+    /// User-Agent and `maxlag=5`. A raw std-socket server captures the request
+    /// head so both are asserted on the wire.
+    #[tokio::test]
+    async fn background_request_carries_user_agent_and_maxlag() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let cap2 = captured.clone();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                *cap2.lock().unwrap() = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let body = b"<html><body>hi</body></html>";
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nETag: W/\"1/x\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+        let client = WikiClient::new(format!("http://127.0.0.1:{port}")).unwrap();
+        let _ = client.fetch_article_html_bg("en", "Test").await;
+        let head = captured.lock().unwrap().clone();
+        assert!(
+            head.to_lowercase().contains("user-agent: wikitui/"),
+            "UA present on the wire: {head:?}"
+        );
+        assert!(
+            head.contains("github.com/iamfoz/wikitui"),
+            "UA carries the repo URL"
+        );
+        assert!(
+            head.contains("maxlag=5"),
+            "maxlag=5 on the request: {head:?}"
+        );
+    }
+
+    /// PRD NF-NET-4: a 429 becomes `RateLimited` carrying the parsed
+    /// `Retry-After` so the substrate can honor it.
+    #[tokio::test]
+    async fn background_429_is_rate_limited_with_retry_after() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut discard = [0u8; 4096];
+                let _ = stream.read(&mut discard);
+                let header = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 7\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(header.as_bytes());
+            }
+        });
+        let client = WikiClient::new(format!("http://127.0.0.1:{port}")).unwrap();
+        let err = client
+            .fetch_article_html_bg("en", "Test")
+            .await
+            .unwrap_err();
+        match err {
+            BgFailure::RateLimited { retry_after } => {
+                assert_eq!(retry_after, Some(Duration::from_secs(7)))
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    /// FR-PF-1: the batched pageviews response sums each title's per-day counts
+    /// (nulls skipped) into one total — the join primitive for link ranking.
+    #[test]
+    fn pageviews_response_sums_daily_counts_per_title() {
+        let json = br#"{"query":{"pages":[
+            {"title":"Enigma machine","pageviews":{"2026-07-13":100,"2026-07-12":null,"2026-07-11":50}},
+            {"title":"Computer science","pageviews":{"2026-07-13":10}}
+        ]}}"#;
+        let parsed: PageviewsResponse = serde_json::from_slice(json).unwrap();
+        let mut totals = std::collections::HashMap::new();
+        for p in parsed.query.unwrap().pages {
+            let total: u64 = p
+                .pageviews
+                .unwrap_or_default()
+                .values()
+                .flatten()
+                .copied()
+                .sum();
+            totals.insert(p.title, total);
+        }
+        assert_eq!(totals.get("Enigma machine"), Some(&150));
+        assert_eq!(totals.get("Computer science"), Some(&10));
     }
 }
