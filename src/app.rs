@@ -1,3 +1,4 @@
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::api::{SearchResult, TitleSuggestion};
@@ -11,8 +12,10 @@ use crate::doc::{Citation, Document};
 use crate::fetch_queue::FetchQueue;
 use crate::hints::{self, HintTarget};
 use crate::layout::{self, Layout, LayoutCache, LayoutOptions};
+use crate::prefetch::FeedCache;
 use crate::research::{ResearchStore, SavedCitation};
 use crate::saved::{SavedPages, Tier};
+use crate::startpage::{self, OnThisDayModel, OtdType, StartPageConfig, StartPageModel};
 use crate::tab::{HistoryEntry, Tab, TabId};
 use crate::theme::Theme;
 
@@ -96,6 +99,12 @@ pub enum Mode {
     /// recent prefetch actions with their reason strings, status, and bytes,
     /// plus the live budget state. Read-only; any key / Esc closes it.
     PrefetchLog,
+    /// `:today` (PRD FR-DL-2): the on-this-day panel — events/births/deaths/
+    /// holidays/selected tabs, each a selectable list of entries; Enter opens
+    /// the focused entry's linked article, Esc closes. Distinct from the
+    /// start page's own condensed on-this-day strip (FR-DL-1), which reuses
+    /// the bundled feed rather than this panel's dedicated per-type fetch.
+    OnThisDay,
 }
 
 /// Where the currently open article's content came from (PRD FR-OFF-6's
@@ -449,6 +458,37 @@ pub struct App {
     pub prefetch: Option<crate::netqueue::SubstrateHandle>,
     /// The mode `open_prefetch_log` was entered from, restored on close.
     pub prefetch_prior_mode: Mode,
+
+    // -- Start page, on-this-day panel, TIL widget (PRD FR-DL-1,2,7) -------
+    /// The daily Wikifeeds cache, shared with the background substrate's
+    /// executor (`main::BgExecutor`) via the same `Arc<Mutex<_>>` — the "one
+    /// daily call" seam `prefetch::FeedCache::get` documents. `None` in tests
+    /// and any path that never spins the runtime, exactly like `prefetch`
+    /// above; `main::run` installs the real one.
+    pub feed_cache: Option<Arc<Mutex<FeedCache>>>,
+    /// `startpage = feed|blank|resume` (PRD FR-DL-1), resolved once at
+    /// startup from `config::ResolvedConfig::startpage`.
+    pub startpage_config: StartPageConfig,
+    /// Selection cursor into the current `start_page_model()`'s flat item
+    /// list — rebuilt fresh each draw, so this index (not an item reference)
+    /// is what persists across frames.
+    pub start_selected: usize,
+    /// FR-DL-7's "or on a key" TIL rotation: bumped by the start page's `t`
+    /// binding, folded into `startpage::pick_til`'s index alongside the
+    /// day's date so a reroll changes the fact without waiting for tomorrow.
+    /// Session-only (never persisted) — a fresh launch starts back at the
+    /// day's plain deterministic pick.
+    pub start_til_reroll: u64,
+    /// The `:today` panel's fetched entries, one list per type (FR-DL-2).
+    pub otd: OnThisDayModel,
+    /// Which type tab the panel is showing.
+    pub otd_tab: OtdType,
+    /// Selection cursor into `otd.entries(otd_tab)` — reset to 0 whenever
+    /// the tab changes (a stale index into a different type's list would be
+    /// meaningless).
+    pub otd_selected: usize,
+    /// The mode `open_on_this_day` was entered from, restored on close.
+    pub otd_prior_mode: Mode,
 }
 
 /// A confirmed-and-resolved bulk save (PRD FR-OFF-5): the human label for the
@@ -544,6 +584,14 @@ impl App {
             pending_saved_export_overwrite: None,
             prefetch: None,
             prefetch_prior_mode: Mode::Reading,
+            feed_cache: None,
+            startpage_config: StartPageConfig::default(),
+            start_selected: 0,
+            start_til_reroll: 0,
+            otd: OnThisDayModel::default(),
+            otd_tab: OtdType::default(),
+            otd_selected: 0,
+            otd_prior_mode: Mode::Reading,
         }
     }
 
@@ -582,6 +630,182 @@ impl App {
                 .prefetch
                 .as_ref()
                 .is_some_and(crate::netqueue::SubstrateHandle::is_enabled)
+    }
+
+    // -- Start page (PRD FR-DL-1) -------------------------------------------
+
+    /// Whether the daily feed hasn't arrived yet but a fetch could still
+    /// land (something is queued/in-flight on the substrate) — the start
+    /// page shows its loading skeleton exactly while this is true, and the
+    /// event loop's scoped poll (`main::run`) stays awake so the feed's
+    /// arrival redraws without a keypress (§6.8: never block startup on it).
+    /// Once nothing is pending and the feed still never showed up (offline,
+    /// the fetch failed, prefetch is off/incognito), this goes `false` and
+    /// `start_page_model` falls back to `StartPageModel::offline_fallback`
+    /// instead of spinning forever.
+    pub fn start_page_pending(&self) -> bool {
+        let Some(fc) = &self.feed_cache else {
+            return false;
+        };
+        if fc.lock().unwrap().get().is_some() {
+            return false; // already arrived — nothing to wait for
+        }
+        // `pending()` alone would flip to 0 the instant the worker dequeues
+        // the job, before its HTTP round trip finishes — `any_inflight()`
+        // stays true across execution (see its doc comment), which is the
+        // signal that actually means "still worth waiting."
+        self.prefetch
+            .as_ref()
+            .is_some_and(|h| h.pending() > 0 || h.any_inflight())
+    }
+
+    /// Builds the current start-page render model (PRD FR-DL-1): the parsed
+    /// feed's sections plus the TIL pick if the feed has arrived, the
+    /// loading skeleton while a fetch could still land, or the graceful
+    /// offline fallback (recent history / saved pages) otherwise. Cheap
+    /// enough (a handful of short strings) to rebuild on every draw rather
+    /// than cache — see the module doc comment on `startpage`.
+    pub fn start_page_model(&self) -> StartPageModel {
+        let (feed, date) = match &self.feed_cache {
+            Some(fc) => {
+                let guard = fc.lock().unwrap();
+                (
+                    guard.get().cloned(),
+                    guard.date().unwrap_or_default().to_string(),
+                )
+            }
+            None => (None, String::new()),
+        };
+        match feed {
+            Some(feed) => {
+                let til = startpage::pick_til(&feed, &date, self.start_til_reroll);
+                StartPageModel::from_feed(&feed, til)
+            }
+            None if self.start_page_pending() => StartPageModel::skeleton(),
+            None => {
+                // PRD FR-DL-1's networking discipline: offline (or the fetch
+                // gave up) degrades to recent history / saved pages, never an
+                // error screen.
+                let recent: Vec<(String, String)> = self
+                    .history
+                    .recent(5)
+                    .into_iter()
+                    .map(|v| (v.lang, v.title))
+                    .collect();
+                let saved: Vec<(String, String)> = self
+                    .saved
+                    .list()
+                    .iter()
+                    .take(5)
+                    .map(|r| (r.lang.clone(), r.title.clone()))
+                    .collect();
+                StartPageModel::offline_fallback(&recent, &saved)
+            }
+        }
+    }
+
+    /// Moves the start page's selection by `delta` (j/k/Tab/Shift-Tab —
+    /// PRD FR-DL-1: "a real navigable view"), wrapping and clamped to
+    /// whatever the model currently has (the feed can arrive mid-session and
+    /// replace a shorter skeleton).
+    pub fn start_page_move(&mut self, delta: i32) {
+        let model = self.start_page_model();
+        self.start_selected = model.clamp_selection(self.start_selected);
+        self.start_selected = model.move_selection(self.start_selected, delta);
+    }
+
+    /// The `(lang override, title)` Enter should open for the focused
+    /// start-page item, owned so the caller can `.await` a fetch after
+    /// releasing the borrow on `self`.
+    pub fn start_page_open_target(&self) -> Option<(Option<String>, String)> {
+        let model = self.start_page_model();
+        let index = model.clamp_selection(self.start_selected);
+        model
+            .open_target(index)
+            .map(|(lang, title)| (lang.map(str::to_string), title.to_string()))
+    }
+
+    /// FR-DL-7's manual reroll: steps the TIL widget to a different
+    /// candidate within today's feed without waiting for tomorrow. A no-op
+    /// (still fine to press) when the feed has no on-this-day entries to
+    /// rotate through.
+    pub fn reroll_til(&mut self) {
+        self.start_til_reroll = self.start_til_reroll.wrapping_add(1);
+    }
+
+    /// PRD FR-DL-1's `gh`/`:start` "home" action: returns the active tab to
+    /// the start page, pushing whatever it was showing onto the back stack
+    /// first (browser-style "Home" — `H` still returns to the article) —
+    /// the tab-content half of `go_home`; the caller is responsible for
+    /// re-syncing anything derived from the active tab's document (this
+    /// mirrors `open_document`'s split between stack bookkeeping and content
+    /// install).
+    pub fn go_home(&mut self) {
+        let index = self.active;
+        self.flush_tab_dwell(index);
+        if let Some(entry) = self.active_tab().current_entry() {
+            self.active_tab_mut().back_stack.push(entry);
+        }
+        self.active_tab_mut().forward_stack.clear();
+        self.active_tab_mut().clear_to_blank();
+        self.start_selected = 0;
+        self.citations.clear();
+        self.selected_citation = 0;
+        self.mode = Mode::Reading;
+        self.layout = None;
+        self.status = "Press / to search, ? for help, q to quit".to_string();
+    }
+
+    // -- On-this-day panel (PRD FR-DL-2) -------------------------------------
+
+    /// Opens the `:today` panel. The caller (`main::open_on_this_day`) is
+    /// responsible for kicking off the per-type fetches; this only handles
+    /// the mode/status bookkeeping so it can run before the `.await`s start
+    /// (the panel shows its own "loading" status in the meantime).
+    pub fn open_on_this_day(&mut self) {
+        self.otd_prior_mode = self.mode;
+        self.mode = Mode::OnThisDay;
+        self.otd_tab = OtdType::default();
+        self.otd_selected = 0;
+        self.status = "Loading on this day…".to_string();
+    }
+
+    /// Closes the on-this-day panel, restoring the prior mode.
+    pub fn close_on_this_day(&mut self) {
+        self.mode = self.otd_prior_mode;
+        self.status = match &self.active_tab().doc {
+            Some(doc) => doc.title.clone(),
+            None => "Press / to search, ? for help, q to quit".to_string(),
+        };
+    }
+
+    /// Moves the selection within the current type tab, wrapping.
+    pub fn otd_move(&mut self, delta: i32) {
+        self.otd_selected = self
+            .otd
+            .move_selection(self.otd_tab, self.otd_selected, delta);
+    }
+
+    /// Switches to the next type tab (PRD FR-DL-2's events/births/deaths/
+    /// holidays/selected), resetting the selection — a stale index into a
+    /// different type's list would be meaningless.
+    pub fn otd_next_tab(&mut self) {
+        self.otd_tab = self.otd_tab.next();
+        self.otd_selected = 0;
+    }
+
+    /// The previous-tab counterpart of `otd_next_tab`.
+    pub fn otd_prev_tab(&mut self) {
+        self.otd_tab = self.otd_tab.prev();
+        self.otd_selected = 0;
+    }
+
+    /// The article title Enter should open for the focused entry in the
+    /// current type tab, or `None` if it links nothing.
+    pub fn otd_open_target(&self) -> Option<String> {
+        self.otd
+            .open_target(self.otd_tab, self.otd_selected)
+            .map(str::to_string)
     }
 
     /// The tab currently on screen. `tabs` is never empty while the app runs
@@ -2466,6 +2690,202 @@ mod tests {
             !app.prefetch_active(),
             "FR-PR-3 incognito forces prefetch off"
         );
+    }
+
+    // -- Start page, on-this-day panel, TIL widget (PRD FR-DL-1,2,7) -------
+
+    fn feed_cache_with(date: &str, feed: crate::prefetch::FeaturedFeed) -> Arc<Mutex<FeedCache>> {
+        let mut cache = FeedCache::default();
+        cache.store(date.to_string(), feed);
+        Arc::new(Mutex::new(cache))
+    }
+
+    fn sample_feed() -> crate::prefetch::FeaturedFeed {
+        crate::prefetch::FeaturedFeed {
+            tfa: Some("Alan Turing".to_string()),
+            extract: Some("A mathematician.".to_string()),
+            mostread: vec![crate::prefetch::MostRead {
+                title: "Enigma machine".to_string(),
+                views: 1000,
+            }],
+            potd: None,
+            potd_thumb_url: None,
+            news: Vec::new(),
+            onthisday: vec![
+                crate::prefetch::OtdEntry {
+                    year: Some(1912),
+                    text: "Turing born.".to_string(),
+                    page_title: Some("Alan Turing".to_string()),
+                },
+                crate::prefetch::OtdEntry {
+                    year: Some(1954),
+                    text: "Turing died.".to_string(),
+                    page_title: None,
+                },
+            ],
+            onthisday_events: 2,
+        }
+    }
+
+    #[test]
+    fn start_page_model_without_a_feed_cache_is_the_graceful_offline_fallback() {
+        let app = App::new("en".to_string(), Theme::terminal(), false);
+        assert!(app.feed_cache.is_none(), "no substrate installed in tests");
+        assert!(!app.start_page_pending());
+        let model = app.start_page_model();
+        assert!(!model.loading);
+        assert!(
+            model.offline,
+            "no feed cache at all degrades to offline, not an error"
+        );
+    }
+
+    #[test]
+    fn start_page_pending_is_false_once_the_feed_has_arrived() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.feed_cache = Some(feed_cache_with("2026-07-14", sample_feed()));
+        assert!(
+            !app.start_page_pending(),
+            "the feed already arrived — nothing left to wait for"
+        );
+    }
+
+    #[test]
+    fn start_page_model_uses_the_cached_feed_when_present() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.feed_cache = Some(feed_cache_with("2026-07-14", sample_feed()));
+        let model = app.start_page_model();
+        assert!(!model.loading);
+        assert!(!model.offline);
+        assert!(
+            model
+                .items
+                .iter()
+                .any(|i| i.section == startpage::Section::Tfa && i.title == "Alan Turing")
+        );
+        assert!(
+            model
+                .items
+                .iter()
+                .any(|i| i.section == startpage::Section::Til),
+            "a TIL fact is picked from the cached feed's onthisday entries"
+        );
+    }
+
+    #[test]
+    fn start_page_move_and_open_target_navigate_the_cached_model() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.feed_cache = Some(feed_cache_with("2026-07-14", sample_feed()));
+        let len = app.start_page_model().items.len();
+        assert!(len >= 2, "fixture has at least TFA + mostread");
+
+        app.start_page_move(1);
+        assert_eq!(app.start_selected, 1);
+        let (_, title_at_1) = app.start_page_open_target().unwrap();
+        assert_eq!(app.start_page_model().items[1].title, title_at_1);
+
+        // Wrapping: from the top, moving up lands on the last item.
+        app.start_selected = 0;
+        app.start_page_move(-1);
+        assert_eq!(app.start_selected, len - 1);
+    }
+
+    #[test]
+    fn reroll_til_can_change_the_picked_fact() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.feed_cache = Some(feed_cache_with("2026-07-14", sample_feed()));
+        let mut texts = std::collections::HashSet::new();
+        for _ in 0..sample_feed().onthisday.len() {
+            let til = app
+                .start_page_model()
+                .items
+                .into_iter()
+                .find(|i| i.section == startpage::Section::Til)
+                .map(|i| i.title);
+            if let Some(t) = til {
+                texts.insert(t);
+            }
+            app.reroll_til();
+        }
+        assert!(
+            texts.len() > 1,
+            "stepping the reroll seed across the candidate count must surface more than one fact: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn go_home_blanks_the_active_tab_and_preserves_back_history() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.open_document(doc("Alan Turing"));
+        assert!(app.active_tab().doc.is_some());
+
+        app.go_home();
+
+        assert!(
+            app.active_tab().doc.is_none(),
+            "home clears the tab's content"
+        );
+        assert_eq!(
+            back_titles(&app),
+            vec!["Alan Turing"],
+            "the outgoing article is pushed onto the back stack, browser-style"
+        );
+        assert_eq!(app.mode, Mode::Reading);
+        assert_eq!(app.start_selected, 0);
+    }
+
+    #[test]
+    fn open_and_close_on_this_day_restores_the_prior_mode() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.mode = Mode::Reading;
+
+        app.open_on_this_day();
+        assert_eq!(app.mode, Mode::OnThisDay);
+        assert_eq!(app.otd_tab, OtdType::Events);
+        assert_eq!(app.otd_selected, 0);
+
+        app.close_on_this_day();
+        assert_eq!(app.mode, Mode::Reading);
+    }
+
+    #[test]
+    fn otd_navigation_moves_selection_and_switches_type_tabs() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.open_on_this_day();
+        app.otd.set(
+            OtdType::Events,
+            vec![
+                crate::prefetch::OtdEntry {
+                    year: Some(1912),
+                    text: "Event one.".to_string(),
+                    page_title: Some("Alan Turing".to_string()),
+                },
+                crate::prefetch::OtdEntry {
+                    year: None,
+                    text: "Event two.".to_string(),
+                    page_title: None,
+                },
+            ],
+        );
+
+        app.otd_move(1);
+        assert_eq!(app.otd_selected, 1);
+        assert_eq!(
+            app.otd_open_target(),
+            None,
+            "the second entry links nothing"
+        );
+
+        app.otd_move(-1);
+        assert_eq!(app.otd_selected, 0);
+        assert_eq!(app.otd_open_target(), Some("Alan Turing".to_string()));
+
+        app.otd_next_tab();
+        assert_eq!(app.otd_tab, OtdType::Births);
+        assert_eq!(app.otd_selected, 0, "switching type resets the selection");
+
+        app.otd_prev_tab();
+        assert_eq!(app.otd_tab, OtdType::Events);
     }
 
     #[test]

@@ -12,6 +12,7 @@ use crate::doc::LinkRef;
 use crate::layout::{
     FLOOR_MIN_HEIGHT, FLOOR_MIN_WIDTH, LaidLine, MatchSpan, SizeTier, SpanKind, size_tier,
 };
+use crate::startpage::{self, StartPageConfig, StartPageModel};
 use crate::theme::Theme;
 
 /// Every title that should render as "visited" in the active tab (PRD
@@ -432,6 +433,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         // The offline card overlays the reading view (drawn after the status
         // bar below, like the help overlay).
         Mode::OfflineCard => draw_reading(frame, app, content_area),
+        Mode::OnThisDay => draw_on_this_day(frame, app, content_area),
     }
 
     draw_status_bar(frame, app, status_area);
@@ -768,25 +770,199 @@ fn draw_reading(frame: &mut Frame, app: &mut App, area: Rect) {
                 .scroll((scroll, 0));
             frame.render_widget(paragraph, area);
         }
+    } else if app.startpage_config == StartPageConfig::Blank {
+        draw_blank_welcome(frame, app, area);
     } else {
-        let welcome = Text::from(vec![
-            Line::from(""),
-            Line::from(RSpan::styled(
-                "wikitui",
-                Style::default().add_modifier(Modifier::BOLD),
-            )),
-            Line::from(RSpan::styled(
-                format!("{}.wikipedia.org — theme: {}", app.lang, app.theme.name),
-                colored(app.no_color, app.theme.dim),
-            )),
-            Line::from(""),
-            Line::from("Press / to search Wikipedia, T to cycle themes, ? for help, q to quit."),
-        ]);
+        draw_start_page(frame, app, area);
+    }
+}
+
+/// PRD FR-DL-1's `startpage = blank`: the original minimal welcome text —
+/// no network, no navigation, exactly what every tab showed before the
+/// start page existed.
+fn draw_blank_welcome(frame: &mut Frame, app: &App, area: Rect) {
+    let welcome = Text::from(vec![
+        Line::from(""),
+        Line::from(RSpan::styled(
+            "wikitui",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(RSpan::styled(
+            format!("{}.wikipedia.org — theme: {}", app.lang, app.theme.name),
+            colored(app.no_color, app.theme.dim),
+        )),
+        Line::from(""),
+        Line::from("Press / to search Wikipedia, T to cycle themes, ? for help, q to quit."),
+    ]);
+    frame.render_widget(
+        Paragraph::new(welcome).style(base_style(&app.theme, app.no_color)),
+        area,
+    );
+}
+
+/// PRD FR-DL-1's start page: today's featured article, top-5 most-read,
+/// "in the news", an on-this-day strip, the TIL widget, and picture of the
+/// day — built fresh from `App::start_page_model` every draw (cheap: a
+/// handful of short strings). A flat `Paragraph` rather than the `List`
+/// widget every picker uses: the section headers interspersed among the
+/// navigable rows aren't themselves selectable, so this paints the
+/// highlight manually instead of fighting `ListState`'s "index into this
+/// exact list" contract. The item count is small enough (TFA + top-5 +
+/// news + a 3-entry OTD strip + TIL) that this never needs to scroll — a
+/// known, documented simplification, not an oversight.
+fn draw_start_page(frame: &mut Frame, app: &App, area: Rect) {
+    let model = app.start_page_model();
+    let selected = model.clamp_selection(app.start_selected);
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(RSpan::styled(
+            "wikitui — today",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+
+    if model.loading {
+        lines.push(Line::from(RSpan::styled(
+            "Loading today's picks…",
+            colored(app.no_color, app.theme.dim),
+        )));
         frame.render_widget(
-            Paragraph::new(welcome).style(base_style(&app.theme, app.no_color)),
+            Paragraph::new(Text::from(lines)).style(base_style(&app.theme, app.no_color)),
             area,
         );
+        return;
     }
+
+    if model.offline {
+        lines.push(Line::from(RSpan::styled(
+            "offline — feed unavailable",
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+    }
+
+    let potd_max_cols = area.width.clamp(1, crate::layout::IMAGE_MAX_COLS);
+    push_potd_lines(&mut lines, app, &model, potd_max_cols);
+
+    let mut last_section: Option<startpage::Section> = None;
+    for (i, item) in model.items.iter().enumerate() {
+        if last_section != Some(item.section) {
+            if last_section.is_some() {
+                lines.push(Line::from(""));
+            }
+            lines.push(Line::from(RSpan::styled(
+                item.section.label(),
+                colored(app.no_color, app.theme.heading).add_modifier(Modifier::BOLD),
+            )));
+            last_section = Some(item.section);
+        }
+
+        let row_style = if i == selected {
+            colored_bg(app.no_color, app.theme.selected_fg, app.theme.selected_bg)
+        } else {
+            Style::default()
+        };
+        let mut spans = Vec::new();
+        if let Some(badge) = item.badge {
+            spans.push(RSpan::styled(
+                format!("{badge} "),
+                row_style.patch(colored(app.no_color, app.theme.match_fg)),
+            ));
+        }
+        spans.push(RSpan::styled(item.title.clone(), row_style));
+        lines.push(Line::from(spans));
+
+        if let Some(detail) = &item.detail {
+            for detail_line in detail.lines() {
+                lines.push(Line::from(RSpan::styled(
+                    format!("  {detail_line}"),
+                    colored(app.no_color, app.theme.dim),
+                )));
+            }
+        }
+    }
+
+    if model.items.is_empty() {
+        lines.push(Line::from(
+            "Nothing to show — try again once you're back online.",
+        ));
+    }
+
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).style(base_style(&app.theme, app.no_color)),
+        area,
+    );
+}
+
+/// A start-page hero image is a "here's today's picture" banner, not the
+/// whole page — capped far below `layout::IMAGE_MAX_ROWS` (which sizes an
+/// inline article image on an otherwise-scrollable page) so it leaves room
+/// for the rest of the sections on a page that, unlike an article, never
+/// scrolls (see `draw_start_page`'s doc comment).
+const POTD_MAX_ROWS: u16 = 8;
+
+/// Appends the picture-of-the-day lines (PRD FR-DL-1): the decoded half-block
+/// image (same pipeline `paint_line`'s `SpanKind::ImageRow` uses — PRD
+/// FR-RD-8) when the theme renders images and the decode has landed;
+/// caption-only text otherwise (text theme, images off, or still loading) —
+/// never a broken box.
+fn push_potd_lines(
+    lines: &mut Vec<Line<'static>>,
+    app: &App,
+    model: &StartPageModel,
+    max_cols: u16,
+) {
+    let Some(title) = &model.potd_title else {
+        return;
+    };
+    let images_would_render = app.images_enabled()
+        && !matches!(
+            app.graphics_protocol(),
+            crate::graphics::GraphicsProtocol::None
+        );
+    let ready = model
+        .potd_thumb_url
+        .as_deref()
+        .filter(|_| images_would_render)
+        .and_then(|src| app.image_store.ready(src));
+
+    if let Some(img) = ready {
+        let (cols, rows) =
+            crate::image::image_box_cells(img.width, img.height, max_cols, POTD_MAX_ROWS);
+        let bg = theme_bg_rgb(&app.theme);
+        for row in 0..rows.max(1) {
+            let spans: Vec<RSpan<'static>> = crate::image::half_block_row(img, cols, rows, row, bg)
+                .into_iter()
+                .map(|cell| {
+                    RSpan::styled(
+                        crate::image::HALF_BLOCK,
+                        Style::default()
+                            .fg(Color::Rgb(cell.fg.0, cell.fg.1, cell.fg.2))
+                            .bg(Color::Rgb(cell.bg.0, cell.bg.1, cell.bg.2)),
+                    )
+                })
+                .collect();
+            lines.push(Line::from(spans));
+        }
+        lines.push(Line::from(RSpan::styled(
+            format!("Picture of the day: {title}"),
+            colored(app.no_color, app.theme.dim).add_modifier(Modifier::ITALIC),
+        )));
+    } else if images_would_render && model.potd_thumb_url.is_some() {
+        lines.push(Line::from(RSpan::styled(
+            format!("Picture of the day: {title} (loading…)"),
+            colored(app.no_color, app.theme.dim).add_modifier(Modifier::ITALIC),
+        )));
+    } else {
+        // Text theme, images off, or no thumbnail URL in the feed: FR-DL-1's
+        // "skipped/caption-only" path.
+        lines.push(Line::from(RSpan::styled(
+            format!("Picture of the day: {title} (images off)"),
+            colored(app.no_color, app.theme.dim).add_modifier(Modifier::ITALIC),
+        )));
+    }
+    lines.push(Line::from(""));
 }
 
 /// Renders a list statefully with the given index selected, so ratatui
@@ -1501,6 +1677,60 @@ fn draw_prefetch_log(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(para, area);
 }
 
+/// PRD FR-DL-2's `:today` panel: a one-row strip of type tabs (events/
+/// births/deaths/holidays/selected) above a selectable list of that type's
+/// entries — Tab/Shift-Tab (or h/l) switch types, j/k move, Enter opens.
+fn draw_on_this_day(frame: &mut Frame, app: &App, area: Rect) {
+    let chunks = UiLayout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(area);
+
+    let tab_spans: Vec<RSpan> = startpage::OtdType::ALL
+        .iter()
+        .map(|&t| {
+            let style = if t == app.otd_tab {
+                colored_bg(app.no_color, app.theme.selected_fg, app.theme.selected_bg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                colored(app.no_color, app.theme.dim)
+            };
+            RSpan::styled(format!(" {} ", t.label()), style)
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(Line::from(tab_spans)).style(base_style(&app.theme, app.no_color)),
+        chunks[0],
+    );
+
+    let entries = app.otd.entries(app.otd_tab);
+    let items: Vec<ListItem> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let text = match e.year {
+                Some(y) => format!("{y} — {}", e.text),
+                None => e.text.clone(),
+            };
+            let style = if i == app.otd_selected {
+                colored_bg(app.no_color, app.theme.selected_fg, app.theme.selected_bg)
+            } else {
+                Style::default()
+            };
+            ListItem::new(Line::from(text)).style(style)
+        })
+        .collect();
+    let title = format!(
+        "On this day — {} ({} entries) — Enter: open  Tab/h/l: switch type  Esc: close",
+        app.otd_tab.label(),
+        entries.len()
+    );
+    let list = List::new(items)
+        .style(base_style(&app.theme, app.no_color))
+        .block(UiBlock::default().borders(Borders::ALL).title(title));
+    render_selectable_list(frame, list, chunks[1], app.otd_selected);
+}
+
 /// §7's "Offline, uncached link" card: a centered overlay offering the two
 /// documented choices (queue for fetch when online / search saved pages).
 fn draw_offline_card(frame: &mut Frame, app: &App, area: Rect) {
@@ -1598,11 +1828,21 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             format!("filter: {}   Esc: apply", app.history_pick_filter)
         }
         Mode::PrefetchLog => app.status.clone(),
+        Mode::OnThisDay => app.status.clone(),
         Mode::Help => "Press any key to close help".to_string(),
         Mode::Reading if app.loading => "Loading…".to_string(),
         // Command feedback outranks the focused-link line until the next
         // keypress clears it (see App::notice).
         Mode::Reading if app.notice.is_some() => app.notice.clone().unwrap_or_default(),
+        // PRD FR-DL-1: the start page's own nav hints, ranked right after
+        // notice/loading — there is no focused link or find state to show
+        // instead (the tab has no document). `startpage = blank` shows the
+        // plain welcome text instead of the navigable start page, so it
+        // keeps the original bare status line rather than hinting at
+        // bindings that view doesn't have.
+        Mode::Reading if tab.doc.is_none() && app.startpage_config != StartPageConfig::Blank => {
+            "j/k or Tab: move   Enter: open   t: shuffle Did You Know   gh: home".to_string()
+        }
         Mode::Reading if !tab.find_matches.is_empty() => {
             format!(
                 "match {}/{} for \"{}\"   n/N: cycle   Esc: clear",

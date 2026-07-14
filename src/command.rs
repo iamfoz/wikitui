@@ -79,6 +79,11 @@ pub enum Command {
     /// `:prefetch-log` (PRD FR-PF-4): open the transparency/debug panel of
     /// recent prefetch actions, their reasons, status, and budget state.
     PrefetchLog,
+    /// `:start` (PRD FR-DL-1) — return the active tab to the start page
+    /// (same action as the `gh` "home" keybinding).
+    Start,
+    /// `:today` (PRD FR-DL-2) — open the on-this-day panel.
+    Today,
     /// `:q` / `:quit` — exit.
     Quit,
 }
@@ -119,7 +124,7 @@ pub enum SaveSpec {
 /// parse-time constant so `command` doesn't depend on the render module.
 const SAVE_EXPORT_FORMATS: [&str; 3] = ["md", "txt", "html"];
 
-pub const USAGE: &str = "commands: open <title>, lang <code>, theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, prefetch-log, set images=on|off|prefetch=on|off, config reload, help, quit";
+pub const USAGE: &str = "commands: open <title>, lang <code>, theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, prefetch-log, start, today, set images=on|off|prefetch=on|off, config reload, help, quit";
 
 pub fn parse(input: &str) -> Result<Command, String> {
     let input = input.trim();
@@ -364,6 +369,9 @@ pub fn parse(input: &str) -> Result<Command, String> {
             }
         }
         "prefetch-log" | "prefetchlog" => Ok(Command::PrefetchLog),
+        // PRD FR-DL-1/2.
+        "start" => Ok(Command::Start),
+        "today" => Ok(Command::Today),
         "help" | "h" => Ok(Command::Help),
         "q" | "quit" => Ok(Command::Quit),
         "" => Err(USAGE.to_string()),
@@ -570,6 +578,12 @@ mod tests {
     fn prefetch_log_parses() {
         assert_eq!(parse("prefetch-log"), Ok(Command::PrefetchLog));
         assert_eq!(parse("prefetchlog"), Ok(Command::PrefetchLog));
+    }
+
+    #[test]
+    fn start_and_today_parse() {
+        assert_eq!(parse("start"), Ok(Command::Start));
+        assert_eq!(parse("today"), Ok(Command::Today));
     }
 
     #[test]

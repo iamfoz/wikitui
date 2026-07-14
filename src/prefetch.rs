@@ -132,23 +132,65 @@ pub fn format_views(v: u64) -> String {
     }
 }
 
-// -- Wikifeeds featured-content parsing (FR-PF-2 / FR-DL-1 seam) -----------
+// -- Wikifeeds featured-content parsing (FR-PF-2 / FR-DL-1/2/7 seam) -------
 
-/// The parsed slice of the daily featured feed prefetch needs, plus the fields
-/// the start page (FR-DL-1 / B9) will consume — exposed so B9 can call
-/// `FeedCache::get` instead of making a second feed request (that is the "one
-/// daily Wikifeeds call" the PRD insists on).
+/// The parsed slice of the daily featured feed prefetch needs, plus the
+/// fields the start page (FR-DL-1) and TIL widget (FR-DL-7) consume —
+/// exposed so `startpage` can call `FeedCache::get` instead of making a
+/// second feed request (that is the "one daily Wikifeeds call" the PRD
+/// insists on).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct FeaturedFeed {
     /// Today's featured article title (fetchable form).
     pub tfa: Option<String>,
+    /// The TFA's lead extract (FR-DL-1's "badge + extract"), sanitized and
+    /// length-capped display text — see [`FEED_EXTRACT_CAP`].
+    pub extract: Option<String>,
     /// Most-read articles with their view counts, in rank order.
     pub mostread: Vec<MostRead>,
-    /// Picture-of-the-day title, for the B9 start page (not prefetched here —
-    /// prefetch fills L2 article bodies only, no images).
+    /// Picture-of-the-day title (caption/alt text).
     pub potd: Option<String>,
-    /// Count of on-this-day events, for the B9 "on this day" strip.
+    /// Picture-of-the-day thumbnail URL, fed into the same half-block image
+    /// pipeline (`image::decode_image`, `App::image_store`) inline article
+    /// images already use (PRD FR-RD-8) — `None` when the feed carried no
+    /// thumbnail, in which case the start page shows caption-only.
+    pub potd_thumb_url: Option<String>,
+    /// "In the news" headlines (FR-DL-1), each optionally linking an article.
+    pub news: Vec<NewsItem>,
+    /// A handful of "on this day" entries bundled into the daily feed —
+    /// Wikifeeds' own mixed/selected set. Good enough for the start page's
+    /// condensed strip (FR-DL-1) and the TIL widget's rotation (FR-DL-7's
+    /// documented "random Good Article" seam: that needs `list=random` +
+    /// `prop=pageassessments`, heavier than this one-call budget allows, so
+    /// v1 rotates through these instead — see `startpage::pick_til`). The
+    /// full per-type breakdown `:today` shows (events/births/deaths/
+    /// holidays/selected, FR-DL-2) is a *separate*, on-demand fetch — see
+    /// [`crate::api::WikiClient::fetch_onthisday_feed`]'s doc comment for why.
+    pub onthisday: Vec<OtdEntry>,
+    /// `onthisday.len()`, kept as its own field for callers that only ever
+    /// wanted the count (prefetch's own log line, and this field's original
+    /// tests).
     pub onthisday_events: usize,
+}
+
+/// One on-this-day entry — events/births/deaths/holidays/selected all share
+/// this shape in the Wikifeeds response: the blurb, its year if the API gave
+/// one, and the first linked article's title (if any) as the Enter target.
+/// Shared between the bundled `feed/featured` entries and the dedicated
+/// `feed/onthisday/{type}` panel (FR-DL-2) so both render identically.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OtdEntry {
+    pub year: Option<i32>,
+    pub text: String,
+    pub page_title: Option<String>,
+}
+
+/// One "in the news" headline (FR-DL-1), with its first linked article (if
+/// any) as the Enter target.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct NewsItem {
+    pub headline: String,
+    pub page_title: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -157,11 +199,23 @@ pub struct MostRead {
     pub views: u64,
 }
 
+/// Display-text caps for feed content (SEC-1 spirit: a hostile/garbled feed
+/// can't paint an unbounded status line or start-page row) — generous enough
+/// for a real headline/blurb/extract, small enough to stay one screen's
+/// worth of text.
+const FEED_TEXT_CAP: usize = 220;
+const FEED_EXTRACT_CAP: usize = 600;
+
 impl FeaturedFeed {
     /// Parse a Wikifeeds `feed/featured/{y}/{m}/{d}` response body.
     pub fn parse(body: &[u8]) -> Result<Self, serde_json::Error> {
         let raw: RawFeed = serde_json::from_slice(body)?;
-        let tfa = raw.tfa.and_then(|p| p.best_title());
+        let extract = raw
+            .tfa
+            .as_ref()
+            .and_then(|p| p.extract.as_deref())
+            .map(|s| crate::sanitize::sanitize_and_cap_multiline(s, FEED_EXTRACT_CAP));
+        let tfa = raw.tfa.and_then(RawPage::best_title);
         let mostread = raw
             .mostread
             .map(|m| {
@@ -174,12 +228,31 @@ impl FeaturedFeed {
                     .collect()
             })
             .unwrap_or_default();
-        let potd = raw.image.and_then(|p| p.best_title());
+        let potd_thumb_url = raw
+            .image
+            .as_ref()
+            .and_then(|p| p.thumbnail.as_ref())
+            .and_then(|t| t.source.clone());
+        let potd = raw.image.and_then(RawPage::best_title);
+        let news = raw
+            .news
+            .into_iter()
+            .filter_map(RawNewsItem::into_item)
+            .collect();
+        let onthisday: Vec<OtdEntry> = raw
+            .onthisday
+            .into_iter()
+            .map(RawOnThisDayItem::into_entry)
+            .collect();
         Ok(Self {
             tfa,
+            extract,
             mostread,
             potd,
-            onthisday_events: raw.onthisday.len(),
+            potd_thumb_url,
+            news,
+            onthisday_events: onthisday.len(),
+            onthisday,
         })
     }
 }
@@ -193,7 +266,9 @@ struct RawFeed {
     #[serde(default)]
     image: Option<RawPage>,
     #[serde(default)]
-    onthisday: Vec<serde_json::Value>,
+    news: Vec<RawNewsItem>,
+    #[serde(default)]
+    onthisday: Vec<RawOnThisDayItem>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -203,11 +278,21 @@ struct RawMostRead {
 }
 
 #[derive(Debug, Deserialize)]
+struct RawThumbnail {
+    #[serde(default)]
+    source: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct RawPage {
     #[serde(default)]
     title: Option<String>,
     #[serde(default)]
     normalizedtitle: Option<String>,
+    #[serde(default)]
+    extract: Option<String>,
+    #[serde(default)]
+    thumbnail: Option<RawThumbnail>,
 }
 
 impl RawPage {
@@ -243,6 +328,101 @@ impl RawArticle {
     }
 }
 
+/// One on-this-day/news linked-pages entry. Wikifeeds represents both news
+/// items and onthisday entries as `{text/story, pages/links: [...]}`; this
+/// shape covers the onthisday side (`RawNewsItem` covers news' own field
+/// names below).
+#[derive(Debug, Deserialize)]
+struct RawOnThisDayItem {
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    year: Option<i64>,
+    #[serde(default)]
+    pages: Vec<RawPage>,
+}
+
+impl RawOnThisDayItem {
+    fn into_entry(self) -> OtdEntry {
+        let text = crate::sanitize::sanitize_and_cap_single_line(
+            self.text.as_deref().unwrap_or(""),
+            FEED_TEXT_CAP,
+        );
+        let page_title = self.pages.into_iter().find_map(RawPage::best_title);
+        OtdEntry {
+            year: self.year.map(|y| y as i32),
+            text,
+            page_title,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RawNewsItem {
+    #[serde(default)]
+    story: Option<String>,
+    #[serde(default)]
+    links: Vec<RawPage>,
+}
+
+impl RawNewsItem {
+    /// `None` for a story with no usable text at all (a blank entry is
+    /// dropped rather than shown as an empty row).
+    fn into_item(self) -> Option<NewsItem> {
+        let story = self.story?;
+        let headline =
+            crate::sanitize::sanitize_and_cap_single_line(&strip_tags(&story), FEED_TEXT_CAP);
+        if headline.is_empty() {
+            return None;
+        }
+        let page_title = self.links.into_iter().find_map(RawPage::best_title);
+        Some(NewsItem {
+            headline,
+            page_title,
+        })
+    }
+}
+
+/// Wikifeeds' "in the news" `story` field carries simple inline HTML (mostly
+/// `<a>` links to the mentioned articles); the start page shows plain text,
+/// so this drops tags outright rather than pulling in a full HTML parser for
+/// what is, at most, a short news blurb. Never panics on unclosed/malformed
+/// tags (mirrors `ui::parse_searchmatch`'s tolerance): an unterminated `<`
+/// just swallows the remainder as "in a tag", which degrades to a shorter
+/// headline rather than corrupting the rest of the line.
+fn strip_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Parses one Wikifeeds `feed/onthisday/{type}/{m}/{d}` response (FR-DL-2):
+/// the body is `{"<type>": [ {text, year, pages} … ]}`, a single top-level
+/// key matching the requested type. Unlike `feed/featured` (one call bundles
+/// everything into the daily prefetch), each on-this-day type is its own
+/// call, made on demand when `:today` opens — see
+/// [`crate::api::WikiClient::fetch_onthisday_feed`]'s doc comment for why
+/// that is a foreground fetch rather than a `netqueue` job.
+pub fn parse_onthisday(body: &[u8], event_type: &str) -> Result<Vec<OtdEntry>, serde_json::Error> {
+    let raw: serde_json::Value = serde_json::from_slice(body)?;
+    let items: Vec<RawOnThisDayItem> = match raw.get(event_type) {
+        Some(v) => serde_json::from_value(v.clone())?,
+        None => Vec::new(),
+    };
+    Ok(items
+        .into_iter()
+        .map(RawOnThisDayItem::into_entry)
+        .collect())
+}
+
 /// FR-PF-2 "once per day": the parsed feed cached under its `yyyy-mm-dd`
 /// bucket. A second `should_fetch` for the same day is `false`, so the
 /// executor skips the network — the once-per-day guarantee, testable with an
@@ -258,15 +438,24 @@ impl FeedCache {
         self.date.as_deref() != Some(date)
     }
 
+    /// The `yyyy-mm-dd` bucket the cached feed (if any) was fetched for —
+    /// the single source of truth `startpage::pick_til` keys its per-day
+    /// rotation on, so the TIL widget never needs its own, separately-drifting
+    /// wall-clock read (PRD's "thread the date, don't read the clock in
+    /// logic" convention).
+    pub fn date(&self) -> Option<&str> {
+        self.date.as_deref()
+    }
+
     pub fn store(&mut self, date: String, feed: FeaturedFeed) {
         self.date = Some(date);
         self.feed = Some(feed);
     }
 
-    /// The parsed feed for the cached day, for the FR-DL-1 start page (B9) to
-    /// consume without a second network call. B9 is a later chunk — this is its
-    /// documented seam, wired in tests but not yet called from the bin.
-    #[allow(dead_code)]
+    /// The parsed feed for the cached day, for the FR-DL-1 start page and
+    /// FR-DL-7 TIL widget to consume without a second network call —
+    /// `App::start_page_model` locks the shared `Arc<Mutex<FeedCache>>` and
+    /// clones out of this on every draw while the start page is showing.
     pub fn get(&self) -> Option<&FeaturedFeed> {
         self.feed.as_ref()
     }
@@ -409,6 +598,88 @@ mod tests {
         assert_eq!(feed.tfa, None);
         assert!(feed.mostread.is_empty());
         assert_eq!(feed.onthisday_events, 0);
+        assert_eq!(feed.extract, None);
+        assert!(feed.news.is_empty());
+        assert!(feed.onthisday.is_empty());
+        assert_eq!(feed.potd_thumb_url, None);
+    }
+
+    /// FR-DL-1: the start page needs the TFA extract, "in the news"
+    /// headlines (each with an Enter target), the onthisday entries with
+    /// their linked pages, and the potd thumbnail URL for the image
+    /// pipeline — all bundled into the one daily `feed/featured` call.
+    #[test]
+    fn featured_feed_parses_extract_news_and_potd_thumbnail() {
+        let body = br#"{
+            "tfa": {"title": "Alan_Turing", "normalizedtitle": "Alan Turing",
+                    "extract": "Alan Turing was a mathematician.\nHe broke Enigma."},
+            "image": {"title": "File:Example.jpg",
+                      "thumbnail": {"source": "https://example.com/thumb.jpg"}},
+            "news": [
+                {"story": "<a href=\"./Enigma_machine\">Enigma</a> anniversary marked.",
+                 "links": [{"title": "Enigma_machine", "normalizedtitle": "Enigma machine"}]},
+                {"story": "A story with no links."}
+            ],
+            "onthisday": [
+                {"text": "Turing born.", "year": 1912,
+                 "pages": [{"title": "Alan_Turing", "normalizedtitle": "Alan Turing"}]}
+            ]
+        }"#;
+        let feed = FeaturedFeed::parse(body).unwrap();
+        assert_eq!(
+            feed.extract.as_deref(),
+            Some("Alan Turing was a mathematician.\nHe broke Enigma.")
+        );
+        assert_eq!(
+            feed.potd_thumb_url.as_deref(),
+            Some("https://example.com/thumb.jpg")
+        );
+        assert_eq!(feed.news.len(), 2);
+        assert_eq!(feed.news[0].headline, "Enigma anniversary marked.");
+        assert_eq!(feed.news[0].page_title.as_deref(), Some("Enigma machine"));
+        assert_eq!(feed.news[1].headline, "A story with no links.");
+        assert_eq!(feed.news[1].page_title, None);
+        assert_eq!(feed.onthisday.len(), 1);
+        assert_eq!(feed.onthisday[0].year, Some(1912));
+        assert_eq!(feed.onthisday[0].text, "Turing born.");
+        assert_eq!(feed.onthisday[0].page_title.as_deref(), Some("Alan Turing"));
+        assert_eq!(feed.onthisday_events, 1);
+    }
+
+    #[test]
+    fn news_item_with_blank_story_is_dropped_not_shown_empty() {
+        let body = br#"{"news": [{"story": "<a href=\"x\"></a>"}]}"#;
+        let feed = FeaturedFeed::parse(body).unwrap();
+        assert!(
+            feed.news.is_empty(),
+            "an empty-after-stripping headline is dropped, not shown blank"
+        );
+    }
+
+    /// FR-DL-2: `:today`'s per-type panel parses the dedicated
+    /// `feed/onthisday/{type}` shape — a single top-level key named after
+    /// the requested type — distinct from the bundled `feed/featured` call.
+    #[test]
+    fn parse_onthisday_extracts_the_requested_type_key() {
+        let body = br#"{"births": [
+            {"text": "A scientist was born.", "year": 1901,
+             "pages": [{"title": "Computer_science", "normalizedtitle": "Computer science"}]}
+        ]}"#;
+        let entries = parse_onthisday(body, "births").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].year, Some(1901));
+        assert_eq!(entries[0].text, "A scientist was born.");
+        assert_eq!(entries[0].page_title.as_deref(), Some("Computer science"));
+    }
+
+    #[test]
+    fn parse_onthisday_tolerates_a_missing_or_mismatched_type_key() {
+        let body = br#"{"deaths": [{"text": "irrelevant"}]}"#;
+        // Asked for "births" but the body only has "deaths" — a shape
+        // mismatch (wrong type requested, or a wiki without this type)
+        // degrades to an empty list, never an error.
+        let entries = parse_onthisday(body, "births").unwrap();
+        assert!(entries.is_empty());
     }
 
     #[test]

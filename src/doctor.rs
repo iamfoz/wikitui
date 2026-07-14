@@ -126,6 +126,10 @@ fn print_resolved_config(resolved: &ResolvedConfig) {
         "  network.contact = {:?} ({})",
         resolved.network_contact.value, resolved.network_contact.source
     );
+    println!(
+        "  startpage = {:?} ({})",
+        resolved.startpage.value, resolved.startpage.source
+    );
 }
 
 fn print_problems(resolved: &ResolvedConfig) {

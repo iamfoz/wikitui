@@ -25,6 +25,7 @@ mod research;
 mod sanitize;
 mod saved;
 mod saved_export;
+mod startpage;
 mod tab;
 mod target;
 mod theme;
@@ -302,6 +303,7 @@ async fn main() -> Result<()> {
         resolved.history_retention_days.value,
         resolved.images.value,
         resolved.include_nonfree.value,
+        resolved.startpage.value,
         prefetch_config_from(&resolved.prefetch),
         resolved.prefetch.enabled.value,
         config_ctx,
@@ -1471,6 +1473,7 @@ async fn run(
     history_retention_days: u64,
     images_config: Option<bool>,
     include_nonfree: bool,
+    startpage_config: String,
     prefetch_config: netqueue::SubstrateConfig,
     prefetch_enabled: bool,
     config_ctx: ConfigContext,
@@ -1491,6 +1494,10 @@ async fn run(
     };
     app.images_override = images_config;
     app.include_nonfree = include_nonfree;
+    // Already validated during resolution (an invalid value fell back to
+    // "feed" with a warning above) — same belt-and-braces default as
+    // `theme`/`cite_style` just above this function.
+    app.startpage_config = startpage::StartPageConfig::parse(&startpage_config).unwrap_or_default();
     app.config_ctx = config_ctx;
     app.incognito = cli.incognito;
     // The real, on-disk reading history (PRD §6.4) — `App::new` defaults to
@@ -1521,7 +1528,11 @@ async fn run(
     let substrate = netqueue::SubstrateHandle::new(prefetch_config);
     substrate.set_enabled(prefetch_enabled);
     app.prefetch = Some(substrate.clone());
+    // Shared with `BgExecutor` below so the start page (FR-DL-1) and TIL
+    // widget (FR-DL-7) can read the parsed feed straight off `App` without a
+    // second request — the exact seam `prefetch::FeedCache::get` documents.
     let feed_cache = Arc::new(std::sync::Mutex::new(prefetch::FeedCache::default()));
+    app.feed_cache = Some(feed_cache.clone());
     let executor = BgExecutor {
         client: client.clone(),
         cache: cache.clone(),
@@ -1537,6 +1548,20 @@ async fn run(
         run_search(client, &mut app).await;
     } else if let Some(title) = cli.title {
         open_title(client, cache, &mut app, &title, &revalidate_tx).await;
+    } else if app.startpage_config == startpage::StartPageConfig::Resume {
+        // PRD FR-DL-1's `startpage = resume`: proper session restore is a
+        // later chunk (B18) — until then this resolves to the single
+        // cheapest approximation already lying around at startup, the most
+        // recent reading-history entry (`History::recent` is already loaded
+        // for the visited-styling feature, so this costs nothing extra).
+        // No history yet (fresh install, or incognito never recorded any)
+        // falls straight through to the feed-backed start page, same as
+        // `startpage = feed` — never an error, never a blank screen with no
+        // explanation.
+        if let Some(visit) = app.history.recent(1).into_iter().next() {
+            app.lang = visit.lang.clone();
+            open_title(client, cache, &mut app, &visit.title, &revalidate_tx).await;
+        }
     }
 
     // PRD FR-PF-2: seed trending prefetch once at startup. The foreground gate
@@ -1554,6 +1579,25 @@ async fn run(
             apply_config_reload(&mut app);
         }
 
+        // PRD FR-DL-1: snapshotted *before* `draw` rather than re-read fresh
+        // for the poll-vs-block decision below — the daily-feed arrival is a
+        // background mutex write racing this loop with no channel/notify to
+        // sequence against (unlike `pending_revalidations`/`any_tab_loading`,
+        // which only ever change via this loop's own channel drains further
+        // down). Feed state is monotonic (arrives once, never reverts), so an
+        // older-or-equal snapshot here is always safe: if it says "still
+        // pending", `draw` below (reading the live state a moment later) may
+        // in fact already show the resolved page — harmless, just one extra
+        // poll tick before the loop notices. If it instead read *fresh*
+        // *after* `draw`, the opposite race is possible and IS harmful: the
+        // feed can complete in the gap between `draw`'s internal read and
+        // this check's, so `draw` paints "loading" while the fresher check
+        // says "resolved" and picks the block-on-`event::read` branch —
+        // parking the loop forever with the settled start page never drawn
+        // until a keypress. Reproduced via pty verification before this
+        // comment was written; see the on-this-day/start-page pty script.
+        let start_page_still_loading = app.active_tab().doc.is_none() && app.start_page_pending();
+
         terminal.draw(|f| ui::draw(f, &mut app))?;
 
         // PRD FR-RD-8: after each draw, lazily kick off fetches for any
@@ -1561,6 +1605,10 @@ async fn run(
         // images are off / no graphics protocol / a text theme). Idempotent —
         // it spawns exactly one fetch per source URL.
         request_visible_images(client, &mut app, &image_tx);
+        // PRD FR-DL-1's picture of the day: the same lazy fetch+decode path,
+        // keyed by the feed's thumbnail URL instead of a document's image
+        // block — see `request_start_page_image`'s doc comment.
+        request_start_page_image(client, &mut app, &image_tx);
 
         // PRD §7 / v0.5's "crash-safe terminal restore": a deliberate,
         // inert-by-default panic trigger for exercising the crash path
@@ -1590,6 +1638,12 @@ async fn run(
             // it is open (scoped to that mode only, so idle Reading still
             // blocks on input — FR-ACS-2).
             || app.mode == Mode::PrefetchLog
+            // PRD FR-DL-1: the start page's skeleton fills in without a
+            // keypress once the daily feed arrives — scoped to exactly the
+            // "showing the start page and still waiting" window, so idle
+            // Reading with an article open still blocks on input. Uses the
+            // pre-`draw` snapshot above, not a fresh read — see its comment.
+            || start_page_still_loading
         {
             let poll_interval = if app.mode == Mode::Search {
                 TYPEAHEAD_POLL
@@ -1734,6 +1788,43 @@ fn request_visible_images(client: &WikiClient, app: &mut App, tx: &UnboundedSend
             let _ = tx.send(ImageOutcome { src, decoded });
         });
     }
+}
+
+/// PRD FR-DL-1's picture of the day: fetches+decodes the feed's thumbnail
+/// through the exact same pipeline `request_visible_images` uses for inline
+/// article images (`image::decode_image`, `App::image_store`,
+/// `App::deliver_image` on the result — no new application code needed,
+/// only this fetch trigger) so a text theme (`images = false`) never touches
+/// the network for it either, same as an article's own images. A no-op
+/// unless the start page is actually showing (a document is open in the
+/// active tab) or the feed hasn't produced a thumbnail URL yet.
+fn request_start_page_image(
+    client: &WikiClient,
+    app: &mut App,
+    tx: &UnboundedSender<ImageOutcome>,
+) {
+    if app.active_tab().doc.is_some()
+        || !app.images_enabled()
+        || matches!(app.graphics_protocol(), graphics::GraphicsProtocol::None)
+    {
+        return;
+    }
+    let Some(src) = app.start_page_model().potd_thumb_url else {
+        return;
+    };
+    if app.image_store.contains(&src) {
+        return;
+    }
+    app.image_store.mark_loading(src.clone());
+    let client = client.clone();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let decoded = match client.fetch_image(&src).await {
+            Ok(bytes) => crate::image::decode_image(&bytes),
+            Err(_) => None,
+        };
+        let _ = tx.send(ImageOutcome { src, decoded });
+    });
 }
 
 /// `:config reload` and SIGHUP both land here (PRD §6.7): re-resolve
@@ -2371,11 +2462,35 @@ async fn handle_key(
             KeyCode::Esc => app.close_offline_card(),
             _ => {}
         },
+        // PRD FR-DL-2's `:today` panel: j/k move within the current type
+        // tab, Tab/Shift-Tab (and h/l, since the tabs are laid out
+        // horizontally) switch type, Enter opens the focused entry's linked
+        // article.
+        Mode::OnThisDay => match code {
+            KeyCode::Esc => app.close_on_this_day(),
+            KeyCode::Char('j') | KeyCode::Down => app.otd_move(1),
+            KeyCode::Char('k') | KeyCode::Up => app.otd_move(-1),
+            KeyCode::Tab | KeyCode::Char('l') | KeyCode::Right => app.otd_next_tab(),
+            KeyCode::BackTab | KeyCode::Char('h') | KeyCode::Left => app.otd_prev_tab(),
+            KeyCode::Enter => {
+                if let Some(title) = app.otd_open_target() {
+                    open_title(client, cache, app, &title, revalidate_tx).await;
+                } else {
+                    app.status = "This entry links no article".to_string();
+                }
+            }
+            KeyCode::Char('?') => {
+                app.prior_mode = app.mode;
+                app.mode = Mode::Help;
+            }
+            _ => {}
+        },
         Mode::Reading => {
             // g-prefix chords (PRD Appendix B): the g-latch's second key.
             // `gg` top, `gt`/`gT` next/prev tab (FR-TB-1), `gb` back-stack
-            // picker (FR-NV-7). An unrecognized second key falls through to
-            // its normal binding (matching how `gj` still scrolls).
+            // picker (FR-NV-7), `gh` home / start page (FR-DL-1). An
+            // unrecognized second key falls through to its normal binding
+            // (matching how `gj` still scrolls).
             if app.pending_g {
                 app.pending_g = false;
                 match code {
@@ -2398,6 +2513,10 @@ async fn handle_key(
                             app.selected_history = app.active_tab().back_stack.len() - 1;
                             app.mode = Mode::HistoryPicker;
                         }
+                        return;
+                    }
+                    KeyCode::Char('h') => {
+                        app.go_home();
                         return;
                     }
                     _ => {} // dead prefix — handle this key normally below.
@@ -2485,6 +2604,21 @@ async fn handle_key(
                     app.prior_mode = app.mode;
                     app.mode = Mode::Help;
                 }
+                // PRD FR-DL-1: with no document open in this tab, the content
+                // area is the start page, not an article — j/k/Tab/Shift-Tab
+                // move its selection instead of scrolling/cycling links, and
+                // `t` rerolls the TIL widget (FR-DL-7) instead of opening the
+                // TOC (which has nothing to show anyway with no document).
+                // Checked once, up front of each binding's normal arm, rather
+                // than duplicating the whole match — matches how the g-/b-/
+                // r-prefix latches above already special-case their own
+                // "what does this mode mean right now" branch.
+                KeyCode::Char('j') | KeyCode::Down if app.active_tab().doc.is_none() => {
+                    app.start_page_move(1)
+                }
+                KeyCode::Char('k') | KeyCode::Up if app.active_tab().doc.is_none() => {
+                    app.start_page_move(-1)
+                }
                 KeyCode::Char('j') | KeyCode::Down => app.scroll_by(1),
                 KeyCode::Char('k') | KeyCode::Up => app.scroll_by(-1),
                 KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
@@ -2500,6 +2634,8 @@ async fn handle_key(
                 // offset for the page, clamped to the widest table).
                 KeyCode::Char(']') => app.scroll_tables(1),
                 KeyCode::Char('[') => app.scroll_tables(-1),
+                KeyCode::Tab if app.active_tab().doc.is_none() => app.start_page_move(1),
+                KeyCode::BackTab if app.active_tab().doc.is_none() => app.start_page_move(-1),
                 KeyCode::Tab => app.cycle_link(true),
                 KeyCode::BackTab => app.cycle_link(false),
                 // PRD FR-NV-1: `f` labels every visible link and follows the
@@ -2518,6 +2654,21 @@ async fn handle_key(
                 // channel and focus does NOT move. (Budget-aware prefetch
                 // scheduling for these is a later chunk; for now it fetches
                 // eagerly.) Checked before the plain-Enter arm below.
+                // PRD FR-DL-1: Enter on the start page opens the focused
+                // item (TFA/most-read/news/on-this-day/TIL) in this tab —
+                // Ctrl-Enter's "open in background tab" has no start-page
+                // equivalent, so this is checked before that arm too.
+                KeyCode::Enter if app.active_tab().doc.is_none() => {
+                    match app.start_page_open_target() {
+                        Some((lang, title)) => {
+                            if let Some(lang) = lang {
+                                app.lang = lang;
+                            }
+                            open_title(client, cache, app, &title, revalidate_tx).await;
+                        }
+                        None => app.status = "Nothing focused to open".to_string(),
+                    }
+                }
                 KeyCode::Enter if modifiers.contains(KeyModifiers::CONTROL) => {
                     let link = app
                         .active_tab()
@@ -2572,6 +2723,7 @@ async fn handle_key(
                         app.status = "No recently closed tabs to reopen".to_string();
                     }
                 }
+                KeyCode::Char('t') if app.active_tab().doc.is_none() => app.reroll_til(),
                 KeyCode::Char('t') => {
                     if app.active_tab().sections.is_empty() {
                         app.status = "No sections on this page".to_string();
@@ -2833,8 +2985,57 @@ async fn execute_command(
         },
         Command::Saved => app.open_saved_picker(),
         Command::FetchQueue => drain_fetch_queue(client, cache, app).await,
+        // PRD FR-DL-1: same action as the `gh` keybinding.
+        Command::Start => app.go_home(),
+        // PRD FR-DL-2.
+        Command::Today => fetch_on_this_day(client, app).await,
         Command::Quit => app.should_quit = true,
     }
+}
+
+/// PRD FR-DL-2's `:today`: fetches all five on-this-day types up front
+/// (foreground, one call each — see `api::WikiClient::fetch_onthisday_feed`'s
+/// doc comment for why this isn't a `netqueue` job) and opens the panel.
+/// Simplest coherent model for a P1 feature: lazy-per-tab-switch is a
+/// documented later optimization if five small calls per `:today` ever
+/// matters. A type whose fetch fails degrades to an empty list for that tab
+/// rather than blocking the others or erroring the whole panel — the same
+/// "graceful, not an error screen" posture the start page's offline
+/// fallback uses.
+async fn fetch_on_this_day(client: &WikiClient, app: &mut App) {
+    app.open_on_this_day();
+    let lang = app.lang.clone();
+    // The month/day the panel shows — resolved once here (the one place in
+    // this call this module reads the wall clock) and threaded down as
+    // plain data from here on, matching the codebase's "never read the
+    // clock in logic" convention (`prefetch::FeedCache` takes its date the
+    // same way).
+    let now = chrono::Utc::now();
+    let (month, day) = (now.format("%m").to_string(), now.format("%d").to_string());
+    let (month, day): (u32, u32) = (month.parse().unwrap_or(1), day.parse().unwrap_or(1));
+
+    let mut any_ok = false;
+    for t in startpage::OtdType::ALL {
+        let entries = match client
+            .fetch_onthisday_feed(&lang, t.wire_name(), month, day)
+            .await
+        {
+            Ok(body) => match prefetch::parse_onthisday(&body, t.wire_name()) {
+                Ok(entries) => {
+                    any_ok = true;
+                    entries
+                }
+                Err(_) => Vec::new(),
+            },
+            Err(_) => Vec::new(),
+        };
+        app.otd.set(t, entries);
+    }
+    app.status = if any_ok {
+        "j/k: move  Tab/S-Tab or h/l: switch type  Enter: open  Esc: close".to_string()
+    } else {
+        "On this day is unavailable right now — Esc to close".to_string()
+    };
 }
 
 async fn run_search(client: &WikiClient, app: &mut App) {

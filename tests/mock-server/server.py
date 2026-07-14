@@ -336,17 +336,83 @@ LINK_PAGEVIEWS = {
 
 # PRD FR-PF-2 trending fixture: the Wikifeeds featured-content payload served
 # at /api/rest_v1/feed/featured/{y}/{m}/{d}. TFA + most-read titles are all
-# real PAGES keys so their prefetched bodies resolve, not 404.
+# real PAGES keys so their prefetched bodies resolve, not 404. Also exercises
+# the FR-DL-1 start page's extra sections: the TFA extract, "in the news"
+# (with an <a>-tagged story the client must strip to plain text), a potd
+# thumbnail pointing at this same mock's real-PNG /media endpoint (so the
+# B6 half-block image pipeline decodes genuine bytes end to end), and
+# onthisday entries carrying a year + linked page (the start page's condensed
+# strip and the TIL widget both read this bundled list — FR-DL-2's `:today`
+# panel instead uses the dedicated ONTHISDAY_BY_TYPE fixture below).
 FEATURED_FEED = {
-    "tfa": {"title": "Alan_Turing", "normalizedtitle": "Alan Turing"},
+    "tfa": {
+        "title": "Alan_Turing",
+        "normalizedtitle": "Alan Turing",
+        "extract": "Alan Turing was an English mathematician, computer scientist, and logician.",
+    },
     "mostread": {
         "articles": [
             {"title": "Enigma_machine", "normalizedtitle": "Enigma machine", "views": 90000, "rank": 1},
             {"title": "Computer_science", "normalizedtitle": "Computer science", "views": 40000, "rank": 2},
         ]
     },
-    "image": {"title": "File:Sample.jpg"},
-    "onthisday": [{"text": "An event."}],
+    "image": {
+        "title": "File:Sample.jpg",
+        "thumbnail": {"source": "http://127.0.0.1:8943/media/quadrants.png"},
+    },
+    "news": [
+        {
+            "story": 'Anniversary of the <a href="./Enigma_machine">Enigma machine</a>\'s break marked.',
+            "links": [{"title": "Enigma_machine", "normalizedtitle": "Enigma machine"}],
+        },
+    ],
+    "onthisday": [
+        {
+            "text": "Alan Turing was born.",
+            "year": 1912,
+            "pages": [{"title": "Alan_Turing", "normalizedtitle": "Alan Turing"}],
+        },
+        {"text": "A minor, unlinked anniversary.", "year": 1954},
+    ],
+}
+
+# PRD FR-DL-2 fixture: the dedicated `feed/onthisday/{type}/{m}/{d}` payload
+# `:today` fetches once per type — a single top-level key named after the
+# type, per the real Wikifeeds shape (`prefetch::parse_onthisday`'s
+# contract). Every linked page is a real PAGES key so Enter opens something.
+ONTHISDAY_BY_TYPE = {
+    "events": [
+        {
+            "text": "The Enigma machine entered military service.",
+            "year": 1932,
+            "pages": [{"title": "Enigma_machine", "normalizedtitle": "Enigma machine"}],
+        },
+    ],
+    "births": [
+        {
+            "text": "Alan Turing was born.",
+            "year": 1912,
+            "pages": [{"title": "Alan_Turing", "normalizedtitle": "Alan Turing"}],
+        },
+    ],
+    "deaths": [
+        {"text": "A computer scientist died.", "year": 1980},
+    ],
+    "holidays": [
+        {"text": "Computer Science Education Week begins."},
+    ],
+    "selected": [
+        {
+            "text": "Alan Turing published \"On Computable Numbers\".",
+            "year": 1936,
+            "pages": [{"title": "Alan_Turing", "normalizedtitle": "Alan Turing"}],
+        },
+        {
+            "text": "Computer science was recognised as its own discipline.",
+            "year": 1965,
+            "pages": [{"title": "Computer_science", "normalizedtitle": "Computer science"}],
+        },
+    ],
 }
 
 # Did-you-mean corrections (FR-SR-4 / §7's zero-results row) for queries
@@ -400,6 +466,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._serve_summary(parts)
         elif '/feed/featured/' in parsed.path:
             self._serve_featured_feed()
+        elif '/feed/onthisday/' in parsed.path:
+            self._serve_onthisday(parts)
         elif '/page/' in parsed.path and parsed.path.endswith('/html'):
             self._serve_article(parts)
         elif '/page/' in parsed.path and parsed.path.endswith('/bare'):
@@ -419,6 +487,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _serve_featured_feed(self):
         # PRD FR-PF-2 / FR-DL-1: the one daily Wikifeeds featured-content call.
         self._send_json(FEATURED_FEED)
+
+    def _serve_onthisday(self, parts):
+        # PRD FR-DL-2: `:today`'s dedicated per-type call
+        # (`feed/onthisday/{type}/{m}/{d}`) — the response is a single
+        # top-level key named after the requested type, per the real
+        # Wikifeeds shape. An unknown/unfixtured type still returns 200 with
+        # an empty list rather than 404, so a type this fixture doesn't
+        # cover degrades to "no entries" instead of an error.
+        event_type = parts[-3]
+        entries = ONTHISDAY_BY_TYPE.get(event_type, [])
+        self._send_json({event_type: entries})
 
     def _serve_summary(self, parts):
         # PRD Appendix A "Summary" (FR-OFF-4 T2): plain-text extract for a

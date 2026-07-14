@@ -195,6 +195,11 @@ pub struct ResolvedConfig {
     /// Default false. Today a policy flag with a documented seam (saved-page
     /// image persistence, which must exclude non-free, isn't built yet).
     pub include_nonfree: Valued<bool>,
+    /// PRD FR-DL-1's `startpage = feed|blank|resume`, default `feed`. File
+    /// only (like `include_nonfree`/`history.*`) — a preference set once,
+    /// not worth a CLI flag or env var for a single run. Parsed into
+    /// `startpage::StartPageConfig` by `App::start_page_for_launch`.
+    pub startpage: Valued<String>,
     /// PRD §5.8 / FR-PF-1..6 prefetch settings (the `[prefetch]` table).
     pub prefetch: ResolvedPrefetch,
     /// PRD NF-NET-2 User-Agent contact channel (`[network] contact`).
@@ -290,6 +295,7 @@ pub fn resolve(
         "history",
         "images",
         "include_nonfree",
+        "startpage",
         "prefetch",
         "network",
     ]
@@ -357,6 +363,7 @@ pub fn resolve(
     let history_retention_days = resolve_history(&table, &mut issues);
     let images = resolve_images(env, &table, &mut issues);
     let include_nonfree = resolve_include_nonfree(&table, &mut issues);
+    let startpage = resolve_startpage(&table, &mut issues);
     let prefetch = resolve_prefetch(env, &table, &mut issues);
     let network_contact = resolve_network_contact(env, &table, &mut issues);
 
@@ -384,6 +391,7 @@ pub fn resolve(
         history_retention_days,
         images,
         include_nonfree,
+        startpage,
         prefetch,
         network_contact,
         migration_summary: config_version.1,
@@ -869,6 +877,32 @@ fn resolve_include_nonfree(table: &toml::Table, issues: &mut Vec<Issue>) -> Valu
             }
         },
         None => default,
+    }
+}
+
+/// PRD FR-DL-1's `startpage`: `feed|blank|resume`, default `feed`. Mirrors
+/// `resolve_metered`'s shape (a closed set of spellings, invalid falls back
+/// straight to the default rather than partially applying).
+fn resolve_startpage(table: &toml::Table, issues: &mut Vec<Issue>) -> Valued<String> {
+    const DEFAULT: &str = "feed";
+    let default = Valued {
+        value: DEFAULT.to_string(),
+        source: Source::Default,
+    };
+    match table.get("startpage") {
+        None => default,
+        Some(v) => match v.as_str() {
+            Some(s) if crate::startpage::StartPageConfig::parse(s).is_some() => Valued {
+                value: s.to_string(),
+                source: Source::File,
+            },
+            _ => {
+                issues.push(Issue::warning(format!(
+                    "startpage must be one of feed|blank|resume; using default {DEFAULT}"
+                )));
+                default
+            }
+        },
     }
 }
 
@@ -1591,6 +1625,42 @@ mod tests {
         let from_env = resolve(&CliOverrides::default(), &env, None);
         assert!(!from_env.readlater_auto_dequeue.value);
         assert_eq!(from_env.readlater_auto_dequeue.source, Source::Env);
+    }
+
+    #[test]
+    fn startpage_defaults_to_feed_and_honors_the_file() {
+        let default = resolve(&CliOverrides::default(), &EnvOverrides::default(), None);
+        assert_eq!(default.startpage.value, "feed");
+        assert_eq!(default.startpage.source, Source::Default);
+
+        for value in ["feed", "blank", "resume"] {
+            let path = temp_config(&format!("startpage = \"{value}\"\n"));
+            let r = resolve(
+                &CliOverrides::default(),
+                &EnvOverrides::default(),
+                Some(&path),
+            );
+            assert_eq!(r.startpage.value, value);
+            assert_eq!(r.startpage.source, Source::File);
+            cleanup(&path);
+        }
+    }
+
+    #[test]
+    fn startpage_rejects_an_unknown_value_and_falls_back_with_a_warning() {
+        let path = temp_config("startpage = \"resurrect\"\n");
+        let r = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(
+            r.startpage.value, "feed",
+            "invalid value falls back to the default"
+        );
+        assert_eq!(r.startpage.source, Source::Default);
+        assert!(r.issues.iter().any(|i| i.message.contains("startpage")));
+        cleanup(&path);
     }
 
     #[test]

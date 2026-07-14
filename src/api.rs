@@ -415,6 +415,39 @@ impl WikiClient {
         Ok(crate::sanitize::sanitize_single_line(&parsed.extract).into_owned())
     }
 
+    /// FR-DL-2's `:today` panel: one Wikifeeds `feed/onthisday/{type}/{m}/{d}`
+    /// call per event type (events/births/deaths/holidays/selected). This is
+    /// a *foreground* fetch — the reader explicitly asked to see today in
+    /// history, the same category as `search`/`fetch_summary` — so unlike
+    /// [`Self::fetch_featured_feed`] (the background FR-PF-2 daily seed) it
+    /// does not carry `maxlag` (§6.5 NF-NET-3 reserves that for
+    /// non-interactive/background traffic) and returns a plain
+    /// `anyhow::Result` rather than the background failure enum. Returns the
+    /// raw body for [`crate::prefetch::parse_onthisday`] to parse.
+    pub async fn fetch_onthisday_feed(
+        &self,
+        lang: &str,
+        event_type: &str,
+        month: u32,
+        day: u32,
+    ) -> Result<Vec<u8>> {
+        let url = format!(
+            "{}/api/rest_v1/feed/onthisday/{event_type}/{month:02}/{day:02}",
+            self.host(lang)
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("requesting on-this-day feed ({event_type})"))?
+            .error_for_status()
+            .context("on-this-day feed request failed")?;
+        read_capped(resp, MAX_SEARCH_RESPONSE_BYTES)
+            .await
+            .context("reading on-this-day feed response body")
+    }
+
     /// The members of a category (PRD FR-OFF-5's bulk-save-by-category:
     /// Appendix A's `list=categorymembers`, depth 1). Namespace-0 article
     /// titles only, capped at `limit`. `cat` may be given with or without the
@@ -1119,6 +1152,50 @@ mod tests {
         assert!(
             head.contains("maxlag=5"),
             "maxlag=5 on the request: {head:?}"
+        );
+    }
+
+    /// PRD §6.5 NF-NET-3: `fetch_onthisday_feed` (FR-DL-2's `:today`) is a
+    /// *foreground* fetch, so — unlike `fetch_featured_feed`'s background
+    /// counterpart above — it must NOT carry `maxlag`, while still carrying
+    /// the mandated User-Agent (NF-NET-2 applies to every request, fore- and
+    /// background alike).
+    #[tokio::test]
+    async fn onthisday_fetch_carries_user_agent_but_not_maxlag() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let cap2 = captured.clone();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                *cap2.lock().unwrap() = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let body = br#"{"events": []}"#;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+        let client = WikiClient::new(format!("http://127.0.0.1:{port}")).unwrap();
+        let result = client.fetch_onthisday_feed("en", "events", 7, 14).await;
+        assert!(result.is_ok());
+        let head = captured.lock().unwrap().clone();
+        assert!(
+            head.contains("GET /api/rest_v1/feed/onthisday/events/07/14"),
+            "path shape: {head:?}"
+        );
+        assert!(
+            head.to_lowercase().contains("user-agent: wikitui/"),
+            "UA present on the wire: {head:?}"
+        );
+        assert!(
+            !head.contains("maxlag"),
+            "foreground fetch must not carry maxlag: {head:?}"
         );
     }
 

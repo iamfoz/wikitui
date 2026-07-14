@@ -43,8 +43,24 @@ Two-layer cache / stale-while-revalidate fixtures (PRD FR-OFF-1/2):
   app's background revalidation both notices the new revid and renders
   visibly different content after `r` reloads.
 
-It does not implement summaries or any other endpoint — only what article
-rendering, search, and the page cache need.
+Trending / delight-and-discovery fixtures (PRD FR-PF-2, FR-DL-1/2/7):
+
+- `GET /api/rest_v1/feed/featured/{y}/{m}/{d}` — the one daily Wikifeeds call
+  (`FEATURED_FEED`): TFA (with extract), top mostread, a potd thumbnail
+  pointing at this same mock's `/media/quadrants.png` (so the half-block
+  image pipeline decodes real bytes end to end), an "in the news" story with
+  inline `<a>` markup the client must strip, and a couple of bundled
+  onthisday entries.
+- `GET /api/rest_v1/feed/onthisday/{type}/{m}/{d}` — the `:today` panel's
+  per-type call (`ONTHISDAY_BY_TYPE`): events/births/deaths/holidays/selected,
+  each a `{"<type>": [...]}` response. Every linked page is a real `PAGES`
+  key so following one resolves; an unfixtured type returns an empty list,
+  not a 404.
+
+It also serves link-target summaries (`GET /api/rest_v1/page/summary/{title}`,
+`SUMMARIES`) for T2 saved-page link-peek. Beyond everything listed above, it
+implements only what article rendering, search, the page cache, and the
+start-page/on-this-day features need — not a general MediaWiki stand-in.
 
 ## Running it
 

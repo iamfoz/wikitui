@@ -166,6 +166,32 @@ impl Tab {
         self.clear_find();
     }
 
+    /// Returns this tab to the blank state `Tab::new` starts from — the
+    /// document and everything derived from it — while leaving `id`, `lang`,
+    /// and the back/forward stacks untouched (PRD FR-DL-1's `gh`/`:start`
+    /// "home" action: it is a navigation, not a tab reset, so `H` must still
+    /// be able to return to whatever was showing). Mirrors
+    /// `install_document`'s resets with `doc` set to `None` instead of
+    /// `Some`.
+    pub fn clear_to_blank(&mut self) {
+        self.doc = None;
+        self.links.clear();
+        self.focused_link = None;
+        self.sections.clear();
+        self.selected_section = 0;
+        self.scroll = 0;
+        self.max_scroll = 0;
+        self.table_col_offset = 0;
+        self.page_source = crate::app::PageSource::None;
+        self.current_revid = 0;
+        self.loading = false;
+        self.pending_title = None;
+        self.pending_reload = None;
+        self.history_visit_id = None;
+        self.visit_started_at = None;
+        self.clear_find();
+    }
+
     /// Clears in-page find state — a fresh article's matches would be
     /// meaningless leftovers from whatever was open before.
     pub fn clear_find(&mut self) {
@@ -184,5 +210,60 @@ impl Tab {
             title: d.title.clone(),
             scroll: self.scroll,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn doc(title: &str) -> Document {
+        Document {
+            title: title.to_string(),
+            blocks: Vec::new(),
+            citations: Vec::new(),
+            truncated: false,
+        }
+    }
+
+    /// PRD FR-DL-1's `gh`/`:start` "home" action (`App::go_home`) clears a
+    /// tab's content back to blank but must not disturb its identity or its
+    /// back/forward history — `H` still has to work afterward.
+    #[test]
+    fn clear_to_blank_resets_content_but_preserves_identity_and_history() {
+        let mut tab = Tab::new(7, "en".to_string());
+        tab.install_document(doc("Alan Turing"));
+        tab.scroll = 12;
+        tab.focused_link = Some(0);
+        tab.back_stack.push(HistoryEntry {
+            lang: "en".to_string(),
+            title: "Earlier Article".to_string(),
+            scroll: 3,
+        });
+        tab.forward_stack.push(HistoryEntry {
+            lang: "en".to_string(),
+            title: "Later Article".to_string(),
+            scroll: 0,
+        });
+
+        tab.clear_to_blank();
+
+        assert!(tab.doc.is_none());
+        assert_eq!(tab.scroll, 0);
+        assert!(tab.focused_link.is_none());
+        assert!(tab.links.is_empty());
+        assert!(tab.sections.is_empty());
+        assert_eq!(tab.id, 7, "identity is untouched");
+        assert_eq!(tab.lang, "en", "language is untouched");
+        assert_eq!(
+            tab.back_stack.len(),
+            1,
+            "back stack is untouched — the caller pushes the outgoing article onto it separately"
+        );
+        assert_eq!(
+            tab.forward_stack.len(),
+            1,
+            "forward stack is untouched by clear_to_blank itself"
+        );
     }
 }

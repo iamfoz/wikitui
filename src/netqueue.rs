@@ -820,6 +820,18 @@ impl SubstrateHandle {
         self.inner.queue.lock().unwrap().pending()
     }
 
+    /// Whether *any* job is still between enqueue and completion — includes
+    /// the moment a job has been popped off the queue (so `pending()` above
+    /// already reports it gone) but its request hasn't returned yet. PRD
+    /// FR-DL-1's start page uses this (not `pending()` alone) to decide
+    /// whether to keep showing its loading skeleton: `pending()` would flip
+    /// to 0 the instant the worker dequeues the daily feed job, well before
+    /// the HTTP round trip actually finishes, which would flash the offline
+    /// fallback on every cold start even when the fetch is about to succeed.
+    pub fn any_inflight(&self) -> bool {
+        !self.inner.queue.lock().unwrap().inflight.is_empty()
+    }
+
     pub fn log_recent(&self) -> Vec<LogEntry> {
         self.inner.log.lock().unwrap().recent()
     }
