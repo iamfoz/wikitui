@@ -79,6 +79,23 @@ fn print_resolved_config(resolved: &ResolvedConfig) {
         resolved.cache_force_refetch_days.value, resolved.cache_force_refetch_days.source
     );
     println!(
+        "  cache.dir = {} ({})",
+        match &resolved.cache_dir.value {
+            Some(p) => format!("{:?} (override)", p.display()),
+            None => "(none — using the platform cache directory)".to_string(),
+        },
+        resolved.cache_dir.source
+    );
+    // PRD FR-PR-5: the *effective* directory a real run would write to —
+    // resolves the override (if any) the same way `PageCache::open` does, so
+    // `doctor` never shows a value that could disagree with reality.
+    println!(
+        "  cache: effective directory = {}",
+        crate::cache::resolve_pages_dir(resolved.cache_dir.value.as_deref())
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(none — cache disabled, no platform directory found)".to_string())
+    );
+    println!(
         "  active_wiki = {:?} ({})",
         resolved.active_wiki.value, resolved.active_wiki.source
     );

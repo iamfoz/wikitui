@@ -50,6 +50,8 @@
 //! hand — a documented simplification, not an oversight.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -75,6 +77,34 @@ pub const DEFAULT_FORCE_REFETCH_SECS: u64 = 30 * 24 * 60 * 60;
 /// density).
 const ZSTD_LEVEL: i32 = 3;
 
+/// PRD FR-PR-5: resolves the pages-cache root directory — an explicit
+/// `[cache] dir` config override, if given, else the platform cache
+/// directory (`$XDG_CACHE_HOME/wikitui/pages` on Linux, honored
+/// automatically by the `directories` crate since it's what `ProjectDirs`
+/// reads). `None` only when no override was given *and* no platform
+/// directory could be determined at all — the same silent-disable
+/// `PageCache::open` already documented before this override existed.
+/// Shared by `PageCache::open` and `doctor`'s report (so the doctor shows
+/// exactly the directory a real run would use) and `cleardata` (so
+/// `clear-data --cache` deletes exactly that directory).
+pub fn resolve_pages_dir(dir_override: Option<&Path>) -> Option<PathBuf> {
+    match dir_override {
+        Some(dir) => Some(dir.join("pages")),
+        None => directories::ProjectDirs::from("", "", "wikitui")
+            .map(|dirs| dirs.cache_dir().join("pages")),
+    }
+}
+
+/// How much [`PageCache::wipe_incognito_entries`] actually removed —
+/// reported at session end (and at the startup crash-recovery sweep) so the
+/// reader can see incognito cleanup actually happened, mirroring FR-PF-4's
+/// "transparency" posture for prefetch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WipeReport {
+    pub entries: u64,
+    pub bytes: u64,
+}
+
 #[derive(Clone)]
 pub struct PageCache {
     /// `None` when no cache directory could be determined — every lookup
@@ -83,6 +113,14 @@ pub struct PageCache {
     max_bytes: u64,
     fresh_ttl_secs: u64,
     force_refetch_secs: u64,
+    /// PRD FR-PR-3: this run's incognito state, as it applies to *cache*
+    /// writes specifically (`privacy::Write::Cache` is never denied —
+    /// see that module's doc comment — only tagged for wipe). `Arc` so every
+    /// clone of this `PageCache` (the background prefetch/revalidation
+    /// executor holds one — see `main::run`'s `BgExecutor`) observes the
+    /// same flag: a runtime `zz` toggle must affect fetches already in
+    /// flight on the substrate, not just ones started after it.
+    incognito: Arc<AtomicBool>,
 }
 
 pub struct CachedPage {
@@ -110,6 +148,27 @@ struct IndexEntry {
     revid: u64,
     fetched_at: u64,
     etag: Option<String>,
+    /// PRD FR-PR-3's "cache entries tagged for wipe at session end": `true`
+    /// exactly when this entry was written while incognito was active.
+    /// `#[serde(default)]` so every entry written before this field existed
+    /// loads as `false` — never retroactively wiped. Set once, at write
+    /// time (`put_at`); a silent revalidation `touch` (`touch_fetched_at`)
+    /// preserves whatever this already was rather than re-deriving it from
+    /// *this run's* current incognito state, since a touch confirms
+    /// existing content is still current, it isn't a new write.
+    #[serde(default)]
+    incognito: bool,
+    /// `lang`/`title` as passed to `put`, carried in the index entry itself
+    /// (not just encoded in its filename) so `wipe_incognito_entries` can
+    /// recompute the exact blob path to delete alongside a tagged index,
+    /// without re-deriving a title from a percent-encoded (or, for very
+    /// long titles, hashed — see `safe_name`) filename. `#[serde(default)]`
+    /// (empty string) for entries written before this field existed; those
+    /// are never `incognito = true` either, so they're never consulted.
+    #[serde(default)]
+    lang: String,
+    #[serde(default)]
+    title: String,
 }
 
 /// PRD FR-OFF-2's on-open staleness decision, as a pure function of age
@@ -169,15 +228,17 @@ impl PageCache {
     /// `max_bytes`/`fresh_ttl_secs`/`force_refetch_secs` come from the
     /// resolved config's `[cache]` section (§6.7); the `DEFAULT_*`/
     /// `FRESH_TTL_SECS` constants are what that resolution falls back to
-    /// absent a config file.
-    pub fn open(max_bytes: u64, fresh_ttl_secs: u64, force_refetch_secs: u64) -> Self {
-        match directories::ProjectDirs::from("", "", "wikitui") {
-            Some(dirs) => Self::at(
-                dirs.cache_dir().join("pages"),
-                max_bytes,
-                fresh_ttl_secs,
-                force_refetch_secs,
-            ),
+    /// absent a config file. `dir_override` is PRD FR-PR-5's `[cache] dir`
+    /// (`None` means "use the platform cache directory" — see
+    /// [`resolve_pages_dir`]).
+    pub fn open(
+        dir_override: Option<PathBuf>,
+        max_bytes: u64,
+        fresh_ttl_secs: u64,
+        force_refetch_secs: u64,
+    ) -> Self {
+        match resolve_pages_dir(dir_override.as_deref()) {
+            Some(dir) => Self::at(dir, max_bytes, fresh_ttl_secs, force_refetch_secs),
             None => Self::disabled(),
         }
     }
@@ -190,6 +251,7 @@ impl PageCache {
             max_bytes,
             fresh_ttl_secs,
             force_refetch_secs,
+            incognito: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -200,7 +262,20 @@ impl PageCache {
             max_bytes: 0,
             fresh_ttl_secs: FRESH_TTL_SECS,
             force_refetch_secs: DEFAULT_FORCE_REFETCH_SECS,
+            incognito: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Sets this run's incognito state (PRD FR-PR-3), from `--incognito` at
+    /// startup and `zz`'s runtime toggle thereafter (`main::run`) — every
+    /// clone of this cache (see the struct's `incognito` field doc comment)
+    /// observes the change immediately.
+    pub fn set_incognito(&self, on: bool) {
+        self.incognito.store(on, Ordering::Relaxed);
+    }
+
+    fn is_incognito(&self) -> bool {
+        self.incognito.load(Ordering::Relaxed)
     }
 
     /// This cache's configured on-open staleness decision for content this
@@ -311,6 +386,16 @@ impl PageCache {
         etag: Option<&str>,
         fetched_at: u64,
     ) {
+        // PRD FR-PR-3's single gate: every cache write consults it too, not
+        // just history/prefetch — `Write::Cache` always resolves to `Allow`
+        // (see `privacy`'s module doc comment for why a cache write is never
+        // denied outright), so this is a documented invariant check, not a
+        // second, independent decision about whether to write.
+        debug_assert_eq!(
+            crate::privacy::decide(self.is_incognito(), crate::privacy::Write::Cache),
+            crate::privacy::Verdict::Allow,
+            "a cache write must never be denied outright — see privacy's module doc comment"
+        );
         let (Some(blob_path), Some(index_path)) = (
             self.blob_path(lang, title, revid),
             self.index_path(lang, title),
@@ -339,6 +424,9 @@ impl PageCache {
             revid,
             fetched_at,
             etag: etag.map(str::to_string),
+            incognito: self.is_incognito(),
+            lang: lang.to_string(),
+            title: title.to_string(),
         };
         let Ok(json) = serde_json::to_string(&entry) else {
             return;
@@ -403,6 +491,51 @@ impl PageCache {
                 }
             }
         }
+    }
+
+    /// PRD FR-PR-3's "cache entries tagged for wipe at session end": deletes
+    /// every title-index entry written with `incognito = true` (see
+    /// `IndexEntry`'s doc comment), plus the blob it points at when one is
+    /// still there. Called unconditionally — both at the end of a clean run
+    /// (`main::run`, right before returning) and once at the *start* of every
+    /// run (`main`, right after opening the cache), the latter being the
+    /// documented mitigation for a crash mid-incognito-session: the tag
+    /// itself is the durable record, so a run that never got to clean up
+    /// finds its own leftovers swept the next time wikitui starts, whether or
+    /// not that next run is incognito too. Idempotent (a second call over an
+    /// already-clean tree finds nothing) and best-effort like every other
+    /// write in this module — a delete that fails (permissions, a concurrent
+    /// second instance) is simply not counted, never a crash.
+    pub fn wipe_incognito_entries(&self) -> WipeReport {
+        let mut report = WipeReport::default();
+        let Some(dir) = self.dir.as_ref() else {
+            return report;
+        };
+        let mut index_files = Vec::new();
+        collect_files(&dir.join("page"), &mut index_files);
+        for (path, size, _) in index_files {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(entry) = serde_json::from_str::<IndexEntry>(&text) else {
+                continue;
+            };
+            if !entry.incognito {
+                continue;
+            }
+            let mut freed = 0u64;
+            if let Some(blob_path) = self.blob_path(&entry.lang, &entry.title, entry.revid)
+                && let Ok(blob_meta) = std::fs::metadata(&blob_path)
+            {
+                freed += blob_meta.len();
+                let _ = std::fs::remove_file(&blob_path);
+            }
+            if std::fs::remove_file(&path).is_ok() {
+                report.entries += 1;
+                report.bytes += freed + size;
+            }
+        }
+        report
     }
 }
 
@@ -686,6 +819,9 @@ mod tests {
             revid: 3,
             fetched_at: now_unix() - 100_000,
             etag: None,
+            incognito: false,
+            lang: "en".to_string(),
+            title: "Turing".to_string(),
         };
         std::fs::write(&index_path, serde_json::to_string(&stale).unwrap()).unwrap();
         assert!(cache.get("en", "Turing").unwrap().age_secs >= 100_000 - 5);
@@ -908,5 +1044,133 @@ mod tests {
         assert_eq!(age_human(60), "1m");
         assert_eq!(age_human(3 * 3600 + 100), "3h");
         assert_eq!(age_human(2 * 86_400 + 5), "2d");
+    }
+
+    // -- Cache-dir resolution (PRD FR-PR-5) ---------------------------------
+
+    #[test]
+    fn resolve_pages_dir_honors_an_explicit_override() {
+        let dir = resolve_pages_dir(Some(Path::new("/tmp/somewhere-custom")))
+            .expect("an explicit override always resolves");
+        assert_eq!(dir, Path::new("/tmp/somewhere-custom/pages"));
+    }
+
+    #[test]
+    fn resolve_pages_dir_falls_back_to_the_platform_cache_dir_without_an_override() {
+        // Whatever the platform dir is, it must end in "pages" and must not
+        // be the override path from the test above.
+        let dir = resolve_pages_dir(None);
+        if let Some(dir) = dir {
+            assert!(dir.ends_with("pages"));
+        }
+        // `None` is also a legitimate outcome in a sandboxed CI environment
+        // with no resolvable home directory — `PageCache::open` degrades to
+        // `disabled()` in that case, never a panic.
+    }
+
+    // -- Incognito cache tagging + wipe (PRD FR-PR-3) -----------------------
+
+    #[test]
+    fn entries_written_while_incognito_are_tagged_and_ordinary_entries_are_not() {
+        let (cache, dir) = temp_cache(DEFAULT_MAX_BYTES);
+        cache.put("en", "Ordinary", "html", 1, None);
+        cache.set_incognito(true);
+        cache.put("en", "Secret", "html", 2, None);
+
+        let ordinary_index =
+            std::fs::read_to_string(dir.join("page").join("en").join("Ordinary.json")).unwrap();
+        let secret_index =
+            std::fs::read_to_string(dir.join("page").join("en").join("Secret.json")).unwrap();
+        assert!(
+            !serde_json::from_str::<IndexEntry>(&ordinary_index)
+                .unwrap()
+                .incognito
+        );
+        assert!(
+            serde_json::from_str::<IndexEntry>(&secret_index)
+                .unwrap()
+                .incognito
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wipe_incognito_entries_removes_only_tagged_entries_and_their_blobs() {
+        let (cache, dir) = temp_cache(DEFAULT_MAX_BYTES);
+        cache.put("en", "Ordinary", "kept content", 1, None);
+        cache.set_incognito(true);
+        cache.put("en", "Secret", "gone content", 2, None);
+        cache.set_incognito(false);
+
+        assert!(cache.get("en", "Ordinary").is_some());
+        assert!(cache.get("en", "Secret").is_some());
+
+        let report = cache.wipe_incognito_entries();
+        assert_eq!(report.entries, 1, "exactly the one tagged entry");
+        assert!(report.bytes > 0);
+
+        assert!(
+            cache.get("en", "Ordinary").is_some(),
+            "a non-incognito entry must survive the wipe"
+        );
+        assert!(
+            cache.get("en", "Secret").is_none(),
+            "the incognito-tagged entry must be gone after the wipe"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wipe_incognito_entries_is_idempotent_and_harmless_on_a_clean_or_disabled_cache() {
+        let (cache, dir) = temp_cache(DEFAULT_MAX_BYTES);
+        cache.put("en", "Ordinary", "html", 1, None);
+        assert_eq!(cache.wipe_incognito_entries(), WipeReport::default());
+        assert_eq!(
+            cache.wipe_incognito_entries(),
+            WipeReport::default(),
+            "calling it again over an already-clean tree finds nothing new"
+        );
+        assert!(cache.get("en", "Ordinary").is_some());
+
+        let disabled = PageCache::disabled();
+        assert_eq!(disabled.wipe_incognito_entries(), WipeReport::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn touching_a_pre_incognito_entry_during_a_later_incognito_session_does_not_retag_it() {
+        // A silent SWR touch (same revid confirmed) must not turn a
+        // pre-existing, non-incognito entry into one that gets wiped later
+        // just because the touch happened to occur while incognito was on —
+        // `touch_fetched_at` never re-derives the tag from the current
+        // session, only preserves whatever was already stored.
+        let (cache, dir) = temp_cache(DEFAULT_MAX_BYTES);
+        cache.put("en", "Turing", "content", 1, None);
+        cache.set_incognito(true);
+        cache.touch_fetched_at("en", "Turing");
+
+        let report = cache.wipe_incognito_entries();
+        assert_eq!(report.entries, 0);
+        assert!(cache.get("en", "Turing").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clones_share_the_same_incognito_flag() {
+        let (cache, dir) = temp_cache(DEFAULT_MAX_BYTES);
+        let clone = cache.clone();
+        clone.set_incognito(true);
+        cache.put("en", "SeenThroughAClone", "html", 1, None);
+
+        let index =
+            std::fs::read_to_string(dir.join("page").join("en").join("SeenThroughAClone.json"))
+                .unwrap();
+        assert!(
+            serde_json::from_str::<IndexEntry>(&index)
+                .unwrap()
+                .incognito,
+            "toggling incognito on a clone must be visible to every other clone"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

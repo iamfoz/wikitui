@@ -442,14 +442,19 @@ pub struct App {
     /// store would make `cargo test` write real rows into the developer's
     /// actual state directory on every run.
     pub history: crate::history::History,
-    /// PRD FR-PR-3's incognito gate (that chunk is not built yet — this one
-    /// only adds the flag and routes every write in this module through it,
-    /// per the PRD's "architectural requirement, do early"): when `true`,
-    /// `record_history_visit` and dwell tracking (`flush_tab_dwell`) become
-    /// no-ops. The future incognito chunk just has to flip this — from
-    /// `--incognito` (`cli::Cli::incognito`, wired in `main::run`) today,
-    /// and presumably a runtime keybind once FR-PR-3 lands.
+    /// PRD FR-PR-3's incognito gate — the flag every persistence write in
+    /// this module consults via `crate::privacy::decide` before touching
+    /// disk (see that module's doc comment for the full policy). Set from
+    /// `--incognito` (`cli::Cli::incognito`) at startup, and flipped live at
+    /// runtime by `zz` (`resolve_z_prefix`, `main::handle_key`).
     pub incognito: bool,
+    /// The `z`-prefix chord's pending-key latch (mirrors `pending_g`/
+    /// `pending_b`): `zz` toggles incognito (PRD FR-PR-3, Appendix B). Any
+    /// other second key falls through unhandled (there is no other `z`
+    /// binding yet — section folding's `za`/`zM`/`zR`, FR-NV-3, is a later
+    /// chunk; `resolve_z_prefix` already has a `PassThrough` arm ready for
+    /// them).
+    pub pending_z: bool,
     /// The reading-history picker's live list (PRD FR-HS-1), rebuilt by
     /// `refresh_history_matches` whenever `history_pick_filter` changes or
     /// the picker (re)opens: recency-weighted, optionally fuzzy-filtered.
@@ -683,6 +688,7 @@ impl App {
             pending_bookmark_export_overwrite: None,
             history: crate::history::History::in_memory(),
             incognito: false,
+            pending_z: false,
             history_pick_matches: Vec::new(),
             history_pick_selected: 0,
             history_pick_filter: String::new(),
@@ -803,10 +809,12 @@ impl App {
     }
 
     /// Whether prefetch is currently active for *this* session: the kill
-    /// switch is on AND we're not incognito (FR-PR-3 forces it off). The single
+    /// switch is on AND `privacy::decide` allows it (`Write::Prefetch` is
+    /// passive, so incognito always denies it — PRD FR-PR-3). The single
     /// gate every prefetch-scheduling decision consults.
     pub fn prefetch_active(&self) -> bool {
-        !self.incognito
+        crate::privacy::decide(self.incognito, crate::privacy::Write::Prefetch)
+            == crate::privacy::Verdict::Allow
             && self
                 .prefetch
                 .as_ref()
@@ -1811,9 +1819,10 @@ impl App {
     // -- Reading history (PRD FR-HS-1/2/4) ---------------------------------
 
     /// Records a visit to whatever document is now installed at
-    /// `tabs[index]` (PRD FR-HS-1), unless `self.incognito` — the one gate
-    /// every write in this module routes through (PRD FR-PR-3, not built
-    /// yet). Starts that tab's dwell clock running from now. Called by
+    /// `tabs[index]` (PRD FR-HS-1), unless `privacy::decide` denies it
+    /// (`Write::History` is passive — PRD FR-PR-3 — so incognito always
+    /// denies it; this is the one gate every write in this module routes
+    /// through). Starts that tab's dwell clock running from now. Called by
     /// `set_document` for the active tab and by `main::apply_tab_load_outcome`
     /// for a background tab's fetch completion — the only two places a
     /// document is ever installed. A no-op if the tab index is gone or has
@@ -1823,7 +1832,9 @@ impl App {
         index: usize,
         referrer: Option<(String, String)>,
     ) {
-        if self.incognito {
+        if crate::privacy::decide(self.incognito, crate::privacy::Write::History)
+            == crate::privacy::Verdict::Deny
+        {
             return;
         }
         let Some(tab) = self.tabs.get(index) else {
@@ -2001,7 +2012,11 @@ impl App {
     }
 
     /// Saves the currently-selected citation (the article's own, or one of
-    /// its references) to the research bibliography.
+    /// its references) to the research bibliography. PRD FR-PR-3: an
+    /// explicit save (the reader chose this exact citation), so incognito
+    /// never suppresses it — only warns, via `privacy::
+    /// append_warning_if_needed` (see `toggle_bookmark`'s doc comment for
+    /// the same reasoning).
     pub fn save_selected_citation(&mut self) {
         let Some(citation) = self.citations.get(self.selected_citation).cloned() else {
             return;
@@ -2028,9 +2043,13 @@ impl App {
             saved_at: crate::research::today(),
             kind,
         });
-        self.status = format!(
-            "Saved to research collection ({} total)",
-            self.research.citations.len()
+        self.status = crate::privacy::append_warning_if_needed(
+            self.incognito,
+            crate::privacy::Write::Citation,
+            format!(
+                "Saved to research collection ({} total)",
+                self.research.citations.len()
+            ),
         );
     }
 
@@ -2457,7 +2476,13 @@ impl App {
     /// `m`: bookmarks the active tab's article, or un-bookmarks it if it
     /// already was (the toggle idiom — see `bookmarks::BookmarkStore::
     /// toggle`'s doc comment). Sets `notice` either way so the reader always
-    /// gets feedback, not just on the add half.
+    /// gets feedback, not just on the add half. PRD FR-PR-3: a bookmark is
+    /// an *explicit* save (the reader named this article), unlike passive
+    /// history/prefetch — so incognito never suppresses it, but the add
+    /// half's notice carries `privacy::EXPLICIT_SAVE_WARNING` via
+    /// `privacy::append_warning_if_needed`, since the reader should still
+    /// know it persisted (removing a bookmark needs no such warning — that
+    /// write only ever deletes).
     pub fn toggle_bookmark(&mut self) {
         let Some(doc) = self.active_tab().doc.as_ref() else {
             self.status = "Open an article first".to_string();
@@ -2469,7 +2494,13 @@ impl App {
         let revid = (revid != 0).then_some(revid);
 
         match self.bookmarks.toggle(&lang, &title, revid) {
-            ToggleOutcome::Added => self.notice = Some(format!("Bookmarked \"{title}\"")),
+            ToggleOutcome::Added => {
+                self.notice = Some(crate::privacy::append_warning_if_needed(
+                    self.incognito,
+                    crate::privacy::Write::Bookmark,
+                    format!("Bookmarked \"{title}\""),
+                ))
+            }
             ToggleOutcome::Removed => {
                 self.notice = Some(format!("Removed bookmark for \"{title}\""))
             }
@@ -2821,8 +2852,14 @@ impl App {
         };
         let added = self.fetch_queue.enqueue(&lang, &title);
         self.close_offline_card();
+        // PRD FR-PR-3: explicit ("fetch this specific thing") — warn, don't
+        // suppress; see `toggle_bookmark`'s doc comment.
         self.notice = Some(if added {
-            format!("Queued \"{title}\" to fetch when online")
+            crate::privacy::append_warning_if_needed(
+                self.incognito,
+                crate::privacy::Write::FetchQueue,
+                format!("Queued \"{title}\" to fetch when online"),
+            )
         } else {
             format!("\"{title}\" is already in the fetch queue")
         });
@@ -2958,6 +2995,27 @@ pub fn resolve_b_prefix(second_key: char) -> BPrefixAction {
         'b' => BPrefixAction::TabPicker,
         'a' => BPrefixAction::Annotate,
         _ => BPrefixAction::PassThrough,
+    }
+}
+
+/// What the `z`-prefix chord's second key means (PRD FR-PR-3's `zz`,
+/// Appendix B). The first binding to claim the `z` prefix — section folding
+/// (FR-NV-3's `za`/`zM`/`zR`) is a later chunk, not this one, so every
+/// second key but `z` itself falls through unhandled today, the same
+/// dead-prefix fallback `resolve_g_prefix`/`resolve_b_prefix` already use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZPrefixAction {
+    /// `zz`: toggle incognito.
+    ToggleIncognito,
+    /// Any other second key: dead prefix — `handle_key` processes it as if
+    /// `z` had never been typed.
+    PassThrough,
+}
+
+pub fn resolve_z_prefix(second_key: char) -> ZPrefixAction {
+    match second_key {
+        'z' => ZPrefixAction::ToggleIncognito,
+        _ => ZPrefixAction::PassThrough,
     }
 }
 
@@ -5611,6 +5669,16 @@ mod tests {
         assert_eq!(resolve_g_prefix('r'), GPrefixAction::Random);
         assert_eq!(resolve_g_prefix('R'), GPrefixAction::Related);
         assert_eq!(resolve_g_prefix('j'), GPrefixAction::PassThrough);
+    }
+
+    /// PRD FR-PR-3 / Appendix B's `zz` incognito toggle: only `zz` resolves,
+    /// every other second key is a dead prefix (no folding chords exist yet
+    /// to claim them — see `resolve_z_prefix`'s doc comment).
+    #[test]
+    fn z_prefix_dispatches_zz_to_toggle_incognito_and_anything_else_passes_through() {
+        assert_eq!(resolve_z_prefix('z'), ZPrefixAction::ToggleIncognito);
+        assert_eq!(resolve_z_prefix('a'), ZPrefixAction::PassThrough);
+        assert_eq!(resolve_z_prefix('M'), ZPrefixAction::PassThrough);
     }
 
     // ---- Reading history (PRD FR-HS-1/2/4) --------------------------------

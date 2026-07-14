@@ -5,6 +5,7 @@ mod bookmark_export;
 mod bookmarks;
 mod cache;
 mod cite;
+mod cleardata;
 mod cli;
 mod command;
 mod config;
@@ -21,6 +22,7 @@ mod jsonl;
 mod layout;
 mod netqueue;
 mod prefetch;
+mod privacy;
 mod random;
 mod registry;
 mod research;
@@ -201,6 +203,34 @@ async fn main() -> Result<()> {
         std::process::exit(doctor::run(&resolved));
     }
 
+    // PRD FR-PR-4: `wikitui clear-data` is the same kind of standalone,
+    // TUI-free diagnostic-adjacent subcommand as `config doctor` above —
+    // deleting local stores must not depend on the terminal, network, or
+    // any in-process store initializing first.
+    if let Some(Commands::ClearData {
+        history,
+        cache,
+        stats,
+        auth,
+        all,
+        yes,
+    }) = &cli.command
+    {
+        let cli_overrides = cli_overrides_from(&cli);
+        let env_overrides = config::EnvOverrides::from_process_env();
+        let config_path =
+            config::resolve_config_path(cli.config.clone(), std::env::var("WIKITUI_CONFIG").ok());
+        let resolved = config::resolve(&cli_overrides, &env_overrides, config_path.as_deref());
+        let scope = cleardata::Scope {
+            history: *history,
+            cache: *cache,
+            stats: *stats,
+            auth: *auth,
+            all: *all,
+        };
+        std::process::exit(cleardata::run(&resolved, scope, *yes));
+    }
+
     let mut cli_overrides = cli_overrides_from(&cli);
 
     // The TITLE argument may be a full wikipedia.org URL or a
@@ -277,6 +307,7 @@ async fn main() -> Result<()> {
         )?
     };
     let page_cache = PageCache::open(
+        resolved.cache_dir.value.clone(),
         resolved.cache_max_mb.value.saturating_mul(1024 * 1024),
         resolved.cache_fresh_ttl_hours.value.saturating_mul(3600),
         resolved
@@ -284,6 +315,15 @@ async fn main() -> Result<()> {
             .value
             .saturating_mul(86_400),
     );
+    // PRD FR-PR-3: `--incognito` takes effect from the very first fetch this
+    // process makes (even `--dump`'s), not just once `App`/`run` exist.
+    page_cache.set_incognito(cli.incognito);
+    // PRD FR-PR-3's documented crash-recovery mitigation: "a crash may leave
+    // [incognito cache entries] behind, mitigated by the session tag being
+    // checked/swept at next startup" — every run sweeps leftovers from
+    // whatever the *previous* run tagged, regardless of this run's own
+    // incognito state, before doing anything else with the cache.
+    startup_sweep_incognito_leftovers(&page_cache);
 
     if cli.dump {
         let title = cli
@@ -297,6 +337,10 @@ async fn main() -> Result<()> {
         let outcome = fetch_page(&client, &page_cache, &resolved.lang.value, &title).await?;
         let document = doc::parse_article_html(&title, &outcome.html);
         print!("{}", doc::render_plain(&document));
+        // `--dump` never reaches `run`'s own end-of-session wipe below, so it
+        // does its own — a one-shot process is still a "session" for FR-PR-3's
+        // purposes.
+        page_cache.wipe_incognito_entries();
         return Ok(());
     }
 
@@ -412,6 +456,27 @@ pub(crate) fn no_color_active() -> bool {
 /// PRD honors alongside `NO_COLOR`/`CLICOLOR_FORCE` (§6.7 precedence).
 pub(crate) fn accessible_active() -> bool {
     std::env::var("ACCESSIBLE").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
+/// PRD FR-PR-3's crash-recovery sweep: deletes any cache entries a *previous*
+/// run tagged incognito and never got to clean up (a crash, a `kill -9`,
+/// anything short of reaching `run`'s own end-of-session wipe). Runs once at
+/// the very start of every invocation — dump or interactive, incognito or
+/// not — since the leftovers being swept belong to whatever run wrote them,
+/// not to this one. Silent on the ordinary case (nothing to sweep); prints a
+/// one-line note to stderr only when it actually found something, the same
+/// "visible on a terminal, never in the way" posture `history.rs`'s
+/// `log_write_failure` uses.
+fn startup_sweep_incognito_leftovers(cache: &PageCache) {
+    let report = cache.wipe_incognito_entries();
+    if report.entries > 0 {
+        eprintln!(
+            "wikitui: incognito: swept {} leftover cache entr{} from a previous session ({} freed)",
+            report.entries,
+            if report.entries == 1 { "y" } else { "ies" },
+            human_bytes(report.bytes)
+        );
+    }
 }
 
 /// PRD §7 / the v0.5 milestone's "crash-safe terminal restore": whether a
@@ -1164,8 +1229,17 @@ fn annotate_current_article(terminal: &mut Terminal<CrosstermBackend<Stdout>>, a
     match saved_note {
         Some(note) => {
             app.bookmarks.set_note(&lang, &title, note);
+            // PRD FR-PR-3: `ba` is `toggle_bookmark`'s explicit-save sibling
+            // — `ensure_bookmarked` above persists a bookmark exactly like
+            // `m` does, so the same warning applies when it actually created
+            // one (a note added to an *existing* bookmark isn't a new write
+            // worth re-warning about).
             app.notice = Some(if was_new {
-                format!("Bookmarked \"{title}\" and saved the note")
+                crate::privacy::append_warning_if_needed(
+                    app.incognito,
+                    crate::privacy::Write::Bookmark,
+                    format!("Bookmarked \"{title}\" and saved the note"),
+                )
             } else {
                 "Note saved".to_string()
             });
@@ -1210,11 +1284,18 @@ async fn enqueue_read_later(client: &WikiClient, cache: &PageCache, app: &mut Ap
         enqueued_at: bookmarks::now_ts(),
         priority: 0,
     });
-    app.notice = Some(if saved_offline {
+    // PRD FR-PR-3: an explicit save (the reader named this article) — warn,
+    // don't suppress; see `App::toggle_bookmark`'s doc comment.
+    let base = if saved_offline {
         format!("Enqueued \"{title}\" for later")
     } else {
         format!("Enqueued \"{title}\" for later (offline save failed — will retry on open)")
-    });
+    };
+    app.notice = Some(crate::privacy::append_warning_if_needed(
+        app.incognito,
+        crate::privacy::Write::ReadLater,
+        base,
+    ));
 }
 
 /// Whether `(lang, title)` is already in L2, fetching it in if not. Returns
@@ -1436,11 +1517,18 @@ fn apply_save_outcome(app: &mut App, outcome: SaveOutcome) {
             &f.source_note,
         ) {
             Ok(record) => {
-                app.notice = Some(format!(
-                    "Saved \"{}\" ({}, {})",
-                    record.title,
-                    record.tier.label(),
-                    human_bytes(record.size_total)
+                // PRD FR-PR-3: `S`/`:save` is an explicit save (the reader
+                // named this article) — warn, don't suppress; see
+                // `App::toggle_bookmark`'s doc comment.
+                app.notice = Some(crate::privacy::append_warning_if_needed(
+                    app.incognito,
+                    crate::privacy::Write::OfflineSave,
+                    format!(
+                        "Saved \"{}\" ({}, {})",
+                        record.title,
+                        record.tier.label(),
+                        human_bytes(record.size_total)
+                    ),
                 ));
             }
             Err(e) => app.notice = Some(format!("Save failed for \"{}\": {e}", f.title)),
@@ -1847,6 +1935,14 @@ async fn run(
     // PRD FR-HS-1's dwell time: whatever every open tab is still showing
     // stops accumulating dwell the moment the app exits.
     app.flush_all_tab_dwell();
+
+    // PRD FR-PR-3's "cache entries tagged for wipe at session end": covers
+    // every entry tagged incognito during this run, whether the session
+    // ended incognito or the reader toggled `zz` off again before quitting —
+    // the tag, not the app's final state, is what's swept. A panic or a
+    // signal kill skips this (documented: mitigated by the startup sweep,
+    // `startup_sweep_incognito_leftovers`, on the *next* run).
+    cache.wipe_incognito_entries();
 
     Ok(())
 }
@@ -2426,6 +2522,7 @@ async fn handle_key(
         && !app.pending_g
         && !app.pending_b
         && !app.pending_r
+        && !app.pending_z
         && code == KeyCode::Char('p')
         && modifiers.contains(KeyModifiers::CONTROL)
     {
@@ -2439,11 +2536,12 @@ async fn handle_key(
     // `None` for every default binding and this is a no-op — `handle_key`'s
     // existing dispatch and behavior are untouched. Only a rebinding surfaces
     // here. Scoped to the reading view (where `dispatch_action` is well
-    // defined) and to single keys — the g/b/r chord latches are resolved
+    // defined) and to single keys — the g/b/r/z chord latches are resolved
     // below, so we skip while one is pending.
     if !app.pending_g
         && !app.pending_b
         && !app.pending_r
+        && !app.pending_z
         && let Some(ctx) = override_context(app)
         && let Some(chord) = registry::Chord::from_key(code, modifiers)
         && let Some(action) = app.keymap.runtime_action(ctx, &chord)
@@ -3177,6 +3275,31 @@ async fn handle_key(
                     }
                 }
             }
+            // z-prefix chord (PRD FR-PR-3, Appendix B): `zz` toggles
+            // incognito. `cache.set_incognito` keeps the page cache's tagging
+            // (see `cache::PageCache`'s doc comment) in sync with the flag the
+            // rest of the app reads off `App`, so a toggle mid-session applies
+            // to the very next fetch, not just ones after a restart.
+            if app.pending_z {
+                app.pending_z = false;
+                if let KeyCode::Char(c) = code {
+                    match app::resolve_z_prefix(c) {
+                        app::ZPrefixAction::ToggleIncognito => {
+                            app.incognito = !app.incognito;
+                            cache.set_incognito(app.incognito);
+                            app.notice = Some(if app.incognito {
+                                "incognito: on — no history, no stats, no prefetch \
+                                 (explicit saves still persist, with a warning)"
+                                    .to_string()
+                            } else {
+                                "incognito: off".to_string()
+                            });
+                            return;
+                        }
+                        app::ZPrefixAction::PassThrough => {} // handle `code` normally below.
+                    }
+                }
+            }
 
             // Captured before `app.notice` is cleared below: PRD FR-OFF-2's
             // "updated — r to reload" notice means this keypress, if it's
@@ -3438,15 +3561,17 @@ async fn handle_key(
                         app.find_prev();
                     }
                 }
-                // Arm the g-/b-prefix latches (their second key is consumed at
-                // the top of this arm on the next keypress).
+                // Arm the g-/b-/z-prefix latches (their second key is
+                // consumed at the top of this arm on the next keypress).
                 KeyCode::Char('g') => app.pending_g = true,
                 KeyCode::Char('b') => app.pending_b = true,
+                KeyCode::Char('z') => app.pending_z = true,
                 KeyCode::Char('G') => app.scroll_to_bottom(),
                 KeyCode::Esc => {
                     app.pending_g = false;
                     app.pending_b = false;
                     app.pending_r = false;
+                    app.pending_z = false;
                     app.clear_find();
                 }
                 _ => {}
@@ -3462,6 +3587,9 @@ async fn handle_key(
     }
     if !matches!(code, KeyCode::Char('r')) {
         app.pending_r = false;
+    }
+    if !matches!(code, KeyCode::Char('z')) {
+        app.pending_z = false;
     }
 }
 

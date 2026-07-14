@@ -185,6 +185,14 @@ pub struct ResolvedConfig {
     /// treated as absent on open, network-first, regardless of what a
     /// background revalidation might otherwise have decided.
     pub cache_force_refetch_days: Valued<u64>,
+    /// PRD FR-PR-5's cache relocation: `[cache] dir` overrides the platform
+    /// cache directory (which already honors `$XDG_CACHE_HOME` via the
+    /// `directories` crate) so a reader can point the whole L2 cache at,
+    /// say, a tmpfs mount. File-only (like the other `[cache]` keys) — no
+    /// CLI flag or env var, matching how `max_mb`/`fresh_ttl_hours`/
+    /// `force_refetch_days` are already file-only. `None` (the default)
+    /// means "use the platform directory" — see `cache::resolve_pages_dir`.
+    pub cache_dir: Valued<Option<PathBuf>>,
     pub active_wiki: Valued<String>,
     /// Always concrete (defaults to `DEFAULT_BASE_URL_TEMPLATE`); `{lang}`
     /// is substituted by `api::WikiClient` when present, else used
@@ -456,7 +464,7 @@ pub fn resolve(
     );
     let measure = resolve_measure(cli, env, &table, &mut issues);
     let ambiguous_wide = resolve_ambiguous_width(cli, env, &table, &mut issues);
-    let (cache_max_mb, cache_fresh_ttl_hours, cache_force_refetch_days) =
+    let (cache_max_mb, cache_fresh_ttl_hours, cache_force_refetch_days, cache_dir) =
         resolve_cache(&table, &mut issues);
     let (active_wiki, base_url_template) = resolve_wiki(env, &table, &mut issues);
     let readlater_auto_dequeue = resolve_readlater_auto_dequeue(env, &table, &mut issues);
@@ -486,6 +494,7 @@ pub fn resolve(
         cache_max_mb,
         cache_fresh_ttl_hours,
         cache_force_refetch_days,
+        cache_dir,
         active_wiki,
         base_url_template,
         readlater_auto_dequeue,
@@ -1272,15 +1281,24 @@ fn resolve_history(table: &toml::Table, issues: &mut Vec<Issue>) -> Valued<u64> 
 fn resolve_cache(
     table: &toml::Table,
     issues: &mut Vec<Issue>,
-) -> (Valued<u64>, Valued<u64>, Valued<u64>) {
+) -> (
+    Valued<u64>,
+    Valued<u64>,
+    Valued<u64>,
+    Valued<Option<PathBuf>>,
+) {
     let default_max_mb = crate::cache::DEFAULT_MAX_BYTES / (1024 * 1024);
     let default_ttl_hours = crate::cache::FRESH_TTL_SECS / 3600;
     let default_force_refetch_days = crate::cache::DEFAULT_FORCE_REFETCH_SECS / 86_400;
+    let no_dir_override = Valued {
+        value: None,
+        source: Source::Default,
+    };
 
     let Some(cache_table) = table.get("cache").and_then(toml::Value::as_table) else {
         if table.contains_key("cache") {
             issues.push(Issue::warning(
-                "cache must be a table (use [cache] with max_mb/fresh_ttl_hours/force_refetch_days); ignoring",
+                "cache must be a table (use [cache] with max_mb/fresh_ttl_hours/force_refetch_days/dir); ignoring",
             ));
         }
         return (
@@ -1296,10 +1314,11 @@ fn resolve_cache(
                 value: default_force_refetch_days,
                 source: Source::Default,
             },
+            no_dir_override,
         );
     };
 
-    let known: BTreeSet<&str> = ["max_mb", "fresh_ttl_hours", "force_refetch_days"]
+    let known: BTreeSet<&str> = ["max_mb", "fresh_ttl_hours", "force_refetch_days", "dir"]
         .into_iter()
         .collect();
     for key in cache_table.keys() {
@@ -1328,7 +1347,20 @@ fn resolve_cache(
         default_force_refetch_days,
         issues,
     );
-    (max_mb, fresh_ttl_hours, force_refetch_days)
+    let dir = match cache_table.get("dir") {
+        None => no_dir_override,
+        Some(toml::Value::String(s)) if !s.trim().is_empty() => Valued {
+            value: Some(PathBuf::from(s)),
+            source: Source::File,
+        },
+        Some(_) => {
+            issues.push(Issue::warning(
+                "cache.dir must be a non-empty string path — ignoring",
+            ));
+            no_dir_override
+        }
+    };
+    (max_mb, fresh_ttl_hours, force_refetch_days, dir)
 }
 
 fn resolve_positive_int(
@@ -2396,6 +2428,58 @@ mod tests {
                 source: Source::File
             }
         );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn cache_dir_override_is_wired_from_the_file() {
+        let path = temp_config("[cache]\ndir = \"/tmp/wikitui-custom-cache\"\n");
+        let resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(
+            resolved.cache_dir,
+            Valued {
+                value: Some(PathBuf::from("/tmp/wikitui-custom-cache")),
+                source: Source::File,
+            }
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn cache_dir_defaults_to_none_when_unset() {
+        let path = temp_config("[cache]\nmax_mb = 100\n");
+        let resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(
+            resolved.cache_dir,
+            Valued {
+                value: None,
+                source: Source::Default,
+            }
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn cache_dir_of_the_wrong_type_warns_and_falls_back_to_none() {
+        let path = temp_config("[cache]\ndir = 42\n");
+        let resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(resolved.cache_dir.value, None);
+        assert!(resolved.issues.iter().any(|i| {
+            i.message
+                .contains("cache.dir must be a non-empty string path")
+        }));
         cleanup(&path);
     }
 

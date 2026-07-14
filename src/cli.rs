@@ -82,6 +82,35 @@ pub enum Commands {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// PRD FR-PR-4: delete local persistence stores by name. Runs before any
+    /// terminal/network/cache initialization (like `config doctor`) — see
+    /// `cleardata`'s module doc comment for exactly what `--all` covers (not
+    /// bookmarks, saved pages, or the research bibliography — those are
+    /// user-created libraries, not tracking data).
+    ClearData {
+        /// Deletes the local reading-history database (PRD FR-HS-1).
+        #[arg(long)]
+        history: bool,
+        /// Deletes the page cache (PRD §5.7's L2 store).
+        #[arg(long)]
+        cache: bool,
+        /// Deletes local reading stats (PRD FR-PC-3) — a seam today: no
+        /// stats file exists yet, so this reports a no-op.
+        #[arg(long)]
+        stats: bool,
+        /// Deletes locally stored auth tokens (PRD FR-ACC-9) — a seam
+        /// today: login doesn't exist yet, so this reports a no-op.
+        #[arg(long)]
+        auth: bool,
+        /// Shorthand for `--history --cache --stats --auth`. Does **not**
+        /// include bookmarks, saved pages, read-later, or the research
+        /// bibliography — see this command's own doc comment.
+        #[arg(long)]
+        all: bool,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]

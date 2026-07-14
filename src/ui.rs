@@ -1968,6 +1968,23 @@ fn draw_offline_card(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+/// PRD FR-PR-3's "visible status glyph": a persistent, plain-text
+/// `[incognito]` marker prepended to the status bar in *every* mode (not
+/// just Reading — a picker or a prompt is exactly when a reader most needs
+/// the reminder that nothing passive is being recorded right now), pure and
+/// unit-testable ahead of `draw_status_bar`'s own Frame-drawing plumbing.
+/// Plain text rather than an emoji/Unicode glyph (contra "🕶 incognito") so
+/// it reads identically under `NO_COLOR` (PRD FR-TH-5, which strips color
+/// but never text) and on the VT100-ish terminal floor (§8) that may not
+/// shape an emoji at all.
+fn with_incognito_glyph(text: String, incognito: bool) -> String {
+    if incognito {
+        format!("[incognito] {text}")
+    } else {
+        text
+    }
+}
+
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let tab = app.active_tab();
     let text = match app.mode {
@@ -2114,6 +2131,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             }
         }
     };
+    let text = with_incognito_glyph(text, app.incognito);
     let style = if matches!(
         app.mode,
         Mode::Search
@@ -2957,5 +2975,51 @@ mod tests {
             .map(|c| c.symbol())
             .collect();
         assert!(!rendered.contains("Terminal too small"));
+    }
+
+    // ---- Incognito status glyph (PRD FR-PR-3) -----------------------------
+
+    #[test]
+    fn incognito_glyph_prefixes_the_status_text_only_when_incognito() {
+        assert_eq!(
+            with_incognito_glyph("Alan Turing".to_string(), false),
+            "Alan Turing"
+        );
+        assert_eq!(
+            with_incognito_glyph("Alan Turing".to_string(), true),
+            "[incognito] Alan Turing"
+        );
+    }
+
+    /// The glyph must show up in the actual rendered frame — not just in the
+    /// pure helper — and it must be plain text so it survives `NO_COLOR`
+    /// (no styling is required to read it, unlike a color-only indicator).
+    #[test]
+    fn incognito_glyph_appears_in_the_rendered_status_bar_and_not_otherwise() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(!rendered.contains("incognito"));
+
+        app.incognito = true;
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(rendered.contains("[incognito]"));
     }
 }

@@ -399,7 +399,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
 /// dir — falls back to `<data_dir>/state` there, a documented, harmless
 /// subdirectory rather than mixing history.sqlite in with bookmarks.jsonl
 /// et al.
-fn history_path() -> Option<PathBuf> {
+pub(crate) fn history_path() -> Option<PathBuf> {
     let dirs = directories::ProjectDirs::from("", "", "wikitui")?;
     let dir = dirs
         .state_dir()
