@@ -159,6 +159,17 @@ struct RelatedOutcome {
     result: std::result::Result<Vec<SearchResult>, String>,
 }
 
+/// One completed (or failed) link-preview summary fetch (PRD FR-NV-5),
+/// delivered off the event loop like every other lazy fetch (see
+/// `fire_summary`) so opening the peek popup never blocks. Tagged with the
+/// `(lang, title)` it answers so a slow response for a preview the reader has
+/// since closed still lands in the session cache (`App::deliver_summary`).
+struct SummaryOutcome {
+    lang: String,
+    title: String,
+    result: std::result::Result<api::SummaryData, String>,
+}
+
 /// One completed (or failed) langlinks fetch (PRD FR-ML-1/2), delivered off
 /// the event loop exactly like `RelatedOutcome` — see `fire_langlinks`.
 /// Tagged with the *source* article's `(lang, title)` so a result for an
@@ -1672,6 +1683,9 @@ async fn run(
     // "available in your preferred language" check after every fresh open)
     // — same idiom again.
     let (langlinks_tx, mut langlinks_rx) = mpsc::unbounded_channel::<LangLinksOutcome>();
+    // PRD FR-NV-5: lazy page-summary fetches for the `K` link-preview popup —
+    // same non-blocking idiom as `related_tx`/`langlinks_tx` above.
+    let (summary_tx, mut summary_rx) = mpsc::unbounded_channel::<SummaryOutcome>();
 
     // PRD §5.8 / NF-NET-1: the one background substrate. A single serial
     // worker drains its priority queue; revalidation (FR-OFF-2) is migrated
@@ -1824,6 +1838,9 @@ async fn run(
             // completes and redraws without a keypress, mirroring the other
             // lazy-fetch cases above.
             || app.related_loading
+            // PRD FR-NV-5: the link-preview popup's lazy summary fetch fills
+            // in without a keypress, same as the Related panel above.
+            || app.summary_loading
             // PRD FR-ML-1/2: same for any in-flight langlinks fetch — the
             // picker's own, and the automatic one fired after every fresh
             // open. Both must gate this condition: without it, the
@@ -1854,6 +1871,7 @@ async fn run(
                     &save_tx,
                     &related_tx,
                     &langlinks_tx,
+                    &summary_tx,
                     terminal,
                 )
                 .await;
@@ -1899,6 +1917,11 @@ async fn run(
             while let Ok(outcome) = related_rx.try_recv() {
                 app.deliver_related(outcome.lang, outcome.title, outcome.result);
             }
+            // PRD FR-NV-5: install a completed link-preview summary; fills the
+            // popup in place if it's still open on this target.
+            while let Ok(outcome) = summary_rx.try_recv() {
+                app.deliver_summary(outcome.lang, outcome.title, outcome.result);
+            }
         } else if let Event::Key(key) = event::read()? {
             // Block until an event arrives instead of redrawing on a timer —
             // an idle reader shouldn't spin the CPU or spam hide-cursor codes.
@@ -1914,6 +1937,7 @@ async fn run(
                     &save_tx,
                     &related_tx,
                     &langlinks_tx,
+                    &summary_tx,
                     terminal,
                 )
                 .await;
@@ -1993,6 +2017,33 @@ fn fire_related(
             .map(|outcome| outcome.results)
             .map_err(|e| e.to_string());
         let _ = tx.send(RelatedOutcome {
+            lang,
+            title,
+            result,
+        });
+    });
+}
+
+/// PRD FR-NV-5: fetch a link target's page summary for the preview popup off
+/// the event loop (never blocking), tagged so a late response still lands in
+/// the session cache even if the popup has since closed — mirrors
+/// `fire_related`/`fire_langlinks`.
+fn fire_summary(
+    client: &WikiClient,
+    lang: &str,
+    title: &str,
+    tx: &UnboundedSender<SummaryOutcome>,
+) {
+    let lang = lang.to_string();
+    let title = title.to_string();
+    let client = client.clone();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let result = client
+            .fetch_summary_full(&lang, &title)
+            .await
+            .map_err(|e| e.to_string());
+        let _ = tx.send(SummaryOutcome {
             lang,
             title,
             result,
@@ -2517,6 +2568,9 @@ async fn open_history_entry(
                 tab.page_source = outcome.source;
                 tab.current_revid = outcome.revid;
             }
+            // PRD FR-NV-8: back/forward restores its own remembered scroll
+            // just below, so it must not also raise the resume toast.
+            app.suppress_resume_once = true;
             app.set_document(document);
             // Restore the scroll position we left this page at (set_document
             // reset it to the top); the draw clamps it to the article's real
@@ -2561,6 +2615,7 @@ async fn handle_key(
     save_tx: &UnboundedSender<SaveOutcome>,
     related_tx: &UnboundedSender<RelatedOutcome>,
     langlinks_tx: &UnboundedSender<LangLinksOutcome>,
+    summary_tx: &UnboundedSender<SummaryOutcome>,
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
 ) {
     // `Q`'s one-keypress quit confirmation (PRD Appendix B) is intercepted
@@ -3293,6 +3348,21 @@ async fn handle_key(
             KeyCode::Esc => app.close_redlink_card(),
             _ => {}
         },
+        // PRD FR-NV-4/5's `K` peek popup: `Ctrl-o` (Appendix B "returns") and
+        // Esc close it; Enter follows the previewed internal link in this tab.
+        Mode::Peek => match code {
+            KeyCode::Char('o') if modifiers.contains(KeyModifiers::CONTROL) => app.close_peek(),
+            KeyCode::Esc => app.close_peek(),
+            KeyCode::Enter => {
+                if let Some((lang, title)) = app.peek_open_target() {
+                    app.close_peek();
+                    app.lang = lang;
+                    follow_internal_link(client, cache, app, &title, revalidate_tx, langlinks_tx)
+                        .await;
+                }
+            }
+            _ => {}
+        },
         // PRD FR-DL-2's `:today` panel: j/k move within the current type
         // tab, Tab/Shift-Tab (and h/l, since the tabs are laid out
         // horizontally) switch type, Enter opens the focused entry's linked
@@ -3362,6 +3432,11 @@ async fn handle_key(
                             open_related(app, client, related_tx);
                             return;
                         }
+                        // PRD FR-NV-4: `gK` jumps to the References section.
+                        app::GPrefixAction::References => {
+                            app.jump_to_references();
+                            return;
+                        }
                         app::GPrefixAction::PassThrough => {} // handle this key normally below.
                     }
                 }
@@ -3409,6 +3484,19 @@ async fn handle_key(
                             });
                             return;
                         }
+                        // PRD FR-NV-3 section folding.
+                        app::ZPrefixAction::ToggleFold => {
+                            app.toggle_fold_at_cursor();
+                            return;
+                        }
+                        app::ZPrefixAction::FoldAll => {
+                            app.fold_all();
+                            return;
+                        }
+                        app::ZPrefixAction::UnfoldAll => {
+                            app.unfold_all();
+                            return;
+                        }
                         app::ZPrefixAction::PassThrough => {} // handle `code` normally below.
                     }
                 }
@@ -3419,6 +3507,11 @@ async fn handle_key(
             // `r`, reloads instead of arming the read-later/Research prefix
             // — see the `r` arm's own comment for why the two share a key.
             let had_pending_reload = app.active_tab().pending_reload.is_some();
+            // PRD FR-NV-8's resume toast, captured for the `r`-precedence
+            // decision below (see the `r` arms). It ranks *below* the SWR "r
+            // to reload" (a fresher update always wins) and *above* the
+            // read-later/Research `r`-prefix.
+            let had_pending_resume = app.pending_resume.is_some();
             // `r`-prefix chord (PRD FR-BM-3's `rl`), reached only when no
             // reload is pending (see above): `rl` enqueues for later, any
             // other second key falls back to `r`'s own original meaning
@@ -3449,6 +3542,11 @@ async fn handle_key(
                 return;
             }
             app.notice = None;
+            // PRD FR-NV-8: the resume toast is non-blocking — any key other
+            // than `r` dismisses it (the `r` arms below consume it first).
+            if !matches!(code, KeyCode::Char('r')) {
+                app.pending_resume = None;
+            }
             match code {
                 // PRD Appendix B: `q` closes the current tab (quitting if it
                 // was the last); `Q` quits outright behind a one-keypress
@@ -3652,6 +3750,14 @@ async fn handle_key(
                 KeyCode::Char('r') if had_pending_reload => {
                     app.reload_from_pending_update(cache);
                 }
+                // PRD FR-NV-8: `r` on the resume toast jumps to the saved
+                // position — ranked below the SWR reload above (a fresher
+                // update wins) and above the read-later/Research `r`-prefix
+                // below (`had_pending_resume` was captured before the toast
+                // was cleared).
+                KeyCode::Char('r') if had_pending_resume => {
+                    app.resume_to_saved_position();
+                }
                 KeyCode::Char('r') => {
                     app.pending_r = true;
                 }
@@ -3679,6 +3785,15 @@ async fn handle_key(
                         app.status = "No active search — Ctrl-f to find in this page".to_string();
                     } else {
                         app.find_prev();
+                    }
+                }
+                // PRD FR-NV-4/5: `K` peeks the focused link — a reference
+                // marker opens the footnote peek (resolved locally, no
+                // network), an internal link opens the link preview (its
+                // summary fetched lazily off the event loop if not cached).
+                KeyCode::Char('K') => {
+                    if let Some((lang, title)) = app.open_peek_at_focus() {
+                        fire_summary(client, &lang, &title, summary_tx);
                     }
                 }
                 // Arm the g-/b-/z-prefix latches (their second key is

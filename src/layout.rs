@@ -227,8 +227,24 @@ pub struct Layout {
     pub block_lines: Vec<usize>,
     /// The first line each link occurrence appears on, indexed identically to
     /// `doc::collect_links`, so cycling links can scroll the focused link
-    /// into view.
+    /// into view. A link inside a folded section (PRD FR-NV-3) is not emitted
+    /// as a visible span, so its entry here stays `0` and its `link_visible`
+    /// flag is `false` — callers must consult `link_visible` before trusting
+    /// this line number for a folded-away link.
     pub link_lines: Vec<usize>,
+    /// Whether each link occurrence (same index space as `link_lines`/
+    /// `doc::collect_links`) actually appears on a visible line. `false` for a
+    /// link swallowed by a folded section (PRD FR-NV-3): folded links keep
+    /// their global occurrence index — so numbering stays aligned with
+    /// `collect_links` — but are not focusable, so Tab-cycling and the
+    /// scroll-into-view helper skip them.
+    pub link_visible: Vec<bool>,
+    /// The sorted heading-block indices folded shut in this layout (PRD
+    /// FR-NV-3). Part of the identity of the laid-out lines — two otherwise
+    /// identical layouts with different folds are different layouts — so
+    /// `App::ensure_layout` compares it (alongside `width`/`options`) to decide
+    /// staleness, and it participates in the L1 cache key ([`LayoutCacheKey`]).
+    pub folds: Vec<usize>,
     /// The grapheme-column range `[start, end)` of each link occurrence's own
     /// text on its `link_lines` line — same units as [`MatchSpan`] (grapheme
     /// clusters from the line's own start, never display cells or bytes) and
@@ -862,6 +878,50 @@ impl Emitter<'_> {
         }
     }
 
+    /// PRD FR-NV-3: emit one folded section's `▸ Title (N ¶, M subsections)`
+    /// summary line in place of its whole body. `body` is the folded range's
+    /// blocks (`doc.blocks[heading + 1 .. end]`); every block in it — the
+    /// heading plus each body block — gets a `block_lines` anchor pointing at
+    /// the summary line (keeping `block_lines` index-aligned with `doc.blocks`),
+    /// and each body block's links advance `link_counter` without being laid
+    /// out (so a visible link past the fold keeps its `collect_links` index but
+    /// is left non-focusable). The `▸ Title` part is styled as the heading it
+    /// stands in for; the dim count suffix reads as secondary.
+    fn emit_fold_summary(
+        &mut self,
+        block_lines: &mut Vec<usize>,
+        link_counter: &mut usize,
+        heading_spans: &[crate::doc::Span],
+        level: u8,
+        body: &[Block],
+    ) {
+        let aw = self.ambiguous_wide;
+        self.blank();
+        let anchor = self.lines.len();
+        let title = flatten_plain(heading_spans);
+        let (paragraphs, subsections) = fold_body_counts(body);
+        let mut content = clusters_from_str(&format!("▸ {title}"), SpanKind::Heading(level), aw);
+        let suffix = {
+            let sub = if subsections == 1 {
+                "1 subsection".to_string()
+            } else {
+                format!("{subsections} subsections")
+            };
+            format!(" ({paragraphs} ¶, {sub})")
+        };
+        content.extend(clusters_from_str(&suffix, SpanKind::Dim, aw));
+        self.emit_plain_wrapped(content);
+        self.blank();
+        // The heading's own anchor, then one per swallowed body block, all
+        // pointing at the summary line — `block_lines` must stay exactly
+        // `doc.blocks.len()` long and index-aligned for section jumps.
+        block_lines.push(anchor);
+        for block in body {
+            *link_counter += block_link_count(block);
+            block_lines.push(anchor);
+        }
+    }
+
     /// Emit a standalone math node (PRD FR-RD-7): a display equation centers
     /// on its own line (approximately — a leading pad wide enough to center
     /// the *first* wrapped line, reused as every continuation line's prefix
@@ -1431,14 +1491,24 @@ fn infobox_card_lines(rows: &[(String, String)], box_w: usize, aw: bool) -> Vec<
 /// [`layout_document_with_images`] with a real box map.
 #[cfg(test)]
 pub fn layout_document(doc: &Document, width: u16, options: LayoutOptions) -> Layout {
-    layout_document_with_images(doc, width, options, &NoImages)
+    layout_document_with_images(doc, width, options, &NoImages, &[])
 }
 
+/// PRD FR-NV-3 section folding. `folds` is the sorted set of heading-block
+/// indices (`doc.blocks` indices, as `doc::SectionRef::block` reports) that are
+/// folded shut: each collapses the run from its heading to the next same-or-
+/// higher-level heading into a single `▸ Title (N ¶, M subsections)` summary
+/// line. Passed as a layout **input** (not a `LayoutOptions` field — that type
+/// is `Copy` and shared across every width bucket) so folded content is never
+/// laid out at all, keeping the no-overflow and `block_lines`/link-ordering
+/// invariants intact for the visible content. Empty `folds` reproduces the
+/// pre-folding layout byte for byte.
 pub fn layout_document_with_images(
     doc: &Document,
     width: u16,
     options: LayoutOptions,
     images: &dyn ImageResolver,
+    folds: &[usize],
 ) -> Layout {
     let available = (width.max(1)) as usize;
     let content_width = available.min((options.measure.max(1)) as usize);
@@ -1518,6 +1588,27 @@ pub fn layout_document_with_images(
                 i = end;
                 continue;
             }
+            // PRD FR-NV-3: a folded heading collapses its whole range to one
+            // summary line. The range's blocks are never laid out — but their
+            // links still advance the occurrence counter (so visible links
+            // downstream keep their `collect_links`-aligned indices) and each
+            // gets a `block_lines` anchor pointing at the summary line (so a
+            // section jump into folded content lands on the fold, and
+            // `block_lines` stays exactly `doc.blocks.len()` long).
+            if let Block::Heading { level, spans } = &doc.blocks[i]
+                && folds.contains(&i)
+            {
+                let end = fold_range_end(&doc.blocks, i, *level);
+                em.emit_fold_summary(
+                    &mut block_lines,
+                    &mut link_counter,
+                    spans,
+                    *level,
+                    &doc.blocks[i + 1..end],
+                );
+                i = end;
+                continue;
+            }
             em.emit_block(
                 &doc.blocks[i],
                 &mut block_lines,
@@ -1561,8 +1652,62 @@ pub fn layout_document_with_images(
         lines,
         block_lines,
         link_lines,
+        // A link occurrence that never appeared as a span (folded away) keeps
+        // `seen[occ] == false` — exactly the "not focusable" set PRD FR-NV-3
+        // needs, derived from the same pass that fills `link_lines`.
+        link_visible: seen,
         link_cols,
         continuation,
+        folds: folds.to_vec(),
+    }
+}
+
+/// PRD FR-NV-3: the exclusive end of a section's block range — the first block
+/// after `heading` that is a heading of the same or higher level (lower or
+/// equal `level` number), or the end of the document. The range folded shut is
+/// `[heading, end)`; the heading itself collapses to the summary line and
+/// `heading + 1 .. end` is the body swallowed by the fold.
+pub fn fold_range_end(blocks: &[Block], heading: usize, level: u8) -> usize {
+    blocks[heading + 1..]
+        .iter()
+        .position(|b| matches!(b, Block::Heading { level: l, .. } if *l <= level))
+        .map(|off| heading + 1 + off)
+        .unwrap_or(blocks.len())
+}
+
+/// PRD FR-NV-3's fold-summary counts: how many paragraphs and how many
+/// (deeper) subsection headings live in a folded range's body `blocks`
+/// (`doc.blocks[heading + 1 .. end]`). Every heading in that slice is deeper by
+/// construction (the range ends at the next same-or-higher heading), so a plain
+/// heading count is the subsection count.
+pub fn fold_body_counts(body: &[Block]) -> (usize, usize) {
+    let paragraphs = body
+        .iter()
+        .filter(|b| matches!(b, Block::Paragraph(_)))
+        .count();
+    let subsections = body
+        .iter()
+        .filter(|b| matches!(b, Block::Heading { .. }))
+        .count();
+    (paragraphs, subsections)
+}
+
+/// The number of link occurrences in one block, counted exactly as
+/// `flatten_spans`/`doc::collect_links` do (both `Link` and `RedLink`, only in
+/// the block kinds those two functions descend into). Used to advance the
+/// occurrence counter across a folded block without laying it out, so a visible
+/// link after the fold keeps the same global index the unfolded layout gave it.
+fn block_link_count(block: &Block) -> usize {
+    let count = |spans: &[crate::doc::Span]| {
+        spans
+            .iter()
+            .filter(|s| matches!(s.style, SpanStyle::Link(_) | SpanStyle::RedLink(_)))
+            .count()
+    };
+    match block {
+        Block::Paragraph(spans) | Block::Blockquote(spans) => count(spans),
+        Block::ListItem { spans, .. } => count(spans),
+        _ => 0,
     }
 }
 
@@ -1746,7 +1891,7 @@ fn occurrence_from_origins(origins: &[Option<(usize, usize)>]) -> Option<Occurre
 /// [`LayoutCacheKey`] (PRD FR-OFF-1's L1 layer) so a stale schema can never
 /// be silently replayed across an upgrade — a version bump makes every
 /// existing L1 entry a guaranteed miss instead.
-pub const LAYOUT_SCHEMA_VERSION: u32 = 3;
+pub const LAYOUT_SCHEMA_VERSION: u32 = 4;
 
 /// PRD §6.8's L1 hit target (< 50 ms) only holds if the cache stays small
 /// enough that a linear scan over it is free — 8 entries covers "the
@@ -1773,6 +1918,11 @@ pub struct LayoutCacheKey {
     pub revid: u64,
     pub width: u16,
     pub options: LayoutOptions,
+    /// PRD FR-NV-3: the sorted folded-heading-block set (see `Layout::folds`).
+    /// Folding changes the laid-out lines, so a layout laid out under one fold
+    /// set must never be served for another — it is part of the L1 key exactly
+    /// like `width`/`options`.
+    pub folds: Vec<usize>,
     pub schema_version: u32,
 }
 
@@ -1948,7 +2098,7 @@ mod tests {
         let doc = parse_article_html("Img", IMG_HTML);
         let mut boxes = std::collections::HashMap::new();
         boxes.insert("https://ex.org/p.png".to_string(), (20u16, 5u16));
-        let layout = layout_document_with_images(&doc, 80, LayoutOptions::default(), &boxes);
+        let layout = layout_document_with_images(&doc, 80, LayoutOptions::default(), &boxes, &[]);
         assert_eq!(image_rows(&layout), 5, "five reserved image rows");
         // Each image row is exactly the reserved width, and rows count is
         // carried in every row's kind.
@@ -1976,7 +2126,7 @@ mod tests {
         // Resolver hands back an over-wide box; layout must clamp cols to the
         // content column (width 30 → content 30).
         boxes.insert("https://ex.org/p.png".to_string(), (200u16, 4u16));
-        let layout = layout_document_with_images(&doc, 30, LayoutOptions::default(), &boxes);
+        let layout = layout_document_with_images(&doc, 30, LayoutOptions::default(), &boxes, &[]);
         for l in &layout.lines {
             for s in &l.spans {
                 if matches!(s.kind, SpanKind::ImageRow { .. }) {
@@ -2217,6 +2367,218 @@ mod tests {
         for w in layout.link_lines.windows(2) {
             assert!(w[0] <= w[1], "link occurrences must be in document order");
         }
+    }
+
+    // ---- PRD FR-NV-3 section folding --------------------------------------
+
+    /// Lead + two h2 sections; the first (`History`) contains two paragraphs
+    /// and an h3 subsection, and holds a link that folding must hide. Every
+    /// section has a distinct link so link visibility is checkable.
+    const FOLD_FIXTURE: &str = r##"
+    <html><head><title>Fold Test</title></head><body>
+      <p>Lead paragraph with a <a href="./Lead_Link">lead link</a> here.</p>
+      <h2>History</h2>
+      <p>First history paragraph mentioning a <a href="./History_Link">history link</a> inline.</p>
+      <h3>Early</h3>
+      <p>Early sub paragraph body text.</p>
+      <p>Second history-area paragraph body text.</p>
+      <h2>Legacy</h2>
+      <p>Legacy paragraph with a <a href="./Legacy_Link">legacy link</a>.</p>
+    </body></html>
+    "##;
+
+    fn heading_block(doc: &Document, title: &str) -> usize {
+        doc.blocks
+            .iter()
+            .position(
+                |b| matches!(b, Block::Heading { spans, .. } if flatten_plain(spans) == title),
+            )
+            .unwrap_or_else(|| panic!("no heading {title:?}"))
+    }
+
+    #[test]
+    fn fold_range_end_stops_at_the_next_same_or_higher_heading() {
+        let doc = parse_article_html("Fold Test", FOLD_FIXTURE);
+        let history = heading_block(&doc, "History");
+        let legacy = heading_block(&doc, "Legacy");
+        // History (h2) folds through its h3 subsection, ending at the next h2.
+        assert_eq!(fold_range_end(&doc.blocks, history, 2), legacy);
+        // The last section folds to the end of the document.
+        assert_eq!(fold_range_end(&doc.blocks, legacy, 2), doc.blocks.len());
+    }
+
+    #[test]
+    fn fold_body_counts_count_paragraphs_and_subsections() {
+        let doc = parse_article_html("Fold Test", FOLD_FIXTURE);
+        let history = heading_block(&doc, "History");
+        let end = fold_range_end(&doc.blocks, history, 2);
+        // Two paragraphs + the early-sub paragraph = 3 paragraphs; one h3.
+        assert_eq!(fold_body_counts(&doc.blocks[history + 1..end]), (3, 1));
+        let legacy = heading_block(&doc, "Legacy");
+        let lend = fold_range_end(&doc.blocks, legacy, 2);
+        assert_eq!(fold_body_counts(&doc.blocks[legacy + 1..lend]), (1, 0));
+    }
+
+    #[test]
+    fn folding_a_section_collapses_its_body_to_one_summary_line() {
+        let doc = parse_article_html("Fold Test", FOLD_FIXTURE);
+        let history = heading_block(&doc, "History");
+        let folded =
+            layout_document_with_images(&doc, 80, LayoutOptions::default(), &NoImages, &[history]);
+        let joined = folded
+            .lines
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("▸ History (3 ¶, 1 subsection)"),
+            "the fold summary line must appear: {joined:?}"
+        );
+        assert!(
+            !joined.contains("First history paragraph"),
+            "the folded body text must be gone"
+        );
+        assert!(
+            !joined.contains("Early sub paragraph"),
+            "the folded subsection's body must be gone too"
+        );
+        assert!(
+            joined.contains("Legacy paragraph"),
+            "content outside the fold is untouched"
+        );
+    }
+
+    #[test]
+    fn folding_keeps_block_lines_aligned_and_points_folded_blocks_at_the_summary() {
+        let doc = parse_article_html("Fold Test", FOLD_FIXTURE);
+        let history = heading_block(&doc, "History");
+        let legacy = heading_block(&doc, "Legacy");
+        let folded =
+            layout_document_with_images(&doc, 80, LayoutOptions::default(), &NoImages, &[history]);
+        assert_eq!(
+            folded.block_lines.len(),
+            doc.blocks.len(),
+            "block_lines must stay index-aligned with doc.blocks"
+        );
+        // Every swallowed block (heading .. next h2) maps to the summary line.
+        let summary_line = folded.block_lines[history];
+        for b in history..legacy {
+            assert_eq!(
+                folded.block_lines[b], summary_line,
+                "folded block {b} must anchor at the fold summary"
+            );
+        }
+        // The summary line really is the `▸ History` line.
+        assert!(line_text(&folded.lines[summary_line]).contains("▸ History"));
+    }
+
+    #[test]
+    fn folded_links_keep_their_index_but_are_not_visible() {
+        let doc = parse_article_html("Fold Test", FOLD_FIXTURE);
+        let links = collect_links(&doc);
+        // Sanity: three links, the middle one inside History.
+        assert_eq!(links.len(), 3);
+        let history = heading_block(&doc, "History");
+        let folded =
+            layout_document_with_images(&doc, 80, LayoutOptions::default(), &NoImages, &[history]);
+        assert_eq!(folded.link_visible.len(), links.len());
+        assert!(folded.link_visible[0], "the lead link stays visible");
+        assert!(
+            !folded.link_visible[1],
+            "the folded History link is not focusable"
+        );
+        assert!(folded.link_visible[2], "the Legacy link stays visible");
+        // The visible link spans are exactly occurrences 0 and 2 — the folded
+        // occurrence keeps its index (never renumbered) but emits no span.
+        let mut emitted: Vec<usize> = folded
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .filter_map(|s| match s.kind {
+                SpanKind::Link(occ) => Some(occ),
+                _ => None,
+            })
+            .collect();
+        emitted.dedup();
+        assert_eq!(emitted, vec![0, 2]);
+    }
+
+    #[test]
+    fn folding_never_overflows_the_width_even_when_narrow() {
+        let doc = parse_article_html("Fold Test", FOLD_FIXTURE);
+        let history = heading_block(&doc, "History");
+        let legacy = heading_block(&doc, "Legacy");
+        for width in [20u16, 40, 80] {
+            let folded = layout_document_with_images(
+                &doc,
+                width,
+                LayoutOptions::default(),
+                &NoImages,
+                &[history, legacy],
+            );
+            for (i, line) in folded.lines.iter().enumerate() {
+                let w = line.width(false);
+                assert!(
+                    w <= width as usize,
+                    "folded line {i} width {w} exceeds {width}: {:?}",
+                    line_text(line)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn folding_the_last_section_summarizes_to_eof() {
+        let doc = parse_article_html("Fold Test", FOLD_FIXTURE);
+        let legacy = heading_block(&doc, "Legacy");
+        let folded =
+            layout_document_with_images(&doc, 80, LayoutOptions::default(), &NoImages, &[legacy]);
+        let joined = folded
+            .lines
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("▸ Legacy (1 ¶, 0 subsections)"));
+        assert!(!joined.contains("Legacy paragraph"));
+    }
+
+    #[test]
+    fn folding_the_cjk_fixture_never_overflows_the_width() {
+        // Folding + per-character CJK wrapping is a real invariant risk (the
+        // summary line and the kinsoku breaker both touch width math).
+        let doc = parse_article_html("アラン・チューリング", JA_FIXTURE);
+        let folds: Vec<usize> = section_outline(&doc).iter().map(|s| s.block).collect();
+        for width in [20u16, 40, 80] {
+            let layout = layout_document_with_images(
+                &doc,
+                width,
+                LayoutOptions::default(),
+                &NoImages,
+                &folds,
+            );
+            for (i, line) in layout.lines.iter().enumerate() {
+                let w = line.width(false);
+                assert!(
+                    w <= width as usize,
+                    "folded CJK line {i} width {w} exceeds {width}: {:?}",
+                    line_text(line)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn empty_folds_lays_out_identically_to_the_unfolded_layout() {
+        let doc = parse_article_html("Fold Test", FOLD_FIXTURE);
+        let plain = layout_document(&doc, 80, LayoutOptions::default());
+        let folded =
+            layout_document_with_images(&doc, 80, LayoutOptions::default(), &NoImages, &[]);
+        assert_eq!(plain.lines, folded.lines);
+        assert_eq!(plain.block_lines, folded.block_lines);
+        assert_eq!(plain.link_lines, folded.link_lines);
+        assert!(folded.link_visible.iter().all(|&v| v));
     }
 
     /// `link_cols` must slice out exactly the link's own rendered text on its
@@ -2474,6 +2836,7 @@ mod tests {
             revid,
             width,
             options: LayoutOptions::default(),
+            folds: Vec::new(),
             schema_version,
         }
     }

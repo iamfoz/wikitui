@@ -189,11 +189,37 @@ struct BareLatest {
 }
 
 /// The subset of `/api/rest_v1/page/summary/{title}` this client consumes
-/// (PRD Appendix A): just the plain-text extract that powers T2 link-peek.
+/// (PRD Appendix A): the plain-text extract that powers T2 link-peek plus the
+/// display title, Wikidata one-line description, and thumbnail URL the
+/// FR-NV-5 link-preview popup shows.
 #[derive(Debug, Deserialize)]
 struct SummaryResponse {
     #[serde(default)]
+    title: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
     extract: String,
+    #[serde(default)]
+    thumbnail: Option<SummaryThumbnail>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SummaryThumbnail {
+    #[serde(default)]
+    source: String,
+}
+
+/// PRD FR-NV-5's link-preview payload: the target article's display title,
+/// Wikidata description, lead extract, and (optional) thumbnail URL, all
+/// resolved from one page-summary call (§6.2 rule 4). Sanitized (SEC-1) since
+/// every field is remote-derived, displayable text.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SummaryData {
+    pub title: String,
+    pub description: String,
+    pub extract: String,
+    pub thumbnail: Option<String>,
 }
 
 /// One interwiki language edition of an article (PRD FR-ML-1/2, Appendix A
@@ -561,6 +587,15 @@ impl WikiClient {
     /// documented optimization and a future seam; this per-title call keeps
     /// the T2 path simple.
     pub async fn fetch_summary(&self, lang: &str, title: &str) -> Result<String> {
+        Ok(self.fetch_summary_full(lang, title).await?.extract)
+    }
+
+    /// The full page-summary payload (PRD FR-NV-5 link preview): title,
+    /// Wikidata description, lead extract, and thumbnail URL. Same endpoint and
+    /// SEC-1 sanitization as [`fetch_summary`] (which is now this method's
+    /// extract-only projection), so the T2 offline path and the interactive
+    /// preview share one request shape and one parser.
+    pub async fn fetch_summary_full(&self, lang: &str, title: &str) -> Result<SummaryData> {
         let url = format!(
             "{}/api/rest_v1/page/summary/{}",
             self.host(lang),
@@ -579,7 +614,16 @@ impl WikiClient {
             .context("reading summary response body")?;
         let parsed: SummaryResponse =
             serde_json::from_slice(&bytes).context("parsing summary response")?;
-        Ok(crate::sanitize::sanitize_single_line(&parsed.extract).into_owned())
+        let clean = |s: &str| crate::sanitize::sanitize_single_line(s).into_owned();
+        Ok(SummaryData {
+            title: clean(&parsed.title),
+            description: clean(&parsed.description),
+            extract: clean(&parsed.extract),
+            thumbnail: parsed
+                .thumbnail
+                .map(|t| clean(&t.source))
+                .filter(|s| !s.is_empty()),
+        })
     }
 
     /// PRD FR-ML-1/2 (Appendix A "Langlinks"): an article's interwiki

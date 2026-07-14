@@ -141,6 +141,26 @@ pub enum Mode {
     /// the start page, when no config file exists yet. Any key dismisses it,
     /// writing the default config so it never shows again.
     Onboarding,
+    /// `K` peek popup (PRD FR-NV-4 footnote peek / FR-NV-5 link preview): a
+    /// floating card over the reading view showing either a reference's text
+    /// (resolved locally, no network) or a link target's summary (title,
+    /// description, lead extract). `Ctrl-o`/`Esc` close it; the content lives
+    /// in `App::peek`. Drawn like the help/offline overlays, over `draw_reading`.
+    Peek,
+}
+
+/// The content of the `K` peek popup (PRD FR-NV-4/FR-NV-5). Two visually
+/// distinct kinds share one overlay mode; the draw code branches on this to
+/// pick the border label and body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeekPopup {
+    /// FR-NV-4 footnote peek: a reference marker's resolved text, pulled
+    /// locally from the parsed citations — never a network call.
+    Footnote { marker: String, text: String },
+    /// FR-NV-5 link preview: the target's `(lang, title)`; the body (title,
+    /// description, extract) is read live from `App::summary_cache`, showing
+    /// "loading…" until the async fetch lands there.
+    LinkPreview { lang: String, title: String },
 }
 
 /// Where the currently open article's content came from (PRD FR-OFF-6's
@@ -643,6 +663,47 @@ pub struct App {
     /// The scroll offset of the `?` help overlay (PRD FR-CS-4): the sheet is
     /// scrollable so it can never clip, however tall the terminal.
     pub help_scroll: u16,
+
+    // -- K peek popup (PRD FR-NV-4 footnote peek / FR-NV-5 link preview) -----
+    /// The open peek popup's content, or `None` when no popup is up. Set by
+    /// `open_peek_at_focus`, cleared by `close_peek`.
+    pub peek: Option<PeekPopup>,
+    /// The mode `K` was pressed from, restored when the popup closes.
+    pub peek_prior_mode: Mode,
+    /// FR-NV-5 link-target summaries, session-cached per `(lang, title)` —
+    /// shares the same "fetched lazily, never blocks, cached for the session"
+    /// idiom as `related_cache`/`langlinks_cache`, and doubles as the peek's
+    /// loading indicator (absent entry = still loading). Never persisted.
+    pub summary_cache: HashMap<(String, String), crate::api::SummaryData>,
+    /// A link-preview summary fetch for the open popup is in flight (PRD
+    /// FR-NV-5's "don't block; show loading… then fill") — mirrors
+    /// `related_loading` for the scoped-poll keep-awake.
+    pub summary_loading: bool,
+
+    // -- Reading-position memory (PRD FR-NV-8) ------------------------------
+    /// Set right after installing a document the reader has an earlier saved
+    /// position for (`History::position`), when that position isn't the top —
+    /// drives the non-blocking "resume at §… (r)" toast and is consumed by
+    /// `resume_to_saved_position` when the reader presses `r`. Cleared the
+    /// moment any other key dismisses the toast.
+    pub pending_resume: Option<ResumePosition>,
+    /// Suppresses the resume toast for the very next `set_document` — set by
+    /// back/forward navigation and the SWR reload, which restore their own
+    /// scroll and must not also raise the cross-session resume prompt.
+    pub suppress_resume_once: bool,
+}
+
+/// PRD FR-NV-8's pending resume: what pressing `r` on the resume toast should
+/// restore. `revid_matches` decides between an exact restore (same revision —
+/// the saved absolute scroll and fold set are still valid) and the anchor
+/// fallback (the article changed — best-effort scroll to the nearest surviving
+/// section heading named `anchor` instead of trusting a stale offset).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumePosition {
+    pub scroll: u16,
+    pub folds: Vec<usize>,
+    pub revid_matches: bool,
+    pub anchor: Option<String>,
 }
 
 /// A confirmed-and-resolved bulk save (PRD FR-OFF-5): the human label for the
@@ -770,6 +831,12 @@ impl App {
             palette_selected: 0,
             palette_prior_mode: Mode::Reading,
             help_scroll: 0,
+            peek: None,
+            peek_prior_mode: Mode::Reading,
+            summary_cache: HashMap::new(),
+            summary_loading: false,
+            pending_resume: None,
+            suppress_resume_once: false,
         }
     }
 
@@ -1369,6 +1436,8 @@ impl App {
         // PRD FR-HS-1's dwell time stops accumulating the moment a tab
         // closes; flush before the tab (and its tracking fields) are gone.
         self.flush_tab_dwell(index);
+        // PRD FR-NV-8: and its reading position is saved before it's gone.
+        self.save_reading_position(index);
         let tab = self.tabs.remove(index);
         self.push_closed(tab);
         if self.tabs.is_empty() {
@@ -1571,8 +1640,12 @@ impl App {
     pub fn ensure_layout(&mut self) {
         let width = self.layout_width;
         let opts = self.layout_options();
+        // PRD FR-NV-3: the active tab's folded-heading set is a layout input,
+        // so a fold/unfold makes a cached layout stale exactly like a
+        // width/options change does.
+        let folds = self.folds_sorted();
         let stale = match &self.layout {
-            Some(l) => l.width != width || l.options != opts,
+            Some(l) => l.width != width || l.options != opts || l.folds != folds,
             None => true,
         };
         if !stale {
@@ -1590,6 +1663,7 @@ impl App {
                 revid: tab.current_revid,
                 width,
                 options: opts,
+                folds: folds.clone(),
                 schema_version: layout::LAYOUT_SCHEMA_VERSION,
             })
         };
@@ -1612,7 +1686,7 @@ impl App {
                 .doc
                 .as_ref()
                 .expect("keyed above, so a document is present");
-            layout::layout_document_with_images(doc, width, opts, &img_map)
+            layout::layout_document_with_images(doc, width, opts, &img_map, &folds)
         };
         self.layout_cache.put(key, computed.clone());
         self.layout = Some(computed);
@@ -1819,6 +1893,9 @@ impl App {
         // accumulating dwell time now (PRD FR-HS-1) — must happen before
         // `install_document` clears the tracking fields below.
         self.flush_tab_dwell(index);
+        // PRD FR-NV-8: and its scroll/fold position is saved before the new
+        // document replaces it — this is the "navigating away" save point.
+        self.save_reading_position(index);
         // The referrer (PRD FR-HS-1's "referrer article") is the top of the
         // back stack at this exact moment: for a fresh navigation
         // (`open_document`) that is precisely the article just pushed off
@@ -1845,6 +1922,10 @@ impl App {
             tab.install_document(doc);
         }
         self.record_history_visit(index, referrer);
+        // PRD FR-NV-8: offer to resume if this article has a saved position —
+        // raised after the visit is recorded and before the status refresh
+        // below, so its toast (a `notice`) is the last word for this open.
+        self.check_resume_position(index);
         self.mode = Mode::Reading;
         // A new document invalidates the cached layout; it is rebuilt lazily
         // (from L1 if available, else a fresh layout pass) on the next draw
@@ -1918,6 +1999,9 @@ impl App {
     pub fn flush_all_tab_dwell(&mut self) {
         for index in 0..self.tabs.len() {
             self.flush_tab_dwell(index);
+            // PRD FR-NV-8: the app is exiting — persist every tab's reading
+            // position, not just its dwell.
+            self.save_reading_position(index);
         }
     }
 
@@ -2038,6 +2122,9 @@ impl App {
                 tab.current_revid = page.revid;
                 tab.page_source = PageSource::Live;
             }
+            // PRD FR-NV-8: the SWR reload reinstalls the same article the
+            // reader is already looking at — the resume toast would be noise.
+            self.suppress_resume_once = true;
             self.set_document(document);
         }
     }
@@ -2222,6 +2309,12 @@ impl App {
     /// each occurrence's first piece's line, for the scroll/counter code
     /// that only ever needed a line to jump to.
     pub fn update_find(&mut self) {
+        // PRD FR-NV-3: "in-page search auto-unfolds hits" — a match inside a
+        // folded section is invisible to `find_matches` (it laid out no
+        // lines), so any folded section whose body contains the query is
+        // unfolded first, then the layout is rebuilt below.
+        let query = self.active_tab().find_input.clone();
+        self.auto_unfold_for_find(&query);
         self.ensure_layout();
         let occurrences = match &self.layout {
             Some(layout) => {
@@ -2306,13 +2399,482 @@ impl App {
             self.status = "No links on this page".to_string();
             return;
         }
-        let next = Some(match self.active_tab().focused_link {
-            None => 0,
-            Some(i) if forward => (i + 1) % len,
-            Some(i) => (i + len - 1) % len,
-        });
-        self.active_tab_mut().focused_link = next;
+        // PRD FR-NV-3: links inside a folded section aren't laid out, so Tab
+        // cycling skips them (`Layout::link_visible`). With nothing folded
+        // every link is visible and this is the plain wrap-around it always was.
+        self.ensure_layout();
+        let visible: Vec<usize> = match &self.layout {
+            Some(l) => (0..len)
+                .filter(|&i| l.link_visible.get(i).copied().unwrap_or(true))
+                .collect(),
+            None => (0..len).collect(),
+        };
+        if visible.is_empty() {
+            self.status = "No visible links — unfold a section (zR) first".to_string();
+            return;
+        }
+        let next = match self.active_tab().focused_link {
+            None => visible[if forward { 0 } else { visible.len() - 1 }],
+            Some(cur) => match visible.iter().position(|&v| v == cur) {
+                Some(pos) if forward => visible[(pos + 1) % visible.len()],
+                Some(pos) => visible[(pos + visible.len() - 1) % visible.len()],
+                // The focused link was just folded away: land on the first
+                // (or last) visible one rather than nowhere.
+                None => visible[if forward { 0 } else { visible.len() - 1 }],
+            },
+        };
+        self.active_tab_mut().focused_link = Some(next);
         self.scroll_focused_link_into_view();
+    }
+
+    // -- Section folding (PRD FR-NV-3) --------------------------------------
+
+    /// The active tab's folded-heading-block set as a sorted vec — the shape
+    /// `layout_document_with_images` and the L1 cache key both take.
+    pub fn folds_sorted(&self) -> Vec<usize> {
+        let mut v: Vec<usize> = self.active_tab().folded_blocks.iter().copied().collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// The section (index into the active tab's `sections`) whose range
+    /// contains the current scroll position — the one `za` folds. Defined as
+    /// the last section whose heading line is at or above the scroll line; the
+    /// first section when the scroll sits in the lead above every heading, so
+    /// `za` always has something to act on when the article has sections at
+    /// all. `None` only for a section-less article.
+    fn current_section_index(&mut self) -> Option<usize> {
+        self.ensure_layout();
+        let scroll = self.active_tab().scroll as usize;
+        let block_lines = self.layout.as_ref().map(|l| l.block_lines.clone())?;
+        let tab = self.active_tab();
+        if tab.sections.is_empty() {
+            return None;
+        }
+        let mut current = 0usize;
+        for (i, section) in tab.sections.iter().enumerate() {
+            let line = block_lines.get(section.block).copied().unwrap_or(0);
+            if line <= scroll {
+                current = i;
+            } else {
+                break;
+            }
+        }
+        Some(current)
+    }
+
+    /// `za` (PRD FR-NV-3): fold/unfold the section at the cursor. Rebuilds the
+    /// layout, keeps the (un)folded heading on screen, and repairs the focused
+    /// link if it was just folded away.
+    pub fn toggle_fold_at_cursor(&mut self) {
+        let Some(section_idx) = self.current_section_index() else {
+            self.status = "No sections to fold on this page".to_string();
+            return;
+        };
+        let block = self.active_tab().sections[section_idx].block;
+        let now_folded = {
+            let folds = &mut self.active_tab_mut().folded_blocks;
+            if folds.remove(&block) {
+                false
+            } else {
+                folds.insert(block);
+                true
+            }
+        };
+        self.layout = None;
+        self.ensure_layout();
+        self.fix_focus_after_fold();
+        self.scroll_block_into_view(block);
+        self.status = if now_folded {
+            "Folded section (za to unfold)".to_string()
+        } else {
+            "Unfolded section".to_string()
+        };
+    }
+
+    /// `zM` (PRD FR-NV-3): fold every section.
+    pub fn fold_all(&mut self) {
+        let blocks: Vec<usize> = self.active_tab().sections.iter().map(|s| s.block).collect();
+        if blocks.is_empty() {
+            self.status = "No sections to fold on this page".to_string();
+            return;
+        }
+        for b in blocks {
+            self.active_tab_mut().folded_blocks.insert(b);
+        }
+        self.layout = None;
+        self.ensure_layout();
+        self.fix_focus_after_fold();
+        self.clamp_scroll();
+        self.status = "Folded all sections (zR to unfold)".to_string();
+    }
+
+    /// `zR` (PRD FR-NV-3): unfold every section.
+    pub fn unfold_all(&mut self) {
+        if self.active_tab().folded_blocks.is_empty() {
+            self.status = "Nothing is folded".to_string();
+            return;
+        }
+        self.active_tab_mut().folded_blocks.clear();
+        self.layout = None;
+        self.status = "Unfolded all sections".to_string();
+    }
+
+    /// After a fold change, move focus off a link that is no longer visible
+    /// (folded away) to the first visible link, or clear it if none remain.
+    fn fix_focus_after_fold(&mut self) {
+        self.ensure_layout();
+        let Some(focused) = self.active_tab().focused_link else {
+            return;
+        };
+        let still_visible = self
+            .layout
+            .as_ref()
+            .map(|l| l.link_visible.get(focused).copied().unwrap_or(false))
+            .unwrap_or(false);
+        if still_visible {
+            return;
+        }
+        let next = self
+            .layout
+            .as_ref()
+            .and_then(|l| l.link_visible.iter().position(|&v| v));
+        self.active_tab_mut().focused_link = next;
+    }
+
+    /// Scroll so `block`'s laid-out line is visible after a fold change, and
+    /// clamp to the article's new extent.
+    fn scroll_block_into_view(&mut self, block: usize) {
+        let line = self
+            .layout
+            .as_ref()
+            .and_then(|l| l.block_lines.get(block).copied())
+            .unwrap_or(0) as u16;
+        let max = self.computed_max_scroll();
+        self.active_tab_mut().scroll = line.min(max);
+    }
+
+    /// Clamp the active tab's scroll to the current layout's extent (used
+    /// after folding shrinks the article under the cursor).
+    fn clamp_scroll(&mut self) {
+        let max = self.computed_max_scroll();
+        let tab = self.active_tab_mut();
+        tab.scroll = tab.scroll.min(max);
+    }
+
+    /// The greatest scroll offset the current layout permits at the last-drawn
+    /// viewport height — `total_lines - viewport_height`, floored at 0.
+    fn computed_max_scroll(&self) -> u16 {
+        let total = self
+            .layout
+            .as_ref()
+            .map(|l| l.lines.len() as u16)
+            .unwrap_or(0);
+        total.saturating_sub(self.viewport_height)
+    }
+
+    /// PRD FR-NV-3's "in-page search auto-unfolds hits": unfold any folded
+    /// section whose body contains `query` (smart-case, matching `find`'s own
+    /// rule), so the match becomes a real laid-out line the finder can locate.
+    fn auto_unfold_for_find(&mut self, query: &str) {
+        if query.is_empty() || self.active_tab().folded_blocks.is_empty() {
+            return;
+        }
+        let case_sensitive = layout::is_case_sensitive(query);
+        let needle = if case_sensitive {
+            query.to_string()
+        } else {
+            query.to_lowercase()
+        };
+        let Some(doc) = self.active_tab().doc.as_ref() else {
+            return;
+        };
+        let folded: Vec<usize> = self.active_tab().folded_blocks.iter().copied().collect();
+        let mut to_unfold = Vec::new();
+        for &h in &folded {
+            let level = match doc.blocks.get(h) {
+                Some(crate::doc::Block::Heading { level, .. }) => *level,
+                _ => continue,
+            };
+            let end = layout::fold_range_end(&doc.blocks, h, level);
+            let hit = doc.blocks[h..end]
+                .iter()
+                .any(|b| block_matches_query(b, &needle, case_sensitive));
+            if hit {
+                to_unfold.push(h);
+            }
+        }
+        if !to_unfold.is_empty() {
+            for h in to_unfold {
+                self.active_tab_mut().folded_blocks.remove(&h);
+            }
+            self.layout = None;
+        }
+    }
+
+    // -- K peek popup (PRD FR-NV-4 footnote peek / FR-NV-5 link preview) -----
+
+    /// `K` (PRD FR-NV-4/5): open the peek popup for the focused link. Context
+    /// decides the kind — a reference marker (`[n]`, a `#cite…` anchor) opens
+    /// the footnote peek, resolved locally from the parsed citations with no
+    /// network; an internal link opens the link preview from the page summary.
+    /// Returns the `(lang, title)` a preview must fetch a summary for when it
+    /// isn't cached yet (the caller fires it off the event loop), else `None`
+    /// (a footnote, an already-cached preview, or nothing focusable to peek).
+    pub fn open_peek_at_focus(&mut self) -> Option<(String, String)> {
+        let link = self
+            .active_tab()
+            .focused_link
+            .and_then(|i| self.active_tab().links.get(i))
+            .cloned();
+        let Some(link) = link else {
+            self.status = "No link focused to peek — Tab to focus one".to_string();
+            return None;
+        };
+        // FR-NV-4 footnote peek: a reference marker resolves locally.
+        if is_reference_marker(&link.href) {
+            let citation = self
+                .active_tab()
+                .doc
+                .as_ref()
+                .and_then(|d| resolve_reference(&d.citations, &link.href, &link.text).cloned());
+            match citation {
+                Some(c) => {
+                    self.peek_prior_mode = self.mode;
+                    self.peek = Some(PeekPopup::Footnote {
+                        marker: link.text.clone(),
+                        text: c.text,
+                    });
+                    self.mode = Mode::Peek;
+                    self.status = "Reference — Ctrl-o/Esc: close".to_string();
+                }
+                None => self.status = "Reference not found".to_string(),
+            }
+            return None;
+        }
+        // FR-NV-5 link preview: an internal link's summary.
+        match link.internal_title {
+            Some(title) => {
+                let lang = self.lang.clone();
+                self.peek_prior_mode = self.mode;
+                self.peek = Some(PeekPopup::LinkPreview {
+                    lang: lang.clone(),
+                    title: title.clone(),
+                });
+                self.mode = Mode::Peek;
+                if self
+                    .summary_cache
+                    .contains_key(&(lang.clone(), title.clone()))
+                {
+                    self.summary_loading = false;
+                    self.status = "Link preview — Ctrl-o/Esc: close   Enter: open".to_string();
+                    None
+                } else {
+                    self.summary_loading = true;
+                    self.status = "Loading preview…".to_string();
+                    Some((lang, title))
+                }
+            }
+            None => {
+                self.status = "External link — nothing to preview".to_string();
+                None
+            }
+        }
+    }
+
+    /// Close the peek popup (`Ctrl-o`/`Esc`), restoring the prior mode.
+    pub fn close_peek(&mut self) {
+        self.mode = self.peek_prior_mode;
+        self.peek = None;
+        self.summary_loading = false;
+        self.refresh_reading_status();
+    }
+
+    /// The cached summary for the open link-preview popup, or `None` while it
+    /// is still loading (the popup then shows "loading…").
+    pub fn peek_summary(&self) -> Option<&crate::api::SummaryData> {
+        match &self.peek {
+            Some(PeekPopup::LinkPreview { lang, title }) => {
+                self.summary_cache.get(&(lang.clone(), title.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    /// The `(lang, title)` Enter opens from an open link-preview popup.
+    pub fn peek_open_target(&self) -> Option<(String, String)> {
+        match &self.peek {
+            Some(PeekPopup::LinkPreview { lang, title }) => Some((lang.clone(), title.clone())),
+            _ => None,
+        }
+    }
+
+    /// Installs a completed (or failed) link-preview summary into the session
+    /// cache (PRD FR-NV-5's "cached per-title for the session"), and — if the
+    /// popup is still showing exactly this target — clears its loading state.
+    /// A failure caches a default (empty) entry so a flaky request isn't
+    /// retried on every reopen, mirroring `deliver_related`.
+    pub fn deliver_summary(
+        &mut self,
+        lang: String,
+        title: String,
+        result: Result<crate::api::SummaryData, String>,
+    ) {
+        let data = result.unwrap_or_default();
+        let is_current = self.mode == Mode::Peek
+            && matches!(
+                &self.peek,
+                Some(PeekPopup::LinkPreview { lang: l, title: t }) if *l == lang && *t == title
+            );
+        self.summary_cache.insert((lang, title), data);
+        if is_current {
+            self.summary_loading = false;
+            self.status = "Link preview — Ctrl-o/Esc: close   Enter: open".to_string();
+        }
+    }
+
+    /// `gK` (PRD FR-NV-4): scroll to the References/Notes section, or report
+    /// that the article has none.
+    pub fn jump_to_references(&mut self) {
+        match find_references_section(&self.active_tab().sections) {
+            Some(i) => self.jump_to_section(i),
+            None => self.status = "No references section on this page".to_string(),
+        }
+    }
+
+    // -- Reading-position memory (PRD FR-NV-8) ------------------------------
+
+    /// The section title the given tab's current scroll sits in, for the
+    /// anchor-based resume fallback (PRD FR-NV-8). Only computable for the
+    /// active tab (the one `self.layout` describes); `None` otherwise or when
+    /// the scroll is above every heading.
+    fn anchor_at_scroll(&self, index: usize) -> Option<String> {
+        if index != self.active {
+            return None;
+        }
+        let layout = self.layout.as_ref()?;
+        let tab = self.tabs.get(index)?;
+        let scroll = tab.scroll as usize;
+        let mut anchor = None;
+        for section in &tab.sections {
+            let line = layout.block_lines.get(section.block).copied().unwrap_or(0);
+            if line <= scroll {
+                anchor = Some(section.title.clone());
+            } else {
+                break;
+            }
+        }
+        anchor
+    }
+
+    /// PRD FR-NV-8: persist the given tab's scroll/fold position for its
+    /// article, keyed to the current revid, unless incognito denies it (the
+    /// passive-write privacy gate — the same bucket as history). Called
+    /// wherever a tab's current view is ending: navigating away, closing the
+    /// tab, or quitting.
+    pub(crate) fn save_reading_position(&mut self, index: usize) {
+        if crate::privacy::decide(self.incognito, crate::privacy::Write::Position)
+            == crate::privacy::Verdict::Deny
+        {
+            return;
+        }
+        let anchor = self.anchor_at_scroll(index);
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let Some(doc) = tab.doc.as_ref() else {
+            return;
+        };
+        let title = doc.title.clone();
+        let lang = tab.lang.clone();
+        let revid = tab.current_revid;
+        let scroll = tab.scroll;
+        let mut folds: Vec<usize> = tab.folded_blocks.iter().copied().collect();
+        folds.sort_unstable();
+        self.history
+            .save_position(&lang, &title, revid, scroll, &folds, anchor.as_deref());
+    }
+
+    /// PRD FR-NV-8: after installing a document, raise the "resume at §… (r)"
+    /// toast when a saved position exists for it that isn't the top. Skipped
+    /// for the one navigation that already restored its own scroll
+    /// (`suppress_resume_once`, set by back/forward and the SWR reload).
+    fn check_resume_position(&mut self, index: usize) {
+        if self.suppress_resume_once {
+            self.suppress_resume_once = false;
+            return;
+        }
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let Some(doc) = tab.doc.as_ref() else {
+            return;
+        };
+        let title = doc.title.clone();
+        let lang = tab.lang.clone();
+        let revid = tab.current_revid;
+        let Some(saved) = self.history.position(&lang, &title) else {
+            return;
+        };
+        if saved.scroll == 0 && saved.folds.is_empty() {
+            return; // top of the article — nothing worth resuming to
+        }
+        let revid_matches = revid != 0 && saved.revid == revid;
+        self.notice = Some(match &saved.anchor {
+            Some(anchor) if !anchor.is_empty() => format!("resume at §{anchor}? (r)"),
+            _ => "resume where you left off? (r)".to_string(),
+        });
+        self.pending_resume = Some(ResumePosition {
+            scroll: saved.scroll,
+            folds: saved.folds,
+            revid_matches,
+            anchor: saved.anchor,
+        });
+    }
+
+    /// PRD FR-NV-8: apply the pending resume when the reader presses `r` on the
+    /// toast. Exact restore (scroll + folds) when the revision still matches;
+    /// otherwise the best-effort anchor fallback — scroll to the nearest
+    /// surviving heading named in the saved anchor rather than trust a stale
+    /// absolute offset against changed content.
+    pub fn resume_to_saved_position(&mut self) {
+        let Some(resume) = self.pending_resume.take() else {
+            return;
+        };
+        self.notice = None;
+        if resume.revid_matches {
+            self.active_tab_mut().folded_blocks = resume.folds.iter().copied().collect();
+            self.layout = None;
+            self.ensure_layout();
+            let max = self.computed_max_scroll();
+            self.active_tab_mut().scroll = resume.scroll.min(max);
+            self.status = "Resumed reading position".to_string();
+        } else {
+            match resume
+                .anchor
+                .as_deref()
+                .and_then(|a| self.section_index_by_title(a))
+            {
+                Some(i) => {
+                    self.jump_to_section(i);
+                    self.status = "Article changed — resumed at the nearest heading".to_string();
+                }
+                None => {
+                    self.status =
+                        "Article changed — couldn't restore the exact position".to_string();
+                }
+            }
+        }
+    }
+
+    /// The section (index into the active tab's outline) whose title matches
+    /// `title` case-insensitively — the anchor-fallback lookup for PRD FR-NV-8.
+    fn section_index_by_title(&self, title: &str) -> Option<usize> {
+        let needle = title.trim().to_lowercase();
+        self.active_tab()
+            .sections
+            .iter()
+            .position(|s| s.title.trim().to_lowercase() == needle)
     }
 
     /// Scroll so the active tab's focused link's first line is visible, if it
@@ -3103,15 +3665,20 @@ pub fn resolve_b_prefix(second_key: char) -> BPrefixAction {
     }
 }
 
-/// What the `z`-prefix chord's second key means (PRD FR-PR-3's `zz`,
-/// Appendix B). The first binding to claim the `z` prefix — section folding
-/// (FR-NV-3's `za`/`zM`/`zR`) is a later chunk, not this one, so every
-/// second key but `z` itself falls through unhandled today, the same
-/// dead-prefix fallback `resolve_g_prefix`/`resolve_b_prefix` already use.
+/// What the `z`-prefix chord's second key means (PRD FR-PR-3's `zz`, plus
+/// FR-NV-3's section folding `za`/`zM`/`zR`, Appendix B). Any other second key
+/// falls through unhandled, the same dead-prefix fallback `resolve_g_prefix`/
+/// `resolve_b_prefix` use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ZPrefixAction {
     /// `zz`: toggle incognito.
     ToggleIncognito,
+    /// `za` (PRD FR-NV-3): fold/unfold the section at the cursor.
+    ToggleFold,
+    /// `zM` (PRD FR-NV-3): fold every section.
+    FoldAll,
+    /// `zR` (PRD FR-NV-3): unfold every section.
+    UnfoldAll,
     /// Any other second key: dead prefix — `handle_key` processes it as if
     /// `z` had never been typed.
     PassThrough,
@@ -3120,6 +3687,9 @@ pub enum ZPrefixAction {
 pub fn resolve_z_prefix(second_key: char) -> ZPrefixAction {
     match second_key {
         'z' => ZPrefixAction::ToggleIncognito,
+        'a' => ZPrefixAction::ToggleFold,
+        'M' => ZPrefixAction::FoldAll,
+        'R' => ZPrefixAction::UnfoldAll,
         _ => ZPrefixAction::PassThrough,
     }
 }
@@ -3177,6 +3747,8 @@ pub enum GPrefixAction {
     Random,
     /// `gR` (PRD FR-SR-6): open the Related panel for the current article.
     Related,
+    /// `gK` (PRD FR-NV-4): jump to the References/Notes section.
+    References,
     /// Any other second key: dead prefix — `handle_key` processes it as if
     /// `g` had never been typed (e.g. `gj` still scrolls).
     PassThrough,
@@ -3191,6 +3763,7 @@ pub fn resolve_g_prefix(second_key: char) -> GPrefixAction {
         'h' => GPrefixAction::Home,
         'r' => GPrefixAction::Random,
         'R' => GPrefixAction::Related,
+        'K' => GPrefixAction::References,
         _ => GPrefixAction::PassThrough,
     }
 }
@@ -3268,6 +3841,102 @@ pub fn fallback_chain(primary: &str, preferred: &[String]) -> Vec<String> {
         }
     }
     chain
+}
+
+/// The reader-visible text of one block, flattened to a single string — used
+/// by the fold auto-unfold search (PRD FR-NV-3) to decide whether a folded
+/// section's body contains an in-page-find query without laying it out.
+fn block_text(block: &crate::doc::Block) -> String {
+    use crate::doc::Block;
+    let spans_text =
+        |spans: &[crate::doc::Span]| spans.iter().map(|s| s.text.as_str()).collect::<String>();
+    match block {
+        Block::Heading { spans, .. } | Block::Paragraph(spans) | Block::Blockquote(spans) => {
+            spans_text(spans)
+        }
+        Block::ListItem { spans, .. } => spans_text(spans),
+        Block::Code(text) => text.clone(),
+        Block::Table(table) => table.to_list_lines().join(" "),
+        Block::Infobox(rows) => rows
+            .iter()
+            .map(|(l, v)| format!("{l} {v}"))
+            .collect::<Vec<_>>()
+            .join(" "),
+        Block::Image { alt, caption, .. } => {
+            format!("{alt} {}", caption.clone().unwrap_or_default())
+        }
+        Block::Gallery(items) => items
+            .iter()
+            .map(|i| i.caption.clone())
+            .collect::<Vec<_>>()
+            .join(" "),
+        Block::Math { tex, .. } => tex.clone(),
+        Block::Rule => String::new(),
+    }
+}
+
+/// Whether one block's text contains `needle` (PRD FR-NV-3 auto-unfold).
+/// `needle` is already lower-cased by the caller when `case_sensitive` is
+/// false, matching `find`'s smart-case handling.
+fn block_matches_query(block: &crate::doc::Block, needle: &str, case_sensitive: bool) -> bool {
+    let text = block_text(block);
+    if case_sensitive {
+        text.contains(needle)
+    } else {
+        text.to_lowercase().contains(needle)
+    }
+}
+
+/// PRD FR-NV-4's `gK` target: the index of the article's References/Notes
+/// section, or `None` when it has none. Matches the common heading titles
+/// case-insensitively, preferring the *last* match (an article's citation
+/// apparatus sits at the end, after any in-prose "notes"). A pure function of
+/// the section outline so the choice is testable without a layout.
+pub fn find_references_section(sections: &[crate::doc::SectionRef]) -> Option<usize> {
+    const NAMES: &[&str] = &[
+        "references",
+        "notes",
+        "footnotes",
+        "citations",
+        "sources",
+        "works cited",
+        "bibliography",
+    ];
+    sections.iter().enumerate().rev().find_map(|(i, s)| {
+        let title = s.title.trim().to_lowercase();
+        NAMES.iter().any(|n| title == *n).then_some(i)
+    })
+}
+
+/// PRD FR-NV-4: resolve a focused reference marker (`[n]`) to its citation.
+/// The marker link's `href` is a same-page anchor (`#cite_note-1`); match it
+/// against `citations` by id first, then fall back to the bracketed number in
+/// the marker text (`[2]` → the 2nd citation) for markup that doesn't anchor
+/// by a matching id. `None` when neither resolves (a graceful "reference not
+/// found"). Pure so the marker→citation mapping is testable in isolation.
+pub fn resolve_reference<'a>(
+    citations: &'a [Citation],
+    href: &str,
+    text: &str,
+) -> Option<&'a Citation> {
+    let anchor = href.trim_start_matches('#');
+    if let Some(c) = citations.iter().find(|c| c.id == anchor) {
+        return Some(c);
+    }
+    let n: usize = text
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse()
+        .ok()?;
+    n.checked_sub(1).and_then(|i| citations.get(i))
+}
+
+/// Whether a focused link is a reference marker (PRD FR-NV-4) rather than a
+/// followable link: its href is a same-page `#cite`/`#cite_note` anchor. Used
+/// by the `K` dispatch to choose footnote peek over link preview.
+pub fn is_reference_marker(href: &str) -> bool {
+    href.starts_with("#cite") || href.starts_with("#endnote") || href.starts_with("#cite_note")
 }
 
 #[cfg(test)]
@@ -4159,6 +4828,368 @@ mod tests {
         assert_eq!(app.mode, Mode::Reading, "should still return to Reading");
     }
 
+    // ---- PRD FR-NV-3 section folding --------------------------------------
+
+    const FOLD_HTML: &str = "<html><body><p>lead</p>\
+        <h2>History</h2><p>history body needle one</p><p>history body two</p>\
+        <h2>Legacy</h2><p>legacy body text</p></body></html>";
+
+    fn laid_text(app: &App) -> String {
+        app.layout
+            .as_ref()
+            .map(|l| {
+                l.lines
+                    .iter()
+                    .map(|line| {
+                        line.spans
+                            .iter()
+                            .map(|s| s.text.as_str())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default()
+    }
+
+    fn fold_app() -> App {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(crate::doc::parse_article_html("T", FOLD_HTML));
+        app.layout_width = 80;
+        app.viewport_height = 6;
+        app.ensure_layout();
+        app
+    }
+
+    #[test]
+    fn za_folds_the_section_at_the_cursor_and_toggles_back() {
+        let mut app = fold_app();
+        let hist_block = app.active_tab().sections[0].block;
+        // Put the cursor in the History section.
+        let line = app.layout.as_ref().unwrap().block_lines[hist_block];
+        app.active_tab_mut().scroll = line as u16;
+
+        app.toggle_fold_at_cursor();
+        assert!(app.active_tab().folded_blocks.contains(&hist_block));
+        app.ensure_layout();
+        let folded = laid_text(&app);
+        assert!(folded.contains("▸ History"), "summary line: {folded:?}");
+        assert!(!folded.contains("history body needle one"), "body gone");
+        assert!(folded.contains("legacy body text"), "other section intact");
+
+        app.toggle_fold_at_cursor();
+        assert!(
+            !app.active_tab().folded_blocks.contains(&hist_block),
+            "za on a folded section unfolds it"
+        );
+    }
+
+    #[test]
+    fn zm_folds_all_and_zr_unfolds_all() {
+        let mut app = fold_app();
+        app.fold_all();
+        assert_eq!(app.active_tab().folded_blocks.len(), 2);
+        app.ensure_layout();
+        let folded = laid_text(&app);
+        assert!(folded.contains("▸ History"));
+        assert!(folded.contains("▸ Legacy"));
+        assert!(!folded.contains("history body needle one"));
+
+        app.unfold_all();
+        assert!(app.active_tab().folded_blocks.is_empty());
+        app.ensure_layout();
+        assert!(laid_text(&app).contains("history body needle one"));
+    }
+
+    #[test]
+    fn find_auto_unfolds_the_section_containing_a_hit() {
+        let mut app = fold_app();
+        let hist_block = app.active_tab().sections[0].block;
+        app.fold_all();
+        app.active_tab_mut().find_input = "needle".to_string();
+        app.update_find();
+        assert!(
+            !app.active_tab().folded_blocks.contains(&hist_block),
+            "the folded section with a hit auto-unfolds (PRD FR-NV-3)"
+        );
+        assert!(
+            !app.active_tab().find_matches.is_empty(),
+            "and the match is now locatable"
+        );
+    }
+
+    #[test]
+    fn cycle_link_skips_links_inside_a_folded_section() {
+        let html = "<html><body><p>lead <a href=\"./Lead\">lead link</a></p>\
+            <h2>History</h2><p>a <a href=\"./Hist\">hist link</a> here</p>\
+            <h2>Legacy</h2><p>a <a href=\"./Leg\">legacy link</a></p></body></html>";
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(crate::doc::parse_article_html("T", html));
+        app.layout_width = 80;
+        app.viewport_height = 20;
+        // The middle link (occ 1) lives in History; fold that section.
+        let hist_block = app.active_tab().sections[0].block;
+        app.active_tab_mut().folded_blocks.insert(hist_block);
+        app.ensure_layout();
+        // Cycle through every link; focus must never land on the folded one.
+        app.active_tab_mut().focused_link = None;
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            app.cycle_link(true);
+            seen.push(app.active_tab().focused_link.unwrap());
+        }
+        assert!(
+            !seen.contains(&1),
+            "the folded link (occ 1) is never focusable: {seen:?}"
+        );
+        assert!(seen.contains(&0) && seen.contains(&2));
+    }
+
+    // ---- PRD FR-NV-4 footnote peek + gK -----------------------------------
+
+    fn cite(id: &str, text: &str) -> Citation {
+        Citation {
+            id: id.to_string(),
+            text: text.to_string(),
+            url: None,
+        }
+    }
+
+    #[test]
+    fn resolve_reference_matches_by_id_then_by_bracket_number() {
+        let cites = vec![
+            cite("cite_note-1", "First source"),
+            cite("cite_note-2", "Second source"),
+        ];
+        assert_eq!(
+            resolve_reference(&cites, "#cite_note-2", "[2]").map(|c| c.text.as_str()),
+            Some("Second source")
+        );
+        // Fallback: a non-matching anchor but a bracket number.
+        assert_eq!(
+            resolve_reference(&cites, "#unknown", "[1]").map(|c| c.text.as_str()),
+            Some("First source")
+        );
+        // Missing reference resolves to nothing, gracefully.
+        assert!(resolve_reference(&cites, "#cite_note-9", "[9]").is_none());
+    }
+
+    #[test]
+    fn is_reference_marker_detects_cite_anchors() {
+        assert!(is_reference_marker("#cite_note-1"));
+        assert!(is_reference_marker("#cite_ref-3"));
+        assert!(!is_reference_marker("./Some_Article"));
+        assert!(!is_reference_marker("https://example.com"));
+    }
+
+    #[test]
+    fn find_references_section_prefers_the_trailing_apparatus() {
+        let sections = vec![
+            crate::doc::SectionRef {
+                level: 2,
+                title: "Notes on style".to_string(),
+                block: 1,
+            },
+            crate::doc::SectionRef {
+                level: 2,
+                title: "History".to_string(),
+                block: 5,
+            },
+            crate::doc::SectionRef {
+                level: 2,
+                title: "References".to_string(),
+                block: 9,
+            },
+        ];
+        assert_eq!(find_references_section(&sections), Some(2));
+        // No apparatus at all → None.
+        let none = vec![crate::doc::SectionRef {
+            level: 2,
+            title: "History".to_string(),
+            block: 1,
+        }];
+        assert_eq!(find_references_section(&none), None);
+    }
+
+    #[test]
+    fn k_on_a_reference_marker_opens_the_footnote_peek_without_network() {
+        let html = "<html><body>\
+            <p>Claim<sup class=\"reference\"><a href=\"#cite_note-1\">[1]</a></sup>.</p>\
+            <div class=\"mw-references-wrap\"><ol class=\"references\">\
+            <li id=\"cite_note-1\"><span class=\"reference-text\">Hodges, Andrew. The Enigma.</span></li>\
+            </ol></div></body></html>";
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(crate::doc::parse_article_html("T", html));
+        // Focus the reference marker (the only collected link).
+        app.active_tab_mut().focused_link = Some(0);
+        let fetch = app.open_peek_at_focus();
+        assert!(fetch.is_none(), "a footnote peek never triggers a fetch");
+        assert_eq!(app.mode, Mode::Peek);
+        match &app.peek {
+            Some(PeekPopup::Footnote { text, .. }) => {
+                assert!(text.contains("Hodges"), "resolved locally: {text:?}");
+            }
+            other => panic!("expected a footnote peek, got {other:?}"),
+        }
+        app.close_peek();
+        assert_eq!(app.mode, Mode::Reading);
+        assert!(app.peek.is_none());
+    }
+
+    // ---- PRD FR-NV-5 link preview -----------------------------------------
+
+    #[test]
+    fn k_on_an_internal_link_opens_a_distinct_preview_and_fetches_once() {
+        let html = "<html><body><p>See <a href=\"./Enigma_machine\">Enigma</a>.</p></body></html>";
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(crate::doc::parse_article_html("T", html));
+        app.active_tab_mut().focused_link = Some(0);
+
+        let fetch = app.open_peek_at_focus();
+        assert_eq!(
+            fetch,
+            Some(("en".to_string(), "Enigma machine".to_string())),
+            "an uncached internal link asks the caller to fetch its summary"
+        );
+        assert_eq!(app.mode, Mode::Peek);
+        assert!(app.summary_loading, "shows loading until the summary lands");
+        assert!(app.peek_summary().is_none());
+        assert!(matches!(app.peek, Some(PeekPopup::LinkPreview { .. })));
+
+        // Deliver the summary.
+        app.deliver_summary(
+            "en".to_string(),
+            "Enigma machine".to_string(),
+            Ok(crate::api::SummaryData {
+                title: "Enigma machine".to_string(),
+                description: "cipher device".to_string(),
+                extract: "The Enigma machine was a cipher device.".to_string(),
+                thumbnail: None,
+            }),
+        );
+        assert!(!app.summary_loading);
+        assert_eq!(
+            app.peek_summary().map(|s| s.description.as_str()),
+            Some("cipher device")
+        );
+
+        // Reopen: a cache hit needs no second fetch.
+        app.close_peek();
+        app.active_tab_mut().focused_link = Some(0);
+        assert!(
+            app.open_peek_at_focus().is_none(),
+            "the second peek is served from the session cache"
+        );
+        assert!(!app.summary_loading);
+    }
+
+    #[test]
+    fn k_with_no_focused_link_peeks_nothing() {
+        let html = "<html><body><p>No links here.</p></body></html>";
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(crate::doc::parse_article_html("T", html));
+        app.active_tab_mut().focused_link = None;
+        assert!(app.open_peek_at_focus().is_none());
+        assert_eq!(app.mode, Mode::Reading, "no popup opens");
+    }
+
+    // ---- PRD FR-NV-8 reading-position memory ------------------------------
+
+    const RESUME_HTML: &str = "<html><body><p>lead paragraph</p>\
+        <h2>History</h2><p>h1</p><p>h2</p><p>h3</p><p>h4</p><p>h5</p>\
+        <h2>Legacy</h2><p>l1</p><p>l2</p><p>l3</p><p>l4</p><p>l5</p></body></html>";
+
+    #[test]
+    fn revisiting_offers_resume_and_r_restores_the_saved_scroll() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.layout_width = 80;
+        app.viewport_height = 4;
+
+        // First open of the article, scroll down, then navigate away (which
+        // saves the position for the outgoing article).
+        app.set_document(crate::doc::parse_article_html("Alan Turing", RESUME_HTML));
+        app.active_tab_mut().current_revid = 5;
+        app.ensure_layout();
+        app.active_tab_mut().scroll = 7;
+        assert!(
+            app.pending_resume.is_none(),
+            "no toast on a first, unread open"
+        );
+        app.set_document(crate::doc::parse_article_html(
+            "Enigma machine",
+            RESUME_HTML,
+        ));
+
+        // Reopen the first article: the saved position raises the resume toast.
+        app.active_tab_mut().current_revid = 5;
+        app.set_document(crate::doc::parse_article_html("Alan Turing", RESUME_HTML));
+        assert!(app.pending_resume.is_some(), "revisit offers a resume");
+        assert!(
+            app.notice.as_deref().unwrap_or_default().contains("resume"),
+            "a non-blocking toast is shown: {:?}",
+            app.notice
+        );
+
+        app.ensure_layout();
+        app.resume_to_saved_position();
+        assert_eq!(app.active_tab().scroll, 7, "r restores the exact scroll");
+        assert!(app.pending_resume.is_none(), "resume is consumed");
+    }
+
+    #[test]
+    fn resume_falls_back_to_the_nearest_heading_when_the_revision_changed() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.layout_width = 80;
+        app.viewport_height = 4;
+        // Directly seed a saved position at an anchor, with a revid that won't
+        // match, to exercise the fallback path deterministically.
+        app.history
+            .save_position("en", "Alan Turing", 5, 99, &[], Some("Legacy"));
+        app.active_tab_mut().current_revid = 9; // different revision
+        app.set_document(crate::doc::parse_article_html("Alan Turing", RESUME_HTML));
+        assert!(app.pending_resume.is_some());
+        let resume = app.pending_resume.clone().unwrap();
+        assert!(
+            !resume.revid_matches,
+            "a changed revision uses the anchor path"
+        );
+
+        app.ensure_layout();
+        app.active_tab_mut().max_scroll = 100; // a long viewport, as after a draw
+        app.resume_to_saved_position();
+        // Landed on the Legacy heading rather than the stale absolute offset.
+        let legacy = app
+            .active_tab()
+            .sections
+            .iter()
+            .position(|s| s.title == "Legacy")
+            .unwrap();
+        let legacy_line =
+            app.layout.as_ref().unwrap().block_lines[app.active_tab().sections[legacy].block];
+        assert_eq!(app.active_tab().scroll as usize, legacy_line);
+    }
+
+    #[test]
+    fn incognito_never_writes_a_reading_position() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.incognito = true;
+        app.layout_width = 80;
+        app.viewport_height = 4;
+        app.set_document(crate::doc::parse_article_html("Alan Turing", RESUME_HTML));
+        app.active_tab_mut().current_revid = 5;
+        app.ensure_layout();
+        app.active_tab_mut().scroll = 7;
+        // Navigating away would save a position — but incognito denies it.
+        app.set_document(crate::doc::parse_article_html(
+            "Enigma machine",
+            RESUME_HTML,
+        ));
+        assert!(
+            app.history.position("en", "Alan Turing").is_none(),
+            "incognito must not persist a reading position (privacy gate)"
+        );
+    }
+
     #[test]
     fn cycle_theme_advances_through_all_builtins() {
         let mut app = App::new("en".to_string(), Theme::terminal(), false);
@@ -4967,8 +5998,10 @@ mod tests {
             ],
             block_lines: vec![0],
             link_lines: vec![],
+            link_visible: vec![],
             link_cols: vec![],
             continuation: vec![true],
+            folds: vec![],
         });
         app.layout_width = 20; // matches the hand-built Layout's `width`, so `ensure_layout` (which `update_find` calls) sees it as fresh and doesn't discard it
         app.active_tab_mut().max_scroll = 100;
@@ -5779,14 +6812,15 @@ mod tests {
         assert_eq!(resolve_g_prefix('j'), GPrefixAction::PassThrough);
     }
 
-    /// PRD FR-PR-3 / Appendix B's `zz` incognito toggle: only `zz` resolves,
-    /// every other second key is a dead prefix (no folding chords exist yet
-    /// to claim them — see `resolve_z_prefix`'s doc comment).
+    /// PRD FR-PR-3's `zz` incognito toggle plus FR-NV-3's folding chords
+    /// (`za`/`zM`/`zR`); every other second key is a dead prefix.
     #[test]
-    fn z_prefix_dispatches_zz_to_toggle_incognito_and_anything_else_passes_through() {
+    fn z_prefix_dispatches_zz_to_toggle_incognito_and_folding_chords() {
         assert_eq!(resolve_z_prefix('z'), ZPrefixAction::ToggleIncognito);
-        assert_eq!(resolve_z_prefix('a'), ZPrefixAction::PassThrough);
-        assert_eq!(resolve_z_prefix('M'), ZPrefixAction::PassThrough);
+        assert_eq!(resolve_z_prefix('a'), ZPrefixAction::ToggleFold);
+        assert_eq!(resolve_z_prefix('M'), ZPrefixAction::FoldAll);
+        assert_eq!(resolve_z_prefix('R'), ZPrefixAction::UnfoldAll);
+        assert_eq!(resolve_z_prefix('x'), ZPrefixAction::PassThrough);
     }
 
     // ---- Reading history (PRD FR-HS-1/2/4) --------------------------------

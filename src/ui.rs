@@ -4,7 +4,9 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout as UiLayout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span as RSpan, Text};
-use ratatui::widgets::{Block as UiBlock, Borders, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{
+    Block as UiBlock, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
+};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::app::{App, Mode};
@@ -496,6 +498,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         // The palette (FR-CS-1) and onboarding (FR-CS-8) are modal overlays
         // painted after the status bar below; the reading view sits behind them.
         Mode::Palette | Mode::Onboarding => draw_reading(frame, app, content_area),
+        // PRD FR-NV-4/5's `K` peek popup overlays the reading view, drawn
+        // after the status bar below like the help/offline overlays.
+        Mode::Peek => draw_reading(frame, app, content_area),
     }
 
     draw_status_bar(frame, app, status_area);
@@ -525,6 +530,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     if app.mode == Mode::Help {
         draw_help_overlay(frame, app, area);
+    }
+
+    // PRD FR-NV-4/5's `K` peek popup: a floating card over the reading view.
+    if app.mode == Mode::Peek {
+        draw_peek_popup(frame, app, area);
     }
 
     // PRD FR-CS-1's command palette and FR-CS-8's onboarding: modal overlays,
@@ -2084,6 +2094,74 @@ fn draw_redlink_card(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+/// PRD FR-NV-4/5's `K` peek popup: a footnote peek (a reference's text,
+/// resolved locally) or a link preview (a target's title, Wikidata
+/// description, and lead extract). The two are visually distinct by their
+/// border label ("Reference [n]" vs "Preview") so a reader can tell at a
+/// glance which kind of peek is up. The body wraps to the popup width, so no
+/// laid line overflows the card (`Wrap` is safe here — this is a fixed short
+/// card, not the reading view's line-mapped content).
+fn draw_peek_popup(frame: &mut Frame, app: &App, area: Rect) {
+    let width = 64.min(area.width.saturating_sub(4)).max(24);
+    let height = 12.min(area.height.saturating_sub(2)).max(6);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    let dim = colored(app.no_color, app.theme.dim);
+    let (title, body): (String, Text) = match &app.peek {
+        Some(crate::app::PeekPopup::Footnote { marker, text }) => {
+            let body = Text::from(vec![
+                Line::from(RSpan::styled(
+                    "Reference",
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(text.clone()),
+            ]);
+            (format!("Reference {marker}"), body)
+        }
+        Some(crate::app::PeekPopup::LinkPreview { title, .. }) => {
+            let mut lines = vec![Line::from(RSpan::styled(
+                title.clone(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ))];
+            match app.peek_summary() {
+                Some(summary) => {
+                    if !summary.description.is_empty() {
+                        lines.push(Line::from(RSpan::styled(
+                            summary.description.clone(),
+                            dim.add_modifier(Modifier::ITALIC),
+                        )));
+                    }
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(if summary.extract.is_empty() {
+                        "(no extract available)".to_string()
+                    } else {
+                        summary.extract.clone()
+                    }));
+                }
+                None => {
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(RSpan::styled("loading…", dim)));
+                }
+            }
+            ("Preview".to_string(), Text::from(lines))
+        }
+        None => ("Peek".to_string(), Text::from("")),
+    };
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(body)
+            .style(base_style(&app.theme, app.no_color))
+            .wrap(Wrap { trim: false })
+            .block(UiBlock::default().borders(Borders::ALL).title(title)),
+        popup,
+    );
+}
+
 /// PRD FR-PR-3's "visible status glyph": a persistent, plain-text
 /// `[incognito]` marker prepended to the status bar in *every* mode (not
 /// just Reading — a picker or a prompt is exactly when a reader most needs
@@ -2162,6 +2240,9 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         Mode::RedlinkCard => {
             "s: search similar titles   y: yank create URL   Esc: dismiss".to_string()
         }
+        // PRD FR-NV-4/5: the `K` peek popup carries its own status text
+        // (set by `open_peek_at_focus`/`deliver_summary`).
+        Mode::Peek => app.status.clone(),
         Mode::ReadingHistory => app.status.clone(),
         Mode::ReadingHistoryFilter => {
             format!("filter: {}   Esc: apply", app.history_pick_filter)

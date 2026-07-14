@@ -109,6 +109,7 @@ PAGES = {
       more widely, with statues, prizes, and many things named after him, including the annual
       Turing Award, the highest distinction in computer science. His portrait appears on the
       Bank of England fifty pound note.</p>
+      <h2>References</h2>
       <div class="mw-references-wrap">
         <ol class="references">
           <li id="cite_note-1">
@@ -409,10 +410,24 @@ SEARCH_PAGES = [
 # extract per title, served at /api/rest_v1/page/summary/{title}. A title with
 # no explicit entry falls back to a synthesized one-liner so any internal link
 # still resolves offline.
+# PRD FR-NV-5 link preview also reads the Wikidata one-line `description` and
+# a `thumbnail` URL from this same endpoint. An entry may be either a bare
+# extract string (back-compat, no description/thumbnail) or a dict with
+# `extract`/`description`/`thumbnail` keys.
 SUMMARIES = {
-    "Computer_science": "Computer science is the study of computation, information, and automation.",
-    "Enigma_machine": "The Enigma machine was a cipher device used in the early to mid-20th century.",
-    "Alan_Turing": "Alan Turing was an English mathematician and computer scientist.",
+    "Computer_science": {
+        "extract": "Computer science is the study of computation, information, and automation.",
+        "description": "study of computation",
+    },
+    "Enigma_machine": {
+        "extract": "The Enigma machine was a cipher device used in the early to mid-20th century.",
+        "description": "German cipher machine",
+        "thumbnail": "/media/potd.png",
+    },
+    "Alan_Turing": {
+        "extract": "Alan Turing was an English mathematician and computer scientist.",
+        "description": "English computer scientist (1912-1954)",
+    },
 }
 
 # PRD FR-OFF-5 bulk-save-by-category fixtures: category name (without the
@@ -661,8 +676,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # link target. A title without an explicit SUMMARIES entry gets a
         # synthesized one-liner so link-peek still resolves offline.
         title = urllib.parse.unquote(parts[-1])
-        extract = SUMMARIES.get(title, f"{title.replace('_', ' ')} is a topic on Wikipedia.")
-        self._send_json({"title": title.replace('_', ' '), "extract": extract})
+        entry = SUMMARIES.get(title, f"{title.replace('_', ' ')} is a topic on Wikipedia.")
+        # PRD FR-NV-5: an entry is either a bare extract string or a dict with
+        # extract/description/thumbnail. Normalise to the REST summary shape.
+        if isinstance(entry, dict):
+            extract = entry.get("extract", "")
+            description = entry.get("description", "")
+            thumb = entry.get("thumbnail")
+        else:
+            extract, description, thumb = entry, "", None
+        payload = {
+            "title": title.replace('_', ' '),
+            "extract": extract,
+            "description": description,
+        }
+        if thumb:
+            payload["thumbnail"] = {"source": thumb}
+        self._send_json(payload)
 
     def _serve_action_api(self, params):
         action = params.get('action', [''])[0]

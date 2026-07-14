@@ -66,6 +66,11 @@ pub enum Write {
     /// posture as `Stats` above.
     #[allow(dead_code)]
     Interest,
+    /// Reading-position memory (PRD FR-NV-8) — `history::History::save_position`
+    /// (`app::save_reading_position`). Passive: a side effect of reading a
+    /// reader never asked to persist by name, so it lives in the same deny
+    /// bucket as `History` (see this module's "Seams" note).
+    Position,
     /// Scheduling a prefetch job (`app::prefetch_active`) — passive.
     Prefetch,
     /// `cache::PageCache::put_at` — see the module doc comment's "The
@@ -114,9 +119,11 @@ pub fn decide(incognito: bool, write: Write) -> Verdict {
         return Verdict::Allow;
     }
     match write {
-        // Passive tracking (PRD FR-PR-3's explicit list, plus the two seams
+        // Passive tracking (PRD FR-PR-3's explicit list, plus the seams
         // it implies): suppressed outright.
-        Write::History | Write::Stats | Write::Interest | Write::Prefetch => Verdict::Deny,
+        Write::History | Write::Stats | Write::Interest | Write::Position | Write::Prefetch => {
+            Verdict::Deny
+        }
         // See the module doc comment's "The passive/explicit split": never
         // denied, only tagged for wipe by `cache::PageCache` itself.
         Write::Cache => Verdict::Allow,
@@ -221,6 +228,7 @@ mod tests {
             Write::History,
             Write::Stats,
             Write::Interest,
+            Write::Position,
             Write::Prefetch,
             Write::Cache,
             Write::Bookmark,
@@ -243,6 +251,7 @@ mod tests {
             Write::History,
             Write::Stats,
             Write::Interest,
+            Write::Position,
             Write::Prefetch,
         ] {
             assert_eq!(

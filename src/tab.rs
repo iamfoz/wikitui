@@ -48,6 +48,13 @@ pub struct Tab {
     pub focused_link: Option<usize>,
     pub sections: Vec<SectionRef>,
     pub selected_section: usize,
+    /// PRD FR-NV-3: the `doc.blocks` indices of headings folded shut in this
+    /// tab (`za`/`zM`/`zR` view state). Stored as heading-block indices — the
+    /// exact set `layout::layout_document_with_images` takes as its `folds`
+    /// input and the L1 cache key carries — rather than section-outline
+    /// indices, so it needs no translation at layout time and stays valid for
+    /// the life of one document. Reset whenever a new document is installed.
+    pub folded_blocks: std::collections::HashSet<usize>,
     pub back_stack: Vec<HistoryEntry>,
     pub forward_stack: Vec<HistoryEntry>,
     pub scroll: u16,
@@ -104,6 +111,7 @@ impl Tab {
             focused_link: None,
             sections: Vec::new(),
             selected_section: 0,
+            folded_blocks: std::collections::HashSet::new(),
             back_stack: Vec::new(),
             forward_stack: Vec::new(),
             scroll: 0,
@@ -146,6 +154,9 @@ impl Tab {
         self.focused_link = if self.links.is_empty() { None } else { Some(0) };
         self.sections = section_outline(&doc);
         self.selected_section = 0;
+        // A fresh document's block indices are new — any folds from the
+        // previous document would collapse the wrong ranges (PRD FR-NV-3).
+        self.folded_blocks.clear();
         self.doc = Some(doc);
         self.scroll = 0;
         self.table_col_offset = 0;
@@ -179,6 +190,7 @@ impl Tab {
         self.focused_link = None;
         self.sections.clear();
         self.selected_section = 0;
+        self.folded_blocks.clear();
         self.scroll = 0;
         self.max_scroll = 0;
         self.table_col_offset = 0;

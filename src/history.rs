@@ -51,7 +51,7 @@ use rusqlite::{Connection, params};
 /// Schema version this build understands (the `PRAGMA user_version`
 /// counterpart of `config::CONFIG_VERSION`). Bump alongside a new branch in
 /// `migrate` when the shape of `visits` changes.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// One logged page view (PRD FR-HS-1's "title, wiki, timestamp, dwell time,
 /// referrer article").
@@ -67,6 +67,21 @@ pub struct Visit {
     pub dwell_secs: i64,
     pub referrer_lang: Option<String>,
     pub referrer_title: Option<String>,
+}
+
+/// A saved reading position (PRD FR-NV-8): where the reader last left an
+/// article, keyed to the revision it was saved against. `revid == 0` means the
+/// revision was unknown at save time (degraded mode), in which case the exact
+/// restore is skipped in favor of the anchor fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedPosition {
+    pub revid: u64,
+    pub scroll: u16,
+    /// The folded-heading-block set, sorted (PRD FR-NV-3 fold state).
+    pub folds: Vec<usize>,
+    /// The section heading the saved scroll sat in — the anchor for the
+    /// revid-mismatch fallback. `None` when the scroll was above every heading.
+    pub anchor: Option<String>,
 }
 
 /// What `History::clear` (PRD FR-HS-4) removes.
@@ -195,6 +210,77 @@ impl History {
             params![additional_secs as i64, id],
         ) {
             log_write_failure("update_dwell", &e);
+        }
+    }
+
+    /// PRD FR-NV-8: save (replacing any prior) the reading position for
+    /// `(lang, title)`. Best-effort like the other passive writes here — a
+    /// failure is swallowed to a log line, never surfaced. `folds` is stored as
+    /// a sorted comma-separated block-index list.
+    pub fn save_position(
+        &mut self,
+        lang: &str,
+        title: &str,
+        revid: u64,
+        scroll: u16,
+        folds: &[usize],
+        anchor: Option<&str>,
+    ) {
+        let folds_csv = folds
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let now = now_unix();
+        if let Err(e) = self.conn.execute(
+            "INSERT INTO positions (lang, title, revid, scroll, folds, anchor, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(lang, title) DO UPDATE SET
+                revid = ?3, scroll = ?4, folds = ?5, anchor = ?6, updated_at = ?7",
+            params![
+                lang,
+                title,
+                revid as i64,
+                scroll as i64,
+                folds_csv,
+                anchor,
+                now
+            ],
+        ) {
+            log_write_failure("save_position", &e);
+        }
+    }
+
+    /// PRD FR-NV-8: the saved reading position for `(lang, title)`, or `None`
+    /// if none was ever stored (or the read failed).
+    pub fn position(&self, lang: &str, title: &str) -> Option<SavedPosition> {
+        let row = self.conn.query_row(
+            "SELECT revid, scroll, folds, anchor FROM positions WHERE lang = ?1 AND title = ?2",
+            params![lang, title],
+            |row| {
+                let revid: i64 = row.get(0)?;
+                let scroll: i64 = row.get(1)?;
+                let folds: String = row.get(2)?;
+                let anchor: Option<String> = row.get(3)?;
+                Ok((revid, scroll, folds, anchor))
+            },
+        );
+        match row {
+            Ok((revid, scroll, folds_csv, anchor)) => Some(SavedPosition {
+                revid: revid.max(0) as u64,
+                scroll: scroll.clamp(0, u16::MAX as i64) as u16,
+                folds: folds_csv
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .filter_map(|s| s.parse().ok())
+                    .collect(),
+                anchor: anchor.filter(|s| !s.is_empty()),
+            }),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => {
+                log_write_failure("position", &e);
+                None
+            }
         }
     }
 
@@ -373,7 +459,10 @@ fn load_visited(conn: &Connection) -> HashMap<String, HashSet<String>> {
 /// no redundant DDL.
 fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if version < SCHEMA_VERSION {
+    if version >= SCHEMA_VERSION {
+        return Ok(()); // already current — no redundant DDL on every launch
+    }
+    if version < 1 {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS visits (
                 id INTEGER PRIMARY KEY,
@@ -387,6 +476,27 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             CREATE INDEX IF NOT EXISTS idx_visits_lang_title ON visits(lang, title);
             CREATE INDEX IF NOT EXISTS idx_visits_opened_at ON visits(opened_at);
             PRAGMA user_version = 1;",
+        )?;
+    }
+    if version < 2 {
+        // PRD FR-NV-8 reading-position memory: one row per article, replaced on
+        // each save. `revid` decides exact-vs-anchor restore; `folds` is the
+        // sorted folded-heading-block set as a comma-separated list; `anchor`
+        // is the section heading the saved scroll sat in (the revid-mismatch
+        // fallback target). Sharing history.sqlite means `clear-data --history`
+        // (a whole-file delete) already covers positions.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS positions (
+                lang TEXT NOT NULL,
+                title TEXT NOT NULL,
+                revid INTEGER NOT NULL DEFAULT 0,
+                scroll INTEGER NOT NULL DEFAULT 0,
+                folds TEXT NOT NULL DEFAULT '',
+                anchor TEXT,
+                updated_at INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (lang, title)
+            );
+            PRAGMA user_version = 2;",
         )?;
     }
     Ok(())
@@ -476,6 +586,55 @@ mod tests {
     }
 
     // ---- Schema / migration ------------------------------------------------
+
+    #[test]
+    fn a_fresh_database_migrates_to_the_current_schema_version() {
+        let history = History::in_memory();
+        let version: i64 = history
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    // ---- PRD FR-NV-8 reading-position memory ------------------------------
+
+    #[test]
+    fn save_and_read_a_reading_position_round_trips() {
+        let mut history = History::in_memory();
+        assert!(history.position("en", "Alan Turing").is_none());
+        history.save_position("en", "Alan Turing", 42, 17, &[3, 8], Some("Legacy"));
+        let pos = history.position("en", "Alan Turing").expect("saved");
+        assert_eq!(pos.revid, 42);
+        assert_eq!(pos.scroll, 17);
+        assert_eq!(pos.folds, vec![3, 8]);
+        assert_eq!(pos.anchor.as_deref(), Some("Legacy"));
+    }
+
+    #[test]
+    fn saving_a_position_replaces_the_prior_one_for_that_article() {
+        let mut history = History::in_memory();
+        history.save_position("en", "Alan Turing", 1, 5, &[], None);
+        history.save_position("en", "Alan Turing", 2, 30, &[], Some("History"));
+        let pos = history.position("en", "Alan Turing").unwrap();
+        assert_eq!(pos.revid, 2);
+        assert_eq!(pos.scroll, 30);
+        assert_eq!(pos.anchor.as_deref(), Some("History"));
+    }
+
+    #[test]
+    fn a_saved_position_survives_a_reopen_of_the_same_file() {
+        let path = temp_path();
+        {
+            let mut history = History::open_at(&path);
+            history.save_position("en", "Alan Turing", 7, 12, &[1], Some("Career"));
+        }
+        let reopened = History::open_at(&path);
+        let pos = reopened.position("en", "Alan Turing").expect("persisted");
+        assert_eq!(pos.scroll, 12);
+        assert_eq!(pos.folds, vec![1]);
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn opening_the_same_file_twice_is_idempotent() {
