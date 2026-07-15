@@ -32,7 +32,13 @@ use crate::theme::Theme;
 /// disk hit per link per frame is exactly what the in-memory cache exists
 /// to avoid.
 fn visited_titles(app: &App) -> HashSet<&str> {
-    let tab = app.active_tab();
+    visited_titles_for(app, app.active_tab())
+}
+
+/// PRD FR-HS-2 visited styling for a *specific* tab (split rendering lays each
+/// pane out against its own tab). The active-tab [`visited_titles`] delegates
+/// here.
+fn visited_titles_for<'a>(app: &'a App, tab: &'a crate::tab::Tab) -> HashSet<&'a str> {
     let mut set: HashSet<&str> = tab.back_stack.iter().map(|e| e.title.as_str()).collect();
     set.extend(tab.forward_stack.iter().map(|e| e.title.as_str()));
     if let Some(doc) = &tab.doc {
@@ -51,7 +57,13 @@ fn visited_titles(app: &App) -> HashSet<&str> {
 /// built fresh each draw exactly like `visited_titles` reads
 /// `history::History` fresh each draw rather than caching a snapshot.
 fn confirmed_redlink_titles(app: &App) -> HashSet<&str> {
-    let lang = &app.active_tab().lang;
+    confirmed_redlink_titles_for(app, &app.active_tab().lang)
+}
+
+/// PRD FR-DL-5 confirmed redlinks for a *specific* wiki edition (split panes
+/// may hold two languages). The active-tab [`confirmed_redlink_titles`]
+/// delegates here.
+fn confirmed_redlink_titles_for<'a>(app: &'a App, lang: &str) -> HashSet<&'a str> {
     app.confirmed_redlinks
         .iter()
         .filter(|(l, _)| l == lang)
@@ -870,6 +882,14 @@ fn draw_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_reading(frame: &mut Frame, app: &mut App, area: Rect) {
+    // PRD FR-TB-4 / FR-ML-3: a split renders two panes side by side instead of
+    // the single reading column. Additive — every mode that draws the reading
+    // view (Reading, and overlays like Command/Help/Peek behind them) routes
+    // through here, so the split shows behind those overlays too.
+    if app.split.is_some() {
+        draw_split(frame, app, area);
+        return;
+    }
     if app.active_tab().doc.is_some() {
         let visible_height = area.height.max(1);
         // Build (or reuse) the width-aware layout for this width, so scroll
@@ -937,6 +957,252 @@ fn draw_reading(frame: &mut Frame, app: &mut App, area: Rect) {
         draw_blank_welcome(frame, app, area);
     } else {
         draw_start_page(frame, app, area);
+    }
+}
+
+/// PRD FR-TB-4 / FR-ML-3: draw the two-pane split. The content area is divided
+/// into left | one-column divider | right, each pane rendering its tab's
+/// document laid out at the pane's own (narrower) width. A per-pane header row
+/// shows the article title + language, highlighted for the focused pane (which
+/// receives keys); a bilingual split adds a top banner making clear the two
+/// editions are independent articles, not a translation (FR-ML-3 UX copy). The
+/// focused pane's layout/width/height are mirrored back onto the app-global
+/// fields so find, section-jump, and link-focus (which read `app.layout`)
+/// operate on the focused pane at its pane width.
+fn draw_split(frame: &mut Frame, app: &mut App, area: Rect) {
+    let (panes, focused_slot, bilingual) = {
+        let s = app
+            .split
+            .as_ref()
+            .expect("draw_split is only reached with a split active");
+        (s.panes, s.focused, s.bilingual)
+    };
+    let (Some(left_idx), Some(right_idx)) =
+        (app.tab_index_by_id(panes[0]), app.tab_index_by_id(panes[1]))
+    else {
+        // A pane's tab vanished (shouldn't happen — every close path drops the
+        // split): degrade to single-pane rather than panic.
+        app.split = None;
+        draw_reading(frame, app, area);
+        return;
+    };
+
+    // PRD FR-ML-3 UX copy: the "not a translation" banner above a bilingual
+    // split, on the terminal's own status colors so it reads as chrome.
+    let mut body = area;
+    if bilingual {
+        let banner = Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: 1,
+        };
+        let banner_style = colored_bg(app.no_color, app.theme.status_fg, app.theme.status_bg);
+        frame.render_widget(
+            Paragraph::new(Line::from(RSpan::styled(
+                "interwiki — independent articles in each language, not a translation",
+                banner_style.add_modifier(Modifier::BOLD),
+            )))
+            .style(banner_style),
+            banner,
+        );
+        body = Rect {
+            x: area.x,
+            y: area.y + 1,
+            width: area.width,
+            height: area.height.saturating_sub(1),
+        };
+    }
+
+    // Two panes plus a one-column vertical divider between them.
+    let divider_w = 1u16;
+    let avail = body.width.saturating_sub(divider_w);
+    let left_w = avail / 2;
+    let right_w = avail - left_w;
+    let left_area = Rect {
+        x: body.x,
+        y: body.y,
+        width: left_w,
+        height: body.height,
+    };
+    let divider_area = Rect {
+        x: body.x + left_w,
+        y: body.y,
+        width: divider_w,
+        height: body.height,
+    };
+    let right_area = Rect {
+        x: body.x + left_w + divider_w,
+        y: body.y,
+        width: right_w,
+        height: body.height,
+    };
+    // The header eats the pane's top row; content fills the rest.
+    let content_h = body.height.saturating_sub(1);
+
+    // Lay each pane out at its own width (an L1 cache lookup/miss — the cache
+    // keys on width, so this shares entries with any single-pane view at the
+    // same width).
+    let left_layout = app.layout_for_tab(left_idx, left_w);
+    let right_layout = app.layout_for_tab(right_idx, right_w);
+
+    // Clamp each pane's scroll to its own laid-out length; record max_scroll so
+    // scroll-sync and the scroll keys stay in bounds per pane.
+    for (idx, layout) in [(left_idx, &left_layout), (right_idx, &right_layout)] {
+        let total = layout.as_ref().map(|l| l.lines.len() as u16).unwrap_or(0);
+        let max_scroll = total.saturating_sub(content_h.max(1));
+        let t = &mut app.tabs[idx];
+        t.max_scroll = max_scroll;
+        t.scroll = t.scroll.min(max_scroll);
+    }
+
+    // Refresh the split's section-boundary line cache (one-frame-stale, per the
+    // field's doc comment) so SyncMode::Section can align without relayout.
+    let left_sec = left_layout
+        .as_ref()
+        .map(|l| pane_section_lines(&app.tabs[left_idx], l))
+        .unwrap_or_default();
+    let right_sec = right_layout
+        .as_ref()
+        .map(|l| pane_section_lines(&app.tabs[right_idx], l))
+        .unwrap_or_default();
+    if let Some(s) = app.split.as_mut() {
+        s.pane_section_lines = [left_sec, right_sec];
+    }
+
+    // Per-pane content rects (header on top).
+    let pane_content = |pane: Rect| Rect {
+        x: pane.x,
+        y: pane.y + 1,
+        width: pane.width,
+        height: pane.height.saturating_sub(1),
+    };
+    let left_content = pane_content(left_area);
+    let right_content = pane_content(right_area);
+
+    // Mirror the focused pane's geometry/layout onto the app-global fields the
+    // reading-view helpers read (find, section jump, link-focus, mouse hit).
+    let (focused_content, focused_w, focused_layout) = if focused_slot == 0 {
+        (left_content, left_w, &left_layout)
+    } else {
+        (right_content, right_w, &right_layout)
+    };
+    app.layout_width = focused_w;
+    app.viewport_height = content_h.max(1);
+    app.last_content_area = focused_content;
+    app.layout = focused_layout.clone();
+
+    // Paint the divider as a full-height rule.
+    let divider_style = colored(app.no_color, app.theme.dim);
+    let divider_lines: Vec<Line> = (0..divider_area.height)
+        .map(|_| Line::from(RSpan::styled("│", divider_style)))
+        .collect();
+    frame.render_widget(
+        Paragraph::new(Text::from(divider_lines)).style(base_style(&app.theme, app.no_color)),
+        divider_area,
+    );
+
+    paint_pane(
+        frame,
+        app,
+        left_area,
+        left_content,
+        left_idx,
+        left_layout.as_ref(),
+        focused_slot == 0,
+    );
+    paint_pane(
+        frame,
+        app,
+        right_area,
+        right_content,
+        right_idx,
+        right_layout.as_ref(),
+        focused_slot == 1,
+    );
+}
+
+/// The sorted, deduped set of laid-out line positions at which `tab`'s sections
+/// begin, for a given `layout` — the section-boundary list PRD FR-ML-3's
+/// heuristic scroll-sync ([`crate::split::section_synced_scroll`]) aligns on.
+fn pane_section_lines(tab: &crate::tab::Tab, layout: &crate::layout::Layout) -> Vec<u16> {
+    let mut v: Vec<u16> = tab
+        .sections
+        .iter()
+        .filter_map(|s| layout.block_lines.get(s.block).copied())
+        .map(|l| l as u16)
+        .collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// Paint one split pane (PRD FR-TB-4): a header row (article title + language,
+/// highlighted when `focused`) above the laid-out content scrolled to the tab's
+/// own offset. The unfocused pane's header is dimmed — the focus indicator.
+#[allow(clippy::too_many_arguments)]
+fn paint_pane(
+    frame: &mut Frame,
+    app: &App,
+    _pane_area: Rect,
+    content_area: Rect,
+    tab_idx: usize,
+    layout: Option<&crate::layout::Layout>,
+    focused: bool,
+) {
+    let tab = &app.tabs[tab_idx];
+    let header_area = Rect {
+        x: content_area.x,
+        y: content_area.y.saturating_sub(1),
+        width: content_area.width,
+        height: 1,
+    };
+    let header_text = format!("{} ({})", tab.display_title(), tab.lang);
+    let header_style = if focused {
+        colored_bg(app.no_color, app.theme.selected_fg, app.theme.selected_bg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        colored(app.no_color, app.theme.dim)
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(RSpan::styled(header_text, header_style)))
+            .style(base_style(&app.theme, app.no_color)),
+        header_area,
+    );
+
+    match layout {
+        Some(layout) => {
+            let visited = visited_titles_for(app, tab);
+            let redlinks = confirmed_redlink_titles_for(app, &tab.lang);
+            let text = paint_document(
+                &layout.lines,
+                tab.focused_link,
+                &tab.links,
+                &visited,
+                &redlinks,
+                &app.theme,
+                app.no_color,
+                &tab.find_occurrences,
+                tab.find_index,
+                &app.image_store,
+            );
+            frame.render_widget(
+                Paragraph::new(text)
+                    .style(base_style(&app.theme, app.no_color))
+                    .scroll((tab.scroll, 0)),
+                content_area,
+            );
+        }
+        None => {
+            frame.render_widget(
+                Paragraph::new(RSpan::styled(
+                    "(empty pane)",
+                    colored(app.no_color, app.theme.dim),
+                ))
+                .style(base_style(&app.theme, app.no_color)),
+                content_area,
+            );
+        }
     }
 }
 

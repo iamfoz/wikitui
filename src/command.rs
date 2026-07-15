@@ -149,6 +149,15 @@ pub enum Command {
     /// bookmark with the configured `watchlist_mirror_tag`, without
     /// touching Reading List sync.
     MirrorWatchlist,
+    /// `:vsplit` / `:vsp` (PRD FR-TB-4, also `Ctrl-w v`) — split the content
+    /// area into two side-by-side panes showing the current article.
+    VSplit,
+    /// `:only` / `:close` (PRD FR-TB-4, also `Ctrl-w c`) — collapse an active
+    /// split back to a single pane.
+    Only,
+    /// `:bilingual` / `:bi` (PRD FR-ML-3) — open the current article in a split
+    /// alongside the same article in another language (via langlinks).
+    Bilingual,
     /// `:q` / `:quit` — exit.
     Quit,
 }
@@ -249,6 +258,8 @@ fn validate_set_value(
         "images" => on_off(value),
         // PRD FR-PF-6 kill switch.
         "prefetch" => on_off(value),
+        // PRD FR-TB-4: sync-scroll the two panes of a split.
+        "scrollbind" => on_off(value),
         // PRD FR-TH-2: live theme switch, same validation as `:theme <name>`
         // and the config loader.
         "theme" => {
@@ -367,12 +378,12 @@ fn validate_set_value(
             Err(_) => Err(format!("word_spacing must be an integer (got {value:?})")),
         },
         other => Err(format!(
-            "unknown :set key {other:?} — try: theme, images=on|off, prefetch=on|off, measure=N, ambiguous_width=1|2, reading_wpm=N, mouse=on|off, animations=full|none, hyperlinks=auto|on|off, text_align=center|left, margin=N, paragraph_spacing=N, line_spacing=N, word_spacing=N"
+            "unknown :set key {other:?} — try: theme, images=on|off, prefetch=on|off, scrollbind=on|off, measure=N, ambiguous_width=1|2, reading_wpm=N, mouse=on|off, animations=full|none, hyperlinks=auto|on|off, text_align=center|left, margin=N, paragraph_spacing=N, line_spacing=N, word_spacing=N"
         )),
     }
 }
 
-pub const USAGE: &str = "commands: open <title>, lang [<code>], theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, prefetch-log, interests, not-interested, stats, start, today, random [good], related, talk, info, set theme=<name>|images=on|off|prefetch=on|off|measure=N|ambiguous_width=1|2|reading_wpm=N|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N, set-tab measure=N|images=on|off|ambiguous_width=1|2|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N (or set-tab key= to reset), config reload, watchlist, notifications, contribs [username], prefs, sync, mirror-watchlist, help, quit";
+pub const USAGE: &str = "commands: open <title>, lang [<code>], theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, prefetch-log, interests, not-interested, stats, start, today, random [good], related, talk, info, set theme=<name>|images=on|off|prefetch=on|off|measure=N|ambiguous_width=1|2|reading_wpm=N|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N, set-tab measure=N|images=on|off|ambiguous_width=1|2|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N (or set-tab key= to reset), config reload, vsplit, only, bilingual, set scrollbind, watchlist, notifications, contribs [username], prefs, sync, mirror-watchlist, help, quit";
 
 /// Parses one `:` command line. `user_theme_names` are accepted alongside
 /// the six built-ins for `:theme <name>` and `:set theme=<name>` (PRD
@@ -598,8 +609,31 @@ pub fn parse_with_user_themes(input: &str, user_theme_names: &[String]) -> Resul
         // `:set <key>=<value>` — session-global render/behavior overrides
         // (PRD FR-TH-7, FR-PF-6, FR-PC-1). Values are validated here so
         // execution (`main::execute_command`) is a pure apply.
+        // PRD FR-TB-4: vim-style side-by-side panes and their close command.
+        "vsplit" | "vsp" | "vs" => Ok(Command::VSplit),
+        "only" | "close" => Ok(Command::Only),
+        // PRD FR-ML-3: the bilingual side-by-side view.
+        "bilingual" | "bi" => Ok(Command::Bilingual),
         "set" => {
             let assignment = require_arg("key=value")?;
+            // PRD FR-TB-4: vim-style boolean toggles without `=` —
+            // `:set scrollbind` / `:set noscrollbind` (the spelling the PRD
+            // uses), normalized to the ordinary `key=value` shape.
+            if !assignment.contains('=') {
+                return match assignment.trim() {
+                    "scrollbind" => Ok(Command::Set {
+                        key: "scrollbind".to_string(),
+                        value: "on".to_string(),
+                    }),
+                    "noscrollbind" => Ok(Command::Set {
+                        key: "scrollbind".to_string(),
+                        value: "off".to_string(),
+                    }),
+                    other => Err(format!(
+                        "usage: :set key=value (e.g. images=on) — or :set scrollbind (got {other:?})"
+                    )),
+                };
+            }
             let (key, value) = assignment
                 .split_once('=')
                 .ok_or_else(|| "usage: :set images=on|off".to_string())?;
@@ -708,6 +742,46 @@ mod tests {
     /// `..._with_user_themes` tests further down cover the non-empty case.
     fn parse(input: &str) -> Result<Command, String> {
         parse_with_user_themes(input, &[])
+    }
+
+    #[test]
+    fn split_commands_parse_with_their_aliases() {
+        assert_eq!(parse("vsplit"), Ok(Command::VSplit));
+        assert_eq!(parse("vsp"), Ok(Command::VSplit));
+        assert_eq!(parse("vs"), Ok(Command::VSplit));
+        assert_eq!(parse("only"), Ok(Command::Only));
+        assert_eq!(parse("close"), Ok(Command::Only));
+        assert_eq!(parse("bilingual"), Ok(Command::Bilingual));
+        assert_eq!(parse("bi"), Ok(Command::Bilingual));
+    }
+
+    #[test]
+    fn set_scrollbind_toggle_parses_with_and_without_equals() {
+        assert_eq!(
+            parse("set scrollbind"),
+            Ok(Command::Set {
+                key: "scrollbind".to_string(),
+                value: "on".to_string()
+            })
+        );
+        assert_eq!(
+            parse("set noscrollbind"),
+            Ok(Command::Set {
+                key: "scrollbind".to_string(),
+                value: "off".to_string()
+            })
+        );
+        assert_eq!(
+            parse("set scrollbind=off"),
+            Ok(Command::Set {
+                key: "scrollbind".to_string(),
+                value: "off".to_string()
+            })
+        );
+        assert!(
+            parse("set scrollbind=maybe").is_err(),
+            "scrollbind is on|off only"
+        );
     }
 
     #[test]

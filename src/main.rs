@@ -37,6 +37,7 @@ mod saved;
 mod saved_export;
 mod search_ops;
 mod session;
+mod split;
 mod startpage;
 mod stats;
 mod tab;
@@ -4183,6 +4184,47 @@ async fn handle_key(
             }
         }
         Mode::Reading => {
+            // Ctrl-w window-command chord (PRD FR-TB-4, Appendix B): the
+            // Ctrl-w latch's second key. `v` splits, `w`/`h`/`l` move focus
+            // between panes, `c`/`o`/`q` close the split. Consumes the second
+            // key (an unrecognized one is a no-op, vim-style) — resolved here
+            // before any other binding so `Ctrl-w v` never falls through to
+            // `v`'s own (absent) meaning.
+            if app.pending_ctrl_w {
+                app.pending_ctrl_w = false;
+                if let KeyCode::Char(c) = code {
+                    match c {
+                        'v' => match app.open_split(app.last_content_area.width) {
+                            Ok(()) => {
+                                app.notice = Some(
+                                    "split — Ctrl-w w switches panes, :set scrollbind syncs, \
+                                     :only closes"
+                                        .to_string(),
+                                )
+                            }
+                            Err(reason) => app.notice = Some(reason),
+                        },
+                        'w' => {
+                            if !app.focus_split_other() {
+                                app.notice = Some("no split — Ctrl-w v to split".to_string());
+                            }
+                        }
+                        'h' => {
+                            app.focus_split_pane(0);
+                        }
+                        'l' => {
+                            app.focus_split_pane(1);
+                        }
+                        'c' | 'o' | 'q' => {
+                            if !app.close_split() {
+                                app.notice = Some("not split".to_string());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                return;
+            }
             // g-prefix chords (PRD Appendix B): the g-latch's second key.
             // `gg` top, `gt`/`gT` next/prev tab (FR-TB-1), `gb` back-stack
             // picker (FR-NV-7), `gh` home / start page (FR-DL-1), `gr`
@@ -4351,7 +4393,13 @@ async fn handle_key(
                 // was the last); `Q` quits outright behind a one-keypress
                 // y/n confirm (armed here, resolved at the top of handle_key).
                 KeyCode::Char('q') => {
-                    if app.close_active_tab() {
+                    // PRD FR-TB-4: while split, `q` closes the split (the
+                    // current "window"), keeping the tabs — like Ctrl-w c.
+                    // Only when unsplit does it close the tab (quitting if it
+                    // was the last).
+                    if app.split.is_some() {
+                        app.close_split();
+                    } else if app.close_active_tab() {
                         app.should_quit = true;
                     }
                 }
@@ -4612,6 +4660,13 @@ async fn handle_key(
                 // PRD §10 / Appendix B's "Article: i article info/attribution".
                 KeyCode::Char('i') => {
                     app.open_info();
+                }
+                // PRD FR-TB-4 / Appendix B: Ctrl-w arms the window-command
+                // chord (resolved at the top of this arm on the next key).
+                // Guarded against the plain `w` watch-toggle below, matching
+                // this match's "more specific/guarded binding first" idiom.
+                KeyCode::Char('w') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.pending_ctrl_w = true;
                 }
                 // PRD FR-ACC-2 / Appendix B's "Library: w watch/unwatch".
                 KeyCode::Char('w') => cmd_watch_toggle(client, app).await,
@@ -6278,6 +6333,8 @@ async fn execute_command(
             }
             // PRD FR-PF-6 kill switch.
             "prefetch" => app.set_prefetch(value == "on"),
+            // PRD FR-TB-4: sync-scroll a split's two panes in lockstep.
+            "scrollbind" => app.set_scrollbind(value == "on"),
             // PRD FR-TH-2: live theme switch (value already validated by the
             // parser, so `by_name` cannot fail here).
             "theme" => {
@@ -6373,7 +6430,7 @@ async fn execute_command(
             }
             other => {
                 app.notice = Some(format!(
-                    "unknown :set key {other:?} (try: theme, images, prefetch, measure, ambiguous_width, reading_wpm, mouse, animations, hyperlinks, text_align, margin, paragraph_spacing, line_spacing, word_spacing)"
+                    "unknown :set key {other:?} (try: theme, images, prefetch, scrollbind, measure, ambiguous_width, reading_wpm, mouse, animations, hyperlinks, text_align, margin, paragraph_spacing, line_spacing, word_spacing)"
                 ));
             }
         },
@@ -6537,8 +6594,93 @@ async fn execute_command(
         // PRD FR-BM-5/6.
         Command::Sync => cmd_sync(client, app).await,
         Command::MirrorWatchlist => cmd_mirror_watchlist(client, app).await,
+        // PRD FR-TB-4: `:vsplit` / `:only`. The width check uses the last
+        // drawn content area (one-frame-stale, exactly like the mouse-hit
+        // rects) — accurate for the current terminal size at command time.
+        Command::VSplit => match app.open_split(app.last_content_area.width) {
+            Ok(()) => {
+                app.notice = Some(
+                    "split — Ctrl-w w switches panes, :set scrollbind syncs, :only closes"
+                        .to_string(),
+                )
+            }
+            Err(reason) => app.notice = Some(reason),
+        },
+        Command::Only => {
+            if !app.close_split() {
+                app.notice = Some("not split".to_string());
+            }
+        }
+        // PRD FR-ML-3: the bilingual side-by-side view.
+        Command::Bilingual => cmd_bilingual(client, cache, app, revalidate_tx, langlinks_tx).await,
         Command::Quit => app.should_quit = true,
     }
+}
+
+/// PRD FR-ML-3 `:bilingual`: open the current article in a split alongside the
+/// same article in another language, resolved via langlinks (B11's
+/// `fetch_langlinks`). The other-language edition is picked by
+/// `App::bilingual_target` (first preferred `languages` entry with an edition,
+/// else the first langlink); langlinks are fetched synchronously here if not
+/// already cached so the command is reliable regardless of the passive
+/// on-open prefetch's timing. The other-language article is fetched into a
+/// fresh tab (the right pane); focus stays on the original-language left pane,
+/// with the "interwiki articles are not translations" notice (FR-ML-3 UX copy).
+async fn cmd_bilingual(
+    client: &WikiClient,
+    cache: &PageCache,
+    app: &mut App,
+    revalidate_tx: &UnboundedSender<RevalidationOutcome>,
+    langlinks_tx: &UnboundedSender<LangLinksOutcome>,
+) {
+    if app.split.is_some() {
+        app.notice = Some(":only to close the current split first".to_string());
+        return;
+    }
+    let Some((cur_lang, cur_title)) = app
+        .active_tab()
+        .doc
+        .as_ref()
+        .map(|d| (app.active_tab().lang.clone(), d.title.clone()))
+    else {
+        app.notice = Some("open an article first, then :bilingual".to_string());
+        return;
+    };
+    if !split::fits(app.last_content_area.width) {
+        app.notice = Some(format!(
+            "terminal too narrow to split (need ≥ {} cols)",
+            split::MIN_SPLIT_WIDTH
+        ));
+        return;
+    }
+    // Warm the langlinks cache synchronously if the on-open fetch hasn't
+    // landed yet — an explicit command may block briefly on one small call.
+    if app.bilingual_target().is_none()
+        && let Ok(links) = client.fetch_langlinks(&cur_lang, &cur_title).await
+    {
+        app.deliver_langlinks(cur_lang.clone(), cur_title.clone(), Ok(links));
+    }
+    let Some((code, title)) = app.bilingual_target() else {
+        app.notice = Some("no other-language edition available for this article".to_string());
+        return;
+    };
+    let original_id = app.active_tab().id;
+    // Fetch the other-language article into a fresh (now active) tab.
+    app.new_foreground_tab();
+    let other_id = app.active_tab().id;
+    app.lang = code.clone();
+    open_title(client, cache, app, &title, revalidate_tx, langlinks_tx).await;
+    if app.active_tab().doc.is_none() {
+        // The other edition failed to load — drop the throwaway tab and
+        // restore focus to the original article, unsplit.
+        app.close_tab(app.active);
+        if let Some(idx) = app.tab_index_by_id(original_id) {
+            app.switch_to_tab(idx);
+        }
+        app.notice = Some(format!("couldn't load the {code} edition"));
+        return;
+    }
+    app.begin_bilingual_split(original_id, other_id);
 }
 
 /// PRD FR-DL-2's `:today`: fetches all five on-this-day types up front

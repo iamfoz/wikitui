@@ -288,8 +288,22 @@ pub struct App {
     /// document, links, scroll, per-tab history, find state) lives on each
     /// [`Tab`], not here — see `src/tab.rs`.
     pub tabs: Vec<Tab>,
-    /// Index into `tabs` of the tab currently on screen.
+    /// Index into `tabs` of the tab currently on screen. When a [`split`] is
+    /// active this is kept equal to the focused pane's tab index (the module
+    /// invariant in `src/split.rs`), so every key handler that routes through
+    /// `active_tab()` reaches the focused pane with no changes.
+    ///
+    /// [`split`]: App::split
     pub active: usize,
+    /// PRD FR-TB-4 / FR-ML-3: the live two-pane split overlay, or `None` for
+    /// the ordinary single-pane view. Additive — when `None`, the app behaves
+    /// exactly as it did before splits existed. See `src/split.rs` for the
+    /// panes model.
+    pub split: Option<crate::split::Split>,
+    /// The `Ctrl-w` window-command chord's pending-key latch (PRD FR-TB-4,
+    /// Appendix B `Ctrl-w v`): armed by `Ctrl-w`, resolved by the next key
+    /// (`v` split, `w`/`h`/`l` focus, `c`/`o` close) — mirrors `pending_g`.
+    pub pending_ctrl_w: bool,
     /// Snapshots of closed tabs for `u` (reopen — PRD FR-TB-1), most-recent
     /// last. Capped at [`CLOSED_TABS_CAP`] so retained `Document`s drop.
     pub closed_tabs: Vec<Tab>,
@@ -1094,6 +1108,8 @@ impl App {
             prior_mode: Mode::Reading,
             tabs: vec![first_tab],
             active: 0,
+            split: None,
+            pending_ctrl_w: false,
             closed_tabs: Vec::new(),
             next_tab_id: 1,
             selected_tab_pick: 0,
@@ -2275,6 +2291,10 @@ impl App {
         if index >= self.tabs.len() {
             return false;
         }
+        // Any tab close collapses an active split: its panes reference tabs by
+        // id, and rather than special-case "was this one of the panes" the
+        // simplest safe rule is that closing a tab drops the two-pane view.
+        self.split = None;
         // PRD FR-HS-1's dwell time stops accumulating the moment a tab
         // closes; flush before the tab (and its tracking fields) are gone.
         self.flush_tab_dwell(index);
@@ -2317,6 +2337,7 @@ impl App {
     pub fn reopen_closed_tab(&mut self) -> bool {
         match self.closed_tabs.pop() {
             Some(tab) => {
+                self.split = None;
                 self.tabs.push(tab);
                 self.active = self.tabs.len() - 1;
                 self.sync_active_tab();
@@ -2326,8 +2347,10 @@ impl App {
         }
     }
 
-    /// `gt` — focus the next tab, wrapping (PRD FR-TB-1).
+    /// `gt` — focus the next tab, wrapping (PRD FR-TB-1). Collapses any split
+    /// first (see [`Self::switch_to_tab`]).
     pub fn next_tab(&mut self) {
+        self.split = None;
         if self.tabs.len() < 2 {
             return;
         }
@@ -2335,8 +2358,9 @@ impl App {
         self.sync_active_tab();
     }
 
-    /// `gT` — focus the previous tab, wrapping.
+    /// `gT` — focus the previous tab, wrapping. Collapses any split first.
     pub fn prev_tab(&mut self) {
+        self.split = None;
         if self.tabs.len() < 2 {
             return;
         }
@@ -2347,9 +2371,198 @@ impl App {
     /// Tab-picker Enter — focus a tab by index.
     pub fn switch_to_tab(&mut self, index: usize) {
         if index < self.tabs.len() {
+            // Explicitly choosing a different tab collapses any active split
+            // (you asked to look at that tab full-width). Dropped *before* the
+            // switch so `sync_active_tab`'s layout invalidation lands on the
+            // full-width single-pane view.
+            self.split = None;
             self.active = index;
             self.sync_active_tab();
         }
+    }
+
+    // -- Splits & bilingual view (PRD FR-TB-4, FR-ML-3) ---------------------
+
+    /// PRD FR-TB-4 `:vsplit` / `Ctrl-w v`: split the content area into two
+    /// side-by-side panes. The focused tab's document is duplicated into a
+    /// fresh tab (the right pane) so each pane has independent scroll/link/fold
+    /// state; focus stays on the left (original) pane. `content_width` is the
+    /// current content-area width; the split is refused (PRD §6.3) when it is
+    /// too narrow for two [`crate::split::MIN_PANE_WIDTH`] panes plus a
+    /// divider. Returns `Err` with the user-facing reason on refusal.
+    pub fn open_split(&mut self, content_width: u16) -> Result<(), String> {
+        if self.split.is_some() {
+            return Err("already split — :only to close it first".to_string());
+        }
+        if self.active_tab().doc.is_none() {
+            return Err("open an article first, then :vsplit".to_string());
+        }
+        if !crate::split::fits(content_width) {
+            return Err(format!(
+                "terminal too narrow to split (need ≥ {} cols)",
+                crate::split::MIN_SPLIT_WIDTH
+            ));
+        }
+        let active_idx = self.active;
+        let focused_id = self.tabs[active_idx].id;
+        let (doc, revid, page_source, scroll, folded, lang) = {
+            let t = &self.tabs[active_idx];
+            (
+                t.doc.clone(),
+                t.current_revid,
+                t.page_source,
+                t.scroll,
+                t.folded_blocks.clone(),
+                t.lang.clone(),
+            )
+        };
+        let dup_id = self.push_blank_tab(lang);
+        let dup_idx = self.tabs.len() - 1;
+        if let Some(doc) = doc {
+            let t = &mut self.tabs[dup_idx];
+            t.install_document(doc);
+            t.current_revid = revid;
+            t.page_source = page_source;
+            t.scroll = scroll;
+            t.folded_blocks = folded;
+        }
+        // Focus stays on the original (left) pane; `active` already points at
+        // it and `push_blank_tab` appended without moving focus.
+        self.split = Some(crate::split::Split::new([focused_id, dup_id]));
+        self.layout = None;
+        Ok(())
+    }
+
+    /// PRD FR-ML-3 `:bilingual`: install a two-pane split whose left pane is
+    /// the article already active and whose right pane (`other_idx`) is the
+    /// same article in another language, freshly fetched into its own tab by
+    /// the caller. Focus stays on the left (original-language) pane; scroll is
+    /// section-synced by default. Sets the "not translations" notice.
+    pub fn begin_bilingual_split(&mut self, original_id: TabId, other_id: TabId) {
+        let Some(orig_idx) = self.tab_index_by_id(original_id) else {
+            return;
+        };
+        self.split = Some(crate::split::Split::bilingual([original_id, other_id]));
+        self.active = orig_idx;
+        // Not a full `sync_active_tab` (which would reset mode/persist): a
+        // lighter refocus onto the original pane.
+        self.lang = self.active_tab().lang.clone();
+        self.rebuild_citations();
+        self.layout = None;
+        self.mode = Mode::Reading;
+        self.notice = Some(
+            "Bilingual view — these are independent articles in each language, not a translation \
+             (Ctrl-w w to switch panes, :only to close)"
+                .to_string(),
+        );
+    }
+
+    /// PRD FR-TB-4 `Ctrl-w c` / `:only`: collapse the split back to a single
+    /// pane, keeping the focused pane's tab on screen full-width. A plain
+    /// `:vsplit`'s throwaway duplicate right pane is removed (no tab clutter);
+    /// a `:bilingual` split's other-language pane is kept as an ordinary
+    /// background tab. Returns whether a split was actually closed.
+    pub fn close_split(&mut self) -> bool {
+        let Some(split) = self.split.take() else {
+            return false;
+        };
+        let focused_id = split.focused_id();
+        let other_id = split.other_id();
+        if !split.bilingual
+            && let Some(idx) = self.tab_index_by_id(other_id)
+        {
+            self.tabs.remove(idx);
+        }
+        if let Some(idx) = self.tab_index_by_id(focused_id) {
+            self.active = idx;
+        }
+        self.active = self.active.min(self.tabs.len().saturating_sub(1));
+        self.sync_active_tab();
+        true
+    }
+
+    /// PRD FR-TB-4 `Ctrl-w w`: toggle focus to the other pane. No-op with no
+    /// split. Returns whether focus moved.
+    pub fn focus_split_other(&mut self) -> bool {
+        let Some(cur) = self.split.as_ref().map(|s| s.focused) else {
+            return false;
+        };
+        self.focus_split_pane(1 - cur)
+    }
+
+    /// PRD FR-TB-4 `Ctrl-w h`/`Ctrl-w l`: focus the pane in slot `slot`
+    /// (`0` = left, `1` = right), keeping the module invariant
+    /// (`active` == focused pane's tab). No-op with no split or an already-
+    /// focused slot. Returns whether focus moved.
+    pub fn focus_split_pane(&mut self, slot: usize) -> bool {
+        let id = match self.split.as_mut() {
+            Some(s) if slot < 2 && slot != s.focused => {
+                s.focused = slot;
+                s.panes[slot]
+            }
+            _ => return false,
+        };
+        if let Some(idx) = self.tab_index_by_id(id) {
+            self.active = idx;
+            // A lighter refocus than `sync_active_tab`: adopt the pane's
+            // language, rebuild citations for its article, and drop the cached
+            // layout (the focused pane lays out at its own pane width). No mode
+            // reset or session persist — a pane focus switch is intra-view.
+            self.lang = self.active_tab().lang.clone();
+            self.rebuild_citations();
+            self.layout = None;
+            self.refresh_reading_status();
+        }
+        true
+    }
+
+    /// PRD FR-TB-4 `:set scrollbind`: couple/uncouple the active split's two
+    /// panes in lockstep. A no-op notice when there is no split. Leaves a
+    /// bilingual split's default section-sync in place only when turning
+    /// scrollbind *off* would otherwise strand it — off always means
+    /// independent here (the explicit toggle wins).
+    pub fn set_scrollbind(&mut self, on: bool) {
+        use crate::split::SyncMode;
+        let applied = if let Some(s) = self.split.as_mut() {
+            s.sync = if on {
+                SyncMode::Lockstep
+            } else {
+                SyncMode::Independent
+            };
+            true
+        } else {
+            false
+        };
+        self.notice = Some(if applied {
+            format!("scrollbind {}", if on { "on" } else { "off" })
+        } else {
+            "scrollbind applies to a split — :vsplit or :bilingual first".to_string()
+        });
+    }
+
+    /// PRD FR-ML-3: the `(language code, title-in-that-edition)` `:bilingual`
+    /// opens in the second pane, chosen from the active article's cached
+    /// langlinks — the first of the reader's preferred `languages` that has an
+    /// edition, else the first langlink that isn't the current language.
+    /// `None` when no langlinks are cached or none point elsewhere.
+    pub fn bilingual_target(&self) -> Option<(String, String)> {
+        let links = self.lang_links();
+        if links.is_empty() {
+            return None;
+        }
+        let cur = self.active_tab().lang.clone();
+        for pref in &self.languages {
+            if *pref == cur {
+                continue;
+            }
+            if let Some(l) = links.iter().find(|l| l.code == *pref) {
+                return Some((l.code.clone(), l.title.clone()));
+            }
+        }
+        links
+            .iter()
+            .find(|l| l.code != cur)
+            .map(|l| (l.code.clone(), l.title.clone()))
     }
 
     /// After any change of which tab is active: adopt the tab's language for
@@ -2498,7 +2711,15 @@ impl App {
     /// with one override still inherits every other setting from the
     /// session — never a partial/stale mix of old and new values.
     pub fn layout_options(&self) -> LayoutOptions {
-        let tab = self.active_tab();
+        self.layout_options_for(self.active_tab())
+    }
+
+    /// The effective [`LayoutOptions`] for a *specific* tab: its own per-tab
+    /// overrides (PRD FR-PC-4) layered over the session-global settings.
+    /// Factored out of [`Self::layout_options`] so split rendering can lay a
+    /// non-active pane out with that pane's own overrides
+    /// ([`Self::layout_for_tab`]).
+    pub fn layout_options_for(&self, tab: &Tab) -> LayoutOptions {
         let ov = &tab.overrides;
         LayoutOptions {
             measure: ov.measure.unwrap_or(self.measure),
@@ -2623,6 +2844,58 @@ impl App {
         self.layout = Some(computed);
     }
 
+    /// PRD FR-TB-4 split rendering: the width-aware layout for the tab at
+    /// `tab_idx` laid out at `width`, honoring that tab's own folds and
+    /// per-tab overrides — the split-pane analogue of [`Self::ensure_layout`],
+    /// but for an arbitrary (possibly non-active) tab and width, returning the
+    /// layout rather than storing it in `self.layout`. Shares the one L1 cache
+    /// (`layout_cache`), which keys on `(lang, title, revid, width, options,
+    /// folds)`, so laying a pane out at half width is an ordinary cache
+    /// lookup/miss — the same machinery single-pane reading uses, just at a
+    /// narrower `width`. Returns `None` when the tab has no document.
+    ///
+    /// A pane's `width` is simply its (narrower) share of the content area:
+    /// the FR-RD-9 measure (default 88) is applied inside the layout engine as
+    /// `min(width, measure)`, so at a typical ~49-col half-pane the measure
+    /// never binds and the pane just uses its full width — exactly the
+    /// documented behavior for splits.
+    pub fn layout_for_tab(&mut self, tab_idx: usize, width: u16) -> Option<Layout> {
+        let (opts, folds, key) = {
+            let tab = self.tabs.get(tab_idx)?;
+            let doc = tab.doc.as_ref()?;
+            let opts = self.layout_options_for(tab);
+            let mut folds: Vec<usize> = tab.folded_blocks.iter().copied().collect();
+            folds.sort_unstable();
+            let key = layout::LayoutCacheKey {
+                lang: tab.lang.clone(),
+                title: doc.title.clone(),
+                revid: tab.current_revid,
+                width,
+                options: opts,
+                folds: folds.clone(),
+                schema_version: layout::LAYOUT_SCHEMA_VERSION,
+            };
+            (opts, folds, key)
+        };
+        if let Some(cached) = self.layout_cache.get(&key) {
+            return Some(cached);
+        }
+        let img_map = {
+            let tab = &self.tabs[tab_idx];
+            self.image_box_map_for(tab, width, opts.measure)
+        };
+        self.layout_computations += 1;
+        let computed = {
+            let doc = self.tabs[tab_idx]
+                .doc
+                .as_ref()
+                .expect("keyed above, so a document is present");
+            layout::layout_document_with_images(doc, width, opts, &img_map, &folds)
+        };
+        self.layout_cache.put(key, computed.clone());
+        Some(computed)
+    }
+
     /// PRD FR-TH-7 / FR-RD-8 / FR-PC-4: whether inline images render right
     /// now for the *active tab* — that tab's own `:set-tab images=`
     /// override if it has one, else the session-global runtime `:set
@@ -2652,6 +2925,24 @@ impl App {
     /// graphics protocol, or the content column is below [`layout::
     /// IMAGE_MIN_COLS`] — every image then falls back to its placeholder.
     fn image_box_map(&self) -> std::collections::HashMap<String, (u16, u16)> {
+        self.image_box_map_for(
+            self.active_tab(),
+            self.layout_width,
+            self.layout_options().measure,
+        )
+    }
+
+    /// The reserved image boxes for a *specific* tab's document at `width`
+    /// with the effective `measure` (PRD FR-RD-8). Factored out so a split
+    /// pane reserves boxes sized to its own (narrower) width
+    /// ([`Self::layout_for_tab`]); [`Self::image_box_map`] is the active-tab,
+    /// full-width caller.
+    fn image_box_map_for(
+        &self,
+        tab: &Tab,
+        width: u16,
+        measure: u16,
+    ) -> std::collections::HashMap<String, (u16, u16)> {
         let mut map = std::collections::HashMap::new();
         if matches!(
             self.graphics_protocol(),
@@ -2659,17 +2950,12 @@ impl App {
         ) {
             return map;
         }
-        // PRD FR-PC-4: reads the active tab's *effective* measure (its own
-        // override if it has one, else the session-global setting) — using
-        // the bare session-global `self.measure` here would size an image
-        // box for the wrong content column on a tab that overrode `measure`.
-        let content_width =
-            (self.layout_width as usize).min(self.layout_options().measure as usize);
+        let content_width = (width as usize).min(measure as usize);
         let max_cols = content_width.min(layout::IMAGE_MAX_COLS as usize) as u16;
         if max_cols < layout::IMAGE_MIN_COLS {
             return map;
         }
-        if let Some(doc) = self.active_tab().doc.as_ref() {
+        if let Some(doc) = tab.doc.as_ref() {
             for block in &doc.blocks {
                 if let crate::doc::Block::Image { src: Some(src), .. } = block
                     && let Some(b) = self
@@ -4096,16 +4382,62 @@ impl App {
         let new = (tab.scroll as i32 + delta).clamp(0, tab.max_scroll as i32);
         tab.scroll = new as u16;
         self.maybe_signal_scroll();
+        self.sync_bound_pane(delta);
     }
 
     pub fn scroll_to_top(&mut self) {
+        let old = self.active_tab().scroll as i32;
         self.active_tab_mut().scroll = 0;
+        self.sync_bound_pane(-old);
     }
 
     pub fn scroll_to_bottom(&mut self) {
+        let old = self.active_tab().scroll as i32;
         let max = self.active_tab().max_scroll;
         self.active_tab_mut().scroll = max;
         self.maybe_signal_scroll();
+        self.sync_bound_pane(max as i32 - old);
+    }
+
+    /// PRD FR-TB-4 scroll coupling: after the focused pane's scroll just moved
+    /// by `requested_delta` lines, carry the change into the *bound* pane per
+    /// the split's [`crate::split::SyncMode`]. A no-op with no split, or a
+    /// split in [`SyncMode::Independent`]. Each pane clamps to its own length
+    /// (panes of different lengths clamp independently — best-effort
+    /// alignment). [`SyncMode::Section`] ignores the delta and re-derives the
+    /// bound pane's position from section boundaries
+    /// ([`crate::split::section_synced_scroll`]).
+    fn sync_bound_pane(&mut self, requested_delta: i32) {
+        use crate::split::SyncMode;
+        let (sync, other_id, focused_lines, other_lines) = match self.split.as_ref() {
+            Some(s) => (
+                s.sync,
+                s.other_id(),
+                s.pane_section_lines[s.focused].clone(),
+                s.pane_section_lines[1 - s.focused].clone(),
+            ),
+            None => return,
+        };
+        let Some(idx) = self.tab_index_by_id(other_id) else {
+            return;
+        };
+        match sync {
+            SyncMode::Independent => {}
+            SyncMode::Lockstep => {
+                let t = &mut self.tabs[idx];
+                t.scroll = (t.scroll as i32 + requested_delta).clamp(0, t.max_scroll as i32) as u16;
+            }
+            SyncMode::Section => {
+                let focused_scroll = self.active_tab().scroll;
+                let target = crate::split::section_synced_scroll(
+                    focused_scroll,
+                    &focused_lines,
+                    &other_lines,
+                );
+                let t = &mut self.tabs[idx];
+                t.scroll = target.min(t.max_scroll);
+            }
+        }
     }
 
     /// PRD FR-PF-3's scroll signal: +1.0 to the article's topics once the
@@ -8818,5 +9150,281 @@ mod tests {
         assert_eq!(after_switch.active, 0);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // -- Splits & bilingual (PRD FR-TB-4, FR-ML-3) --------------------------
+
+    /// A ready-to-split app: one tab with a short article installed.
+    fn split_app() -> App {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(crate::doc::parse_article_html(
+            "Alan Turing",
+            "<html><body><p>alpha</p><p>bravo</p></body></html>",
+        ));
+        app
+    }
+
+    #[test]
+    fn vsplit_duplicates_the_active_tab_into_a_second_pane_focus_left() {
+        let mut app = split_app();
+        assert!(app.split.is_none());
+        assert_eq!(app.tabs.len(), 1);
+
+        app.open_split(100)
+            .expect("100 cols is wide enough to split");
+
+        let split = app.split.as_ref().expect("a split is now active");
+        assert_eq!(app.tabs.len(), 2, "the right pane is a real duplicate tab");
+        assert_eq!(split.focused, 0, "focus stays on the original (left) pane");
+        assert_eq!(
+            app.active_tab().id,
+            split.focused_id(),
+            "the invariant holds: active tab == focused pane"
+        );
+        assert!(!split.bilingual, "a plain :vsplit is not a bilingual split");
+        assert_eq!(
+            app.tabs[0].doc.as_ref().map(|d| d.title.as_str()),
+            app.tabs[1].doc.as_ref().map(|d| d.title.as_str()),
+            "both panes show the same article"
+        );
+    }
+
+    #[test]
+    fn vsplit_refuses_when_the_terminal_is_too_narrow() {
+        let mut app = split_app();
+        let err = app.open_split(70).expect_err("70 cols is too narrow");
+        assert!(err.contains("too narrow"), "got: {err}");
+        assert!(app.split.is_none(), "no broken split is left behind");
+        assert_eq!(app.tabs.len(), 1, "no duplicate tab was created");
+    }
+
+    #[test]
+    fn vsplit_refuses_a_second_split_and_with_no_article() {
+        let mut app = split_app();
+        app.open_split(100).unwrap();
+        assert!(
+            app.open_split(100).is_err(),
+            "already-split refuses another :vsplit"
+        );
+
+        let mut empty = App::new("en".to_string(), Theme::terminal(), false);
+        assert!(
+            empty.open_split(100).is_err(),
+            "an empty tab has nothing to split"
+        );
+    }
+
+    #[test]
+    fn focus_movement_switches_which_pane_receives_keys() {
+        let mut app = split_app();
+        app.open_split(100).unwrap();
+        let left_id = app.tabs[0].id;
+        let right_id = app.tabs[1].id;
+
+        assert_eq!(app.active_tab().id, left_id);
+        assert!(app.focus_split_other(), "Ctrl-w w moves focus");
+        assert_eq!(
+            app.active_tab().id,
+            right_id,
+            "keys now route to the right pane"
+        );
+        assert_eq!(app.split.as_ref().unwrap().focused, 1);
+
+        assert!(app.focus_split_pane(0), "Ctrl-w h focuses the left pane");
+        assert_eq!(app.active_tab().id, left_id);
+        assert!(!app.focus_split_pane(0), "already focused — no-op");
+    }
+
+    #[test]
+    fn scroll_routes_to_the_focused_pane_only_without_scrollbind() {
+        let mut app = split_app();
+        app.open_split(100).unwrap();
+        app.tabs[0].max_scroll = 100;
+        app.tabs[1].max_scroll = 100;
+
+        app.scroll_by(5);
+        assert_eq!(app.tabs[0].scroll, 5, "the focused (left) pane scrolled");
+        assert_eq!(
+            app.tabs[1].scroll, 0,
+            "the unfocused pane did NOT move — independent scroll"
+        );
+    }
+
+    #[test]
+    fn scrollbind_scrolls_both_panes_in_lockstep() {
+        let mut app = split_app();
+        app.open_split(100).unwrap();
+        app.tabs[0].max_scroll = 100;
+        app.tabs[1].max_scroll = 100;
+        app.set_scrollbind(true);
+
+        app.scroll_by(7);
+        assert_eq!(app.tabs[0].scroll, 7);
+        assert_eq!(app.tabs[1].scroll, 7, "scrollbind mirrors the delta");
+
+        app.scroll_by(-3);
+        assert_eq!(app.tabs[0].scroll, 4);
+        assert_eq!(app.tabs[1].scroll, 4);
+
+        app.set_scrollbind(false);
+        app.scroll_by(10);
+        assert_eq!(app.tabs[0].scroll, 14);
+        assert_eq!(app.tabs[1].scroll, 4, "off again: back to independent");
+    }
+
+    #[test]
+    fn scrollbind_clamps_each_pane_to_its_own_length() {
+        let mut app = split_app();
+        app.open_split(100).unwrap();
+        app.tabs[0].max_scroll = 100; // a long focused pane
+        app.tabs[1].max_scroll = 4; // a short bound pane
+        app.set_scrollbind(true);
+
+        app.scroll_by(50);
+        assert_eq!(app.tabs[0].scroll, 50, "the long pane scrolls freely");
+        assert_eq!(
+            app.tabs[1].scroll, 4,
+            "the short pane clamps to its own max — best-effort alignment"
+        );
+    }
+
+    #[test]
+    fn only_collapses_the_split_and_drops_the_duplicate_pane() {
+        let mut app = split_app();
+        app.open_split(100).unwrap();
+        assert_eq!(app.tabs.len(), 2);
+        let left_id = app.tabs[0].id;
+
+        assert!(app.close_split(), "a split was closed");
+        assert!(app.split.is_none());
+        assert_eq!(
+            app.tabs.len(),
+            1,
+            "a plain :vsplit's throwaway duplicate is removed on :only"
+        );
+        assert_eq!(app.active_tab().id, left_id, "the focused article stays");
+        assert!(!app.close_split(), "closing again is a no-op");
+    }
+
+    #[test]
+    fn closing_the_split_from_the_right_pane_keeps_that_pane() {
+        let mut app = split_app();
+        app.open_split(100).unwrap();
+        app.focus_split_other(); // focus the right (duplicate) pane
+        let right_id = app.tabs[1].id;
+
+        app.close_split();
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(
+            app.active_tab().id,
+            right_id,
+            "the pane you were focused on is the one that stays"
+        );
+    }
+
+    #[test]
+    fn switching_tabs_collapses_an_active_split() {
+        let mut app = split_app();
+        app.open_split(100).unwrap();
+        app.next_tab();
+        assert!(
+            app.split.is_none(),
+            "gt/gT leave the split — you asked to look at a tab full-width"
+        );
+    }
+
+    #[test]
+    fn bilingual_target_prefers_a_configured_language_then_first_langlink() {
+        let mut app = split_app();
+        let key = app.current_article_key().unwrap();
+        app.langlinks_cache.insert(
+            key,
+            vec![
+                crate::api::LangLink {
+                    code: "fr".to_string(),
+                    autonym: "français".to_string(),
+                    langname: "French".to_string(),
+                    title: "Alan Turing".to_string(),
+                    url: None,
+                },
+                crate::api::LangLink {
+                    code: "ja".to_string(),
+                    autonym: "日本語".to_string(),
+                    langname: "Japanese".to_string(),
+                    title: "アラン・チューリング".to_string(),
+                    url: None,
+                },
+            ],
+        );
+
+        // With ja preferred, it wins over the first-listed fr.
+        app.languages = vec!["ja".to_string()];
+        assert_eq!(
+            app.bilingual_target(),
+            Some(("ja".to_string(), "アラン・チューリング".to_string()))
+        );
+
+        // With no relevant preference, the first langlink is taken.
+        app.languages = vec![];
+        assert_eq!(
+            app.bilingual_target(),
+            Some(("fr".to_string(), "Alan Turing".to_string()))
+        );
+    }
+
+    #[test]
+    fn begin_bilingual_split_marks_it_and_sets_the_not_translation_notice() {
+        let mut app = split_app();
+        let original_id = app.active_tab().id;
+        // A second tab standing in for the fetched other-language article.
+        app.new_foreground_tab();
+        app.tabs.last_mut().unwrap().lang = "ja".to_string();
+        app.set_document(crate::doc::parse_article_html(
+            "アラン・チューリング",
+            "<html><body><p>ja</p></body></html>",
+        ));
+        let other_id = app.active_tab().id;
+
+        app.begin_bilingual_split(original_id, other_id);
+
+        let split = app.split.as_ref().expect("a bilingual split is active");
+        assert!(split.bilingual);
+        assert_eq!(split.sync, crate::split::SyncMode::Section);
+        assert_eq!(
+            app.active_tab().id,
+            original_id,
+            "focus is the left/original pane"
+        );
+        let notice = app.notice.as_deref().unwrap_or_default();
+        assert!(
+            notice.contains("not a translation"),
+            "FR-ML-3 UX copy must set the not-a-translation expectation: {notice:?}"
+        );
+    }
+
+    #[test]
+    fn layout_for_tab_fits_every_line_within_the_pane_width() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(crate::doc::parse_article_html(
+            "Wide",
+            "<html><body><p>The quick brown fox jumps over the lazy dog again and again \
+             and again to force wrapping at a narrow pane width.</p></body></html>",
+        ));
+        let pane_width = 45u16;
+        let layout = app
+            .layout_for_tab(0, pane_width)
+            .expect("the tab has a document");
+        assert_eq!(layout.width, pane_width);
+        for line in &layout.lines {
+            let w: usize = line
+                .spans
+                .iter()
+                .map(|s| crate::layout::display_width(&s.text, false))
+                .sum();
+            assert!(
+                w <= pane_width as usize,
+                "a laid-out line ({w} cells) overflowed the pane width {pane_width}"
+            );
+        }
     }
 }
