@@ -643,7 +643,15 @@ fn fallback_image_tex(node: NodeRef<Node>) -> Option<String> {
 /// unrecognized macro, a mix of letters this table doesn't have a subscript
 /// glyph for) is left exactly as raw TeX — FR-RD-7 v1.0 scope is passthrough
 /// plus *only* the trivial cases; general math typesetting is the v1.x
-/// Unicode-layout upgrade this deliberately doesn't attempt.
+/// Unicode-layout upgrade [`render_math_layout`] provides behind the
+/// `math-layout` feature.
+///
+/// Retained (and still tested) even when that feature supersedes it in
+/// `layout::render_math_display`: it is the default build's math renderer and
+/// the baseline the feature's superset test measures against, so it is
+/// `allow(dead_code)` only for the feature-on binary where nothing else calls
+/// it.
+#[cfg_attr(feature = "math-layout", allow(dead_code))]
 pub fn normalize_trivial_math(tex: &str) -> String {
     let chars: Vec<char> = tex.chars().collect();
     let mut out = String::with_capacity(tex.len());
@@ -807,6 +815,253 @@ fn greek_letter(name: &str) -> Option<char> {
         "Phi" => 'Φ',
         "Psi" => 'Ψ',
         "Omega" => 'Ω',
+        _ => return None,
+    })
+}
+
+/// PRD FR-RD-7 (v1.x, behind the off-by-default `math-layout` feature): a
+/// fuller — but still deliberately simple, and pure-Rust (no C `utftex`
+/// dependency) — Unicode rendering of TeX math. It is a strict superset of
+/// [`normalize_trivial_math`]: everything that function normalizes (Greek
+/// macros, single-token super/subscripts) it still normalizes, and on top it
+/// handles `\frac{a}{b}` → `a⁄b`, `\sqrt{x}` → `√x`, and a table of common
+/// operator/relation/arrow/set macros ([`math_macro`]). Everything outside
+/// that table is left exactly as raw TeX — so a complex expression (matrices,
+/// nested environments, unknown macros) still degrades to the same
+/// passthrough B14 produced, even with the feature on.
+///
+/// Documented scope (what "simple" means, so callers don't over-promise):
+/// one level of `\frac`/`\sqrt` (their arguments are rendered recursively but
+/// multi-token arguments are just parenthesized, never stacked vertically — a
+/// cell grid can't stack), the single-token super/subscript rule
+/// [`normalize_trivial_math`] already uses, and single-glyph macro
+/// substitution. No alignment, no big-operator limits placement, no
+/// delimiter sizing. `--dump`/`render_plain` still shows raw TeX (it never
+/// calls this), exactly as under the trivial renderer.
+#[cfg(feature = "math-layout")]
+pub fn render_math_layout(tex: &str) -> String {
+    let chars: Vec<char> = tex.chars().collect();
+    render_math_chars(&chars)
+}
+
+/// The recursive worker behind [`render_math_layout`] — also used for
+/// `\frac`/`\sqrt` arguments, so nesting renders consistently.
+#[cfg(feature = "math-layout")]
+fn render_math_chars(chars: &[char]) -> String {
+    let mut out = String::with_capacity(chars.len());
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' {
+            let start = i + 1;
+            let mut j = start;
+            while j < chars.len() && chars[j].is_ascii_alphabetic() {
+                j += 1;
+            }
+            let name: String = chars[start..j].iter().collect();
+            if name == "frac"
+                && let Some((num, den, next)) = read_two_groups(chars, j)
+            {
+                out.push_str(&render_fraction(&num, &den));
+                i = next;
+                continue;
+            }
+            if name == "sqrt"
+                && let Some((arg, next)) = read_one_group(chars, j)
+            {
+                out.push('√');
+                out.push_str(&paren_if_multi(&render_math_chars(&arg)));
+                i = next;
+                continue;
+            }
+            if let Some(sym) = math_macro(&name) {
+                out.push_str(sym);
+                i = j;
+                continue;
+            }
+            if let Some(g) = greek_letter(&name) {
+                out.push(g);
+                i = j;
+                continue;
+            }
+            // Unknown macro: leave it raw (passthrough), consuming only the
+            // backslash so the next iteration re-reads the (now bare) name.
+            out.push('\\');
+            i += 1;
+            continue;
+        }
+        if (c == '^' || c == '_')
+            && let Some((converted, next)) = trivial_script(chars, i + 1, c == '^')
+        {
+            out.push_str(&converted);
+            i = next;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// Reads one `{...}` group (matching nested braces) starting at `from`, or —
+/// mirroring TeX's "only the next token" rule — one bare character when there
+/// is no brace. Returns the inner chars and the index just past the group, or
+/// `None` when there is nothing to read.
+#[cfg(feature = "math-layout")]
+fn read_one_group(chars: &[char], from: usize) -> Option<(Vec<char>, usize)> {
+    match chars.get(from) {
+        Some('{') => {
+            let mut depth = 1i32;
+            let mut j = from + 1;
+            while j < chars.len() && depth > 0 {
+                match chars[j] {
+                    '{' => depth += 1,
+                    '}' => depth -= 1,
+                    _ => {}
+                }
+                if depth == 0 {
+                    break;
+                }
+                j += 1;
+            }
+            if depth != 0 {
+                return None; // unbalanced → treat as complex, passthrough
+            }
+            Some((chars[from + 1..j].to_vec(), j + 1))
+        }
+        Some(_) => Some((vec![chars[from]], from + 1)),
+        None => None,
+    }
+}
+
+/// Reads two consecutive groups (`\frac`'s numerator and denominator).
+#[cfg(feature = "math-layout")]
+fn read_two_groups(chars: &[char], from: usize) -> Option<(Vec<char>, Vec<char>, usize)> {
+    let (a, after_a) = read_one_group(chars, from)?;
+    let (b, after_b) = read_one_group(chars, after_a)?;
+    Some((a, b, after_b))
+}
+
+/// Renders a `\frac` as `num⁄den` (U+2044 fraction slash), each side rendered
+/// recursively and wrapped in parentheses when it is more than one glyph so
+/// the grouping stays unambiguous on a single line (`\frac{a+b}{c}` →
+/// `(a+b)⁄c`). No vertical stacking — a cell grid can't, and the PRD's v1.x
+/// scope is explicitly "fractions as a/b or with Unicode."
+#[cfg(feature = "math-layout")]
+fn render_fraction(num: &[char], den: &[char]) -> String {
+    format!(
+        "{}\u{2044}{}",
+        paren_if_multi(&render_math_chars(num)),
+        paren_if_multi(&render_math_chars(den))
+    )
+}
+
+#[cfg(feature = "math-layout")]
+fn paren_if_multi(s: &str) -> String {
+    if s.chars().count() > 1 {
+        format!("({s})")
+    } else {
+        s.to_string()
+    }
+}
+
+/// The `math-layout` single-glyph macro table (PRD FR-RD-7): common
+/// operators, relations, arrows, and set/logic symbols that map cleanly to a
+/// single Unicode character. Deliberately small and single-glyph — anything
+/// needing layout (limits, matrices, delimiter sizing) is out of scope and
+/// falls through to passthrough. `\left`/`\right` map to nothing (the bare
+/// delimiter that follows renders itself).
+#[cfg(feature = "math-layout")]
+fn math_macro(name: &str) -> Option<&'static str> {
+    Some(match name {
+        // Big operators.
+        "sum" => "∑",
+        "prod" => "∏",
+        "int" => "∫",
+        "oint" => "∮",
+        "coprod" => "∐",
+        "bigcup" => "⋃",
+        "bigcap" => "⋂",
+        // Binary operators.
+        "times" => "×",
+        "div" => "÷",
+        "pm" => "±",
+        "mp" => "∓",
+        "cdot" => "⋅",
+        "ast" => "∗",
+        "star" => "⋆",
+        "circ" => "∘",
+        "bullet" => "∙",
+        "oplus" => "⊕",
+        "ominus" => "⊖",
+        "otimes" => "⊗",
+        "odot" => "⊙",
+        "cup" => "∪",
+        "cap" => "∩",
+        "setminus" => "∖",
+        "wedge" | "land" => "∧",
+        "vee" | "lor" => "∨",
+        "neg" | "lnot" => "¬",
+        // Relations.
+        "leq" | "le" => "≤",
+        "geq" | "ge" => "≥",
+        "neq" | "ne" => "≠",
+        "equiv" => "≡",
+        "approx" => "≈",
+        "cong" => "≅",
+        "sim" => "∼",
+        "simeq" => "≃",
+        "propto" => "∝",
+        "ll" => "≪",
+        "gg" => "≫",
+        "subset" => "⊂",
+        "subseteq" => "⊆",
+        "supset" => "⊃",
+        "supseteq" => "⊇",
+        "in" => "∈",
+        "notin" => "∉",
+        "ni" => "∋",
+        "mid" => "∣",
+        "parallel" => "∥",
+        "perp" => "⊥",
+        // Arrows.
+        "rightarrow" | "to" => "→",
+        "leftarrow" | "gets" => "←",
+        "leftrightarrow" => "↔",
+        "Rightarrow" | "implies" => "⇒",
+        "Leftarrow" => "⇐",
+        "Leftrightarrow" | "iff" => "⇔",
+        "mapsto" => "↦",
+        "uparrow" => "↑",
+        "downarrow" => "↓",
+        // Set / logic / misc.
+        "forall" => "∀",
+        "exists" => "∃",
+        "nexists" => "∄",
+        "emptyset" | "varnothing" => "∅",
+        "infty" => "∞",
+        "partial" => "∂",
+        "nabla" => "∇",
+        "angle" => "∠",
+        "triangle" => "△",
+        "cdots" => "⋯",
+        "ldots" | "dots" => "…",
+        "vdots" => "⋮",
+        "ddots" => "⋱",
+        "prime" => "′",
+        "aleph" => "ℵ",
+        "hbar" => "ℏ",
+        "ell" => "ℓ",
+        "Re" => "ℜ",
+        "Im" => "ℑ",
+        "degree" => "°",
+        // Delimiter-size macros: render nothing; the delimiter itself follows.
+        "left" | "right" | "bigl" | "bigr" | "Bigl" | "Bigr" => "",
+        // Named spacing macros collapse to a single space. (The single-punct
+        // spacers `\,` `\;` etc. never reach here — the macro name is the
+        // maximal ASCII-alphabetic run after `\`, so they parse as an empty
+        // name and pass through as a literal backslash + punctuation.)
+        "quad" | "qquad" => " ",
         _ => return None,
     })
 }
@@ -3572,6 +3827,71 @@ mod tests {
             if let Some(url) = &citation.url {
                 assert_terminal_safe(url, &format!("{context} (citation url)"));
             }
+        }
+    }
+}
+
+/// PRD FR-RD-7 (v1.x): the `math-layout` feature's richer Unicode renderer.
+/// These only compile/run under `cargo test --features math-layout`; the
+/// default build's math behavior is locked by the tests in `layout.rs`
+/// (`default_build_uses_trivial_math_passthrough`) and by the existing
+/// `normalize_trivial_math_*` tests above, which the feature leaves untouched.
+#[cfg(all(test, feature = "math-layout"))]
+mod math_layout_tests {
+    use super::*;
+
+    #[test]
+    fn renders_operators_greek_and_scripts() {
+        // Subscript/superscript reuse B14's (deliberately partial) Unicode
+        // tables unchanged, so this exercises letters those tables actually
+        // carry (k,=,0 as subscripts; n as a superscript).
+        assert_eq!(render_math_layout("\\sum_{k=0}^{n} k"), "∑ₖ₌₀ⁿ k");
+        assert_eq!(render_math_layout("\\alpha \\times \\beta"), "α × β");
+        assert_eq!(render_math_layout("\\int_0^1 x"), "∫₀¹ x");
+        assert_eq!(render_math_layout("a \\leq b \\neq c"), "a ≤ b ≠ c");
+        assert_eq!(render_math_layout("x \\to \\infty"), "x → ∞");
+        assert_eq!(render_math_layout("A \\cup B \\cap C"), "A ∪ B ∩ C");
+        assert_eq!(render_math_layout("\\nabla \\cdot F"), "∇ ⋅ F");
+    }
+
+    #[test]
+    fn renders_simple_fractions_and_sqrt() {
+        assert_eq!(render_math_layout("\\frac{1}{2}"), "1\u{2044}2");
+        assert_eq!(render_math_layout("\\frac{a+b}{c}"), "(a+b)\u{2044}c");
+        assert_eq!(render_math_layout("\\sqrt{2}"), "√2");
+        assert_eq!(render_math_layout("\\sqrt{x+y}"), "√(x+y)");
+        // One level of nesting still renders (the numerator is a fraction).
+        assert_eq!(render_math_layout("\\frac{\\alpha}{\\beta}"), "α\u{2044}β");
+    }
+
+    #[test]
+    fn complex_or_unknown_tex_falls_back_to_passthrough() {
+        // An unknown macro is left as raw TeX.
+        assert_eq!(render_math_layout("\\foobar x"), "\\foobar x");
+        // A matrix environment is far beyond the simple scope: passthrough.
+        let m = render_math_layout("\\begin{matrix} a & b \\end{matrix}");
+        assert!(
+            m.contains("\\begin{matrix}") && m.contains("\\end{matrix}"),
+            "complex TeX stays passthrough: {m}"
+        );
+        // A malformed (unbalanced) \\frac group can't be split — left raw.
+        assert!(render_math_layout("\\frac{1}{2").contains("\\frac"));
+    }
+
+    #[test]
+    fn is_a_strict_superset_of_trivial_normalization() {
+        // On inputs that are purely trivial cases, the richer renderer agrees
+        // exactly with `normalize_trivial_math` — so nothing B14 handled
+        // regresses, the feature only *adds* coverage.
+        for s in [
+            "E=mc^2",
+            "x_n",
+            "H_2O",
+            "\\alpha + \\beta",
+            "a^{-1}",
+            "plain text, no math at all",
+        ] {
+            assert_eq!(render_math_layout(s), normalize_trivial_math(s), "{s}");
         }
     }
 }

@@ -327,7 +327,7 @@ const SAVE_EXPORT_FORMATS: [&str; 3] = ["md", "txt", "html"];
 /// article reads," so a per-tab override for them would have no coherent
 /// meaning. Shared by the parser (this list gates which keys `:set-tab`
 /// accepts) and quoted verbatim in its own error message.
-pub const TAB_SCOPED_KEYS: [&str; 8] = [
+pub const TAB_SCOPED_KEYS: [&str; 10] = [
     "measure",
     "images",
     "ambiguous_width",
@@ -336,6 +336,8 @@ pub const TAB_SCOPED_KEYS: [&str; 8] = [
     "paragraph_spacing",
     "line_spacing",
     "word_spacing",
+    "justify",
+    "hyphenate",
 ];
 
 /// Validates and normalizes one `:set`/`:set-tab` `key=value` pair's value,
@@ -363,6 +365,10 @@ fn validate_set_value(
         "scrollbind" => on_off(value),
         // PRD FR-DL-4: citation-needed highlighting, default off.
         "show-cn" => on_off(value),
+        // PRD FR-RD-9 (v1.x): full justification / soft hyphenation, both
+        // default off. `:set`-session-wide or `:set-tab`-per-tab.
+        "justify" => on_off(value),
+        "hyphenate" => on_off(value),
         // PRD FR-TH-2: live theme switch, same validation as `:theme <name>`
         // and the config loader.
         "theme" => {
@@ -481,12 +487,12 @@ fn validate_set_value(
             Err(_) => Err(format!("word_spacing must be an integer (got {value:?})")),
         },
         other => Err(format!(
-            "unknown :set key {other:?} — try: theme, images=on|off, prefetch=on|off, scrollbind=on|off, show-cn=on|off, measure=N, ambiguous_width=1|2, reading_wpm=N, mouse=on|off, animations=full|none, hyperlinks=auto|on|off, text_align=center|left, margin=N, paragraph_spacing=N, line_spacing=N, word_spacing=N"
+            "unknown :set key {other:?} — try: theme, images=on|off, prefetch=on|off, scrollbind=on|off, show-cn=on|off, measure=N, ambiguous_width=1|2, reading_wpm=N, mouse=on|off, animations=full|none, hyperlinks=auto|on|off, text_align=center|left, margin=N, paragraph_spacing=N, line_spacing=N, word_spacing=N, justify=on|off, hyphenate=on|off"
         )),
     }
 }
 
-pub const USAGE: &str = "commands: open <title>, lang [<code>], theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, prefetch-log, interests, not-interested, stats, start, today, random [good], related, talk, info, set theme=<name>|images=on|off|prefetch=on|off|show-cn=on|off|measure=N|ambiguous_width=1|2|reading_wpm=N|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N, set-tab measure=N|images=on|off|ambiguous_width=1|2|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N (or set-tab key= to reset), config reload, vsplit, only, bilingual, wiki [<name>], set scrollbind, set show-cn, watchlist, notifications, contribs [username], prefs, sync, mirror-watchlist, search-offline, trail [all|days N|export md|dot|mermaid [path]], mksession <name>, session <name>, sessions, tts [stop], speak [stop], run <macro>, game [daily|share|<start> <goal>], xyzzy, help, quit";
+pub const USAGE: &str = "commands: open <title>, lang [<code>], theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, prefetch-log, interests, not-interested, stats, start, today, random [good], related, talk, info, set theme=<name>|images=on|off|prefetch=on|off|show-cn=on|off|measure=N|ambiguous_width=1|2|reading_wpm=N|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N|justify=on|off|hyphenate=on|off, set-tab measure=N|images=on|off|ambiguous_width=1|2|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N|justify=on|off|hyphenate=on|off (or set-tab key= to reset), config reload, vsplit, only, bilingual, wiki [<name>], set scrollbind, set show-cn, watchlist, notifications, contribs [username], prefs, sync, mirror-watchlist, search-offline, trail [all|days N|export md|dot|mermaid [path]], mksession <name>, session <name>, sessions, tts [stop], speak [stop], run <macro>, game [daily|share|<start> <goal>], xyzzy, help, quit";
 
 /// Parses one `:` command line. `user_theme_names` are accepted alongside
 /// the six built-ins for `:theme <name>` and `:set theme=<name>` (PRD
@@ -1567,7 +1573,7 @@ mod tests {
         // Every key in TAB_SCOPED_KEYS round-trips through validation.
         for key in TAB_SCOPED_KEYS {
             let value = match key {
-                "images" => "on",
+                "images" | "justify" | "hyphenate" => "on",
                 "ambiguous_width" => "2",
                 "text_align" => "left",
                 "measure" => "60",

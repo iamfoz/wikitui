@@ -71,6 +71,11 @@ pub struct TabOverrides {
     pub paragraph_spacing: Option<u8>,
     pub line_spacing: Option<u8>,
     pub word_spacing: Option<u8>,
+    /// PRD FR-RD-9 (v1.x): per-tab full justification / soft hyphenation
+    /// overrides. `None` inherits the session-global `App::justify`/
+    /// `App::hyphenate`.
+    pub justify: Option<bool>,
+    pub hyphenate: Option<bool>,
 }
 
 /// One open reading context. Owns everything that is per-view; the app-global

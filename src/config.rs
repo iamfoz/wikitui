@@ -484,6 +484,13 @@ pub struct ResolvedReading {
     pub line_spacing: Valued<u8>,
     /// Extra inter-word gap width in cells, default 0.
     pub word_spacing: Valued<u8>,
+    /// PRD FR-RD-9 (v1.x): full justification, default **false** (ragged-right
+    /// stays the default). Also `:set justify=on|off`. See
+    /// `layout::LayoutOptions::justify`.
+    pub justify: Valued<bool>,
+    /// PRD FR-RD-9 (v1.x): soft (Knuth-Liang) hyphenation, default false. Also
+    /// `:set hyphenate=on|off`. See `layout::LayoutOptions::hyphenate`.
+    pub hyphenate: Valued<bool>,
 }
 
 /// The resolved `[auth]` table (PRD §5.9, FR-ACC-1, §6.2 rule 2): the OAuth
@@ -578,12 +585,20 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = "\
 # default 0 — there is no literal \"1.5\"; a true half-row isn't renderable,
 # so `line_spacing = 1` is offered as the closest honest approximation.
 # word_spacing: extra cells in every inter-word gap, 0 or 1, default 0.
+# justify (FR-RD-9): stretch each wrapped line's gaps to a flush right edge,
+# default false (ragged-right); the last line of a paragraph and lines too
+# sparse to fill without an ugly whitespace river stay ragged. hyphenate
+# (FR-RD-9): break long words at Knuth-Liang points (en-US patterns) with a
+# trailing \"-\", default false. Both also via `:set justify=on|off` /
+# `:set hyphenate=on|off`, or per-tab with `:set-tab`.
 # [reading]
 # margin = 0
 # text_align = \"center\"
 # paragraph_spacing = 1
 # line_spacing = 0
 # word_spacing = 0
+# justify = false
+# hyphenate = false
 
 # Citation style for Research mode: apa | harvard | mla | chicago.
 # cite_style = \"apa\"
@@ -1944,6 +1959,8 @@ fn resolve_reading(table: &toml::Table, issues: &mut Vec<Issue>) -> ResolvedRead
             "paragraph_spacing",
             "line_spacing",
             "word_spacing",
+            "justify",
+            "hyphenate",
         ]
         .into_iter()
         .collect();
@@ -1991,6 +2008,8 @@ fn resolve_reading(table: &toml::Table, issues: &mut Vec<Issue>) -> ResolvedRead
             WORD_SPACING_MAX,
             issues,
         ),
+        justify: resolve_bool_field("reading.justify", None, field("justify"), false, issues),
+        hyphenate: resolve_bool_field("reading.hyphenate", None, field("hyphenate"), false, issues),
     }
 }
 

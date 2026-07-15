@@ -24,6 +24,12 @@
 //!   * Line breaking happens at spaces and after hyphens for spaced scripts,
 //!     and *between* CJK characters (per-character, FR-RD-10) with a minimal
 //!     kinsoku rule set (see [`is_no_start`]/[`is_no_end`]).
+//!   * Optional (default-off) full justification and Knuth-Liang soft
+//!     hyphenation (PRD FR-RD-9's v1.x half) ride the same greedy filler —
+//!     see [`LayoutOptions::justify`]/[`LayoutOptions::hyphenate`], [`fill`],
+//!     [`try_hyphenate`], and [`justify_line`]. Both are no-ops under their
+//!     defaults, so the default build lays every page out byte-for-byte as
+//!     before they existed.
 
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -246,6 +252,35 @@ pub struct LayoutOptions {
     /// widening the gaps inside a fixed-width grid column would misalign it
     /// against its own border, not make it more readable.
     pub word_spacing: u8,
+    /// PRD FR-RD-9's optional full justification (`justify = true|false`,
+    /// `:set justify=on|off`, default **false** — ragged-right stays the
+    /// default). When on, `fill` distributes extra spaces between the words of
+    /// every *width-wrapped* prose line so the line reaches exactly the
+    /// content width, EXCEPT: the last line of a paragraph/run (stays
+    /// ragged), lines with no inter-word gaps (a purely-CJK line can't
+    /// justify by spacing — left alone), and lines a "river cap" rejects (a
+    /// line so sparse that filling it would open an ugly river of whitespace,
+    /// see [`RIVER_CAP_MAX_EXTRA_PER_GAP`] — left ragged). For a justified
+    /// line the no-overflow invariant tightens to an *equality*: its content
+    /// width == the content column exactly. Only meaningful with the default
+    /// `text_align = Left`/center column of prose — it composes with
+    /// `word_spacing` (justification stretches on top of the widened base
+    /// gap) and is a no-op for the box/grid content `emit_wrapped` never
+    /// touches. Part of the L1 cache key like every field here.
+    pub justify: bool,
+    /// PRD FR-RD-9's optional soft hyphenation (`hyphenate = true|false`,
+    /// `:set hyphenate=on|off`, default false). When on, a word that would
+    /// overflow the end of a *non-empty* prose line may be broken at a
+    /// Knuth-Liang-valid point (embedded en-US patterns) with a trailing
+    /// `-`, when a prefix+`-` fits the remaining width — see
+    /// [`try_hyphenate`]. The break is always at a grapheme-cluster boundary,
+    /// the `-` counts toward the line width (the no-overflow invariant holds
+    /// with it), and it composes with `justify` (hyphenation fills the line
+    /// tighter first, then justification stretches the result). Scoped to
+    /// ASCII-alphabetic words over [`MIN_HYPHEN_WORD_LEN`]; CJK never
+    /// hyphenates (per-character breaking already handles it). Part of the L1
+    /// cache key like every field here.
+    pub hyphenate: bool,
 }
 
 impl Default for LayoutOptions {
@@ -263,6 +298,8 @@ impl Default for LayoutOptions {
             paragraph_spacing: 1,
             line_spacing: 0,
             word_spacing: 0,
+            justify: false,
+            hyphenate: false,
         }
     }
 }
@@ -572,7 +609,16 @@ fn span_kind(style: &SpanStyle, plain_kind: &SpanKind, link_counter: &mut usize)
 /// shows the raw `doc::Span`/`Block::Math` text untouched (PRD: "TeX as
 /// plain text, no escapes").
 fn render_math_display(tex: &str) -> String {
-    format!("⟨{}⟩", crate::doc::normalize_trivial_math(tex))
+    // PRD FR-RD-7: the `math-layout` feature (off by default) upgrades the
+    // inner rendering from B14's trivial normalization to the fuller — still
+    // deliberately simple, still pure-Rust — Unicode math renderer; the `⟨…⟩`
+    // delimiters and the passthrough-when-complex contract are unchanged, so
+    // the default build stays byte-identical to B14.
+    #[cfg(feature = "math-layout")]
+    let inner = crate::doc::render_math_layout(tex);
+    #[cfg(not(feature = "math-layout"))]
+    let inner = crate::doc::normalize_trivial_math(tex);
+    format!("⟨{inner}⟩")
 }
 
 fn flatten_spans(
@@ -687,21 +733,193 @@ fn build_pieces(clusters: &[Cluster]) -> Vec<Piece> {
     pieces
 }
 
+/// The three optional wrap-shaping knobs `fill` needs, bundled so the many
+/// non-prose call sites (table/infobox cells, gallery strips) can keep
+/// passing "plain wrapping" as one value while prose call sites opt into
+/// justification/hyphenation. `word_spacing` is PRD FR-PC-1's base inter-word
+/// gap widening; `justify`/`hyphenate` are PRD FR-RD-9's v1.x additions.
+#[derive(Clone, Copy)]
+struct WrapOpts {
+    word_spacing: usize,
+    justify: bool,
+    hyphenate: bool,
+}
+
+impl WrapOpts {
+    /// Plain wrapping with no justify/hyphenate — the byte-identical
+    /// pre-FR-RD-9 behavior, carrying only `word_spacing` through. Every
+    /// non-prose call site (grid cells, gallery captions) uses this.
+    fn plain(word_spacing: usize) -> Self {
+        Self {
+            word_spacing,
+            justify: false,
+            hyphenate: false,
+        }
+    }
+}
+
+/// PRD FR-RD-9's river cap: the most extra cells justification will ever add
+/// to a single inter-word gap. A width-wrapped line that would need more than
+/// this per gap to reach the content column is left ragged instead — the
+/// documented heuristic that keeps a sparse line (few words, or a long
+/// just-wrapped word leaving a big hole) from opening an ugly "river" of
+/// whitespace down the page. Three cells is generous enough that ordinary
+/// greedily-packed lines (whose deficit is at most the width of the word that
+/// didn't fit, spread over several gaps) justify cleanly, while a two-word
+/// line with a gaping hole stays ragged.
+const RIVER_CAP_MAX_EXTRA_PER_GAP: usize = 3;
+
+/// PRD FR-RD-9 soft hyphenation: the shortest word (in grapheme clusters)
+/// `try_hyphenate` will attempt to break. Below this, breaking buys too
+/// little to be worth a mid-word hyphen. Chosen above en-US's own
+/// left(2)+right(3) minima so the shortest hyphenation still leaves a
+/// readable piece on each side.
+const MIN_HYPHEN_WORD_LEN: usize = 6;
+
+/// PRD FR-RD-9's embedded en-US Knuth-Liang patterns (the one language
+/// wikitui enables; the crate bundles them, `embed_en-us` in `Cargo.toml`).
+/// Loaded once, lazily, and shared — `None` only if the embedded data somehow
+/// fails to decode, in which case hyphenation silently no-ops (ragged wrap,
+/// never a panic). A word in any other script/language simply isn't
+/// hyphenated: `try_hyphenate` restricts itself to ASCII-alphabetic words, so
+/// accented-Latin and non-Latin text is left unbroken rather than mangled by
+/// English patterns.
+fn en_us_dict() -> Option<&'static hyphenation::Standard> {
+    use std::sync::OnceLock;
+    static EN_US: OnceLock<Option<hyphenation::Standard>> = OnceLock::new();
+    EN_US
+        .get_or_init(|| {
+            use hyphenation::{Language, Load};
+            hyphenation::Standard::from_embedded(Language::EnglishUS).ok()
+        })
+        .as_ref()
+}
+
+/// PRD FR-RD-9: try to break `clusters` (one word) so a prefix plus a
+/// trailing `-` fits in `remaining` cells, at a Knuth-Liang-valid point.
+/// Returns `(head, tail)` where `head` is the prefix clusters *plus* the
+/// hyphen cluster (to end the current line) and `tail` is the remainder (to
+/// continue on the next line), or `None` when no valid break fits.
+///
+/// Scope, all enforced here so the invariants hold: only ASCII-alphabetic
+/// words (so a byte offset from the hyphenator lands exactly on a grapheme
+/// boundary — no cluster is ever split — and non-English/CJK text is left
+/// alone), only words of at least [`MIN_HYPHEN_WORD_LEN`] clusters, only
+/// breaks the embedded en-US dictionary marks valid, and only the *largest*
+/// such prefix that still leaves room for the `-` (best fill). The `-`
+/// counts toward the width the caller checked, so the emitted line honors the
+/// no-overflow invariant with the hyphen included.
+fn try_hyphenate(clusters: &[Cluster], remaining: usize) -> Option<(Vec<Cluster>, Vec<Cluster>)> {
+    use hyphenation::Hyphenator;
+    if clusters.len() < MIN_HYPHEN_WORD_LEN || clusters.iter().any(|c| c.cjk) {
+        return None;
+    }
+    let word: String = clusters.iter().map(|c| c.text.as_str()).collect();
+    // ASCII-alphabetic only: keeps offset↔cluster mapping trivially 1:1 and
+    // scopes hyphenation to the language whose patterns we actually loaded.
+    if !word.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return None;
+    }
+    let dict = en_us_dict()?;
+    let hyphen_w = 1; // a plain ASCII '-' is one cell.
+    let mut best: Option<usize> = None; // cluster count in the prefix
+    for &off in &dict.hyphenate(&word).breaks {
+        // ASCII: byte offset == cluster index. Reject the degenerate ends.
+        if off == 0 || off >= clusters.len() {
+            continue;
+        }
+        let prefix_w: usize = clusters[..off].iter().map(|c| c.width).sum();
+        if prefix_w + hyphen_w <= remaining {
+            best = Some(best.map_or(off, |b| b.max(off)));
+        }
+    }
+    let split = best?;
+    let mut head: Vec<Cluster> = clusters[..split].to_vec();
+    let hyphen_kind = head
+        .last()
+        .map(|c| c.kind.clone())
+        .unwrap_or(SpanKind::Plain);
+    head.push(make_cluster("-", hyphen_kind, false));
+    Some((head, clusters[split..].to_vec()))
+}
+
+/// PRD FR-RD-9: how many extra cells each of `gaps` inter-word gaps receives
+/// to close a `deficit`-cell shortfall, distributed as evenly as possible
+/// with the remainder round-robined onto the *leading* gaps (a deterministic,
+/// testable rule). `sum(spread_extra(d, g)) == d` exactly, which is what makes
+/// a justified line reach the content column precisely.
+fn spread_extra(deficit: usize, gaps: usize) -> Vec<usize> {
+    if gaps == 0 {
+        return Vec::new();
+    }
+    let base = deficit / gaps;
+    let rem = deficit % gaps;
+    (0..gaps).map(|k| base + usize::from(k < rem)).collect()
+}
+
+/// PRD FR-RD-9: stretch one width-wrapped prose line's inter-word gaps so it
+/// exactly fills `avail`, or leave it untouched when it shouldn't justify —
+/// a purely-CJK / single-word line (no gaps to stretch) or a line the river
+/// cap ([`RIVER_CAP_MAX_EXTRA_PER_GAP`]) judges too sparse. Only the
+/// [`Cluster::is_space`] gaps (which `fill` only ever places *between* words,
+/// never leading/trailing) are widened, so no word or grapheme cluster is
+/// ever touched and the link/find column mappings — recomputed from the final
+/// lines — stay correct.
+fn justify_line(line: &mut [Cluster], avail: usize) {
+    let cur_w: usize = line.iter().map(|c| c.width).sum();
+    if cur_w >= avail {
+        return;
+    }
+    let deficit = avail - cur_w;
+    let gap_idx: Vec<usize> = line
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.is_space)
+        .map(|(i, _)| i)
+        .collect();
+    if gap_idx.is_empty() {
+        return;
+    }
+    // River cap: the widest single gap this would open. `div_ceil` because
+    // the round-robin remainder lands the extra cell on some gap.
+    if deficit.div_ceil(gap_idx.len()) > RIVER_CAP_MAX_EXTRA_PER_GAP {
+        return;
+    }
+    for (idx, extra) in gap_idx.iter().zip(spread_extra(deficit, gap_idx.len())) {
+        if extra == 0 {
+            continue;
+        }
+        let c = &mut line[*idx];
+        c.width += extra;
+        c.text = " ".repeat(c.width);
+    }
+}
+
 /// Greedily pack pieces into lines no wider than `avail`. A piece wider than
 /// `avail` is hard-split at cluster boundaries so nothing ever overflows.
-/// `word_spacing` (PRD FR-PC-1) widens every collapsed inter-word gap from 1
-/// cell to `1 + word_spacing`; the extra width is folded into the same
-/// wrap-or-not check a plain 1-cell gap already used, so a widened gap still
-/// wraps at the right point instead of silently overflowing.
-fn fill(pieces: Vec<Piece>, avail: usize, word_spacing: usize) -> Vec<Vec<Cluster>> {
+/// `WrapOpts::word_spacing` (PRD FR-PC-1) widens every collapsed inter-word
+/// gap from 1 cell to `1 + word_spacing`; the extra width is folded into the
+/// same wrap-or-not check a plain 1-cell gap already used, so a widened gap
+/// still wraps at the right point instead of silently overflowing.
+///
+/// PRD FR-RD-9 (both no-ops under their defaults, so the `WrapOpts::plain`
+/// path is byte-identical to the pre-FR-RD-9 filler): when
+/// `WrapOpts::hyphenate` is set, a word that would overflow a non-empty line
+/// is offered to [`try_hyphenate`], which may place a hyphenated prefix on the
+/// current line and continue the remainder on the next; when
+/// `WrapOpts::justify` is set, every *width-wrapped* line (all but the last
+/// line this call emits, which is the paragraph/run's ragged final line) is
+/// stretched by [`justify_line`] to exactly fill `avail`.
+fn fill(pieces: Vec<Piece>, avail: usize, opts: WrapOpts) -> Vec<Vec<Cluster>> {
     let avail = avail.max(1);
-    let space_w = 1 + word_spacing;
+    let space_w = 1 + opts.word_spacing;
     let mut lines: Vec<Vec<Cluster>> = Vec::new();
     let mut cur: Vec<Cluster> = Vec::new();
     let mut cur_w = 0usize;
     let mut pending_space: Option<SpanKind> = None;
 
-    for piece in pieces {
+    let mut queue: std::collections::VecDeque<Piece> = pieces.into();
+    while let Some(piece) = queue.pop_front() {
         let pw = piece.width();
         let sep_w = if pending_space.is_some() && !cur.is_empty() {
             space_w
@@ -709,6 +927,28 @@ fn fill(pieces: Vec<Piece>, avail: usize, word_spacing: usize) -> Vec<Vec<Cluste
             0
         };
         if !cur.is_empty() && cur_w + sep_w + pw > avail {
+            // PRD FR-RD-9: before giving up the rest of this line, try to
+            // hyphenate the word that didn't fit onto its tail end.
+            if opts.hyphenate
+                && let Some((head, tail)) =
+                    try_hyphenate(&piece.clusters, avail.saturating_sub(cur_w + sep_w))
+            {
+                // The width was already reserved in the fit check above; the
+                // line is pushed and `cur_w` reset immediately, so we don't
+                // bother re-accounting it here.
+                if let Some(kind) = pending_space.take() {
+                    cur.push(space_cluster(kind, space_w));
+                }
+                cur.extend(head);
+                lines.push(std::mem::take(&mut cur));
+                cur_w = 0;
+                pending_space = None;
+                queue.push_front(Piece {
+                    clusters: tail,
+                    sep: piece.sep,
+                });
+                continue;
+            }
             lines.push(std::mem::take(&mut cur));
             cur_w = 0;
             pending_space = None;
@@ -741,24 +981,35 @@ fn fill(pieces: Vec<Piece>, avail: usize, word_spacing: usize) -> Vec<Vec<Cluste
     if !cur.is_empty() {
         lines.push(cur);
     }
+    // PRD FR-RD-9 full justification: stretch every width-wrapped line — all
+    // but the last, which is the ragged final line of this run — to fill the
+    // column exactly. Done here, after packing, so the last-line-stays-ragged
+    // rule is just "skip the final element."
+    if opts.justify && lines.len() > 1 {
+        let last = lines.len() - 1;
+        for line in &mut lines[..last] {
+            justify_line(line, avail);
+        }
+    }
     lines
 }
 
 /// Wrap a run of clusters (with hard `\n` breaks honored) into visual lines.
-/// `word_spacing` is threaded straight through to `fill` — see its own doc
-/// comment.
-fn wrap_content(clusters: Vec<Cluster>, avail: usize, word_spacing: usize) -> Vec<Vec<Cluster>> {
+/// `opts` is threaded straight through to `fill` — each hard-`\n` sub-run is
+/// filled independently, so the line before a hard break is that sub-run's
+/// ragged last line (never justified), exactly like a paragraph's final line.
+fn wrap_content(clusters: Vec<Cluster>, avail: usize, opts: WrapOpts) -> Vec<Vec<Cluster>> {
     let mut out = Vec::new();
     let mut sub: Vec<Cluster> = Vec::new();
     for c in clusters {
         if c.is_newline {
-            out.extend(fill(build_pieces(&sub), avail, word_spacing));
+            out.extend(fill(build_pieces(&sub), avail, opts));
             sub = Vec::new();
         } else {
             sub.push(c);
         }
     }
-    out.extend(fill(build_pieces(&sub), avail, word_spacing));
+    out.extend(fill(build_pieces(&sub), avail, opts));
     out
 }
 
@@ -850,6 +1101,15 @@ struct Emitter<'a> {
     /// Emitter call sites) — see `fill`'s doc comment for the width-safety
     /// argument.
     word_spacing: usize,
+    /// PRD FR-RD-9 `justify`/`hyphenate`: the two default-off wrap-shaping
+    /// knobs. Applied only to *prose* blocks (paragraphs, list items,
+    /// blockquotes), which pass them to `emit_wrapped` via
+    /// [`Emitter::prose_wrap_opts`]; headings, math, captions, image
+    /// placeholders, fold summaries, and every grid/box builder deliberately
+    /// wrap plain (`emit_plain_wrapped`), so a heading or a display equation
+    /// is never stretched flush or mid-word hyphenated.
+    justify: bool,
+    hyphenate: bool,
 }
 
 impl Emitter<'_> {
@@ -886,14 +1146,31 @@ impl Emitter<'_> {
         }
     }
 
+    /// The `WrapOpts` for a *prose* block: the session/tab `word_spacing` plus
+    /// this emitter's resolved `justify`/`hyphenate` (PRD FR-RD-9). The one
+    /// place those two knobs enter the filler, so a non-prose builder that
+    /// wants plain wrapping simply doesn't call it (it uses
+    /// [`WrapOpts::plain`] / [`Self::emit_plain_wrapped`] instead).
+    fn prose_wrap_opts(&self) -> WrapOpts {
+        WrapOpts {
+            word_spacing: self.word_spacing,
+            justify: self.justify,
+            hyphenate: self.hyphenate,
+        }
+    }
+
     /// Emit a block whose content wraps under an optional hanging prefix
     /// (list bullet, blockquote gutter). Returns nothing; the caller records
-    /// the anchor line before calling.
+    /// the anchor line before calling. `opts` selects plain vs.
+    /// justified/hyphenated wrapping (PRD FR-RD-9) — prose blocks pass
+    /// [`Self::prose_wrap_opts`], everything else passes
+    /// [`WrapOpts::plain`].
     fn emit_wrapped(
         &mut self,
         content: Vec<Cluster>,
         first_prefix: Vec<LaidSpan>,
         cont_prefix: Vec<LaidSpan>,
+        opts: WrapOpts,
     ) {
         let prefix_width: usize = first_prefix
             .iter()
@@ -907,7 +1184,7 @@ impl Emitter<'_> {
             (first_prefix, cont_prefix, prefix_width)
         };
         let avail = self.content_width - prefix_width;
-        let wrapped = wrap_content(content, avail, self.word_spacing);
+        let wrapped = wrap_content(content, avail, opts);
         if wrapped.is_empty() {
             self.push_line(finalize(self.pad_width, &first_prefix, &[]), false);
             self.line_spacing_filler();
@@ -921,7 +1198,12 @@ impl Emitter<'_> {
     }
 
     fn emit_plain_wrapped(&mut self, content: Vec<Cluster>) {
-        self.emit_wrapped(content, Vec::new(), Vec::new());
+        self.emit_wrapped(
+            content,
+            Vec::new(),
+            Vec::new(),
+            WrapOpts::plain(self.word_spacing),
+        );
     }
 
     /// Emit one document block, pushing exactly one `block_lines` scroll
@@ -951,7 +1233,10 @@ impl Emitter<'_> {
             Block::Paragraph(spans) => {
                 let anchor = self.lines.len();
                 let content = flatten_spans(spans, SpanKind::Plain, link_counter, aw);
-                self.emit_plain_wrapped(content);
+                // PRD FR-RD-9: body paragraphs are the prototypical prose that
+                // justifies/hyphenates (when enabled) — every other block wraps
+                // plain.
+                self.emit_wrapped(content, Vec::new(), Vec::new(), self.prose_wrap_opts());
                 self.blank();
                 block_lines.push(anchor);
             }
@@ -979,7 +1264,7 @@ impl Emitter<'_> {
                     kind: SpanKind::Plain,
                 }];
                 let content = flatten_spans(spans, SpanKind::Plain, link_counter, aw);
-                self.emit_wrapped(content, first_prefix, cont_prefix);
+                self.emit_wrapped(content, first_prefix, cont_prefix, self.prose_wrap_opts());
                 block_lines.push(anchor);
             }
             Block::Blockquote(spans) => {
@@ -989,7 +1274,7 @@ impl Emitter<'_> {
                     kind: SpanKind::Dim,
                 }];
                 let content = flatten_spans(spans, SpanKind::Quote, link_counter, aw);
-                self.emit_wrapped(content, gutter.clone(), gutter);
+                self.emit_wrapped(content, gutter.clone(), gutter, self.prose_wrap_opts());
                 self.blank();
                 block_lines.push(anchor);
             }
@@ -1148,10 +1433,13 @@ impl Emitter<'_> {
                 text: " ".repeat(extra_pad),
                 kind: SpanKind::Plain,
             }];
+            // Plain wrap: a display equation is centered, never stretched
+            // flush or hyphenated (PRD FR-RD-9 justify/hyphenate are prose-only).
             self.emit_wrapped(
                 clusters_from_str(&text, SpanKind::Math, aw),
                 pad_prefix.clone(),
                 pad_prefix,
+                WrapOpts::plain(self.word_spacing),
             );
         } else {
             self.emit_plain_wrapped(clusters_from_str(&text, SpanKind::Math, aw));
@@ -1215,9 +1503,13 @@ impl Emitter<'_> {
                 .collect::<Vec<_>>()
                 .join("   ");
             let clusters = clusters_from_str(&joined, SpanKind::Caption, aw);
-            for (i, wl) in wrap_content(clusters, self.content_width.max(1), self.word_spacing)
-                .into_iter()
-                .enumerate()
+            for (i, wl) in wrap_content(
+                clusters,
+                self.content_width.max(1),
+                WrapOpts::plain(self.word_spacing),
+            )
+            .into_iter()
+            .enumerate()
             {
                 self.push_line(finalize(self.pad_width, &[], &wl), i > 0);
             }
@@ -1248,7 +1540,11 @@ impl Emitter<'_> {
                         continue;
                     }
                     let clusters = clusters_from_str(&line, SpanKind::Table, aw);
-                    for wl in wrap_content(clusters, self.content_width.max(1), self.word_spacing) {
+                    for wl in wrap_content(
+                        clusters,
+                        self.content_width.max(1),
+                        WrapOpts::plain(self.word_spacing),
+                    ) {
                         self.push_line(finalize(self.pad_width, &[], &wl), false);
                     }
                 }
@@ -1314,6 +1610,8 @@ impl Emitter<'_> {
                 paragraph_spacing: self.paragraph_spacing,
                 line_spacing: self.line_spacing,
                 word_spacing: self.word_spacing,
+                justify: self.justify,
+                hyphenate: self.hyphenate,
             };
             for b in lead_blocks {
                 tem.emit_block(
@@ -1549,14 +1847,16 @@ fn pad_to_width(s: &str, w: usize, aw: bool) -> String {
 /// text uses (so a cell that overflows its column wraps and grows the row's
 /// height, never overflows). Returns one string per visual line.
 ///
-/// Deliberately never widened by `word_spacing` (PRD FR-PC-1): this feeds
-/// fixed-width table/infobox grid cells, where a widened inter-word gap
-/// would misalign the cell's own padding against its column border rather
-/// than make it more readable — `word_spacing` is scoped to prose wrapping
-/// (`Emitter::emit_wrapped` and its own direct `wrap_content` call sites).
+/// Deliberately plain-wrapped (PRD FR-PC-1/FR-RD-9): never widened by
+/// `word_spacing`, never justified, never hyphenated. This feeds fixed-width
+/// table/infobox grid cells, where a widened/stretched inter-word gap would
+/// misalign the cell's own padding against its column border rather than make
+/// it more readable, and a mid-word hyphen would collide with the border —
+/// those knobs are scoped to prose wrapping (`Emitter::emit_wrapped`'s prose
+/// call sites via `prose_wrap_opts`).
 fn wrap_cell_text(text: &str, w: usize, aw: bool) -> Vec<String> {
     let clusters = clusters_from_str(text, SpanKind::Table, aw);
-    let wrapped = wrap_content(clusters, w.max(1), 0);
+    let wrapped = wrap_content(clusters, w.max(1), WrapOpts::plain(0));
     let mut out: Vec<String> = wrapped
         .into_iter()
         .map(|line| line.iter().map(|c| c.text.as_str()).collect())
@@ -1778,6 +2078,8 @@ pub fn layout_document_with_images(
             paragraph_spacing: options.paragraph_spacing as usize,
             line_spacing: options.line_spacing as usize,
             word_spacing: options.word_spacing as usize,
+            justify: options.justify,
+            hyphenate: options.hyphenate,
         };
         // Title, then a blank line — mirrors the previous renderer's header.
         em.emit_plain_wrapped(clusters_from_str(&doc.title, SpanKind::Title, aw));
@@ -2152,7 +2454,11 @@ pub fn citation_needed_lines(lines: &[LaidLine], continuation: &[bool]) -> Vec<u
 /// v5 (PRD FR-PC-1): line emission gained `paragraph_spacing`/`line_spacing`/
 /// `word_spacing`, which insert or widen rows a v4-shaped `LayoutOptions`
 /// never accounted for.
-pub const LAYOUT_SCHEMA_VERSION: u32 = 5;
+/// v6 (PRD FR-RD-9): line emission gained `justify` (stretches a wrapped
+/// line's inter-word gaps to fill the column) and `hyphenate` (may break a
+/// word with a trailing `-`), both of which change the emitted glyphs a
+/// v5-shaped `LayoutOptions` never accounted for.
+pub const LAYOUT_SCHEMA_VERSION: u32 = 6;
 
 /// PRD §6.8's L1 hit target (< 50 ms) only holds if the cache stays small
 /// enough that a linear scan over it is free — 8 entries covers "the
@@ -4215,6 +4521,557 @@ mod tests {
         assert!(
             leading_spaces > 0,
             "a short display equation on an 80-wide line should have a centering pad, got {leading_spaces}"
+        );
+    }
+
+    // ---- FR-RD-9: justification (river-capped) ----------------------------
+
+    /// The prose (lowercase-letters-and-spaces) content lines of a laid-out
+    /// document — the paragraph lines the spacing/justify tests reason about,
+    /// filtered away from the title, "N min read", headings, and blanks.
+    fn prose_lines(layout: &Layout) -> Vec<String> {
+        layout
+            .lines
+            .iter()
+            .map(line_text)
+            .filter(|t| {
+                !t.trim().is_empty() && t.chars().all(|c| c.is_ascii_lowercase() || c == ' ')
+            })
+            .collect()
+    }
+
+    fn paragraph_doc(title: &str, body: &str) -> Document {
+        parse_article_html(
+            title,
+            &format!("<html><head><title>{title}</title></head><body><p>{body}</p></body></html>"),
+        )
+    }
+
+    #[test]
+    fn spread_extra_round_robins_the_remainder_onto_leading_gaps() {
+        assert_eq!(spread_extra(7, 3), vec![3, 2, 2]);
+        assert_eq!(spread_extra(4, 4), vec![1, 1, 1, 1]);
+        assert_eq!(spread_extra(2, 3), vec![1, 1, 0]);
+        assert_eq!(spread_extra(0, 3), vec![0, 0, 0]);
+        assert!(spread_extra(5, 0).is_empty());
+        // The exact-fill guarantee: the extras always sum back to the deficit.
+        for (d, g) in [(7usize, 3usize), (10, 4), (1, 5), (13, 6), (23, 7)] {
+            assert_eq!(spread_extra(d, g).iter().sum::<usize>(), d, "sum({d},{g})");
+        }
+    }
+
+    #[test]
+    fn justify_fills_full_lines_exactly_and_leaves_the_last_line_ragged() {
+        let doc = paragraph_doc(
+            "JT",
+            "the cat sat on a mat and the dog ran to the sun for fun in the big red car by a bee hive",
+        );
+        // width 30 (< measure 88) → content column 30, no centering pad, so a
+        // line's display width IS its content width.
+        let default = prose_lines(&layout_document(&doc, 30, LayoutOptions::default()));
+        let justified = prose_lines(&layout_document(
+            &doc,
+            30,
+            LayoutOptions {
+                justify: true,
+                ..LayoutOptions::default()
+            },
+        ));
+        assert!(default.len() >= 2, "the paragraph wraps to several lines");
+        assert_eq!(
+            default.len(),
+            justified.len(),
+            "justify redistributes spaces without changing where lines break"
+        );
+        let n = justified.len();
+        let mut saw_stretched = false;
+        for i in 0..n - 1 {
+            // The tightened equality: every justified full line reaches the
+            // content column EXACTLY, not merely `<=`.
+            assert_eq!(
+                display_width(&justified[i], false),
+                30,
+                "justified full line must fill the content column exactly: {:?}",
+                justified[i]
+            );
+            // Same words, only the spacing changed.
+            assert_eq!(
+                justified[i].split_whitespace().collect::<Vec<_>>(),
+                default[i].split_whitespace().collect::<Vec<_>>(),
+            );
+            if justified[i] != default[i] {
+                saw_stretched = true;
+            }
+        }
+        assert!(
+            saw_stretched,
+            "at least one line actually received extra spaces"
+        );
+        // The paragraph's last line is never justified — byte-identical to
+        // the ragged-right default.
+        assert_eq!(
+            justified[n - 1],
+            default[n - 1],
+            "the last line of the paragraph stays ragged"
+        );
+    }
+
+    #[test]
+    fn justify_river_cap_leaves_a_sparse_line_ragged() {
+        // "aa bb" then a 26-cell word that can't share the line: filling that
+        // one gap would need 25 extra cells (>> the river cap) → left ragged.
+        let long = "c".repeat(26);
+        let doc = paragraph_doc("jr", &format!("aa bb {long} dd ee ff gg hh"));
+        let layout = layout_document(
+            &doc,
+            30,
+            LayoutOptions {
+                justify: true,
+                ..LayoutOptions::default()
+            },
+        );
+        let sparse = layout
+            .lines
+            .iter()
+            .map(line_text)
+            .find(|t| t.trim() == "aa bb")
+            .expect("the sparse line stays 'aa bb', not stretched into a river");
+        assert!(
+            display_width(&sparse, false) < 30,
+            "the river cap kept the sparse line ragged: {sparse:?}"
+        );
+        for l in &layout.lines {
+            assert!(l.width(false) <= 30, "no overflow: {:?}", line_text(l));
+        }
+    }
+
+    #[test]
+    fn justify_composes_with_word_spacing_and_still_fills_exactly() {
+        let doc = paragraph_doc(
+            "JW",
+            "the cat sat on a mat and the dog ran to the sun for fun in the red car today",
+        );
+        let layout = layout_document(
+            &doc,
+            30,
+            LayoutOptions {
+                justify: true,
+                word_spacing: 1,
+                ..LayoutOptions::default()
+            },
+        );
+        let prose = prose_lines(&layout);
+        assert!(prose.len() >= 2);
+        for l in &prose[..prose.len() - 1] {
+            assert_eq!(
+                display_width(l, false),
+                30,
+                "justify fills exactly even atop the word_spacing base gap: {l:?}"
+            );
+            // Every inter-word gap is at least the widened base (2 cells).
+            for gap in l.split(|c: char| c != ' ').filter(|s| !s.is_empty()) {
+                assert!(
+                    gap.len() >= 2,
+                    "word_spacing=1 keeps every gap at least 2 cells wide: {l:?}"
+                );
+            }
+        }
+        for l in &layout.lines {
+            assert!(l.width(false) <= 30);
+        }
+    }
+
+    #[test]
+    fn justify_does_not_corrupt_cjk_lines() {
+        let doc = parse_article_html("アラン・チューリング", JA_FIXTURE);
+        for width in [20u16, 40, 60, 80] {
+            let just = layout_document(
+                &doc,
+                width,
+                LayoutOptions {
+                    justify: true,
+                    ..LayoutOptions::default()
+                },
+            );
+            let def = layout_document(&doc, width, LayoutOptions::default());
+            assert_eq!(just.lines.len(), def.lines.len());
+            for l in &just.lines {
+                assert!(
+                    l.width(false) <= width as usize,
+                    "justify must not overflow a CJK line at width {width}"
+                );
+            }
+            // A line with no inter-word ASCII gap (purely CJK) can't justify by
+            // spacing, so it must be byte-identical to the default layout.
+            for (j, d) in just.lines.iter().zip(def.lines.iter()) {
+                if !line_text(d).contains(' ') {
+                    assert_eq!(
+                        line_text(j),
+                        line_text(d),
+                        "a gapless CJK line must be untouched by justify"
+                    );
+                }
+            }
+        }
+        // The CJK content and a CJK link both survive justification intact.
+        let just = layout_document(
+            &doc,
+            40,
+            LayoutOptions {
+                justify: true,
+                ..LayoutOptions::default()
+            },
+        );
+        let joined: String = just.lines.iter().map(line_text).collect();
+        assert!(
+            joined.contains("計算機科学"),
+            "CJK link text preserved whole"
+        );
+    }
+
+    // ---- FR-RD-9: soft (Knuth-Liang) hyphenation -------------------------
+
+    fn word_clusters(w: &str) -> Vec<Cluster> {
+        clusters_from_str(w, SpanKind::Plain, false)
+    }
+
+    #[test]
+    fn try_hyphenate_breaks_only_at_knuth_liang_points() {
+        // en-US hyphenates "hyphenation" as hy-phen-a-tion (breaks after 2, 6,
+        // 7 chars). Ample room → the largest valid prefix that still fits '-'.
+        let cl = word_clusters("hyphenation");
+        let (head, tail) = try_hyphenate(&cl, 20).expect("a valid break exists");
+        let head_text: String = head.iter().map(|c| c.text.as_str()).collect();
+        let tail_text: String = tail.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(
+            head_text, "hyphena-",
+            "largest fitting KL prefix, with hyphen"
+        );
+        assert_eq!(tail_text, "tion");
+        // The hyphen carries the word's own kind (so a hyphenated link keeps
+        // its span), and one cluster's worth of width.
+        assert_eq!(head.last().unwrap().text, "-");
+        assert_eq!(head.last().unwrap().width, 1);
+        // Tight room forces the earliest valid break — never an invalid
+        // mid-syllable cut.
+        let (head, tail) = try_hyphenate(&cl, 4).expect("earliest break fits in 4");
+        let ht: String = head.iter().map(|c| c.text.as_str()).collect();
+        let tt: String = tail.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(ht, "hy-");
+        assert_eq!(tt, "phenation");
+        // No valid break fits in 2 cells (even "hy-" needs 3).
+        assert!(try_hyphenate(&cl, 2).is_none());
+    }
+
+    #[test]
+    fn try_hyphenate_respects_scope_min_length_and_cjk() {
+        // Below MIN_HYPHEN_WORD_LEN: never hyphenated.
+        assert!(try_hyphenate(&word_clusters("cats"), 40).is_none());
+        // Non-ASCII (accented) words are out of scope — patterns are en-US
+        // only, so they're left unbroken rather than mangled.
+        assert!(try_hyphenate(&word_clusters("naïveté"), 40).is_none());
+        // CJK never hyphenates (per-character breaking already handles it).
+        assert!(try_hyphenate(&word_clusters("計算機科学"), 40).is_none());
+        // A word with digits is not a spaced-script word for this purpose.
+        assert!(try_hyphenate(&word_clusters("abc123def"), 40).is_none());
+    }
+
+    #[test]
+    fn hyphenate_breaks_a_long_word_with_a_trailing_hyphen_and_reconstructs() {
+        let doc = paragraph_doc("hy", "aaaa bbbb cccc hyphenation dddd eeee ffff");
+        let on = LayoutOptions {
+            hyphenate: true,
+            ..LayoutOptions::default()
+        };
+        let hyph = layout_document(&doc, 20, on);
+        let plain = layout_document(&doc, 20, LayoutOptions::default());
+        // The hyphen counts toward the width — nothing overflows.
+        for l in &hyph.lines {
+            assert!(
+                l.width(false) <= 20,
+                "hyphenated line overflowed: {:?}",
+                line_text(l)
+            );
+        }
+        let ends_with_hyphen = |ll: &Layout| {
+            ll.lines
+                .iter()
+                .any(|l| line_text(l).trim_end().ends_with('-'))
+        };
+        assert!(
+            ends_with_hyphen(&hyph),
+            "a long word should have been hyphenated"
+        );
+        assert!(
+            !ends_with_hyphen(&plain),
+            "without the flag no word is ever hyphenated"
+        );
+        // Reconstruct: gluing each soft-hyphen line straight onto the next
+        // (dropping the '-') puts the word back together whole — proof the
+        // break fell on a grapheme boundary that reforms a real word.
+        let mut recon = String::new();
+        for l in &hyph.lines {
+            let t = line_text(l);
+            let t = t.trim();
+            if t.is_empty() {
+                continue;
+            }
+            match t.strip_suffix('-') {
+                Some(head) => recon.push_str(head),
+                None => {
+                    recon.push_str(t);
+                    recon.push(' ');
+                }
+            }
+        }
+        assert!(
+            recon.contains("hyphenation"),
+            "the hyphenated word reconstructs intact: {recon:?}"
+        );
+    }
+
+    #[test]
+    fn hyphenate_and_justify_together_never_overflow_and_fill_full_lines() {
+        let doc = paragraph_doc(
+            "HJ",
+            "aaaa bbbb cccc hyphenation dddd eeee ffff gggg hyphenation iiii jjjj",
+        );
+        let layout = layout_document(
+            &doc,
+            24,
+            LayoutOptions {
+                hyphenate: true,
+                justify: true,
+                ..LayoutOptions::default()
+            },
+        );
+        for l in &layout.lines {
+            assert!(
+                l.width(false) <= 24,
+                "hyphenate+justify must never overflow: {:?}",
+                line_text(l)
+            );
+        }
+        // The combination still produces flush full lines: at least one
+        // non-empty content line reaches the content column exactly (24), the
+        // tightened justify equality holding even with hyphenation reflowing
+        // the words. (Checked on raw lines, since a justified line may now end
+        // in a soft hyphen.)
+        assert!(
+            layout
+                .lines
+                .iter()
+                .any(|l| l.width(false) == 24 && !line_text(l).trim().is_empty()),
+            "a justified line under hyphenation still fills the column exactly"
+        );
+    }
+
+    // ---- FR-RD-9: mappings survive justify + hyphenate --------------------
+
+    const MAPPING_FIXTURE: &str = r##"<html><head><title>Mapping</title></head><body>
+      <p>The systematic study of <a href="./Computer_science">computer science</a>
+      frequently involves extraordinarily complicated hyphenation scenarios that
+      are worth testing here today with the <a href="./Enigma_machine">Enigma</a>.</p>
+      <h2>History</h2>
+      <p>Some history paragraph text mentioning <a href="./Alan_Turing">Turing</a> once.</p>
+    </body></html>"##;
+
+    #[test]
+    fn block_link_and_find_mappings_survive_justify_and_hyphenate() {
+        let doc = parse_article_html("Mapping", MAPPING_FIXTURE);
+        let opts = LayoutOptions {
+            justify: true,
+            hyphenate: true,
+            ..LayoutOptions::default()
+        };
+        let layout = layout_document(&doc, 40, opts);
+
+        // No overflow with both knobs on.
+        for l in &layout.lines {
+            assert!(l.width(false) <= 40, "overflow: {:?}", line_text(l));
+        }
+
+        // Section jump: block_lines still lands on the heading's own text.
+        let sections = section_outline(&doc);
+        assert_eq!(sections.len(), 1);
+        for section in &sections {
+            let line = layout.block_lines[section.block];
+            assert_eq!(
+                line_text(&layout.lines[line]).trim(),
+                section.title,
+                "block_lines must land on the heading under justify+hyphenate"
+            );
+        }
+
+        // Link order: occurrences stay in document order.
+        for w in layout.link_lines.windows(2) {
+            assert!(w[0] <= w[1], "link occurrences stay in document order");
+        }
+
+        // Link mapping: link_cols bounds EXACTLY this occurrence's own rendered
+        // span(s) on its line — the property that lets a hint/focus overlay
+        // paint the right cells even after justification widened the gaps that
+        // precede the link (shifting its grapheme columns) and hyphenation
+        // reflowed the surrounding words.
+        let links = collect_links(&doc);
+        assert_eq!(layout.link_cols.len(), links.len());
+        for (occ, _link) in links.iter().enumerate() {
+            if !layout.link_visible[occ] {
+                continue;
+            }
+            let line = &layout.lines[layout.link_lines[occ]];
+            let text = line_text(line);
+            let graphemes: Vec<&str> = text.graphemes(true).collect();
+            let span = layout.link_cols[occ];
+            let sliced: String = graphemes[span.start..span.end].concat();
+            let own: String = line
+                .spans
+                .iter()
+                .filter(|s| s.kind == SpanKind::Link(occ))
+                .map(|s| s.text.as_str())
+                .collect();
+            assert_eq!(
+                sliced, own,
+                "link_cols[{occ}] must bound exactly the link's own rendered span"
+            );
+            assert!(
+                !sliced.is_empty(),
+                "a visible link maps to a nonempty range"
+            );
+        }
+
+        // In-page find: a single-word query still resolves onto a line that
+        // really contains it (widened gaps never masquerade as matches).
+        let occurrences = find_matches(&layout.lines, &layout.continuation, "history");
+        assert!(
+            !occurrences.is_empty(),
+            "find still works under justify+hyphenate"
+        );
+        for occ in &occurrences {
+            for (line_idx, span) in &occ.pieces {
+                let text = line_text(&layout.lines[*line_idx]);
+                let graphemes: Vec<&str> = text.graphemes(true).collect();
+                let matched: String = graphemes[span.start..span.end].concat();
+                assert_eq!(matched.to_lowercase(), "history");
+            }
+        }
+    }
+
+    // ---- FR-RD-9: defaults reproduce the pre-FR-RD-9 layout ---------------
+
+    #[test]
+    fn defaults_are_byte_identical_with_justify_and_hyphenate_off() {
+        // The wrap path with both knobs at their (false) defaults renders a
+        // paragraph with single collapsed spaces and no hyphens — and is
+        // byte-identical to explicitly turning them off.
+        let doc = paragraph_doc("t", "one two three");
+        let layout = layout_document(&doc, 40, LayoutOptions::default());
+        assert!(
+            layout.lines.iter().any(|l| line_text(l) == "one two three"),
+            "default (justify/hyphenate off) keeps single spaces and no hyphen"
+        );
+        let explicit_off = layout_document(
+            &doc,
+            40,
+            LayoutOptions {
+                justify: false,
+                hyphenate: false,
+                ..LayoutOptions::default()
+            },
+        );
+        assert_eq!(layout.lines, explicit_off.lines);
+
+        // Across the broader fixtures too, the default layout is unchanged by
+        // spelling the new flags out as false — the whole-suite byte-identity
+        // guard, localized here.
+        for html in [FIXTURE, JA_FIXTURE] {
+            let doc = parse_article_html("F", html);
+            for width in [24u16, 40, 80, 120] {
+                let a = layout_document(&doc, width, LayoutOptions::default());
+                let b = layout_document(
+                    &doc,
+                    width,
+                    LayoutOptions {
+                        justify: false,
+                        hyphenate: false,
+                        ..LayoutOptions::default()
+                    },
+                );
+                assert_eq!(a.lines, b.lines, "default path unchanged at width {width}");
+            }
+        }
+    }
+
+    #[test]
+    fn justify_and_hyphenate_never_overflow_across_fixtures_and_widths() {
+        let docs = [
+            parse_article_html("Test Article", FIXTURE),
+            parse_article_html("アラン・チューリング", JA_FIXTURE),
+            hard_cases_doc(),
+        ];
+        for doc in &docs {
+            for width in [20u16, 40, 60, 80, 100, 200] {
+                for (justify, hyphenate) in [(true, false), (false, true), (true, true)] {
+                    assert_no_overflow(
+                        doc,
+                        width,
+                        LayoutOptions {
+                            justify,
+                            hyphenate,
+                            ..LayoutOptions::default()
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    // ---- FR-RD-7: math-layout feature (off by default) --------------------
+
+    /// Under the DEFAULT build (no `math-layout` feature), inline math is
+    /// B14's trivial-normalized passthrough — this proves the feature is
+    /// genuinely off by default and the default rendering is unchanged.
+    #[cfg(not(feature = "math-layout"))]
+    #[test]
+    fn default_build_uses_trivial_math_passthrough() {
+        let html = r#"<html><body><p>x <span typeof="mw:Extension/math"><math alttext="\sum_{i=1}^{n}"></math></span></p></body></html>"#;
+        let doc = parse_article_html("T", html);
+        let layout = layout_document(&doc, 80, LayoutOptions::default());
+        let joined: String = layout
+            .lines
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join(" ");
+        // `\sum` is NOT a trivial-normalization case, so it stays raw TeX
+        // inside the ⟨…⟩ delimiters (subscript still normalizes).
+        assert!(
+            joined.contains("⟨\\sum") || joined.contains("\\sum"),
+            "default build leaves \\sum as raw TeX passthrough: {joined:?}"
+        );
+        assert!(
+            !joined.contains('∑'),
+            "the Unicode ∑ only appears under the math-layout feature: {joined:?}"
+        );
+    }
+
+    /// Under `--features math-layout`, the same inline math renders the
+    /// richer Unicode form.
+    #[cfg(feature = "math-layout")]
+    #[test]
+    fn math_layout_feature_renders_richer_inline_math() {
+        let html = r#"<html><body><p>x <span typeof="mw:Extension/math"><math alttext="\sum_{k=0}^{n} k"></math></span> y</p></body></html>"#;
+        let doc = parse_article_html("T", html);
+        let layout = layout_document(&doc, 80, LayoutOptions::default());
+        let joined: String = layout
+            .lines
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            joined.contains("⟨∑ₖ₌₀ⁿ k⟩"),
+            "the feature renders the sum via Unicode: {joined:?}"
         );
     }
 }

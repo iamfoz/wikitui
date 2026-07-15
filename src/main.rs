@@ -2343,6 +2343,8 @@ async fn run(
     app.paragraph_spacing = reading_cfg.paragraph_spacing.value;
     app.line_spacing = reading_cfg.line_spacing.value;
     app.word_spacing = reading_cfg.word_spacing.value;
+    app.justify = reading_cfg.justify.value;
+    app.hyphenate = reading_cfg.hyphenate.value;
     app.cite_style = cite_style;
     app.readlater_auto_dequeue = readlater_auto_dequeue;
     // PRD FR-RD-8/§6.3: terminal graphics capability snapshot, taken once.
@@ -3235,6 +3237,8 @@ fn apply_config_reload(app: &mut App) {
     app.paragraph_spacing = resolved.reading.paragraph_spacing.value;
     app.line_spacing = resolved.reading.line_spacing.value;
     app.word_spacing = resolved.reading.word_spacing.value;
+    app.justify = resolved.reading.justify.value;
+    app.hyphenate = resolved.reading.hyphenate.value;
     app.readlater_auto_dequeue = resolved.readlater_auto_dequeue.value;
     // PRD FR-ML-2: the fallback chain and picker-pinning both read this
     // live, like measure/ambiguous_wide above — no restart needed to pick
@@ -7520,9 +7524,21 @@ async fn execute_command(
                     app.notice = Some(format!("word_spacing={n}"));
                 }
             }
+            // PRD FR-RD-9 (v1.x): full justification / soft hyphenation, both
+            // feed `layout_options`, so each needs the same relayout seam.
+            "justify" => {
+                app.justify = value == "on";
+                app.layout = None;
+                app.notice = Some(format!("justify={value}"));
+            }
+            "hyphenate" => {
+                app.hyphenate = value == "on";
+                app.layout = None;
+                app.notice = Some(format!("hyphenate={value}"));
+            }
             other => {
                 app.notice = Some(format!(
-                    "unknown :set key {other:?} (try: theme, images, prefetch, scrollbind, show-cn, measure, ambiguous_width, reading_wpm, mouse, animations, hyperlinks, text_align, margin, paragraph_spacing, line_spacing, word_spacing)"
+                    "unknown :set key {other:?} (try: theme, images, prefetch, scrollbind, show-cn, measure, ambiguous_width, reading_wpm, mouse, animations, hyperlinks, text_align, margin, paragraph_spacing, line_spacing, word_spacing, justify, hyphenate)"
                 ));
             }
         },

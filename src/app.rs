@@ -552,6 +552,14 @@ pub struct App {
     /// PRD FR-PC-1's session-global extra inter-word gap width in cells
     /// (`:set word_spacing=`, `[reading] word_spacing`, default 0).
     pub word_spacing: u8,
+    /// PRD FR-RD-9's session-global full justification toggle (`:set
+    /// justify=on|off`, `[reading] justify`, default false — ragged-right).
+    /// A tab's own `TabOverrides::justify` wins over this when set.
+    pub justify: bool,
+    /// PRD FR-RD-9's session-global soft-hyphenation toggle (`:set
+    /// hyphenate=on|off`, `[reading] hyphenate`, default false). A tab's own
+    /// `TabOverrides::hyphenate` wins over this when set.
+    pub hyphenate: bool,
     /// The active tab's currently-labeled link hints (PRD FR-NV-1), valid
     /// only while `mode == Mode::Hint`. Recomputed from scratch by
     /// `refresh_hint_targets` on entry and on every draw — never patched
@@ -1332,6 +1340,8 @@ impl App {
             paragraph_spacing: 1,
             line_spacing: 0,
             word_spacing: 0,
+            justify: false,
+            hyphenate: false,
             hint_targets: Vec::new(),
             hint_input: String::new(),
             hint_background: false,
@@ -2995,6 +3005,8 @@ impl App {
             paragraph_spacing: ov.paragraph_spacing.unwrap_or(self.paragraph_spacing),
             line_spacing: ov.line_spacing.unwrap_or(self.line_spacing),
             word_spacing: ov.word_spacing.unwrap_or(self.word_spacing),
+            justify: ov.justify.unwrap_or(self.justify),
+            hyphenate: ov.hyphenate.unwrap_or(self.hyphenate),
         }
     }
 
@@ -3271,6 +3283,8 @@ impl App {
             }
             "line_spacing" => tab.overrides.line_spacing = value.and_then(|v| v.parse().ok()),
             "word_spacing" => tab.overrides.word_spacing = value.and_then(|v| v.parse().ok()),
+            "justify" => tab.overrides.justify = value.map(|v| v == "on"),
+            "hyphenate" => tab.overrides.hyphenate = value.map(|v| v == "on"),
             _ => {}
         }
         self.layout = None;

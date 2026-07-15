@@ -39,6 +39,18 @@ rust-version = "1.92"
 # the feature — hence off by default, with the 0600 file store standing in.
 keychain = ["dep:keyring"]
 
+# PRD FR-RD-7 (v1.x): richer Unicode math layout behind an off-by-default
+# feature flag. When enabled, `layout::render_math_display` upgrades from
+# B14's `⟨tex⟩` passthrough (still the default) to `doc::render_math_layout`
+# — a pure-Rust, deliberately-simple Unicode renderer (fractions as `a⁄b`,
+# `\sqrt` as `√…`, common operator/relation/arrow macros to their Unicode
+# glyphs, super/subscript stacking where Unicode allows). No C dependency
+# (the PRD's utftex/libtexprintf option is deliberately not taken — see
+# `doc::render_math_layout`'s scope note). Complex TeX still falls back to
+# raw passthrough even with the flag on; the default build is byte-identical
+# to before this feature existed.
+math-layout = []
+
 [dependencies]
 anyhow = "1.0.103"
 base64 = "0.22.1"
@@ -52,6 +64,13 @@ ego-tree = "0.11.0"
 # (already in the tree transitively) is the lightest option: a thin wrapper
 # over the OS entropy source, no `rand` distribution machinery pulled in.
 getrandom = "0.2"
+# PRD FR-RD-9 (v1.x soft hyphenation): Knuth-Liang hyphenation. The crate
+# bundles the TeX hyphenation patterns; `embed_en-us` compiles the en-US
+# patterns straight into the binary (no runtime pattern-file load), which is
+# the only language wikitui enables — `layout::en_us_dict`/`try_hyphenate`.
+# Words in scripts/languages without a loaded pattern set simply aren't
+# hyphenated (see `layout::try_hyphenate`'s scope note).
+hyphenation = { version = "0.8.4", features = ["embed_en-us"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 # PRD SEC-4: OS keychain token storage, gated behind the off-by-default
 # `keychain` feature above (see it for why). Optional so the default build

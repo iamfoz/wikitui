@@ -321,6 +321,18 @@ PAGES["Math_Showcase"] = """<html><head><title>Math Showcase</title></head><body
     <math display="block"><semantics><mrow></mrow>
     <annotation encoding="application/x-tex">F_{net} = m a</annotation></semantics></math>
   </span></dd></dl>
+  <h2>Series and roots</h2>
+  <p>The following uses macros the trivial normalizer leaves raw but the
+  optional <code>math-layout</code> feature (FR-RD-7 v1.x) renders as Unicode:
+  a big operator, a fraction, and a root. The square root of two is
+  <span typeof="mw:Extension/math">
+    <math alttext="\\sqrt{2}"><semantics><mrow></mrow>
+    <annotation encoding="application/x-tex">\\sqrt{2}</annotation></semantics></math>
+  </span>.</p>
+  <dl><dd><span typeof="mw:Extension/math">
+    <math display="block"><semantics><mrow></mrow>
+    <annotation encoding="application/x-tex">\\sum_{k=1}^{n} k = \\frac{n(n+1)}{2}</annotation></semantics></math>
+  </span></dd></dl>
 </body></html>"""
 
 # PRD FR-DL-5 pty-verification fixture: one link Parsoid itself pre-marks as
