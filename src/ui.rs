@@ -2362,9 +2362,61 @@ fn with_incognito_glyph(text: String, incognito: bool) -> String {
     }
 }
 
-fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
+/// Modes whose status bar shows the reader's own live input — the search/
+/// command/find/hint prompts, the `/` filters, and the command palette.
+/// `status_bar_text`'s uniform notice priority skips these: a `notice`
+/// showing up here would clobber text the reader is still typing, and for
+/// `Command`/`Hint` specifically it's moot anyway — both land back in
+/// `Mode::Reading` (see `Mode::Command`'s `Enter` arm and `exit_hint_mode` in
+/// `main.rs`) before their own actions ever call `App::notice`'s setter, so
+/// any notice they raise is already showing under `Mode::Reading` by the
+/// time the next frame draws.
+fn mode_shows_input_prompt(mode: Mode) -> bool {
+    matches!(
+        mode,
+        Mode::Search
+            | Mode::Command
+            | Mode::Find
+            | Mode::Hint
+            | Mode::BookmarkFilter
+            | Mode::BookmarkTagEdit
+            | Mode::ReadingHistoryFilter
+            | Mode::LangFilter
+            | Mode::Palette
+    )
+}
+
+/// The status bar's text for the current frame, pulled out of
+/// `draw_status_bar` so the priority chain is unit-testable without a
+/// `Frame`/`TestBackend`.
+///
+/// A systemic bug independently hit by three prior chunks: `app.notice` — the
+/// transient one-keypress-lifetime feedback channel (a save confirmation, a
+/// yank, a bookmark toggle, an incognito warning, "External link: ...") — was
+/// only ever checked by `Mode::Reading`'s own arm (and only *there* when no
+/// link was focused, since the focused-link line took over first). Every
+/// other mode's arm was a per-mode hint/status string that never looked at
+/// `notice` at all, so feedback set while in Research, on the redlink card,
+/// etc. was computed and then silently never drawn. The fix is one early
+/// check here — not a copy of the same `if app.notice.is_some()` pasted into
+/// every arm below — so a notice, wherever it's set, always outranks the
+/// current mode's own hint content in every mode where that makes sense
+/// (`mode_shows_input_prompt` carves out the handful where it doesn't).
+fn status_bar_text(app: &App, width: u16) -> String {
     let tab = app.active_tab();
-    let text = match app.mode {
+
+    // Reading's own "Loading…" is checked ahead of a notice: it's rarer and
+    // more urgent than feedback left over from the keypress that triggered
+    // the fetch (preserves this bar's pre-existing order for Reading).
+    let reading_loading = app.mode == Mode::Reading && app.loading;
+    if !reading_loading
+        && !mode_shows_input_prompt(app.mode)
+        && let Some(notice) = &app.notice
+    {
+        return notice.clone();
+    }
+
+    match app.mode {
         Mode::Search if app.search_operator_help => {
             "Search operators — ?/Esc: close   Tab: complete operator name".to_string()
         }
@@ -2377,10 +2429,6 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             app.search_input
         ),
         Mode::Command => format!(":{}", app.command_input),
-        // PRD FR-NV-1's hint-mode status line, ahead of everything Reading
-        // shows (notice, find, focused link, breadcrumb) by being its own
-        // `Mode` arm here — the same priority mechanism `Find`/`Command`
-        // already use, not a special case bolted onto `Mode::Reading`.
         Mode::Hint => format!("hint: {}   Esc: cancel", app.hint_input),
         Mode::Find if tab.find_matches.is_empty() && !tab.find_input.is_empty() => {
             format!("find: {} (no matches)", tab.find_input)
@@ -2445,9 +2493,6 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         ),
         Mode::Onboarding => "Press any key to start reading".to_string(),
         Mode::Reading if app.loading => "Loading…".to_string(),
-        // Command feedback outranks the focused-link line until the next
-        // keypress clears it (see App::notice).
-        Mode::Reading if app.notice.is_some() => app.notice.clone().unwrap_or_default(),
         // PRD FR-DL-1: the start page's own nav hints, ranked right after
         // notice/loading — there is no focused link or find state to show
         // instead (the tab has no document). `startpage = blank` shows the
@@ -2518,7 +2563,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                     let titles = app.breadcrumb_titles();
                     if titles.len() > 1 {
                         let prefix = tab.page_source.prefix();
-                        let budget = (area.width as usize).saturating_sub(display_width(&prefix));
+                        let budget = (width as usize).saturating_sub(display_width(&prefix));
                         format!("{prefix}{}{hint}{badge}", build_breadcrumb(&titles, budget))
                     } else {
                         format!("{}{hint}{badge}", app.status)
@@ -2526,7 +2571,11 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                 }
             }
         }
-    };
+    }
+}
+
+fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
+    let text = status_bar_text(app, area.width);
     let text = with_incognito_glyph(text, app.incognito);
     let style = if matches!(
         app.mode,
@@ -3657,5 +3706,218 @@ mod tests {
             .map(|c| c.symbol())
             .collect();
         assert!(rendered.contains("[incognito]"));
+    }
+
+    // ---- Uniform notice priority across status-bar modes ------------------
+    //
+    // Three prior chunks each independently hit a variant of the same bug:
+    // a mode's own status-bar arm never looked at `app.notice` at all (or,
+    // for Reading, only did so when no link was focused — nearly never
+    // true), so action feedback was computed and then silently never drawn.
+    // These tests pin `status_bar_text`'s fix: a notice, wherever it's set,
+    // outranks the current mode's own hint/content in every mode that isn't
+    // itself a live input prompt.
+
+    /// A Reading-mode app with one internal and one external link on the
+    /// page, whichever one `focus_external` names left focused — mirroring
+    /// `install_document`'s real "link 0 focuses itself" default, which is
+    /// exactly what made an external link's own status line so easy to hide
+    /// behind (nearly every article the reader focuses right after
+    /// following something has *a* link focused).
+    fn app_with_links(focus_external: bool) -> App {
+        let html = r#"<html><body><p>See <a href="./Internal_Target">Alpha</a> and
+            <a href="https://example.com/">External</a>.</p></body></html>"#;
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.research = crate::research::ResearchStore::in_memory();
+        app.set_document(crate::doc::parse_article_html("Test Article", html));
+        app.active_tab_mut().focused_link = Some(if focus_external { 1 } else { 0 });
+        app
+    }
+
+    /// Regression guard for deliverable 4: with no active notice, Reading's
+    /// rich focused-link line (page-source glyph prefix, cycle position,
+    /// keys) must render exactly as it always has.
+    #[test]
+    fn reading_focused_internal_link_line_is_unchanged_without_a_notice() {
+        let app = app_with_links(false);
+        assert_eq!(app.notice, None);
+        let text = status_bar_text(&app, 80);
+        assert_eq!(
+            text,
+            "→ Alpha (1/2)   Tab/S-Tab: cycle   Enter: open   H: back   L: forward"
+        );
+    }
+
+    /// PRD-adjacent B2: an external link's "External link: ..." notice must
+    /// win the status bar even though a link (nearly always) is focused —
+    /// previously, whatever `main::handle_key` wrote there landed in
+    /// `app.status`, which Reading's focused-link arm never even looks at.
+    #[test]
+    fn reading_notice_outranks_the_focused_external_link_line() {
+        let mut app = app_with_links(true);
+        // Confirms the fixture actually has the bug's precondition: a link
+        // focused, and it's the external one whose own line would otherwise
+        // take over the bar (see the `Some(link) => ...` arm without
+        // `internal_title`).
+        assert_eq!(
+            status_bar_text(&app, 80),
+            "→ External (external, not yet followable)"
+        );
+        app.notice = Some("External link: https://example.com/".to_string());
+        assert_eq!(
+            status_bar_text(&app, 80),
+            "External link: https://example.com/",
+            "the notice must outrank the focused-link line, not be hidden behind it"
+        );
+    }
+
+    /// Same outranking, proven with a focused *internal* link too — the fix
+    /// is unconditional on the notice channel, not specific to which kind of
+    /// link happens to be focused.
+    #[test]
+    fn reading_notice_outranks_the_focused_internal_link_line() {
+        let mut app = app_with_links(false);
+        app.notice = Some("Bookmarked \"Test Article\"".to_string());
+        assert_eq!(status_bar_text(&app, 80), "Bookmarked \"Test Article\"");
+    }
+
+    /// Reading's "Loading…" is rarer and more urgent than a leftover notice
+    /// from the keypress that triggered the fetch — this bar's pre-existing
+    /// order, preserved by `status_bar_text`'s `reading_loading` guard.
+    #[test]
+    fn reading_loading_still_outranks_a_pending_notice() {
+        let mut app = app_with_links(false);
+        app.notice = Some("Bookmarked \"Test Article\"".to_string());
+        app.loading = true;
+        assert_eq!(status_bar_text(&app, 80), "Loading…");
+    }
+
+    /// B13/B14: Research mode's status-bar arm used to be a hardcoded static
+    /// hint that never read `app.notice`, so `save_selected_citation`'s
+    /// confirmation (and any incognito warning it carries) was computed and
+    /// then never drawn. Exercises the *real* `App::save_selected_citation`
+    /// — not a simulated notice — to prove the fix end to end.
+    #[test]
+    fn citation_save_notice_renders_in_research_mode() {
+        let mut app = app_with_links(false);
+        app.mode = Mode::Research;
+        assert_eq!(
+            status_bar_text(&app, 80),
+            "Enter/s: save citation   R: library   Esc: done   j/k: move",
+            "no notice yet: the static hint still shows"
+        );
+
+        app.save_selected_citation();
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|n| n.contains("Saved to research collection")),
+            "save_selected_citation must set a notice: {:?}",
+            app.notice
+        );
+        assert_eq!(
+            status_bar_text(&app, 80),
+            app.notice.clone().unwrap(),
+            "the save confirmation must outrank Research's static hint"
+        );
+    }
+
+    /// The incognito half of the same fix: `save_selected_citation`'s
+    /// `privacy::append_warning_if_needed` persist-warning must also reach
+    /// the bar, not just the plain confirmation.
+    #[test]
+    fn citation_save_incognito_warning_renders_in_research_mode() {
+        let mut app = app_with_links(false);
+        app.mode = Mode::Research;
+        app.incognito = true;
+
+        app.save_selected_citation();
+        let notice = app.notice.clone().expect("save must set a notice");
+        assert!(
+            notice.contains("persist") || notice.contains("Saved to research collection"),
+            "incognito citation save should still warn or confirm: {notice:?}"
+        );
+        assert_eq!(status_bar_text(&app, 80), notice);
+    }
+
+    /// B14: the redlink card's `y`-yank confirmation, and the offline card's
+    /// own notices, must render — both cards used to be hardcoded static
+    /// hint strings with no notice check at all.
+    #[test]
+    fn redlink_card_yank_notice_renders_over_the_static_hint() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.mode = Mode::RedlinkCard;
+        assert_eq!(
+            status_bar_text(&app, 80),
+            "s: search similar titles   y: yank create URL   Esc: dismiss"
+        );
+        app.notice =
+            Some("Yanked https://en.wikipedia.org/w/index.php?title=X&action=edit".to_string());
+        assert_eq!(
+            status_bar_text(&app, 80),
+            "Yanked https://en.wikipedia.org/w/index.php?title=X&action=edit"
+        );
+    }
+
+    #[test]
+    fn offline_card_notice_renders_over_the_static_hint() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.mode = Mode::OfflineCard;
+        assert_eq!(
+            status_bar_text(&app, 80),
+            "f: queue for fetch when online   s: search saved pages   Esc: dismiss"
+        );
+        app.notice = Some("Queued \"X\" to fetch when online".to_string());
+        assert_eq!(
+            status_bar_text(&app, 80),
+            "Queued \"X\" to fetch when online"
+        );
+    }
+
+    /// Text-input prompts are the deliberate exception (deliverable 1): a
+    /// notice must NOT clobber a line the reader is still typing into.
+    #[test]
+    fn input_prompt_modes_keep_showing_their_own_input_even_with_a_notice_set() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.notice = Some("should not appear".to_string());
+
+        app.mode = Mode::Search;
+        app.search_input = "turing".to_string();
+        assert!(status_bar_text(&app, 80).starts_with("/turing"));
+        assert!(!status_bar_text(&app, 80).contains("should not appear"));
+
+        app.mode = Mode::Command;
+        app.command_input = "theme dark".to_string();
+        assert_eq!(status_bar_text(&app, 80), ":theme dark");
+
+        app.mode = Mode::Hint;
+        app.hint_input = "a".to_string();
+        assert_eq!(status_bar_text(&app, 80), "hint: a   Esc: cancel");
+    }
+
+    /// The notice lifecycle deliverable: set → visible → the next keypress's
+    /// choke point clears it → the mode's normal content returns. The
+    /// choke point itself is the single `app.notice = None` at the very top
+    /// of `main::handle_key` (before any mode dispatch) — this pins the
+    /// render-side contract that clearing depends on: once `notice` goes
+    /// back to `None`, the mode's own hint reappears unaided.
+    #[test]
+    fn notice_lifecycle_clearing_restores_the_modes_own_hint() {
+        let mut app = app_with_links(false);
+        app.mode = Mode::Research;
+
+        app.notice = Some("Saved to research collection (1 total)".to_string());
+        assert_eq!(
+            status_bar_text(&app, 80),
+            "Saved to research collection (1 total)"
+        );
+
+        // What `main::handle_key`'s choke point does on the next keypress.
+        app.notice = None;
+        assert_eq!(
+            status_bar_text(&app, 80),
+            "Enter/s: save citation   R: library   Esc: done   j/k: move",
+            "clearing the notice must restore Research's own hint line"
+        );
     }
 }

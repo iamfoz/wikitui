@@ -2506,14 +2506,19 @@ impl App {
             saved_at: crate::research::today(),
             kind,
         });
-        self.status = crate::privacy::append_warning_if_needed(
+        // A `notice`, not `status` — Research mode's own status-bar arm is a
+        // static hint string that never reads `status` at all (see
+        // `ui::status_bar_text`), so this confirmation (and the incognito
+        // warning `append_warning_if_needed` may append) would otherwise be
+        // computed and then silently never drawn.
+        self.notice = Some(crate::privacy::append_warning_if_needed(
             self.incognito,
             crate::privacy::Write::Citation,
             format!(
                 "Saved to research collection ({} total)",
                 self.research.citations.len()
             ),
-        );
+        ));
     }
 
     /// Whether the Research picker's entry at `index` is currently present

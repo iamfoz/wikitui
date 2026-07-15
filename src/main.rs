@@ -3005,12 +3005,26 @@ async fn handle_key(
     summary_tx: &UnboundedSender<SummaryOutcome>,
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
 ) {
+    // The single choke point for `App::notice`'s "shown until the next
+    // keypress" lifetime (PRD FR-CS-4-adjacent — see `ui::status_bar_text`):
+    // every call to `handle_key` is a keypress, so every call starts by
+    // discarding whatever notice the *previous* one left behind, before any
+    // mode-specific dispatch runs. A handler below is free to set a fresh
+    // `app.notice` after this point — Research's citation save, the redlink
+    // card's yank, a bookmark toggle, "External link: ..." — and that one
+    // survives to be drawn this frame, then gets cleared in turn by the next
+    // keypress's call. This used to happen piecemeal (only inside
+    // `Mode::Reading`'s own key handling), so a notice set while in Research,
+    // on the redlink card, or anywhere else that isn't Reading never got
+    // cleared at all and would linger stale once the reader returned to a
+    // mode that does show it.
+    app.notice = None;
+
     // `Q`'s one-keypress quit confirmation (PRD Appendix B) is intercepted
     // before any mode dispatch so no other binding can leak through: `y`
     // confirms the quit, anything else cancels it.
     if app.pending_quit_confirm {
         app.pending_quit_confirm = false;
-        app.notice = None;
         match code {
             KeyCode::Char('y') | KeyCode::Char('Y') => app.should_quit = true,
             _ => app.status = "Quit cancelled".to_string(),
@@ -3022,7 +3036,6 @@ async fn handle_key(
     // way: `y` proceeds with the resolved target list on the background save
     // queue, anything else cancels. Nothing was fetched until this point.
     if let Some(request) = app.pending_bulk_save.take() {
-        app.notice = None;
         match code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 let source_note = format!("bulk: {}", request.label);
@@ -3329,7 +3342,13 @@ async fn handle_key(
                             app.status = "Opening in a background tab…".to_string();
                         }
                         Some(app::HintFollowAction::External(href)) => {
-                            app.status = format!("External link: {href}");
+                            // A `notice`, not `status` — a link is almost
+                            // always focused right after following a hint,
+                            // and the focused-link line would otherwise hide
+                            // this behind Reading's own status line (the bug
+                            // three prior chunks independently hit — see
+                            // `ui::status_bar_text`).
+                            app.notice = Some(format!("External link: {href}"));
                         }
                         None => {}
                     }
@@ -3899,10 +3918,10 @@ async fn handle_key(
                 }
             }
 
-            // Captured before `app.notice` is cleared below: PRD FR-OFF-2's
-            // "updated — r to reload" notice means this keypress, if it's
-            // `r`, reloads instead of arming the read-later/Research prefix
-            // — see the `r` arm's own comment for why the two share a key.
+            // PRD FR-OFF-2's "updated — r to reload" notice means this
+            // keypress, if it's `r`, reloads instead of arming the
+            // read-later/Research prefix — see the `r` arm's own comment for
+            // why the two share a key.
             let had_pending_reload = app.active_tab().pending_reload.is_some();
             // PRD FR-NV-8's resume toast, captured for the `r`-precedence
             // decision below (see the `r` arms). It ranks *below* the SWR "r
@@ -3917,7 +3936,6 @@ async fn handle_key(
             // rather than reprocessing it as its own binding.
             if app.pending_r {
                 app.pending_r = false;
-                app.notice = None;
                 if let KeyCode::Char(c) = code {
                     match app::resolve_r_prefix(c) {
                         app::RPrefixAction::ReadLater => {
@@ -3938,7 +3956,6 @@ async fn handle_key(
                 }
                 return;
             }
-            app.notice = None;
             // PRD FR-NV-8: the resume toast is non-blocking — any key other
             // than `r` dismisses it (the `r` arms below consume it first).
             if !matches!(code, KeyCode::Char('r')) {
@@ -4071,7 +4088,10 @@ async fn handle_key(
                                 )
                                 .await
                             }
-                            None => app.status = format!("External link: {}", link.href),
+                            // A `notice`, not `status` — the very link this
+                            // reports on is the one still focused, so the
+                            // focused-link line would otherwise hide it.
+                            None => app.notice = Some(format!("External link: {}", link.href)),
                         }
                     }
                 }
@@ -4640,7 +4660,9 @@ async fn dispatch_action(
                         )
                         .await
                     }
-                    None => app.status = format!("External link: {}", link.href),
+                    // A `notice`, not `status` — same reasoning as the
+                    // hardcoded `Enter` arm this mirrors.
+                    None => app.notice = Some(format!("External link: {}", link.href)),
                 }
             }
         }
