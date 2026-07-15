@@ -533,6 +533,14 @@ impl WikiClient {
         }
     }
 
+    /// PRD §6.2 rule 2 / FR-BM-5: exposes the per-lang resolved wiki origin
+    /// for the Reading List sync's `project` field and same-wiki entry
+    /// filter (`account`'s ReadingLists module doc) — the one external need
+    /// for what was, until this feature, a private helper.
+    pub fn wiki_origin(&self, lang: &str) -> String {
+        self.host(lang)
+    }
+
     fn title_path(title: &str) -> String {
         urlencoding::encode(&title.replace(' ', "_")).into_owned()
     }
@@ -1087,6 +1095,126 @@ impl WikiClient {
         if unwatch {
             form.push(("unwatch", "1"));
         }
+        self.authed_post_form(&url, access_token, &form).await
+    }
+
+    /// PRD FR-BM-6: the watch-mirror's batched `action=watch`/unwatch —
+    /// `titles=A|B|C` in one request (real MediaWiki's own batching for this
+    /// module), distinct from [`watch_raw`](Self::watch_raw)'s single-`title`
+    /// form the `w` keybinding uses. Same response shape either way (see
+    /// `account::parse_watch_batch_outcome`).
+    pub async fn watch_batch_raw(
+        &self,
+        lang: &str,
+        access_token: &str,
+        titles: &[String],
+        token: &str,
+        unwatch: bool,
+    ) -> Result<Vec<u8>> {
+        let url = format!("{}/w/api.php?format=json&formatversion=2", self.host(lang));
+        let joined = titles.join("|");
+        let mut form = vec![
+            ("action", "watch"),
+            ("titles", joined.as_str()),
+            ("token", token),
+        ];
+        if unwatch {
+            form.push(("unwatch", "1"));
+        }
+        self.authed_post_form(&url, access_token, &form).await
+    }
+
+    /// PRD FR-BM-5 / SP-7 (uncertain — see `account.rs`'s ReadingLists module
+    /// doc for every assumption this build makes): `action=readinglists&
+    /// command=setup`, a CSRF-token'd write. Idempotent on a real account
+    /// (calling it again once already set up is a documented no-op there);
+    /// the test mock always answers success.
+    pub async fn readinglists_setup_raw(
+        &self,
+        lang: &str,
+        access_token: &str,
+        token: &str,
+    ) -> Result<Vec<u8>> {
+        let url = format!("{}/w/api.php?format=json&formatversion=2", self.host(lang));
+        let form = [
+            ("action", "readinglists"),
+            ("command", "setup"),
+            ("token", token),
+        ];
+        self.authed_post_form(&url, access_token, &form).await
+    }
+
+    /// PRD FR-BM-5 / SP-7: `command=list` — the account's Reading Lists
+    /// (this build only ever uses the default one, `account::default_list_id`).
+    pub async fn fetch_readinglists(&self, lang: &str, access_token: &str) -> Result<Vec<u8>> {
+        let url = format!(
+            "{}/w/api.php?format=json&formatversion=2&action=readinglists&command=list",
+            self.host(lang)
+        );
+        let resp = self.authed_get(&url, access_token).await?;
+        read_capped(resp, MAX_SEARCH_RESPONSE_BYTES)
+            .await
+            .context("reading readinglists-list response body")
+    }
+
+    /// PRD FR-BM-5 / SP-7: `command=listentries` — every entry in one list.
+    pub async fn fetch_readinglist_entries(
+        &self,
+        lang: &str,
+        access_token: &str,
+        list_id: u64,
+    ) -> Result<Vec<u8>> {
+        let url = format!(
+            "{}/w/api.php?format=json&formatversion=2&action=readinglists&command=listentries&list={list_id}",
+            self.host(lang)
+        );
+        let resp = self.authed_get(&url, access_token).await?;
+        read_capped(resp, MAX_SEARCH_RESPONSE_BYTES)
+            .await
+            .context("reading readinglists-listentries response body")
+    }
+
+    /// PRD FR-BM-5 / SP-7: `command=createentry` — adds `title` (on
+    /// `project`, this build's own resolved wiki origin, see
+    /// [`wiki_origin`](Self::wiki_origin)) to `list_id`.
+    pub async fn readinglists_createentry_raw(
+        &self,
+        lang: &str,
+        access_token: &str,
+        list_id: u64,
+        project: &str,
+        title: &str,
+        token: &str,
+    ) -> Result<Vec<u8>> {
+        let url = format!("{}/w/api.php?format=json&formatversion=2", self.host(lang));
+        let list_id_str = list_id.to_string();
+        let form = [
+            ("action", "readinglists"),
+            ("command", "createentry"),
+            ("list", list_id_str.as_str()),
+            ("project", project),
+            ("title", title),
+            ("token", token),
+        ];
+        self.authed_post_form(&url, access_token, &form).await
+    }
+
+    /// PRD FR-BM-5 / SP-7: `command=deleteentry`.
+    pub async fn readinglists_deleteentry_raw(
+        &self,
+        lang: &str,
+        access_token: &str,
+        entry_id: u64,
+        token: &str,
+    ) -> Result<Vec<u8>> {
+        let url = format!("{}/w/api.php?format=json&formatversion=2", self.host(lang));
+        let entry_id_str = entry_id.to_string();
+        let form = [
+            ("action", "readinglists"),
+            ("command", "deleteentry"),
+            ("entry", entry_id_str.as_str()),
+            ("token", token),
+        ];
         self.authed_post_form(&url, access_token, &form).await
     }
 

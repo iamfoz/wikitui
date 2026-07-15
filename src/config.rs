@@ -266,6 +266,11 @@ pub struct ResolvedConfig {
     pub reading: ResolvedReading,
     /// PRD §5.9 / FR-ACC-1's `[auth]` table (OAuth client id + endpoints).
     pub auth: ResolvedAuth,
+    /// PRD FR-BM-6's designated mirror tag: which bookmark tag `:sync`/
+    /// `:mirror-watchlist` mirrors to the real watchlist. File only (a
+    /// preference set once, like `startpage`/`include_nonfree`), default
+    /// `"watched"`.
+    pub watchlist_mirror_tag: Valued<String>,
     /// Parse errors, unknown keys, and rejected values — never fatal, but
     /// `doctor` reports them and exits 1 if any is `IssueLevel::Error`.
     pub issues: Vec<Issue>,
@@ -602,6 +607,7 @@ pub fn resolve(
         "hyperlinks",
         "color_depth",
         "reading",
+        "watchlist_mirror_tag",
     ]
     .into_iter()
     .collect();
@@ -689,6 +695,7 @@ pub fn resolve(
     let terminal = resolve_terminal(env, &table, &user_theme_names, &mut issues);
     let reading = resolve_reading(&table, &mut issues);
     let auth = resolve_auth(&table, &mut issues);
+    let watchlist_mirror_tag = resolve_watchlist_mirror_tag(&table, &mut issues);
 
     ResolvedConfig {
         config_version: Valued {
@@ -724,6 +731,7 @@ pub fn resolve(
         terminal,
         reading,
         auth,
+        watchlist_mirror_tag,
         migration_summary: config_version.1,
         issues,
         config_path: config_path.map(Path::to_path_buf),
@@ -1255,6 +1263,44 @@ fn resolve_startpage(table: &toml::Table, issues: &mut Vec<Issue>) -> Valued<Str
             _ => {
                 issues.push(Issue::warning(format!(
                     "startpage must be one of feed|blank|resume; using default {DEFAULT}"
+                )));
+                default
+            }
+        },
+    }
+}
+
+/// PRD FR-BM-6's designated mirror tag (file-only, default `"watched"`,
+/// mirroring `resolve_startpage`'s shape). A leading `#` some users will type
+/// out of habit is stripped, same convention as `bookmarks::parse_tags`;
+/// anything left blank after that falls back to the default with a warning
+/// — an empty tag can never match `Bookmark::tags`.
+fn resolve_watchlist_mirror_tag(table: &toml::Table, issues: &mut Vec<Issue>) -> Valued<String> {
+    const DEFAULT: &str = "watched";
+    let default = Valued {
+        value: DEFAULT.to_string(),
+        source: Source::Default,
+    };
+    match table.get("watchlist_mirror_tag") {
+        None => default,
+        Some(v) => match v.as_str() {
+            Some(s) => {
+                let trimmed = s.strip_prefix('#').unwrap_or(s).trim();
+                if trimmed.is_empty() {
+                    issues.push(Issue::warning(format!(
+                        "watchlist_mirror_tag must be a non-empty tag name; using default {DEFAULT:?}"
+                    )));
+                    default
+                } else {
+                    Valued {
+                        value: trimmed.to_string(),
+                        source: Source::File,
+                    }
+                }
+            }
+            None => {
+                issues.push(Issue::warning(format!(
+                    "watchlist_mirror_tag must be a string; using default {DEFAULT:?}"
                 )));
                 default
             }
@@ -2635,6 +2681,53 @@ mod tests {
             r.issues.iter().any(|i| i.message.contains("auth.bogus")),
             "unknown auth key should warn: {:?}",
             r.issues
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn watchlist_mirror_tag_defaults_to_watched_and_honors_the_file() {
+        let default = resolve(&CliOverrides::default(), &EnvOverrides::default(), None);
+        assert_eq!(default.watchlist_mirror_tag.value, "watched");
+        assert_eq!(default.watchlist_mirror_tag.source, Source::Default);
+
+        let path = temp_config("watchlist_mirror_tag = \"to-watch\"\n");
+        let r = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(r.watchlist_mirror_tag.value, "to-watch");
+        assert_eq!(r.watchlist_mirror_tag.source, Source::File);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn watchlist_mirror_tag_strips_a_leading_hash_a_user_typed_out_of_habit() {
+        let path = temp_config("watchlist_mirror_tag = \"#watched\"\n");
+        let r = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(r.watchlist_mirror_tag.value, "watched");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn watchlist_mirror_tag_rejects_an_empty_value_with_a_warning() {
+        let path = temp_config("watchlist_mirror_tag = \"   \"\n");
+        let r = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(r.watchlist_mirror_tag.value, "watched");
+        assert_eq!(r.watchlist_mirror_tag.source, Source::Default);
+        assert!(
+            r.issues
+                .iter()
+                .any(|i| i.message.contains("watchlist_mirror_tag")),
         );
         cleanup(&path);
     }

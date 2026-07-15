@@ -148,6 +148,26 @@ fn atomic_rewrite(path: &Path, lines: &[String]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Rewrites the *entire* file to `records`, in the given order — unlike
+/// `rewrite_matching`'s single-line replace/delete, every record is
+/// re-serialized from scratch, so a line this build couldn't parse does NOT
+/// survive a whole-file reorder the way it survives `rewrite_matching` (there
+/// is nothing to preserve byte-for-byte once every record has already been
+/// read into memory and it wasn't one of them). Used by `bookmarks::
+/// BookmarkStore::reorder` (PRD FR-BM-5's "server wins on order" conflict
+/// policy) — the one caller whose contract is "line order is itself
+/// meaningful data," not just "one line's content changed."
+pub fn rewrite_all<T: Serialize>(path: &Path, records: &[T]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let lines: Vec<String> = records
+        .iter()
+        .map(|r| serde_json::to_string(r).map_err(std::io::Error::other))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    atomic_rewrite(path, &lines)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,6 +364,79 @@ mod tests {
         let path = temp_path("nofile");
         let found = rewrite_matching::<Rec, _>(&path, |_| true, None).unwrap();
         assert!(!found);
+    }
+
+    #[test]
+    fn rewrite_all_replaces_the_whole_file_in_the_given_order() {
+        let path = temp_path("rewrite-all");
+        append(
+            &path,
+            &Rec {
+                id: 1,
+                text: "a".into(),
+            },
+        )
+        .unwrap();
+        append(
+            &path,
+            &Rec {
+                id: 2,
+                text: "b".into(),
+            },
+        )
+        .unwrap();
+        append(
+            &path,
+            &Rec {
+                id: 3,
+                text: "c".into(),
+            },
+        )
+        .unwrap();
+
+        // Reordered AND missing id 2 — a whole-file rewrite, not an edit.
+        let reordered = vec![
+            Rec {
+                id: 3,
+                text: "c".into(),
+            },
+            Rec {
+                id: 1,
+                text: "a".into(),
+            },
+        ];
+        rewrite_all(&path, &reordered).unwrap();
+
+        let loaded: Vec<Rec> = load(&path);
+        assert_eq!(loaded, reordered);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rewrite_all_on_a_fresh_path_creates_the_file_and_parent_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "wikitui-test-jsonl-rewrite-all-fresh-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let path = dir.join("nested").join("store.jsonl");
+        rewrite_all(
+            &path,
+            &[Rec {
+                id: 1,
+                text: "x".into(),
+            }],
+        )
+        .unwrap();
+        let loaded: Vec<Rec> = load(&path);
+        assert_eq!(
+            loaded,
+            vec![Rec {
+                id: 1,
+                text: "x".into()
+            }]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

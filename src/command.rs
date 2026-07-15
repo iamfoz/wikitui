@@ -130,6 +130,16 @@ pub enum Command {
     /// `:prefs` (PRD FR-ACC-7, logged in only) — the read-only preferences
     /// card.
     Prefs,
+    /// `:sync` (PRD FR-BM-5/6, logged in only, opt-in): a two-way Reading
+    /// List reconcile (`action=readinglists`) plus applying the watchlist-
+    /// mirror tag (`action=watch`) — two distinct backends, reported
+    /// separately, never conflated into one count (see `main::cmd_sync`).
+    Sync,
+    /// `:mirror-watchlist` (PRD FR-BM-6 alone): applies just the watch-
+    /// mirror half of `:sync` — e.g. right after tagging/untagging a
+    /// bookmark with the configured `watchlist_mirror_tag`, without
+    /// touching Reading List sync.
+    MirrorWatchlist,
     /// `:q` / `:quit` — exit.
     Quit,
 }
@@ -353,7 +363,7 @@ fn validate_set_value(
     }
 }
 
-pub const USAGE: &str = "commands: open <title>, lang [<code>], theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, prefetch-log, start, today, random [good], related, talk, info, set theme=<name>|images=on|off|prefetch=on|off|measure=N|ambiguous_width=1|2|reading_wpm=N|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N, set-tab measure=N|images=on|off|ambiguous_width=1|2|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N (or set-tab key= to reset), config reload, watchlist, notifications, contribs [username], prefs, help, quit";
+pub const USAGE: &str = "commands: open <title>, lang [<code>], theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, prefetch-log, start, today, random [good], related, talk, info, set theme=<name>|images=on|off|prefetch=on|off|measure=N|ambiguous_width=1|2|reading_wpm=N|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N, set-tab measure=N|images=on|off|ambiguous_width=1|2|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N (or set-tab key= to reset), config reload, watchlist, notifications, contribs [username], prefs, sync, mirror-watchlist, help, quit";
 
 /// Parses one `:` command line. `user_theme_names` are accepted alongside
 /// the six built-ins for `:theme <name>` and `:set theme=<name>` (PRD
@@ -664,6 +674,9 @@ pub fn parse_with_user_themes(input: &str, user_theme_names: &[String]) -> Resul
         )),
         // PRD FR-ACC-7.
         "prefs" => Ok(Command::Prefs),
+        // PRD FR-BM-5/6.
+        "sync" => Ok(Command::Sync),
+        "mirror-watchlist" | "mirrorwatchlist" => Ok(Command::MirrorWatchlist),
         "help" | "h" => Ok(Command::Help),
         "q" | "quit" => Ok(Command::Quit),
         "" => Err(USAGE.to_string()),
@@ -1285,6 +1298,15 @@ mod tests {
         assert_eq!(parse("watchlist"), Ok(Command::Watchlist));
         assert_eq!(parse("notifications"), Ok(Command::Notifications));
         assert_eq!(parse("prefs"), Ok(Command::Prefs));
+    }
+
+    // ---- PRD FR-BM-5/6: sync / mirror-watchlist -----------------------------
+
+    #[test]
+    fn sync_and_mirror_watchlist_parse_bare() {
+        assert_eq!(parse("sync"), Ok(Command::Sync));
+        assert_eq!(parse("mirror-watchlist"), Ok(Command::MirrorWatchlist));
+        assert_eq!(parse("mirrorwatchlist"), Ok(Command::MirrorWatchlist));
     }
 
     #[test]

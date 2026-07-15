@@ -918,6 +918,20 @@ pub struct App {
     pub prefs: Option<crate::account::UserPrefs>,
     /// The mode `:prefs` was opened from, restored on close.
     pub prefs_prior_mode: Mode,
+
+    // -- Reading List sync (PRD FR-BM-5) / watchlist mirror (PRD FR-BM-6) --
+    /// Config `watchlist_mirror_tag` (default `"watched"`): which bookmark
+    /// tag `:sync`/`:mirror-watchlist` mirrors to the real watchlist.
+    pub watchlist_mirror_tag: String,
+    /// Where the Reading List sync's id-map state persists
+    /// (`account::readinglist_sync_state_path`), loaded once at startup like
+    /// `watchlist_state_path`; `None` when no state directory resolves.
+    pub readinglist_sync_state_path: Option<PathBuf>,
+    /// Where the watch-mirror's own "what did *we* watch" state persists
+    /// (`account::watch_mirror_state_path`) — see `account::watch_mirror_
+    /// diff`'s doc comment for why this can't just be re-derived from the
+    /// live watchlist.
+    pub watch_mirror_state_path: Option<PathBuf>,
 }
 
 /// The watchlist pane's two tabs (PRD FR-ACC-2).
@@ -1213,6 +1227,9 @@ impl App {
             tokens: crate::account::TokenCache::new(),
             prefs: None,
             prefs_prior_mode: Mode::Reading,
+            watchlist_mirror_tag: "watched".to_string(),
+            readinglist_sync_state_path: None,
+            watch_mirror_state_path: None,
         }
     }
 

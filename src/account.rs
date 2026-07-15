@@ -45,6 +45,7 @@
 //! Marking read (`echomarkread`) updates the in-memory badge locally instead
 //! of firing a third network call.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -278,6 +279,11 @@ struct WatchActionResponse {
 
 #[derive(Debug, Deserialize, Default)]
 struct WatchActionEntry {
+    /// Only populated by the batched form (`parse_watch_batch_outcome`) —
+    /// the single-title `parse_watch_outcome` already knows which title it
+    /// asked about, so it never needs to read this field back.
+    #[serde(default)]
+    title: String,
     #[serde(default)]
     watched: bool,
     #[serde(default)]
@@ -599,6 +605,513 @@ pub fn parse_userinfo_options(body: &[u8]) -> Result<UserPrefs, serde_json::Erro
         email_confirmed: info.emailauthenticated.is_some(),
         editcount: info.editcount,
     })
+}
+
+// ---------------------------------------------------------------------------
+// FR-BM-5: Reading List sync (Extension:ReadingLists, `action=readinglists`)
+// ---------------------------------------------------------------------------
+//
+// ## SP-7 assumptions (unverifiable live — see PRD SP-7 / Appendix A)
+//
+// The real extension's exact wire shape for third-party OAuth consumers is
+// explicitly flagged unverified (SP-7: "verify third-party OAuth consumers
+// can use `action=readinglists`; which grants the write modules require;
+// list-size caps; conflict semantics"). Live Wikipedia is unreachable from
+// this build's test environment, so every shape below is this project's own
+// documented best-effort reading, mirrored exactly by the test mock
+// (`tests/mock-server/server.py`), not a verified live behavior:
+//
+//   - Every response (read or write) rides one top-level `"readinglists"`
+//     key, keyed further by what the command returned (`lists`, `entries`,
+//     `entry`, `list`, `success`) — chosen for a single, generic parse shape
+//     rather than one struct per command's own top-level key.
+//   - `command=list`/`command=listentries` before the account has ever run
+//     `command=setup` come back as an error with code
+//     `"readinglists-db-error-not-set-up"` ([`READINGLISTS_NOT_SET_UP`]) —
+//     the signal `main::fetch_readinglists_with_setup` treats the same way
+//     `is_badtoken_response` treats a stale token (§6.2 rule 8): try, detect
+//     that one recoverable failure, fix it (`command=setup`), retry once.
+//   - `command=list`/`listentries`/`setup`/`createentry`/`deleteentry` are
+//     called against the *current* `lang`'s per-wiki endpoint (PRD §6.2 rule
+//     1: per-wiki endpoints only), matching every other authenticated write
+//     in this codebase. Appendix A notes the real extension is "cross-wiki";
+//     if that means a single central list resolves identically regardless of
+//     which wiki host serves the request, this degrades to one independent
+//     list per wiki host — safe (nothing crashes or double-syncs), just not
+//     the cross-wiki ideal. **Multi-wiki Reading List sync is a documented
+//     v1 seam**, same as multiple *named* lists (`default_list_id` always
+//     picks the one default list — see its own doc comment).
+//   - A `listentries` entry whose `project` doesn't match the current
+//     session's own wiki origin is left alone by `main::sync_reading_list`
+//     (filtered out before reconciling) rather than guessed into some other
+//     `lang` bucket — the safe version of the same cross-wiki scope-cut.
+//
+// ## The two-way reconcile + sync-mapping model (FR-BM-5's conflict policy)
+//
+// FR-BM-5's conflict policy, verbatim: "server wins on order, local wins on
+// tags/notes (which the server can't store — kept local-only)." Concretely:
+//
+//   - **Tags/notes**: never sent to the server (no field exists for them —
+//     `readinglists_createentry_raw` takes only a title/project) and never
+//     touched by a pull, because [`reconcile_reading_list`] only ever calls
+//     an operation on a title that's *missing* from one side; a title
+//     present on both sides (`matched`) is left completely untouched, tags
+//     and notes included. "Local wins" here isn't an active merge decision —
+//     it's that sync has no path that could ever overwrite them.
+//   - **Order**: [`apply_server_order`] re-sorts local bookmarks (within the
+//     synced `lang`) to the server's own `listentries` return order after
+//     every reconcile; a title the server doesn't know about yet (this
+//     round's fresh pushes) keeps its prior relative position, appended
+//     last, until the *next* sync re-lists it with a real rank.
+//   - **The sync-mapping problem**: telling "a page deleted locally after
+//     being synced" (must delete server-side, never re-pull) apart from "a
+//     page new to the server" (must pull) needs memory of what was
+//     previously synced — a same-run diff of local-vs-server alone can't
+//     distinguish them (both look like "on the server, not local"). This
+//     build's model is a **persisted id-map** ([`ReadingListSyncState`],
+//     `synced: Vec<SyncedEntry>`), not a tombstone list: after every
+//     reconcile the map is fully recomputed as exactly "every title known to
+//     be on both sides right now" (`matched` ∪ freshly pushed ∪ freshly
+//     pulled) — a title that drops off *either* side (deleted locally,
+//     deleted server-side, or both) simply isn't re-added, which is the
+//     model's garbage collection: no tombstone ever needs explicit expiry.
+//     **Limit**: a page removed from the server by a *different* client
+//     between two of this client's syncs, while still bookmarked locally,
+//     is indistinguishable from "never synced" — [`reconcile_reading_list`]
+//     re-pushes it (favors never silently losing a local bookmark over
+//     never re-creating a deliberately-server-deleted one).
+
+/// PRD FR-BM-5 / SP-7: this mock/build's own chosen error code for "no
+/// reading list exists for this user yet" — see this section's module doc
+/// for why the real extension's actual code (if any) is unverified.
+pub const READINGLISTS_NOT_SET_UP: &str = "readinglists-db-error-not-set-up";
+
+/// Recognizes [`READINGLISTS_NOT_SET_UP`] the same way [`is_badtoken_response`]
+/// recognizes `badtoken` — the one recoverable failure `main::
+/// fetch_readinglists_with_setup` retries after running `command=setup`.
+pub fn is_readinglists_not_set_up(body: &[u8]) -> bool {
+    #[derive(Deserialize)]
+    struct ErrorEnvelope {
+        error: Option<ErrorCode>,
+    }
+    #[derive(Deserialize)]
+    struct ErrorCode {
+        code: String,
+    }
+    serde_json::from_slice::<ErrorEnvelope>(body)
+        .ok()
+        .and_then(|e| e.error)
+        .is_some_and(|e| e.code == READINGLISTS_NOT_SET_UP)
+}
+
+/// `command=setup`'s response: the id of the (now-available) default list,
+/// when this build's assumed shape parses. `None` on any other shape
+/// (including a genuine error body) — the caller treats that as "setup
+/// didn't confirm anything usable," not as a crash.
+pub fn parse_readinglists_setup(body: &[u8]) -> Option<u64> {
+    #[derive(Deserialize)]
+    struct Resp {
+        readinglists: Option<Inner>,
+    }
+    #[derive(Deserialize)]
+    struct Inner {
+        #[serde(default)]
+        list: Option<u64>,
+    }
+    serde_json::from_slice::<Resp>(body)
+        .ok()
+        .and_then(|r| r.readinglists)
+        .and_then(|i| i.list)
+}
+
+/// One of the account's Reading Lists (`command=list`'s `lists` array): its
+/// server id, display name, and whether it's the account's default list.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ReadingListInfo {
+    pub id: u64,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub default: bool,
+}
+
+/// Parses `command=list`'s response into every list the account has.
+pub fn parse_readinglists(body: &[u8]) -> Vec<ReadingListInfo> {
+    #[derive(Deserialize)]
+    struct Resp {
+        readinglists: Option<Inner>,
+    }
+    #[derive(Deserialize, Default)]
+    struct Inner {
+        #[serde(default)]
+        lists: Vec<ReadingListInfo>,
+    }
+    serde_json::from_slice::<Resp>(body)
+        .ok()
+        .and_then(|r| r.readinglists)
+        .map(|i| i.lists)
+        .unwrap_or_default()
+}
+
+/// Picks the list `:sync` reconciles against (PRD FR-BM-5 v1: one default
+/// list only — multiple *named* lists are a documented seam, see this
+/// section's module doc): the entry flagged `default`, or else simply the
+/// first list returned, tolerant of a server that omits the flag entirely.
+/// `None` only when the account has no lists at all (shouldn't happen right
+/// after a successful `command=setup`, but kept total).
+pub fn default_list_id(lists: &[ReadingListInfo]) -> Option<u64> {
+    lists
+        .iter()
+        .find(|l| l.default)
+        .or_else(|| lists.first())
+        .map(|l| l.id)
+}
+
+/// One entry in a Reading List (`command=listentries`): its server id, the
+/// wiki origin it belongs to (`project`, e.g. `https://en.wikipedia.org` —
+/// empty when a server omits it, tolerated rather than rejected), and its
+/// title.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ReadingListEntry {
+    pub id: u64,
+    #[serde(default)]
+    pub project: String,
+    pub title: String,
+}
+
+/// Parses `command=listentries`.
+pub fn parse_readinglist_entries(body: &[u8]) -> Vec<ReadingListEntry> {
+    #[derive(Deserialize)]
+    struct Resp {
+        readinglists: Option<Inner>,
+    }
+    #[derive(Deserialize, Default)]
+    struct Inner {
+        #[serde(default)]
+        entries: Vec<ReadingListEntry>,
+    }
+    serde_json::from_slice::<Resp>(body)
+        .ok()
+        .and_then(|r| r.readinglists)
+        .map(|i| i.entries)
+        .unwrap_or_default()
+}
+
+/// Parses `command=createentry`'s response into the entry the server just
+/// created (its assigned id, in particular — the whole point of the call).
+pub fn parse_readinglists_createentry(body: &[u8]) -> Option<ReadingListEntry> {
+    #[derive(Deserialize)]
+    struct Resp {
+        readinglists: Option<Inner>,
+    }
+    #[derive(Deserialize)]
+    struct Inner {
+        entry: Option<ReadingListEntry>,
+    }
+    serde_json::from_slice::<Resp>(body)
+        .ok()
+        .and_then(|r| r.readinglists)
+        .and_then(|i| i.entry)
+}
+
+/// Whether `command=deleteentry` reported success.
+pub fn readinglists_deleteentry_succeeded(body: &[u8]) -> bool {
+    #[derive(Deserialize)]
+    struct Resp {
+        readinglists: Option<Inner>,
+    }
+    #[derive(Deserialize, Default)]
+    struct Inner {
+        #[serde(default)]
+        success: bool,
+    }
+    serde_json::from_slice::<Resp>(body)
+        .ok()
+        .and_then(|r| r.readinglists)
+        .is_some_and(|i| i.success)
+}
+
+/// One title this client has previously reconciled to a server entry id —
+/// [`ReadingListSyncState`]'s id-map row (see this section's module doc for
+/// the model this implements).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncedEntry {
+    pub lang: String,
+    pub title: String,
+    pub entry_id: u64,
+}
+
+/// The Reading List sync's persisted state (PRD §6.4: `$XDG_STATE_HOME` —
+/// this is a local bookmark into server-side state, not user content of its
+/// own, the same reasoning `watchlist.json` already uses).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadingListSyncState {
+    #[serde(default)]
+    pub list_id: Option<u64>,
+    #[serde(default)]
+    pub synced: Vec<SyncedEntry>,
+}
+
+/// `$XDG_STATE_HOME/wikitui/readinglist-sync.json`.
+pub fn readinglist_sync_state_path() -> Option<PathBuf> {
+    let dirs = directories::ProjectDirs::from("", "", "wikitui")?;
+    let dir = dirs
+        .state_dir()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| dirs.data_dir().join("state"));
+    Some(dir.join("readinglist-sync.json"))
+}
+
+/// Loads the Reading List sync state from `path`. Best-effort like
+/// `load_last_seen`: a missing file, a corrupt one, or no readable path all
+/// degrade to `ReadingListSyncState::default()` (nothing previously synced)
+/// rather than an error the caller would have to handle.
+pub fn load_readinglist_sync_state(path: &Path) -> ReadingListSyncState {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+/// Persists the Reading List sync state to `path`, creating parent
+/// directories as needed. Best-effort — the caller discards the `Result`,
+/// matching `save_last_seen`'s "losing one write is preferable to
+/// interrupting reading" posture.
+pub fn save_readinglist_sync_state(
+    path: &Path,
+    state: &ReadingListSyncState,
+) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string(state).map_err(std::io::Error::other)?;
+    std::fs::write(path, json)
+}
+
+/// The three actions one Reading List two-way reconcile decides on (PRD
+/// FR-BM-5's conflict policy — see this section's module doc for the full
+/// model): `push` titles need a server entry created; `pull` titles need a
+/// local bookmark created; `server_delete` entry ids need deleting
+/// server-side. `matched` (present on both sides already, so nothing to do)
+/// is exposed too, since the caller needs it to recompute the sync-mapping
+/// going forward — see [`reconcile_reading_list`]'s doc comment.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReadingListPlan {
+    pub push: Vec<String>,
+    pub pull: Vec<String>,
+    pub server_delete: Vec<u64>,
+    pub matched: Vec<(String, u64)>,
+}
+
+/// The pure heart of FR-BM-5's two-way sync (no I/O — every network call and
+/// every `BookmarkStore`/state-file write is the caller's job, `main::
+/// sync_reading_list`): given the local bookmark titles for the wiki being
+/// synced (in their existing local order — the caller passes a slice, not a
+/// set, precisely so this stays deterministic), the server's current
+/// entries for that list, and the previous sync's id-map, decides:
+///
+///   - a **local** title with no matching server entry → [`push`
+///     ](ReadingListPlan::push) it (covers both "brand-new local bookmark"
+///     and "was synced before, but the server copy is gone now" — treated
+///     identically, since either way the local bookmark should exist on the
+///     server and currently doesn't; see this section's module doc for why
+///     that favors never losing a local bookmark).
+///   - a **server** entry with no matching local title, whose title was
+///     *not* in `previously_synced` → [`pull`](ReadingListPlan::pull) it
+///     (new to this client, from another device/app).
+///   - a **server** entry with no matching local title, whose title *was* in
+///     `previously_synced` → [`server_delete`](ReadingListPlan::server_delete)
+///     it (this client had it, the reader deleted the local bookmark since —
+///     mirror that deletion server-side, don't resurrect it locally).
+///   - a title present on **both** sides → [`matched`](ReadingListPlan::matched)
+///     (already in sync; completely untouched, tags/notes included — the
+///     "local wins on tags/notes" half of the conflict policy, enforced by
+///     omission rather than by an active merge).
+pub fn reconcile_reading_list(
+    local_titles: &[String],
+    server_entries: &[ReadingListEntry],
+    previously_synced: &[SyncedEntry],
+) -> ReadingListPlan {
+    let server_id_by_title: HashMap<&str, u64> = server_entries
+        .iter()
+        .map(|e| (e.title.as_str(), e.id))
+        .collect();
+    let local_set: HashSet<&str> = local_titles.iter().map(String::as_str).collect();
+    let was_synced: HashSet<&str> = previously_synced.iter().map(|s| s.title.as_str()).collect();
+
+    let mut push = Vec::new();
+    let mut matched = Vec::new();
+    for title in local_titles {
+        match server_id_by_title.get(title.as_str()) {
+            Some(&id) => matched.push((title.clone(), id)),
+            None => push.push(title.clone()),
+        }
+    }
+
+    let mut pull = Vec::new();
+    let mut server_delete = Vec::new();
+    for entry in server_entries {
+        if local_set.contains(entry.title.as_str()) {
+            continue; // already accounted for in `matched` above
+        }
+        if was_synced.contains(entry.title.as_str()) {
+            server_delete.push(entry.id);
+        } else {
+            pull.push(entry.title.clone());
+        }
+    }
+
+    ReadingListPlan {
+        push,
+        pull,
+        server_delete,
+        matched,
+    }
+}
+
+/// PRD FR-BM-5's "server wins on order": returns `local_titles` reordered so
+/// every title the server also returned follows `server_titles_in_order`'s
+/// ranking; a title the server doesn't (yet) know about — this sync round's
+/// fresh pushes, before the *next* sync re-lists them — keeps its prior
+/// relative position among the rest, appended after every server-ranked
+/// title. Stable by construction (ties broken by original index), so this
+/// is a total ordering with no arbitrary tie-breaking.
+pub fn apply_server_order(
+    server_titles_in_order: &[String],
+    local_titles: &[String],
+) -> Vec<String> {
+    let rank: HashMap<&str, usize> = server_titles_in_order
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.as_str(), i))
+        .collect();
+    let mut indexed: Vec<(usize, &String)> = local_titles.iter().enumerate().collect();
+    indexed.sort_by_key(|(i, t)| (rank.get(t.as_str()).copied().unwrap_or(usize::MAX), *i));
+    indexed.into_iter().map(|(_, t)| t.clone()).collect()
+}
+
+// ---------------------------------------------------------------------------
+// FR-BM-6: watchlist mirror
+// ---------------------------------------------------------------------------
+//
+// One designated bookmark tag (config `watchlist_mirror_tag`, default
+// `"watched"`) mirrors to the real watchlist. This is edit-monitoring, not
+// bookmarking — PRD FR-BM-6's own wording ("clearly labeled as 'watching
+// edits', separate from bookmarks") — so tagging a bookmark `watched` adds
+// its page to the server watchlist, and removing the tag (or deleting the
+// bookmark outright) unwatches it; it never works the other direction (a
+// page watched by hand, outside this mirror, is never touched by it — see
+// [`watch_mirror_diff`]'s doc comment for exactly why that needs its own
+// persisted state rather than reading the live watchlist).
+
+/// The watch-mirror's own persisted state: which titles *this mirror*
+/// caused to be watched, as of its last run. Never re-derived from the live
+/// watchlist (`list=watchlistraw`) — a page the reader watches by hand for
+/// unrelated reasons must never be unwatched just because it isn't tagged.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchMirrorState {
+    #[serde(default)]
+    pub mirrored: Vec<String>,
+}
+
+/// `$XDG_STATE_HOME/wikitui/watch-mirror.json`.
+pub fn watch_mirror_state_path() -> Option<PathBuf> {
+    let dirs = directories::ProjectDirs::from("", "", "wikitui")?;
+    let dir = dirs
+        .state_dir()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| dirs.data_dir().join("state"));
+    Some(dir.join("watch-mirror.json"))
+}
+
+/// Loads the watch-mirror state from `path` — best-effort, same degrade-to-
+/// default posture as [`load_readinglist_sync_state`].
+pub fn load_watch_mirror_state(path: &Path) -> WatchMirrorState {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+/// Persists the watch-mirror state to `path` — best-effort, same posture as
+/// [`save_readinglist_sync_state`].
+pub fn save_watch_mirror_state(path: &Path, state: &WatchMirrorState) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string(state).map_err(std::io::Error::other)?;
+    std::fs::write(path, json)
+}
+
+/// What one watch-mirror application needs to do (PRD FR-BM-6): titles to
+/// watch and titles to unwatch.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WatchMirrorPlan {
+    pub to_watch: Vec<String>,
+    pub to_unwatch: Vec<String>,
+}
+
+/// The pure heart of FR-BM-6's mirror (no I/O): `tagged_titles` are every
+/// bookmark title currently carrying the mirror tag; `previously_mirrored`
+/// is [`WatchMirrorState::mirrored`] from the last run. A title just tagged
+/// shows up only in [`to_watch`](WatchMirrorPlan::to_watch); a title
+/// untagged (or whose bookmark was deleted outright) shows up only in
+/// [`to_unwatch`](WatchMirrorPlan::to_unwatch) — the two sets are disjoint by
+/// construction, since a title can't simultaneously be in `tagged_titles`
+/// and be the *complement* of `tagged_titles`.
+///
+/// This is deliberately a diff against the mirror's own prior state, never
+/// against the live watchlist: unwatching everything the live watchlist
+/// shows that isn't currently tagged would also unwatch pages the reader
+/// watches by hand for reasons that have nothing to do with bookmarking.
+pub fn watch_mirror_diff(
+    tagged_titles: &[String],
+    previously_mirrored: &[String],
+) -> WatchMirrorPlan {
+    let tagged_set: HashSet<&str> = tagged_titles.iter().map(String::as_str).collect();
+    let previously_set: HashSet<&str> = previously_mirrored.iter().map(String::as_str).collect();
+    let to_watch = tagged_titles
+        .iter()
+        .filter(|t| !previously_set.contains(t.as_str()))
+        .cloned()
+        .collect();
+    let to_unwatch = previously_mirrored
+        .iter()
+        .filter(|t| !tagged_set.contains(t.as_str()))
+        .cloned()
+        .collect();
+    WatchMirrorPlan {
+        to_watch,
+        to_unwatch,
+    }
+}
+
+/// Parses a batched `action=watch`/unwatch response (`titles=A|B` in one
+/// request — PRD FR-BM-6's own batching, distinct from `watch_raw`'s single-
+/// `title` form the `w` keybinding uses) into per-title outcomes. An entry
+/// with no `title` (a response shape this build doesn't expect) is skipped
+/// rather than guessed at; an unparseable body is an empty list, same
+/// "degrade to nothing rather than crash" posture as `parse_watch_outcome`.
+pub fn parse_watch_batch_outcome(body: &[u8]) -> Vec<(String, WatchOutcome)> {
+    let Ok(parsed) = serde_json::from_slice::<WatchActionResponse>(body) else {
+        return Vec::new();
+    };
+    parsed
+        .watch
+        .into_iter()
+        .filter_map(|e| {
+            if e.title.is_empty() {
+                return None;
+            }
+            if e.unwatched {
+                Some((e.title, WatchOutcome::Unwatched))
+            } else if e.watched {
+                Some((e.title, WatchOutcome::Watched))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -948,5 +1461,363 @@ mod tests {
         cache.invalidate_csrf();
         assert_eq!(cache.csrf, None);
         assert_eq!(cache.watch.as_deref(), Some("w"));
+    }
+
+    // ---- FR-BM-5: ReadingLists parse + setup-needed signal ----------------
+
+    #[test]
+    fn is_readinglists_not_set_up_recognizes_the_assumed_error_code() {
+        let body = br#"{"error":{"code":"readinglists-db-error-not-set-up","info":"not set up"}}"#;
+        assert!(is_readinglists_not_set_up(body));
+        assert!(!is_readinglists_not_set_up(
+            br#"{"error":{"code":"badtoken","info":"x"}}"#
+        ));
+        assert!(!is_readinglists_not_set_up(
+            br#"{"readinglists":{"lists":[]}}"#
+        ));
+    }
+
+    #[test]
+    fn parse_readinglists_setup_reads_the_new_list_id() {
+        let body = br#"{"readinglists":{"list":100}}"#;
+        assert_eq!(parse_readinglists_setup(body), Some(100));
+        assert_eq!(parse_readinglists_setup(b"garbage"), None);
+    }
+
+    #[test]
+    fn parse_readinglists_reads_every_list() {
+        let body = br#"{"readinglists":{"lists":[
+            {"id":100,"name":"default","default":true},
+            {"id":101,"name":"later","default":false}
+        ]}}"#;
+        let lists = parse_readinglists(body);
+        assert_eq!(lists.len(), 2);
+        assert_eq!(lists[0].id, 100);
+        assert!(lists[0].default);
+        assert!(!lists[1].default);
+    }
+
+    #[test]
+    fn parse_readinglists_of_an_error_body_is_empty_not_a_panic() {
+        assert!(parse_readinglists(br#"{"error":{"code":"x","info":"y"}}"#).is_empty());
+    }
+
+    #[test]
+    fn default_list_id_prefers_the_flagged_default() {
+        let lists = vec![
+            ReadingListInfo {
+                id: 101,
+                name: "later".into(),
+                default: false,
+            },
+            ReadingListInfo {
+                id: 100,
+                name: "default".into(),
+                default: true,
+            },
+        ];
+        assert_eq!(default_list_id(&lists), Some(100));
+    }
+
+    #[test]
+    fn default_list_id_falls_back_to_the_first_list_when_none_is_flagged() {
+        let lists = vec![ReadingListInfo {
+            id: 202,
+            name: "mystery".into(),
+            default: false,
+        }];
+        assert_eq!(default_list_id(&lists), Some(202));
+        assert_eq!(default_list_id(&[]), None);
+    }
+
+    #[test]
+    fn parse_readinglist_entries_reads_id_project_and_title() {
+        let body = br#"{"readinglists":{"entries":[
+            {"id":7,"project":"http://127.0.0.1:8943","title":"Alan Turing"}
+        ]}}"#;
+        let entries = parse_readinglist_entries(body);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, 7);
+        assert_eq!(entries[0].project, "http://127.0.0.1:8943");
+        assert_eq!(entries[0].title, "Alan Turing");
+    }
+
+    #[test]
+    fn parse_readinglists_createentry_reads_the_new_entry() {
+        let body = br#"{"readinglists":{"entry":{"id":9,"project":"http://x","title":"Bombe"}}}"#;
+        let entry = parse_readinglists_createentry(body).unwrap();
+        assert_eq!(entry.id, 9);
+        assert_eq!(entry.title, "Bombe");
+        assert!(parse_readinglists_createentry(b"garbage").is_none());
+    }
+
+    #[test]
+    fn readinglists_deleteentry_succeeded_reads_the_flag() {
+        assert!(readinglists_deleteentry_succeeded(
+            br#"{"readinglists":{"success":true}}"#
+        ));
+        assert!(!readinglists_deleteentry_succeeded(
+            br#"{"readinglists":{"success":false}}"#
+        ));
+        assert!(!readinglists_deleteentry_succeeded(b"garbage"));
+    }
+
+    // ---- FR-BM-5: sync state round-trip ------------------------------------
+
+    #[test]
+    fn readinglist_sync_state_round_trips_through_save_and_load() {
+        let dir = temp_path("rlsync");
+        let path = dir.join("readinglist-sync.json");
+        assert_eq!(
+            load_readinglist_sync_state(&path),
+            ReadingListSyncState::default(),
+            "nothing saved yet"
+        );
+        let state = ReadingListSyncState {
+            list_id: Some(100),
+            synced: vec![SyncedEntry {
+                lang: "en".into(),
+                title: "Alan Turing".into(),
+                entry_id: 7,
+            }],
+        };
+        save_readinglist_sync_state(&path, &state).unwrap();
+        assert_eq!(load_readinglist_sync_state(&path), state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn readinglist_sync_state_of_a_corrupt_file_degrades_to_default() {
+        let dir = temp_path("rlsync-corrupt");
+        let path = dir.join("readinglist-sync.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "not json").unwrap();
+        assert_eq!(
+            load_readinglist_sync_state(&path),
+            ReadingListSyncState::default()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- FR-BM-5: the two-way reconcile (PURE) — the conflict policy ------
+
+    fn entry(id: u64, title: &str) -> ReadingListEntry {
+        ReadingListEntry {
+            id,
+            project: "http://127.0.0.1:8943".into(),
+            title: title.to_string(),
+        }
+    }
+
+    fn synced(title: &str, id: u64) -> SyncedEntry {
+        SyncedEntry {
+            lang: "en".into(),
+            title: title.to_string(),
+            entry_id: id,
+        }
+    }
+
+    #[test]
+    fn reconcile_pushes_a_brand_new_local_bookmark() {
+        let local = vec!["Alan Turing".to_string()];
+        let plan = reconcile_reading_list(&local, &[], &[]);
+        assert_eq!(plan.push, vec!["Alan Turing"]);
+        assert!(plan.pull.is_empty());
+        assert!(plan.server_delete.is_empty());
+        assert!(plan.matched.is_empty());
+    }
+
+    #[test]
+    fn reconcile_pulls_a_server_entry_never_seen_before() {
+        let server = vec![entry(7, "Enigma machine")];
+        let plan = reconcile_reading_list(&[], &server, &[]);
+        assert_eq!(plan.pull, vec!["Enigma machine"]);
+        assert!(plan.push.is_empty());
+        assert!(plan.server_delete.is_empty());
+    }
+
+    #[test]
+    fn reconcile_deletes_server_side_a_title_removed_locally_after_sync() {
+        // Previously synced (entry_id 7), still on the server, but no
+        // longer a local bookmark — the reader deleted it locally.
+        let server = vec![entry(7, "Alan Turing")];
+        let previously = vec![synced("Alan Turing", 7)];
+        let plan = reconcile_reading_list(&[], &server, &previously);
+        assert_eq!(plan.server_delete, vec![7]);
+        assert!(
+            plan.pull.is_empty(),
+            "a deleted-then-synced title must never be pulled back"
+        );
+    }
+
+    #[test]
+    fn reconcile_leaves_an_unchanged_title_untouched_in_every_list() {
+        let local = vec!["Alan Turing".to_string()];
+        let server = vec![entry(7, "Alan Turing")];
+        let previously = vec![synced("Alan Turing", 7)];
+        let plan = reconcile_reading_list(&local, &server, &previously);
+        assert!(plan.push.is_empty());
+        assert!(plan.pull.is_empty());
+        assert!(plan.server_delete.is_empty());
+        assert_eq!(plan.matched, vec![("Alan Turing".to_string(), 7)]);
+    }
+
+    #[test]
+    fn reconcile_matches_a_local_title_the_server_already_has_even_if_never_tracked() {
+        // Never in `previously_synced` at all — e.g. another device pushed
+        // the exact same title this client already had bookmarked. Must be
+        // treated as a match (no push, no pull, no duplicate), not a push.
+        let local = vec!["Alan Turing".to_string()];
+        let server = vec![entry(42, "Alan Turing")];
+        let plan = reconcile_reading_list(&local, &server, &[]);
+        assert!(plan.push.is_empty());
+        assert!(plan.pull.is_empty());
+        assert_eq!(plan.matched, vec![("Alan Turing".to_string(), 42)]);
+    }
+
+    #[test]
+    fn reconcile_repushes_a_synced_title_the_server_lost_independently() {
+        // Was synced (entry_id 7), still a local bookmark, but the server no
+        // longer has it — favor never silently losing a local bookmark.
+        let local = vec!["Alan Turing".to_string()];
+        let previously = vec![synced("Alan Turing", 7)];
+        let plan = reconcile_reading_list(&local, &[], &previously);
+        assert_eq!(plan.push, vec!["Alan Turing"]);
+    }
+
+    #[test]
+    fn reconcile_a_mixed_batch_sorts_every_title_into_exactly_one_bucket() {
+        let local = vec![
+            "New Local".to_string(),
+            "Unchanged".to_string(),
+            // "Deleted Locally" intentionally absent: it was synced before.
+        ];
+        let server = vec![
+            entry(1, "Unchanged"),
+            entry(2, "Deleted Locally"),
+            entry(3, "New From Server"),
+        ];
+        let previously = vec![synced("Unchanged", 1), synced("Deleted Locally", 2)];
+        let plan = reconcile_reading_list(&local, &server, &previously);
+        assert_eq!(plan.push, vec!["New Local"]);
+        assert_eq!(plan.pull, vec!["New From Server"]);
+        assert_eq!(plan.server_delete, vec![2]);
+        assert_eq!(plan.matched, vec![("Unchanged".to_string(), 1)]);
+    }
+
+    #[test]
+    fn reconcile_tags_and_notes_survive_because_matched_titles_are_never_touched() {
+        // The reconcile function itself never sees tags/notes at all (only
+        // titles) — this test locks the invariant that makes "local wins on
+        // tags/notes" true: a matched title produces no push/pull/delete
+        // action whatsoever, so nothing downstream ever has a reason to
+        // overwrite the local `Bookmark`'s tags/notes fields.
+        let local = vec!["Alan Turing".to_string()];
+        let server = vec![entry(7, "Alan Turing")];
+        let previously = vec![synced("Alan Turing", 7)];
+        let plan = reconcile_reading_list(&local, &server, &previously);
+        assert!(plan.push.is_empty());
+        assert!(plan.pull.is_empty());
+        assert!(plan.server_delete.is_empty());
+    }
+
+    // ---- FR-BM-5: "server wins on order" -----------------------------------
+
+    #[test]
+    fn apply_server_order_reorders_local_titles_to_match_the_server() {
+        let server_order = vec!["B".to_string(), "A".to_string(), "C".to_string()];
+        let local = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+        assert_eq!(
+            apply_server_order(&server_order, &local),
+            vec!["B", "A", "C"]
+        );
+    }
+
+    #[test]
+    fn apply_server_order_appends_a_title_the_server_does_not_know_yet() {
+        // "Fresh Push" was just created server-side this round and hasn't
+        // been re-listed, so the server order doesn't mention it yet.
+        let server_order = vec!["B".to_string(), "A".to_string()];
+        let local = vec!["Fresh Push".to_string(), "A".to_string(), "B".to_string()];
+        assert_eq!(
+            apply_server_order(&server_order, &local),
+            vec!["B", "A", "Fresh Push"],
+            "an unranked title keeps its relative position, appended last"
+        );
+    }
+
+    // ---- FR-BM-6: watch-mirror state + diff --------------------------------
+
+    #[test]
+    fn watch_mirror_state_round_trips() {
+        let dir = temp_path("watchmirror");
+        let path = dir.join("watch-mirror.json");
+        assert_eq!(
+            load_watch_mirror_state(&path),
+            WatchMirrorState::default(),
+            "nothing saved yet"
+        );
+        let state = WatchMirrorState {
+            mirrored: vec!["Alan Turing".to_string()],
+        };
+        save_watch_mirror_state(&path, &state).unwrap();
+        assert_eq!(load_watch_mirror_state(&path), state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn watch_mirror_diff_a_newly_tagged_title_needs_watching() {
+        let tagged = vec!["Alan Turing".to_string()];
+        let plan = watch_mirror_diff(&tagged, &[]);
+        assert_eq!(plan.to_watch, vec!["Alan Turing"]);
+        assert!(plan.to_unwatch.is_empty());
+    }
+
+    #[test]
+    fn watch_mirror_diff_an_untagged_title_needs_unwatching() {
+        let previously = vec!["Alan Turing".to_string()];
+        let plan = watch_mirror_diff(&[], &previously);
+        assert!(plan.to_watch.is_empty());
+        assert_eq!(plan.to_unwatch, vec!["Alan Turing"]);
+    }
+
+    #[test]
+    fn watch_mirror_diff_an_unchanged_tag_needs_neither() {
+        let titles = vec!["Alan Turing".to_string()];
+        let plan = watch_mirror_diff(&titles, &titles);
+        assert!(plan.to_watch.is_empty());
+        assert!(plan.to_unwatch.is_empty());
+    }
+
+    #[test]
+    fn watch_mirror_diff_never_unwatches_a_title_it_never_mirrored() {
+        // "Manually Watched" isn't in `previously_mirrored` at all (the
+        // reader watched it by hand, outside this mirror) — must never
+        // appear in `to_unwatch` just because it also isn't tagged.
+        let tagged: Vec<String> = vec![];
+        let previously: Vec<String> = vec![];
+        let plan = watch_mirror_diff(&tagged, &previously);
+        assert!(plan.to_unwatch.is_empty());
+    }
+
+    #[test]
+    fn parse_watch_batch_outcome_reads_every_title() {
+        let body = br#"{"watch":[
+            {"ns":0,"title":"A","watched":true},
+            {"ns":0,"title":"B","unwatched":true}
+        ]}"#;
+        let outcomes = parse_watch_batch_outcome(body);
+        assert_eq!(
+            outcomes,
+            vec![
+                ("A".to_string(), WatchOutcome::Watched),
+                ("B".to_string(), WatchOutcome::Unwatched),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_watch_batch_outcome_of_garbage_is_empty() {
+        assert!(parse_watch_batch_outcome(b"not json").is_empty());
     }
 }

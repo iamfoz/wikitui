@@ -233,6 +233,49 @@ impl BookmarkStore {
         }
         true
     }
+
+    /// PRD FR-BM-5's "server wins on order" conflict-policy half: re-sorts
+    /// only the bookmarks in `lang`, in place — every slot in `self.
+    /// bookmarks` occupied by a *different* lang is never written to, so a
+    /// `de` bookmark's absolute position is unaffected by reordering `en`.
+    /// Among the `lang`-matching bookmarks, ranking follows `order`; a title
+    /// `order` doesn't mention (shouldn't happen given how `main::
+    /// sync_reading_list` builds `order`, but this stays total rather than
+    /// panicking on it) keeps its prior relative position among them,
+    /// sorted after every title `order` does rank.
+    ///
+    /// Unlike every other mutator in this store, this rewrites the *whole*
+    /// file in one shot (`jsonl::rewrite_all`) rather than one line — line
+    /// order becomes meaningful data here, a step beyond FR-BM-7's baseline
+    /// append-only/single-line-edit contract.
+    pub fn reorder(&mut self, lang: &str, order: &[String]) -> std::io::Result<()> {
+        let slots: Vec<usize> = self
+            .bookmarks
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.lang == lang)
+            .map(|(i, _)| i)
+            .collect();
+        let rank = |b: &Bookmark| {
+            order
+                .iter()
+                .position(|t| t == &b.title)
+                .unwrap_or(usize::MAX)
+        };
+        let mut subset: Vec<(usize, Bookmark)> = slots
+            .iter()
+            .enumerate()
+            .map(|(original_index, &slot)| (original_index, self.bookmarks[slot].clone()))
+            .collect();
+        subset.sort_by_key(|(original_index, b)| (rank(b), *original_index));
+        for (&slot, (_, bookmark)) in slots.iter().zip(subset.into_iter()) {
+            self.bookmarks[slot] = bookmark;
+        }
+        if let Some(path) = &self.path {
+            crate::jsonl::rewrite_all(path, &self.bookmarks)?;
+        }
+        Ok(())
+    }
 }
 
 fn bookmarks_path() -> Option<PathBuf> {
@@ -542,6 +585,81 @@ mod tests {
         let mut store = BookmarkStore::in_memory();
         assert!(!store.set_tags("en", "Nope", vec!["x".into()]));
         assert!(!store.set_note("en", "Nope", Some("x".into())));
+    }
+
+    #[test]
+    fn reorder_matches_the_given_order_and_persists() {
+        let path = temp_path("bookmarks-reorder");
+        let mut store = BookmarkStore::load_from(path.clone());
+        store.toggle("en", "Alan Turing", None);
+        store.toggle("en", "Enigma machine", None);
+        store.toggle("en", "Bombe", None);
+
+        store
+            .reorder(
+                "en",
+                &[
+                    "Bombe".to_string(),
+                    "Alan Turing".to_string(),
+                    "Enigma machine".to_string(),
+                ],
+            )
+            .unwrap();
+        let titles: Vec<_> = store.bookmarks.iter().map(|b| b.title.as_str()).collect();
+        assert_eq!(titles, vec!["Bombe", "Alan Turing", "Enigma machine"]);
+
+        let reloaded = BookmarkStore::load_from(path.clone());
+        let titles: Vec<_> = reloaded
+            .bookmarks
+            .iter()
+            .map(|b| b.title.as_str())
+            .collect();
+        assert_eq!(
+            titles,
+            vec!["Bombe", "Alan Turing", "Enigma machine"],
+            "the new order must persist to disk"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reorder_leaves_a_title_the_order_omits_after_every_ranked_one() {
+        let mut store = BookmarkStore::in_memory();
+        store.toggle("en", "Alan Turing", None);
+        store.toggle("en", "Unranked", None);
+        store.toggle("en", "Enigma machine", None);
+
+        store
+            .reorder(
+                "en",
+                &["Enigma machine".to_string(), "Alan Turing".to_string()],
+            )
+            .unwrap();
+        let titles: Vec<_> = store.bookmarks.iter().map(|b| b.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec!["Enigma machine", "Alan Turing", "Unranked"],
+            "a title the server order doesn't mention keeps going last, not vanishing"
+        );
+    }
+
+    #[test]
+    fn reorder_never_touches_a_different_langs_bookmarks() {
+        let mut store = BookmarkStore::in_memory();
+        store.toggle("de", "Berlin", None);
+        store.toggle("en", "Alan Turing", None);
+        store.toggle("en", "Enigma machine", None);
+
+        store
+            .reorder(
+                "en",
+                &["Enigma machine".to_string(), "Alan Turing".to_string()],
+            )
+            .unwrap();
+        let titles: Vec<_> = store.bookmarks.iter().map(|b| b.title.as_str()).collect();
+        // "Berlin" (de) keeps its original position rather than being pulled
+        // to the front or back by the `en` reorder.
+        assert_eq!(titles, vec!["Berlin", "Enigma machine", "Alan Turing"]);
     }
 
     #[test]

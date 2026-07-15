@@ -213,6 +213,39 @@ contributions, thank, prefs), all building on the OAuth session above:
   `REQUEST_LOG` clear), so a test can isolate phases the same way it already
   could for the request log.
 
+Reading List sync / watchlist mirror fixtures (PRD FR-BM-5/6). SP-7 flags the
+real Extension:ReadingLists wire shape for third-party OAuth consumers as
+unverified; this mock is `src/account.rs`'s own documented best-effort
+reading, not a verified live behavior — see that module's doc comment for
+every assumption it makes:
+
+- `GET .../api.php?action=readinglists&command=list|listentries` — the
+  account's one default list (`READINGLISTS_DEFAULT_LIST_ID`, id 100) and its
+  entries (`READING_LIST_ENTRIES`). Both 404 with the assumed
+  `"readinglists-db-error-not-set-up"` error until `command=setup` has run
+  once (`READINGLISTS_SETUP_DONE`) — the signal `main::
+  fetch_readinglists_with_setup` retries on, mirroring the badtoken-retry
+  idiom.
+- `POST action=readinglists` `command=setup|createentry|deleteentry` —
+  CSRF-token'd writes sharing the same token check as `watch`/`thank`/
+  `echomarkread`. `createentry` assigns the next `READINGLISTS_NEXT_ENTRY_ID`;
+  `deleteentry` removes by id and reports whether anything was actually
+  removed.
+- `POST action=watch` now also accepts a batched `titles=A|B` form (PRD
+  FR-BM-6's watch-mirror substrate) alongside the pre-existing single-`title`
+  form the `w` keybinding uses — same response shape either way, one `watch`
+  array entry per title.
+- `GET /debug/readinglist` — the mock's current `setup_done`/`list_id`/
+  `entries`, for confirming `:sync` actually pushed/pulled/deleted
+  server-side state.
+- `GET /debug/readinglist/seed?title=<t>&project=<p>` — test-only convenience
+  that injects a server-side entry directly (and flips `setup_done` true),
+  simulating "another device already added this page" — the substrate the
+  pull-side of the two-way sync test needs.
+- `GET /debug/reset` additionally clears the Reading List mock's own state
+  (`READINGLISTS_SETUP_DONE`/`READING_LIST_ENTRIES`/
+  `READINGLISTS_NEXT_ENTRY_ID`).
+
 ## Running it
 
 ```sh

@@ -786,6 +786,21 @@ USER_PREFS = {
     "emailauthenticated": "2020-05-01T00:00:00Z",
 }
 
+# PRD FR-BM-5's Extension:ReadingLists mock (`action=readinglists`). SP-7
+# flags the real extension's wire shape for third-party OAuth consumers as
+# unverified; this fixture is `src/account.rs`'s own documented best-effort
+# reading, not a verified live behavior — every response rides one top-level
+# "readinglists" key, keyed further by the command (see that module's doc
+# comment for the full list of assumptions this mirrors).
+READINGLISTS_DEFAULT_LIST_ID = 100
+READINGLISTS_SETUP_DONE = [False]
+READINGLISTS_NEXT_ENTRY_ID = [1]
+# Each entry: {"id": int, "project": str, "title": str}. `/debug/readinglist`
+# exposes this for pty verification; `/debug/readinglist/seed` injects an
+# entry directly (simulating "another device already added this page"), the
+# substrate the pull-side of the two-way sync test needs.
+READING_LIST_ENTRIES = []
+
 # CSRF/watch token epoch (PRD §6.2 rule 8's badtoken-retry contract). Tokens
 # are minted `f"{kind}TOKEN-{epoch}"`; `/debug/expire-tokens` bumps the epoch,
 # instantly invalidating every token issued before the bump, so a test can:
@@ -860,6 +875,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             WATCHED_TITLES.update(WATCHED_TITLES_SEED)
             NOTIFICATIONS[:] = [dict(n) for n in NOTIFICATIONS_SEED]
             TOKEN_EPOCH[0] = 0
+            # PRD FR-BM-5: the Reading List mock's own mutable state, reset
+            # the same way the watchlist/notifications fixtures are above.
+            READINGLISTS_SETUP_DONE[0] = False
+            READINGLISTS_NEXT_ENTRY_ID[0] = 1
+            READING_LIST_ENTRIES.clear()
             self._send_json({"ok": True})
         elif parsed.path == '/debug/expire-tokens':
             # PRD §6.2 rule 8: bump the token epoch, instantly invalidating
@@ -874,6 +894,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # mutated server-side state without re-deriving it from the
             # picker's rendered text.
             self._send_json({"watched": sorted(WATCHED_TITLES)})
+        elif parsed.path == '/debug/readinglist':
+            # PRD FR-BM-5: introspection for pty verification — the mock's
+            # current Reading List entries, so a test can confirm `:sync`
+            # actually pushed/pulled/deleted server-side state.
+            self._send_json({
+                "setup_done": READINGLISTS_SETUP_DONE[0],
+                "list_id": READINGLISTS_DEFAULT_LIST_ID,
+                "entries": list(READING_LIST_ENTRIES),
+            })
+        elif parsed.path == '/debug/readinglist/seed':
+            # Test-only convenience: injects a server-side entry directly,
+            # bypassing this client entirely — simulates "another device
+            # already added this page to the Reading List," the substrate
+            # the pull-side of the two-way sync test needs. Also flips
+            # `setup_done` true (a seeded account is, definitionally, one
+            # that's already set up).
+            title = urllib.parse.unquote(params.get('title', [''])[0]).replace('_', ' ')
+            project = urllib.parse.unquote(params.get('project', ['http://127.0.0.1:8943'])[0])
+            READINGLISTS_SETUP_DONE[0] = True
+            entry_id = READINGLISTS_NEXT_ENTRY_ID[0]
+            READINGLISTS_NEXT_ENTRY_ID[0] += 1
+            READING_LIST_ENTRIES.append({"id": entry_id, "project": project, "title": title})
+            self._send_json({"ok": True, "id": entry_id})
         elif parsed.path.endswith('/oauth2/authorize'):
             self._serve_oauth_authorize(params)
         elif '/page/summary/' in parsed.path:
@@ -987,6 +1030,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             ttype = params.get('type', ['csrf'])[0]
             self._send_json({"query": {"tokens": {f"{ttype}token": _mint_token(ttype)}}})
             return
+        # PRD FR-BM-5: `action=readinglists` (its own top-level action, not
+        # `action=query` — see `account.rs`'s ReadingLists module doc for
+        # the assumed shape). `command=list`/`listentries` are reads;
+        # `setup`/`createentry`/`deleteentry` are CSRF-token'd writes
+        # handled in `_serve_action_api_write` below.
+        if action == 'readinglists':
+            self._serve_readinglists_read(params)
+            return
         # PRD FR-ACC-2: the raw watched-pages list.
         if action == 'query' and listing == 'watchlistraw':
             self._send_json({
@@ -1098,6 +1149,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(404)
         self.end_headers()
 
+    def _serve_readinglists_read(self, params):
+        # PRD FR-BM-5 / SP-7: `command=list`/`listentries`. Both require
+        # login (a real Bearer token this provider issued) and both 404 with
+        # the assumed "not set up" error until `command=setup` has run once
+        # — the signal `main::fetch_readinglists_with_setup` retries on,
+        # mirroring the badtoken-retry idiom.
+        command = params.get('command', [''])[0]
+        if _bearer_username(self.headers) is None:
+            self._send_json({"error": {"code": "notloggedin", "info": "Must be logged in"}})
+            return
+        if command in ('list', 'listentries') and not READINGLISTS_SETUP_DONE[0]:
+            self._send_json({
+                "error": {
+                    "code": "readinglists-db-error-not-set-up",
+                    "info": "reading lists are not set up for this user",
+                }
+            })
+            return
+        if command == 'list':
+            self._send_json({
+                "readinglists": {
+                    "lists": [{"id": READINGLISTS_DEFAULT_LIST_ID, "name": "default", "default": True}]
+                }
+            })
+            return
+        if command == 'listentries':
+            self._send_json({"readinglists": {"entries": list(READING_LIST_ENTRIES)}})
+            return
+        self.send_response(404)
+        self.end_headers()
+
     def _serve_oauth_authorize(self, params):
         # PRD §5.9: no consent screen — mint a code bound to the PKCE
         # challenge and 302-redirect to the client's loopback redirect_uri.
@@ -1146,7 +1228,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # wire shapes on the real APIs too).
         action = form.get('action', '')
         username = _bearer_username(self.headers)
-        if action not in ('watch', 'thank', 'echomarkread'):
+        if action not in ('watch', 'thank', 'echomarkread', 'readinglists'):
             self.send_response(404)
             self.end_headers()
             return
@@ -1158,13 +1240,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_json({"error": {"code": "badtoken", "info": "Invalid CSRF token"}})
             return
         if action == 'watch':
-            title = form.get('title', '').replace('_', ' ')
-            if form.get('unwatch', '') in ('1', 'true'):
-                WATCHED_TITLES.discard(title)
-                self._send_json({"watch": [{"ns": 0, "title": title, "unwatched": True}]})
-            else:
-                WATCHED_TITLES.add(title)
-                self._send_json({"watch": [{"ns": 0, "title": title, "watched": True}]})
+            # PRD FR-BM-6: `titles=A|B` (the watch-mirror's own batching) is
+            # tried first; the single-`title` form the `w` keybinding uses
+            # (FR-ACC-2) still works too — both share this one handler and
+            # response shape.
+            titles_param = form.get('titles', '') or form.get('title', '')
+            titles = [t.replace('_', ' ') for t in titles_param.split('|') if t]
+            unwatch = form.get('unwatch', '') in ('1', 'true')
+            results = []
+            for title in titles:
+                if unwatch:
+                    WATCHED_TITLES.discard(title)
+                    results.append({"ns": 0, "title": title, "unwatched": True})
+                else:
+                    WATCHED_TITLES.add(title)
+                    results.append({"ns": 0, "title": title, "watched": True})
+            self._send_json({"watch": results})
+            return
+        if action == 'readinglists':
+            self._serve_readinglists_write(form)
             return
         if action == 'thank':
             # PRD FR-ACC-6: purely positive, one-way — nothing here tracks
@@ -1182,6 +1276,44 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if n["id"] in ids:
                     n["read"] = True
         self._send_json({"query": {"echomarkread": {"result": "success"}}})
+
+    def _serve_readinglists_write(self, form):
+        # PRD FR-BM-5 / SP-7: the CSRF-token'd `action=readinglists` write
+        # commands (`_serve_action_api_write` already checked the token
+        # before dispatching here) — `setup` (idempotent), `createentry`,
+        # `deleteentry`. See `account.rs`'s ReadingLists module doc for the
+        # exact assumed shape this mirrors.
+        command = form.get('command', '')
+        if command == 'setup':
+            READINGLISTS_SETUP_DONE[0] = True
+            self._send_json({"readinglists": {"list": READINGLISTS_DEFAULT_LIST_ID}})
+            return
+        if command == 'createentry':
+            if not READINGLISTS_SETUP_DONE[0]:
+                self._send_json({
+                    "error": {
+                        "code": "readinglists-db-error-not-set-up",
+                        "info": "reading lists are not set up for this user",
+                    }
+                })
+                return
+            project = form.get('project', '')
+            title = form.get('title', '').replace('_', ' ')
+            entry_id = READINGLISTS_NEXT_ENTRY_ID[0]
+            READINGLISTS_NEXT_ENTRY_ID[0] += 1
+            entry = {"id": entry_id, "project": project, "title": title}
+            READING_LIST_ENTRIES.append(entry)
+            self._send_json({"readinglists": {"entry": entry}})
+            return
+        if command == 'deleteentry':
+            entry_id = int(form.get('entry', '0') or '0')
+            before = len(READING_LIST_ENTRIES)
+            READING_LIST_ENTRIES[:] = [e for e in READING_LIST_ENTRIES if e["id"] != entry_id]
+            self._send_json({"readinglists": {"success": len(READING_LIST_ENTRIES) < before}})
+            return
+        self._send_json({
+            "error": {"code": "readinglists-bad-command", "info": f"unknown command {command!r}"}
+        })
 
     def _serve_oauth_token(self, form):
         # PRD §5.9: the token endpoint. `authorization_code` enforces PKCE;

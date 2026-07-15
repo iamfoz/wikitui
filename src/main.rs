@@ -522,6 +522,7 @@ async fn main() -> Result<()> {
         show_onboarding,
         resolved.auth.clone(),
         resolved.network_contact.value.clone(),
+        resolved.watchlist_mirror_tag.value.clone(),
     )
     .await
 }
@@ -1805,6 +1806,7 @@ async fn run(
     show_onboarding: bool,
     auth_cfg: config::ResolvedAuth,
     contact: String,
+    watchlist_mirror_tag: String,
 ) -> Result<()> {
     let mut app = App::new(lang, theme, no_color);
     app.keymap = keymap;
@@ -1892,6 +1894,12 @@ async fn run(
     if let Some(path) = &app.watchlist_state_path {
         app.watchlist_last_seen = account::load_last_seen(path);
     }
+    // PRD FR-BM-5/6: the Reading List sync id-map and the watch-mirror's own
+    // "what did we watch" state, resolved now the same way `watchlist_
+    // state_path` is just above — a fast local read, never network.
+    app.watchlist_mirror_tag = watchlist_mirror_tag;
+    app.readinglist_sync_state_path = account::readinglist_sync_state_path();
+    app.watch_mirror_state_path = account::watch_mirror_state_path();
     // PRD FR-ACC-3's login/startup poll (see `account.rs`'s poll-cadence
     // doc): a restored session gets its unread-count badge without waiting
     // for the reader to open `:notifications` first.
@@ -5618,6 +5626,349 @@ async fn open_prefs(client: &WikiClient, app: &mut App) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// PRD FR-BM-5/6: Reading List sync and the watchlist mirror
+// ---------------------------------------------------------------------------
+//
+// Two independent, login-gated, opt-in operations against two distinct
+// backends (`account.rs`'s module doc for each has the full model + every
+// SP-7 assumption). `:sync` runs both, one after the other, and reports each
+// half on its own — never conflated into a single count, per FR-BM-6's own
+// "separate from bookmarks" wording. `:mirror-watchlist` runs only the
+// watch-mirror half, for a reader who wants that applied right after tagging
+// a bookmark without touching Reading List sync at all.
+
+/// PRD FR-BM-5 / SP-7's assumed "needs setup" retry: calls `command=list`;
+/// if the response is the not-set-up error this build's mock/reading
+/// documents (`account::READINGLISTS_NOT_SET_UP`), runs `command=setup`
+/// once and retries `list` exactly once more — the same "try, detect the
+/// one known recoverable failure, fix it, retry exactly once" shape as
+/// `watch_with_retry`'s badtoken handling (§6.2 rule 8), applied to this
+/// build's own ReadingLists assumption instead of a real badtoken.
+async fn fetch_readinglists_with_setup(
+    app: &mut App,
+    client: &WikiClient,
+    lang: &str,
+    access_token: &str,
+) -> Result<Vec<account::ReadingListInfo>> {
+    let body = client.fetch_readinglists(lang, access_token).await?;
+    if !account::is_readinglists_not_set_up(&body) {
+        return Ok(account::parse_readinglists(&body));
+    }
+    let token = app.tokens.csrf_token(client, lang, access_token).await?;
+    let setup_body = client
+        .readinglists_setup_raw(lang, access_token, &token)
+        .await?;
+    let setup_list_id = account::parse_readinglists_setup(&setup_body);
+    let retried = client.fetch_readinglists(lang, access_token).await?;
+    let lists = account::parse_readinglists(&retried);
+    if !lists.is_empty() {
+        return Ok(lists);
+    }
+    // Tolerant of a server that confirms setup but returns no lists on the
+    // very next call (a plausible SP-7 shape surprise): fall back to the id
+    // `command=setup` itself reported, if any, rather than treating this as
+    // "the account has no reading lists."
+    Ok(setup_list_id
+        .into_iter()
+        .map(|id| account::ReadingListInfo {
+            id,
+            name: "default".to_string(),
+            default: true,
+        })
+        .collect())
+}
+
+/// PRD FR-BM-5's `:sync` reading-list half: two-way reconcile against the
+/// account's default Reading List (see `account.rs`'s ReadingLists module
+/// doc for the full conflict-policy + sync-mapping writeup this implements).
+/// Returns a short human report ("Reading List: pushed N, pulled M") —
+/// never aborts the rest of `:sync` on a partial failure; a push/pull/
+/// delete that itself fails is simply skipped (not retried, not counted),
+/// so a flaky write degrades to "fewer than expected synced this run"
+/// rather than losing the whole operation.
+async fn sync_reading_list(
+    client: &WikiClient,
+    app: &mut App,
+    lang: &str,
+    access_token: &str,
+) -> String {
+    let lists = match fetch_readinglists_with_setup(app, client, lang, access_token).await {
+        Ok(lists) => lists,
+        Err(e) => return format!("Reading List sync failed: {e}"),
+    };
+    let Some(list_id) = account::default_list_id(&lists) else {
+        return "Reading List sync failed: account has no reading lists".to_string();
+    };
+    let entries_body = match client
+        .fetch_readinglist_entries(lang, access_token, list_id)
+        .await
+    {
+        Ok(b) => b,
+        Err(e) => return format!("Reading List sync failed: {e}"),
+    };
+    // PRD FR-BM-5's documented cross-wiki scope-cut (`account.rs`'s module
+    // doc): an entry from a different project than this session's own wiki
+    // is left alone rather than guessed into some other `lang`'s bucket. An
+    // entry that omits `project` entirely is tolerated (shape-surprise
+    // tolerance), not rejected.
+    let expected_project = client.wiki_origin(lang);
+    let server_entries: Vec<account::ReadingListEntry> =
+        account::parse_readinglist_entries(&entries_body)
+            .into_iter()
+            .filter(|e| e.project.is_empty() || e.project == expected_project)
+            .collect();
+
+    let state_path = app.readinglist_sync_state_path.clone();
+    let mut state = state_path
+        .as_deref()
+        .map(account::load_readinglist_sync_state)
+        .unwrap_or_default();
+
+    let local_titles: Vec<String> = app
+        .bookmarks
+        .bookmarks
+        .iter()
+        .filter(|b| b.lang == lang)
+        .map(|b| b.title.clone())
+        .collect();
+
+    let plan = account::reconcile_reading_list(&local_titles, &server_entries, &state.synced);
+
+    let mut pushed = 0u32;
+    let mut new_pushed: Vec<(String, u64)> = Vec::new();
+    for title in &plan.push {
+        let Ok(token) = app.tokens.csrf_token(client, lang, access_token).await else {
+            continue;
+        };
+        if let Ok(body) = client
+            .readinglists_createentry_raw(
+                lang,
+                access_token,
+                list_id,
+                &expected_project,
+                title,
+                &token,
+            )
+            .await
+            && let Some(created) = account::parse_readinglists_createentry(&body)
+        {
+            new_pushed.push((title.clone(), created.id));
+            pushed += 1;
+        }
+    }
+
+    let mut pulled = 0u32;
+    let mut new_pulled: Vec<(String, u64)> = Vec::new();
+    for entry in &server_entries {
+        if plan.pull.contains(&entry.title) {
+            // PRD FR-BM-5 conflict policy: a pull only ever creates a
+            // bookmark that didn't already exist locally (that's exactly
+            // what `plan.pull` means), so there is no existing tags/note to
+            // clobber — `ensure_bookmarked` starts both empty, same as `m`.
+            app.bookmarks.ensure_bookmarked(lang, &entry.title, None);
+            new_pulled.push((entry.title.clone(), entry.id));
+            pulled += 1;
+        }
+    }
+
+    // A delete that doesn't actually land must NOT drop out of the sync
+    // mapping the way a *successful* one does: if it did, the next reconcile
+    // would see this entry as "on the server, not local, never synced" and
+    // wrongly PULL it back instead of retrying the delete — resurrecting a
+    // bookmark the reader deliberately removed. `delete_failed` preserves
+    // exactly those rows so they stay tracked as `was_synced` for next time.
+    let mut delete_failed: Vec<(String, u64)> = Vec::new();
+    for entry_id in &plan.server_delete {
+        let title = server_entries
+            .iter()
+            .find(|e| e.id == *entry_id)
+            .map(|e| e.title.clone());
+        let Ok(token) = app.tokens.csrf_token(client, lang, access_token).await else {
+            if let Some(title) = title {
+                delete_failed.push((title, *entry_id));
+            }
+            continue;
+        };
+        let succeeded = matches!(
+            client
+                .readinglists_deleteentry_raw(lang, access_token, *entry_id, &token)
+                .await,
+            Ok(body) if account::readinglists_deleteentry_succeeded(&body)
+        );
+        if !succeeded && let Some(title) = title {
+            delete_failed.push((title, *entry_id));
+        }
+    }
+
+    // PRD FR-BM-5 "server wins on order": reorder local bookmarks for this
+    // lang to match the server's own entry order — this round's fresh
+    // pushes (not yet re-listed) keep their prior relative order, appended
+    // last (see `account::apply_server_order`'s doc comment).
+    let server_order: Vec<String> = server_entries.iter().map(|e| e.title.clone()).collect();
+    let local_titles_after: Vec<String> = app
+        .bookmarks
+        .bookmarks
+        .iter()
+        .filter(|b| b.lang == lang)
+        .map(|b| b.title.clone())
+        .collect();
+    let new_order = account::apply_server_order(&server_order, &local_titles_after);
+    let _ = app.bookmarks.reorder(lang, &new_order);
+
+    // Recompute the sync-mapping: everything matched (untouched this round),
+    // freshly pushed, and freshly pulled — an entry that was deleted
+    // server-side (or vanished from both sides between runs) isn't in any
+    // of these three and drops out of the map here, exactly the garbage
+    // collection the id-map model needs (`account.rs`'s module doc).
+    let mut new_synced: Vec<account::SyncedEntry> = plan
+        .matched
+        .iter()
+        .map(|(title, id)| account::SyncedEntry {
+            lang: lang.to_string(),
+            title: title.clone(),
+            entry_id: *id,
+        })
+        .chain(new_pushed.iter().map(|(title, id)| account::SyncedEntry {
+            lang: lang.to_string(),
+            title: title.clone(),
+            entry_id: *id,
+        }))
+        .chain(new_pulled.iter().map(|(title, id)| account::SyncedEntry {
+            lang: lang.to_string(),
+            title: title.clone(),
+            entry_id: *id,
+        }))
+        .chain(
+            delete_failed
+                .iter()
+                .map(|(title, id)| account::SyncedEntry {
+                    lang: lang.to_string(),
+                    title: title.clone(),
+                    entry_id: *id,
+                }),
+        )
+        .collect();
+    // A different lang's mapping rows are untouched — this build syncs one
+    // wiki per `:sync` (multi-wiki Reading List sync is a documented seam).
+    let mut kept: Vec<account::SyncedEntry> = state
+        .synced
+        .iter()
+        .filter(|s| s.lang != lang)
+        .cloned()
+        .collect();
+    kept.append(&mut new_synced);
+    state.synced = kept;
+    state.list_id = Some(list_id);
+    if let Some(path) = &state_path {
+        let _ = account::save_readinglist_sync_state(path, &state);
+    }
+
+    format!("Reading List: pushed {pushed}, pulled {pulled}")
+}
+
+/// PRD FR-BM-6's watch-mirror application (shared by `:sync` and
+/// `:mirror-watchlist`): diffs the bookmarks currently carrying `app.
+/// watchlist_mirror_tag` against what this mirror itself watched last time
+/// (persisted state — never the live watchlist; `account::watch_mirror_
+/// diff`'s doc comment explains why), then applies the two batched
+/// `action=watch` calls this needs. Only a title *confirmed* watched/
+/// unwatched this round updates the persisted "mirrored" set — one whose
+/// write failed stays exactly where it was, so the next run retries it
+/// instead of silently forgetting it needed action.
+async fn mirror_watchlist(
+    client: &WikiClient,
+    app: &mut App,
+    lang: &str,
+    access_token: &str,
+) -> String {
+    let mirror_tag = app.watchlist_mirror_tag.clone();
+    let tagged_titles: Vec<String> = app
+        .bookmarks
+        .bookmarks
+        .iter()
+        .filter(|b| b.lang == lang && b.tags.iter().any(|t| t.eq_ignore_ascii_case(&mirror_tag)))
+        .map(|b| b.title.clone())
+        .collect();
+
+    let state_path = app.watch_mirror_state_path.clone();
+    let mut state = state_path
+        .as_deref()
+        .map(account::load_watch_mirror_state)
+        .unwrap_or_default();
+
+    let plan = account::watch_mirror_diff(&tagged_titles, &state.mirrored);
+
+    let mut confirmed_watched: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if !plan.to_watch.is_empty()
+        && let Ok(token) = app.tokens.watch_token(client, lang, access_token).await
+        && let Ok(body) = client
+            .watch_batch_raw(lang, access_token, &plan.to_watch, &token, false)
+            .await
+    {
+        confirmed_watched = account::parse_watch_batch_outcome(&body)
+            .into_iter()
+            .filter(|(_, o)| *o == account::WatchOutcome::Watched)
+            .map(|(t, _)| t)
+            .collect();
+    }
+    let mut confirmed_unwatched: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    if !plan.to_unwatch.is_empty()
+        && let Ok(token) = app.tokens.watch_token(client, lang, access_token).await
+        && let Ok(body) = client
+            .watch_batch_raw(lang, access_token, &plan.to_unwatch, &token, true)
+            .await
+    {
+        confirmed_unwatched = account::parse_watch_batch_outcome(&body)
+            .into_iter()
+            .filter(|(_, o)| *o == account::WatchOutcome::Unwatched)
+            .map(|(t, _)| t)
+            .collect();
+    }
+
+    let unwatched_count = confirmed_unwatched.len();
+    let previously: std::collections::HashSet<String> = state.mirrored.iter().cloned().collect();
+    state.mirrored = tagged_titles
+        .iter()
+        .filter(|t| previously.contains(t.as_str()) || confirmed_watched.contains(t.as_str()))
+        .cloned()
+        .collect();
+    if let Some(path) = &state_path {
+        let _ = account::save_watch_mirror_state(path, &state);
+    }
+
+    format!(
+        "Watch mirror: {} watched, {unwatched_count} unwatched",
+        confirmed_watched.len()
+    )
+}
+
+/// PRD FR-BM-5/6's `:sync`: runs the Reading List two-way reconcile, then
+/// applies the watchlist mirror — two distinct backends, reported on
+/// separate clauses of one notice line, never conflated (per FR-BM-6's own
+/// "separate from bookmarks" wording).
+async fn cmd_sync(client: &WikiClient, app: &mut App) {
+    let Some(access_token) = require_login(app, "sync your reading list").await else {
+        return;
+    };
+    let lang = app.lang.clone();
+    let rl_report = sync_reading_list(client, app, &lang, &access_token).await;
+    let wm_report = mirror_watchlist(client, app, &lang, &access_token).await;
+    app.notice = Some(format!("{rl_report}  ·  {wm_report}"));
+}
+
+/// PRD FR-BM-6's `:mirror-watchlist`: applies just the watch-mirror half of
+/// `:sync`, without touching Reading List sync at all.
+async fn cmd_mirror_watchlist(client: &WikiClient, app: &mut App) {
+    let Some(access_token) = require_login(app, "mirror your watchlist").await else {
+        return;
+    };
+    let lang = app.lang.clone();
+    let report = mirror_watchlist(client, app, &lang, &access_token).await;
+    app.notice = Some(report);
+}
+
 /// PRD FR-ACC-3's login/startup poll (see `account.rs`'s poll-cadence doc):
 /// fetches the unread-count badge once, right after a session is
 /// established. Best-effort — a failure here just leaves the badge absent
@@ -5939,6 +6290,9 @@ async fn execute_command(
         Command::Contribs(username) => open_contribs(client, app, username).await,
         // PRD FR-ACC-7.
         Command::Prefs => open_prefs(client, app).await,
+        // PRD FR-BM-5/6.
+        Command::Sync => cmd_sync(client, app).await,
+        Command::MirrorWatchlist => cmd_mirror_watchlist(client, app).await,
         Command::Quit => app.should_quit = true,
     }
 }
@@ -6641,5 +6995,229 @@ mod tests {
         // Confirms only 2 requests were made (token + one write): a 3rd
         // request against this two-response server would hang, so reaching
         // this assertion at all proves no retry was attempted.
+    }
+
+    // ---------------------------------------------------------------------
+    // PRD FR-BM-5/6: Reading List sync + watchlist mirror
+    // ---------------------------------------------------------------------
+
+    fn temp_state_path(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "wikitui-main-test-{tag}-{}-{}.json",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[tokio::test]
+    async fn cmd_sync_logged_out_shows_the_login_prompt_and_makes_no_request() {
+        let client = test_client();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        cmd_sync(&client, &mut app).await;
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("Log in to sync your reading list (:login)")
+        );
+    }
+
+    #[tokio::test]
+    async fn cmd_mirror_watchlist_logged_out_shows_the_login_prompt_and_makes_no_request() {
+        let client = test_client();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        cmd_mirror_watchlist(&client, &mut app).await;
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("Log in to mirror your watchlist (:login)")
+        );
+    }
+
+    /// PRD FR-BM-5 / SP-7's setup-if-needed retry: `command=list` comes back
+    /// "not set up," which must run `command=setup` exactly once and retry
+    /// `list` exactly once more — mirroring `watch_with_retry_refetches_
+    /// once_on_badtoken_and_succeeds`'s "exactly N scripted responses, a
+    /// 5th would hang" proof technique.
+    #[tokio::test]
+    async fn fetch_readinglists_with_setup_runs_setup_once_when_not_set_up() {
+        let base = spawn_scripted_server(vec![
+            r#"{"error":{"code":"readinglists-db-error-not-set-up","info":"not set up"}}"#,
+            r#"{"query":{"tokens":{"csrftoken":"T1"}}}"#,
+            r#"{"readinglists":{"list":100}}"#,
+            r#"{"readinglists":{"lists":[{"id":100,"name":"default","default":true}]}}"#,
+        ]);
+        let client = WikiClient::new(base).unwrap();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        let lists = fetch_readinglists_with_setup(&mut app, &client, "en", "access-tok")
+            .await
+            .unwrap();
+        assert_eq!(lists.len(), 1);
+        assert_eq!(lists[0].id, 100);
+        assert!(lists[0].default);
+    }
+
+    #[tokio::test]
+    async fn fetch_readinglists_with_setup_skips_setup_when_already_set_up() {
+        let base = spawn_scripted_server(vec![
+            r#"{"readinglists":{"lists":[{"id":100,"name":"default","default":true}]}}"#,
+        ]);
+        let client = WikiClient::new(base).unwrap();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        let lists = fetch_readinglists_with_setup(&mut app, &client, "en", "access-tok")
+            .await
+            .unwrap();
+        assert_eq!(lists.len(), 1);
+        // Only one scripted response exists — a setup call here would hang,
+        // so reaching this assertion proves setup was skipped.
+    }
+
+    /// End-to-end proof of FR-BM-5's push half: one brand-new local bookmark,
+    /// nothing on the server yet — `:sync` must create a server entry and
+    /// report "pushed 1, pulled 0".
+    #[tokio::test]
+    async fn sync_reading_list_pushes_a_new_local_bookmark_and_reports_it() {
+        let base = spawn_scripted_server(vec![
+            r#"{"readinglists":{"lists":[{"id":100,"name":"default","default":true}]}}"#,
+            r#"{"readinglists":{"entries":[]}}"#,
+            r#"{"query":{"tokens":{"csrftoken":"T1"}}}"#,
+            r#"{"readinglists":{"entry":{"id":55,"project":"x","title":"Alan Turing"}}}"#,
+        ]);
+        let client = WikiClient::new(base).unwrap();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.bookmarks = bookmarks::BookmarkStore::in_memory();
+        app.bookmarks.toggle("en", "Alan Turing", None);
+        let state_path = temp_state_path("sync-push");
+        app.readinglist_sync_state_path = Some(state_path.clone());
+
+        let report = sync_reading_list(&client, &mut app, "en", "access-tok").await;
+        assert_eq!(report, "Reading List: pushed 1, pulled 0");
+
+        let state = account::load_readinglist_sync_state(&state_path);
+        assert_eq!(state.list_id, Some(100));
+        assert_eq!(state.synced.len(), 1);
+        assert_eq!(state.synced[0].title, "Alan Turing");
+        assert_eq!(state.synced[0].entry_id, 55);
+        let _ = std::fs::remove_file(&state_path);
+    }
+
+    /// FR-BM-5's conflict policy, at the orchestration level (not just the
+    /// pure `reconcile_reading_list` unit test): a local bookmark that's
+    /// ALSO already on the server (a "matched" title) must come out of
+    /// `:sync` with its tags/notes completely unchanged — sync has no path
+    /// that could touch them, since a matched title is never pushed,
+    /// pulled, or deleted.
+    #[tokio::test]
+    async fn sync_reading_list_never_touches_tags_or_notes_on_a_matched_title() {
+        let base = spawn_scripted_server(vec![
+            r#"{"readinglists":{"lists":[{"id":100,"name":"default","default":true}]}}"#,
+            // An empty `project` is tolerated (kept, not scope-filtered) —
+            // see `sync_reading_list`'s doc comment — so this fixture
+            // doesn't need to know the scripted server's own port.
+            r#"{"readinglists":{"entries":[{"id":7,"project":"","title":"Alan Turing"}]}}"#,
+        ]);
+        let client = WikiClient::new(base).unwrap();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.bookmarks = bookmarks::BookmarkStore::in_memory();
+        app.bookmarks.toggle("en", "Alan Turing", None);
+        app.bookmarks
+            .set_tags("en", "Alan Turing", vec!["crypto".to_string()]);
+        app.bookmarks
+            .set_note("en", "Alan Turing", Some("great read".to_string()));
+        let state_path = temp_state_path("sync-matched");
+        app.readinglist_sync_state_path = Some(state_path.clone());
+
+        let report = sync_reading_list(&client, &mut app, "en", "access-tok").await;
+        assert_eq!(report, "Reading List: pushed 0, pulled 0");
+
+        let b = app.bookmarks.find("en", "Alan Turing").unwrap();
+        assert_eq!(b.tags, vec!["crypto"]);
+        assert_eq!(b.note.as_deref(), Some("great read"));
+        let _ = std::fs::remove_file(&state_path);
+    }
+
+    /// FR-BM-5's other conflict-policy half, at the orchestration level: a
+    /// bookmark deleted locally *after* a previous sync synced it must be
+    /// deleted server-side on the next sync, never pulled back — the
+    /// classic sync-mapping problem this build solves with a persisted
+    /// id-map (`account::ReadingListSyncState`).
+    #[tokio::test]
+    async fn sync_reading_list_deletes_server_side_a_bookmark_removed_locally_since_the_last_sync()
+    {
+        let base = spawn_scripted_server(vec![
+            r#"{"readinglists":{"lists":[{"id":100,"name":"default","default":true}]}}"#,
+            r#"{"readinglists":{"entries":[{"id":7,"project":"x","title":"Alan Turing"}]}}"#,
+            r#"{"query":{"tokens":{"csrftoken":"T1"}}}"#,
+            r#"{"readinglists":{"success":true}}"#,
+        ]);
+        let client = WikiClient::new(base).unwrap();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        // No local bookmarks at all — "Alan Turing" was deleted locally.
+        app.bookmarks = bookmarks::BookmarkStore::in_memory();
+        let state_path = temp_state_path("sync-delete");
+        account::save_readinglist_sync_state(
+            &state_path,
+            &account::ReadingListSyncState {
+                list_id: Some(100),
+                synced: vec![account::SyncedEntry {
+                    lang: "en".to_string(),
+                    title: "Alan Turing".to_string(),
+                    entry_id: 7,
+                }],
+            },
+        )
+        .unwrap();
+        app.readinglist_sync_state_path = Some(state_path.clone());
+
+        let report = sync_reading_list(&client, &mut app, "en", "access-tok").await;
+        assert_eq!(
+            report, "Reading List: pushed 0, pulled 0",
+            "a server-delete is neither a push nor a pull"
+        );
+        assert!(
+            !app.bookmarks.is_bookmarked("en", "Alan Turing"),
+            "the deleted title must never be pulled back"
+        );
+
+        let state = account::load_readinglist_sync_state(&state_path);
+        assert!(
+            state.synced.is_empty(),
+            "a successfully server-deleted title drops out of the sync map"
+        );
+        let _ = std::fs::remove_file(&state_path);
+    }
+
+    /// PRD FR-BM-6's mirror, at the orchestration level: one newly-tagged
+    /// bookmark needs watching, one previously-mirrored title that's no
+    /// longer tagged needs unwatching — both batched (one `action=watch`
+    /// POST per direction), one shared `watch` token fetched only once.
+    #[tokio::test]
+    async fn mirror_watchlist_batches_a_watch_and_an_unwatch_in_one_pass() {
+        let base = spawn_scripted_server(vec![
+            r#"{"query":{"tokens":{"watchtoken":"WT"}}}"#,
+            r#"{"watch":[{"ns":0,"title":"Alan Turing","watched":true}]}"#,
+            r#"{"watch":[{"ns":0,"title":"Old Watch","unwatched":true}]}"#,
+        ]);
+        let client = WikiClient::new(base).unwrap();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.bookmarks = bookmarks::BookmarkStore::in_memory();
+        app.bookmarks.toggle("en", "Alan Turing", None);
+        app.bookmarks
+            .set_tags("en", "Alan Turing", vec!["watched".to_string()]);
+        let state_path = temp_state_path("watchmirror");
+        account::save_watch_mirror_state(
+            &state_path,
+            &account::WatchMirrorState {
+                mirrored: vec!["Old Watch".to_string()],
+            },
+        )
+        .unwrap();
+        app.watch_mirror_state_path = Some(state_path.clone());
+
+        let report = mirror_watchlist(&client, &mut app, "en", "access-tok").await;
+        assert_eq!(report, "Watch mirror: 1 watched, 1 unwatched");
+
+        let state = account::load_watch_mirror_state(&state_path);
+        assert_eq!(state.mirrored, vec!["Alan Turing".to_string()]);
+        let _ = std::fs::remove_file(&state_path);
     }
 }
