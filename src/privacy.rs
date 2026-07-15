@@ -93,6 +93,14 @@ pub enum Write {
     /// (`app::queue_offline_target`) — explicit: the reader chose "fetch
     /// this specific thing when online" over "search saved pages instead".
     FetchQueue,
+    /// `:mksession <name>` (PRD FR-TB-5, `main::cmd_mksession`) — explicit.
+    /// Unlike the continuous auto-restore snapshot (`app::persist_session`,
+    /// denied outright in incognito — see `session.rs`'s own doc comment
+    /// and this module's "Seams" note above, which anticipated only that
+    /// passive, continuous half of FR-TB-5), a named session is the reader
+    /// choosing a name and asking wikitui to keep *this* tab set — the same
+    /// "explicit beats implicit" reasoning as `Bookmark`/`OfflineSave`.
+    NamedSession,
 }
 
 /// What a caller must do about a [`Write`] it's about to perform.
@@ -133,7 +141,8 @@ pub fn decide(incognito: bool, write: Write) -> Verdict {
         | Write::ReadLater
         | Write::OfflineSave
         | Write::Citation
-        | Write::FetchQueue => Verdict::AllowWithWarning,
+        | Write::FetchQueue
+        | Write::NamedSession => Verdict::AllowWithWarning,
     }
 }
 
@@ -236,6 +245,7 @@ mod tests {
             Write::OfflineSave,
             Write::Citation,
             Write::FetchQueue,
+            Write::NamedSession,
         ] {
             assert_eq!(
                 decide(false, write),
@@ -278,6 +288,7 @@ mod tests {
             Write::OfflineSave,
             Write::Citation,
             Write::FetchQueue,
+            Write::NamedSession,
         ] {
             assert_eq!(
                 decide(true, write),

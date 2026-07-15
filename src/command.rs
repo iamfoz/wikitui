@@ -5,6 +5,7 @@
 
 use crate::cite::CiteStyle;
 use crate::saved::Tier;
+use crate::session;
 use crate::theme::Theme;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,8 +186,41 @@ pub enum Command {
         format: String,
         path: Option<String>,
     },
+    /// `:mksession <name>` (PRD FR-TB-5): saves the current tab set as a
+    /// named session (`session::save`), alongside the continuous
+    /// auto-restore snapshot. `name` is validated at parse time — same
+    /// "fail fast, before any I/O" pattern `:lang <code>`'s shape check
+    /// already uses.
+    MkSession(String),
+    /// `:session <name>` — switches to a named session at runtime,
+    /// replacing every currently open tab (see `main::switch_to_named_
+    /// session`'s doc comment for why replace, not merge, was chosen).
+    SessionSwitch(String),
+    /// `:sessions` (bare) — lists every saved named session by name.
+    Sessions,
+    /// `:tts` / `:speak` (PRD FR-PC-2): play/stop TTS playback. `:speak` is
+    /// a full alias for the whole command (both its bare and `stop` forms),
+    /// not just a synonym for the bare spelling — neither reads more
+    /// "canonical" than the other, and Appendix B pins no default keybinding
+    /// for this v1.x feature.
+    Tts(TtsSpec),
+    /// `:run <name>` (PRD FR-CS-5) — explicitly runs a configured macro.
+    /// Bare `:<macro-name>` is the shorthand (resolved in `main`'s command
+    /// dispatch, after the ordinary command grammar reports it unknown —
+    /// see that call site's doc comment for why macro names can't be
+    /// validated inside this parser itself).
+    RunMacro(String),
     /// `:q` / `:quit` — exit.
     Quit,
+}
+
+/// `:tts`/`:speak`'s two forms (PRD FR-PC-2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TtsSpec {
+    /// Bare `:tts`/`:speak`: play from the reading cursor onward.
+    Play,
+    /// `:tts stop`/`:speak stop`: halt playback.
+    Stop,
 }
 
 /// `:trail`'s scope argument (PRD FR-HS-3). Kept separate from
@@ -426,7 +460,7 @@ fn validate_set_value(
     }
 }
 
-pub const USAGE: &str = "commands: open <title>, lang [<code>], theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, prefetch-log, interests, not-interested, stats, start, today, random [good], related, talk, info, set theme=<name>|images=on|off|prefetch=on|off|measure=N|ambiguous_width=1|2|reading_wpm=N|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N, set-tab measure=N|images=on|off|ambiguous_width=1|2|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N (or set-tab key= to reset), config reload, vsplit, only, bilingual, wiki [<name>], set scrollbind, watchlist, notifications, contribs [username], prefs, sync, mirror-watchlist, search-offline, trail [all|days N|export md|dot|mermaid [path]], help, quit";
+pub const USAGE: &str = "commands: open <title>, lang [<code>], theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, prefetch-log, interests, not-interested, stats, start, today, random [good], related, talk, info, set theme=<name>|images=on|off|prefetch=on|off|measure=N|ambiguous_width=1|2|reading_wpm=N|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N, set-tab measure=N|images=on|off|ambiguous_width=1|2|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N (or set-tab key= to reset), config reload, vsplit, only, bilingual, wiki [<name>], set scrollbind, watchlist, notifications, contribs [username], prefs, sync, mirror-watchlist, search-offline, trail [all|days N|export md|dot|mermaid [path]], mksession <name>, session <name>, sessions, tts [stop], speak [stop], run <macro>, help, quit";
 
 /// Parses one `:` command line. `user_theme_names` are accepted alongside
 /// the six built-ins for `:theme <name>` and `:set theme=<name>` (PRD
@@ -829,6 +863,43 @@ pub fn parse_with_user_themes(input: &str, user_theme_names: &[String]) -> Resul
         // PRD FR-BM-5/6.
         "sync" => Ok(Command::Sync),
         "mirror-watchlist" | "mirrorwatchlist" => Ok(Command::MirrorWatchlist),
+        // PRD FR-TB-5: named sessions. `:mksession`/`:session` both take a
+        // name validated up front (`session::is_valid_session_name`) — the
+        // same "letters, digits, - and _" shape the file path resolver
+        // itself enforces, checked here too so a bad name reports a clear
+        // parse error instead of a later, more confusing I/O failure.
+        "mksession" => {
+            let name = require_arg("name")?;
+            if session::is_valid_session_name(&name) {
+                Ok(Command::MkSession(name))
+            } else {
+                Err(format!(
+                    "{name:?} is not a usable session name — letters, digits, - and _ only"
+                ))
+            }
+        }
+        "session" => {
+            let name = require_arg("name")?;
+            if session::is_valid_session_name(&name) {
+                Ok(Command::SessionSwitch(name))
+            } else {
+                Err(format!(
+                    "{name:?} is not a usable session name — letters, digits, - and _ only"
+                ))
+            }
+        }
+        "sessions" => Ok(Command::Sessions),
+        // PRD FR-PC-2: `:tts`/`:speak` (bare) plays from the cursor; `stop`
+        // halts playback.
+        "tts" | "speak" => match arg {
+            "" => Ok(Command::Tts(TtsSpec::Play)),
+            "stop" => Ok(Command::Tts(TtsSpec::Stop)),
+            other => Err(format!(
+                "unknown :tts argument {other:?} — try: tts, tts stop"
+            )),
+        },
+        // PRD FR-CS-5: `:run <macro-name>`.
+        "run" => Ok(Command::RunMacro(require_arg("macro name")?)),
         "help" | "h" => Ok(Command::Help),
         "q" | "quit" => Ok(Command::Quit),
         "" => Err(USAGE.to_string()),
@@ -1606,5 +1677,64 @@ mod tests {
         }
         assert!(parse("trail export").is_err());
         assert!(parse("trail export pdf").is_err());
+    }
+
+    // ---- PRD FR-TB-5: named sessions ---------------------------------------
+
+    #[test]
+    fn mksession_and_session_parse_a_valid_name() {
+        assert_eq!(
+            parse("mksession research"),
+            Ok(Command::MkSession("research".to_string()))
+        );
+        assert_eq!(
+            parse("session research"),
+            Ok(Command::SessionSwitch("research".to_string()))
+        );
+        assert_eq!(
+            parse("mksession ww2-research_2"),
+            Ok(Command::MkSession("ww2-research_2".to_string()))
+        );
+    }
+
+    #[test]
+    fn mksession_and_session_require_a_name() {
+        assert!(parse("mksession").is_err());
+        assert!(parse("session").is_err());
+    }
+
+    #[test]
+    fn mksession_and_session_reject_an_unsafe_name() {
+        for cmd in ["mksession", "session"] {
+            assert!(parse(&format!("{cmd} has space")).is_err());
+            assert!(parse(&format!("{cmd} ../escape")).is_err());
+        }
+    }
+
+    #[test]
+    fn sessions_parses_bare() {
+        assert_eq!(parse("sessions"), Ok(Command::Sessions));
+    }
+
+    // ---- PRD FR-PC-2: :tts / :speak ----------------------------------------
+
+    #[test]
+    fn tts_and_speak_parse_play_and_stop() {
+        assert_eq!(parse("tts"), Ok(Command::Tts(TtsSpec::Play)));
+        assert_eq!(parse("tts stop"), Ok(Command::Tts(TtsSpec::Stop)));
+        assert_eq!(parse("speak"), Ok(Command::Tts(TtsSpec::Play)));
+        assert_eq!(parse("speak stop"), Ok(Command::Tts(TtsSpec::Stop)));
+        assert!(parse("tts pause").is_err());
+    }
+
+    // ---- PRD FR-CS-5: :run <macro> ------------------------------------------
+
+    #[test]
+    fn run_parses_a_macro_name() {
+        assert_eq!(
+            parse("run morning"),
+            Ok(Command::RunMacro("morning".to_string()))
+        );
+        assert!(parse("run").is_err());
     }
 }

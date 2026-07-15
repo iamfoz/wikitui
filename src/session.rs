@@ -142,6 +142,95 @@ pub fn load(path: &Path) -> Option<SessionState> {
     serde_json::from_str(&text).ok()
 }
 
+// ---- Named sessions (PRD FR-TB-5, v1.x half) --------------------------
+//
+// The auto-restore session above is one continuous, unnamed snapshot at a
+// fixed path. `:mksession <name>` saves a second, independent snapshot
+// under a reader-chosen name; `wikitui --session <name>` / `:session
+// <name>` load it back. Both live in the same `$XDG_STATE_HOME/wikitui/`
+// tree (§6.4: sessions are state, not cache) but in their own `sessions/`
+// subdirectory, so `ls`-ing state doesn't mix "what was on screen last
+// time" with "the reading lists the reader explicitly named and saved" —
+// and so a stray file matching `session.json` itself can never collide
+// with a same-named saved session. `save`/`load` above are reused as-is
+// for the named-file I/O; only path resolution is new here.
+
+/// Whether `name` is safe to use as a session file's stem: non-empty,
+/// reasonably short, and restricted to characters that can never spell a
+/// path traversal or a hidden/relative segment (`..`, `/`, a leading `.`) —
+/// the file lives at `sessions/<name>.json` with no further sanitization
+/// downstream, so this is the one gate standing between a reader-typed
+/// `:mksession <name>` and writing outside the sessions directory.
+pub fn is_valid_session_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 100
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// The `sessions/` directory alongside the auto-restore `session.json` —
+/// shared plumbing behind [`resolve_named_session_path`] and
+/// [`list_named_sessions`], mirroring [`resolve_session_path`]'s own
+/// state-dir resolution (so a sandboxed environment with no resolvable
+/// platform directory degrades to `None` for named sessions exactly the
+/// way it already does for the auto-restore one).
+fn resolve_named_sessions_dir() -> Option<PathBuf> {
+    let dirs = directories::ProjectDirs::from("", "", "wikitui")?;
+    let dir = dirs
+        .state_dir()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| dirs.data_dir().join("state"));
+    Some(dir.join("sessions"))
+}
+
+/// Where `:mksession <name>` writes and `:session <name>`/`--session <name>`
+/// read: `$XDG_STATE_HOME/wikitui/sessions/<name>.json`. `None` for an
+/// invalid `name` (see [`is_valid_session_name`]) or when no platform state
+/// directory could be resolved at all — both are the caller's cue to report
+/// a notice rather than attempt the read/write.
+pub fn resolve_named_session_path(name: &str) -> Option<PathBuf> {
+    if !is_valid_session_name(name) {
+        return None;
+    }
+    Some(resolve_named_sessions_dir()?.join(format!("{name}.json")))
+}
+
+/// Every saved session name found directly under `dir` (its `*.json` files'
+/// stems), sorted for a stable `:sessions` listing. A separate,
+/// directory-parameterized function from [`list_named_sessions`] so tests
+/// can exercise the real listing logic against an isolated temp directory
+/// rather than the process's real (and possibly nonexistent, possibly
+/// reader-owned) state directory.
+pub fn list_named_sessions_in(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                return None;
+            }
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::to_string)
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// `:sessions`: every session saved via `:mksession`, by name. Empty (never
+/// an error) when the sessions directory doesn't exist yet — a fresh
+/// install has saved none — or no platform state directory resolves at all.
+pub fn list_named_sessions() -> Vec<String> {
+    resolve_named_sessions_dir()
+        .map(|dir| list_named_sessions_in(&dir))
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,5 +370,91 @@ mod tests {
         save(&empty, &path).unwrap();
         assert_eq!(load(&path), Some(empty));
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- Named sessions (PRD FR-TB-5) --------------------------------
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("wikitui-test-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn is_valid_session_name_accepts_alnum_dash_underscore_only() {
+        assert!(is_valid_session_name("research"));
+        assert!(is_valid_session_name("ww2-research"));
+        assert!(is_valid_session_name("ww2_research_2"));
+        assert!(!is_valid_session_name(""));
+        assert!(!is_valid_session_name(".."));
+        assert!(!is_valid_session_name("../escape"));
+        assert!(!is_valid_session_name("has space"));
+        assert!(!is_valid_session_name("has/slash"));
+        assert!(
+            !is_valid_session_name(&"x".repeat(101)),
+            "over the length cap"
+        );
+        assert!(
+            is_valid_session_name(&"x".repeat(100)),
+            "exactly at the cap"
+        );
+    }
+
+    /// PRD FR-TB-5: a named session round-trips tabs, wiki scope, and scroll
+    /// exactly like the auto-restore session (same `save`/`load`, same
+    /// atomic-write contract already exercised above) — proving
+    /// `:mksession <name>` / `--session <name>` have a real, working file
+    /// format to read and write at their own `sessions/<name>.json` shape;
+    /// only the *path* differs from the auto-restore session, not the I/O.
+    #[test]
+    fn named_session_save_then_load_round_trips_tabs_wiki_and_scroll() {
+        let dir = temp_dir("named-session-roundtrip");
+        let path = dir.join("research.json");
+        let state = sample_state();
+        save(&state, &path).unwrap();
+        let loaded = load(&path).expect("just-saved named session must load back");
+        assert_eq!(loaded, state);
+        assert_eq!(
+            loaded.tabs[1].wiki, "wiktionary",
+            "wiki scope survives (C6b)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_named_session_path_rejects_an_unsafe_name() {
+        assert_eq!(resolve_named_session_path(""), None);
+        assert_eq!(resolve_named_session_path(".."), None);
+        assert_eq!(resolve_named_session_path("../escape"), None);
+        assert_eq!(resolve_named_session_path("has space"), None);
+    }
+
+    #[test]
+    fn resolve_named_session_path_lands_under_a_sessions_subdirectory() {
+        if let Some(path) = resolve_named_session_path("research") {
+            assert!(path.ends_with("sessions/research.json"));
+        }
+        // `None` is legitimate with no resolvable platform directory.
+    }
+
+    #[test]
+    fn list_named_sessions_in_lists_json_stems_sorted_and_ignores_other_files() {
+        let dir = temp_dir("list-sessions");
+        save(&sample_state(), &dir.join("ww2.json")).unwrap();
+        save(&sample_state(), &dir.join("morning.json")).unwrap();
+        std::fs::write(dir.join("notes.txt"), b"not a session").unwrap();
+
+        let names = list_named_sessions_in(&dir);
+        assert_eq!(names, vec!["morning".to_string(), "ww2".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_named_sessions_in_on_a_missing_directory_is_empty_not_an_error() {
+        let dir = std::env::temp_dir().join("wikitui-test-sessions-does-not-exist");
+        assert_eq!(list_named_sessions_in(&dir), Vec::<String>::new());
     }
 }

@@ -65,7 +65,11 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sha2 = "0.10"
 textwrap = "0.16.2"
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "test-util"] }
+# PRD FR-PC-2 / SEC-5: `process` enables `tokio::process` — TTS playback
+# spawns one child per paragraph and awaits it asynchronously (`tts::
+# speak_one`) so a long article's playback never blocks the UI-owning
+# thread (see `tts::TtsRuntime`'s doc comment for the full threading story).
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "process", "signal", "sync", "time", "test-util"] }
 toml = "1.1.2"
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2.2"

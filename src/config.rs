@@ -292,6 +292,23 @@ pub struct ResolvedConfig {
     /// preference set once, like `startpage`/`include_nonfree`), default
     /// `"watched"`.
     pub watchlist_mirror_tag: Valued<String>,
+    /// PRD FR-PC-2 / SEC-5: the user-configured TTS command (e.g.
+    /// `"espeak-ng -s 160"`, macOS `"say"`). File only (no CLI/env — a
+    /// preference set once, like `watchlist_mirror_tag`/`startpage`).
+    /// `None` (unset, the default) means TTS is disabled; `main::
+    /// start_tts_playback` reports a notice rather than silently doing
+    /// nothing when invoked with nothing configured — there is no portable
+    /// platform default to guess (unlike `$EDITOR`, there is no `$SPEECH`
+    /// convention).
+    pub tts_command: Valued<Option<String>>,
+    /// PRD FR-CS-5's command-sequence macros (`[command.<name>] run =
+    /// [...]`): every macro name mapped to its ordered step list. Each step
+    /// is already checked against the registry/command grammar at load time
+    /// (an unknown step warns via `issues` but does not drop the macro —
+    /// see [`resolve_macros`]'s doc comment for why); a step that still
+    /// turns out bad at run time is caught again there, per FR-CS-5's own
+    /// per-step error policy.
+    pub macros: std::collections::BTreeMap<String, Vec<String>>,
     /// Parse errors, unknown keys, and rejected values — never fatal, but
     /// `doctor` reports them and exits 1 if any is `IssueLevel::Error`.
     pub issues: Vec<Issue>,
@@ -695,6 +712,8 @@ pub fn resolve(
         "color_depth",
         "reading",
         "watchlist_mirror_tag",
+        "tts_command",
+        "command",
     ]
     .into_iter()
     .collect();
@@ -786,6 +805,8 @@ pub fn resolve(
     let reading = resolve_reading(&table, &mut issues);
     let auth = resolve_auth(&table, &mut issues);
     let watchlist_mirror_tag = resolve_watchlist_mirror_tag(&table, &mut issues);
+    let tts_command = resolve_tts_command(&table, &mut issues);
+    let macros = resolve_macros(&table, &mut issues);
 
     ResolvedConfig {
         config_version: Valued {
@@ -826,6 +847,8 @@ pub fn resolve(
         reading,
         auth,
         watchlist_mirror_tag,
+        tts_command,
+        macros,
         migration_summary: config_version.1,
         issues,
         config_path: config_path.map(Path::to_path_buf),
@@ -1400,6 +1423,127 @@ fn resolve_watchlist_mirror_tag(table: &toml::Table, issues: &mut Vec<Issue>) ->
             }
         },
     }
+}
+
+/// PRD FR-PC-2 / SEC-5: the TTS command, file-only, unset by default. Never
+/// falls back to a guessed platform default (unlike, say, `$EDITOR`'s own
+/// convention) — an unset value means the feature stays off until the
+/// reader opts in explicitly, and a set-but-blank string is treated the
+/// same as unset (with a warning), since `tts::parse_command_line` would
+/// otherwise have nothing to spawn.
+fn resolve_tts_command(table: &toml::Table, issues: &mut Vec<Issue>) -> Valued<Option<String>> {
+    let unset = Valued {
+        value: None,
+        source: Source::Default,
+    };
+    match table.get("tts_command") {
+        None => unset,
+        Some(v) => match v.as_str() {
+            Some(s) if !s.trim().is_empty() => Valued {
+                value: Some(s.trim().to_string()),
+                source: Source::File,
+            },
+            Some(_) => {
+                issues.push(Issue::warning(
+                    "tts_command must be a non-empty string; TTS stays disabled",
+                ));
+                unset
+            }
+            None => {
+                issues.push(Issue::warning(
+                    "tts_command must be a string; TTS stays disabled",
+                ));
+                unset
+            }
+        },
+    }
+}
+
+/// PRD FR-CS-5: `[command.<name>] run = ["step1", "step2", ...]` — named
+/// macros, resolved the same "table of named sections" shape `resolve_wiki`
+/// already uses for `[wiki.<name>]`. Each step is checked against
+/// `macros::step_names_a_known_command`'s grammar ("validate at load, warn
+/// on unknown") — an unrecognized step *warns*, but the macro is still
+/// registered with that step left in place: `main::run_macro`'s own
+/// per-step error policy (report the failing step, run the rest) already
+/// has to handle "this step doesn't resolve to anything" at run time
+/// regardless (config can be hand-edited after this load, or reloaded via
+/// `:config reload`), so dropping the whole macro here would just move the
+/// same partial-failure outcome earlier without avoiding it — and would
+/// silently discard the *valid* steps of an otherwise-working macro over
+/// one typo.
+fn resolve_macros(
+    table: &toml::Table,
+    issues: &mut Vec<Issue>,
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut macros = std::collections::BTreeMap::new();
+    let Some(sections) = table.get("command").and_then(toml::Value::as_table) else {
+        if table.get("command").is_some() {
+            issues.push(Issue::warning(
+                "command must be a table of [command.<name>] sections; ignoring",
+            ));
+        }
+        return macros;
+    };
+    for (name, section) in sections {
+        let Some(section_table) = section.as_table() else {
+            issues.push(Issue::warning(format!(
+                "command.{name} must be a table with a run key; ignoring"
+            )));
+            continue;
+        };
+        for key in section_table.keys() {
+            if key != "run" {
+                issues.push(Issue::warning(format!(
+                    "unknown config key 'command.{name}.{key}' — ignored"
+                )));
+            }
+        }
+        let Some(run) = section_table.get("run") else {
+            issues.push(Issue::warning(format!(
+                "command.{name} has no run key; ignoring"
+            )));
+            continue;
+        };
+        let Some(steps) = run.as_array() else {
+            issues.push(Issue::warning(format!(
+                "command.{name}.run must be an array of strings; ignoring"
+            )));
+            continue;
+        };
+        let mut parsed_steps = Vec::with_capacity(steps.len());
+        let mut malformed = false;
+        for step in steps {
+            match step.as_str() {
+                Some(s) if !s.trim().is_empty() => parsed_steps.push(s.trim().to_string()),
+                _ => {
+                    issues.push(Issue::warning(format!(
+                        "command.{name}.run must be an array of non-empty strings; ignoring the whole macro"
+                    )));
+                    malformed = true;
+                    break;
+                }
+            }
+        }
+        if malformed {
+            continue;
+        }
+        if parsed_steps.is_empty() {
+            issues.push(Issue::warning(format!(
+                "command.{name}.run is empty; ignoring"
+            )));
+            continue;
+        }
+        for step in &parsed_steps {
+            if !crate::macros::step_names_a_known_command(step) {
+                issues.push(Issue::warning(format!(
+                    "command.{name}.run: unknown command/action {step:?} — will warn again if run"
+                )));
+            }
+        }
+        macros.insert(name.clone(), parsed_steps);
+    }
+    macros
 }
 
 /// PRD FR-RD-11's reading-time WPM divisor, default 230 (an average adult
@@ -3084,6 +3228,202 @@ mod tests {
                 .iter()
                 .any(|i| i.message.contains("watchlist_mirror_tag")),
         );
+        cleanup(&path);
+    }
+
+    // ---- tts_command (PRD FR-PC-2 / SEC-5) -------------------------------
+
+    #[test]
+    fn tts_command_is_unset_by_default() {
+        let default = resolve(&CliOverrides::default(), &EnvOverrides::default(), None);
+        assert_eq!(default.tts_command.value, None);
+        assert_eq!(default.tts_command.source, Source::Default);
+    }
+
+    #[test]
+    fn tts_command_honors_the_file_value() {
+        let path = temp_config("tts_command = \"espeak-ng -s 160\"\n");
+        let r = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(r.tts_command.value, Some("espeak-ng -s 160".to_string()));
+        assert_eq!(r.tts_command.source, Source::File);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn tts_command_rejects_a_blank_value_and_stays_disabled() {
+        let path = temp_config("tts_command = \"   \"\n");
+        let r = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(r.tts_command.value, None);
+        assert!(r.issues.iter().any(|i| i.message.contains("tts_command")));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn tts_command_rejects_a_non_string_value() {
+        let path = temp_config("tts_command = 160\n");
+        let r = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(r.tts_command.value, None);
+        assert!(r.issues.iter().any(|i| i.message.contains("tts_command")));
+        cleanup(&path);
+    }
+
+    // ---- [command.<name>] macros (PRD FR-CS-5) ---------------------------
+
+    #[test]
+    fn no_command_sections_resolves_to_an_empty_macro_table() {
+        let default = resolve(&CliOverrides::default(), &EnvOverrides::default(), None);
+        assert!(default.macros.is_empty());
+    }
+
+    /// PRD FR-CS-5's own example: `[command.morning] run = ["open-feed",
+    /// "tab-open-random-good"]`.
+    #[test]
+    fn a_valid_command_section_parses_its_run_steps_in_order() {
+        let path =
+            temp_config("[command.morning]\nrun = [\"open-feed\", \"tab-open-random-good\"]\n");
+        let r = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(
+            r.macros.get("morning"),
+            Some(&vec![
+                "open-feed".to_string(),
+                "tab-open-random-good".to_string()
+            ])
+        );
+        assert!(
+            r.issues.is_empty(),
+            "a valid, fully-known macro warns nothing: {:?}",
+            r.issues
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn multiple_command_sections_each_resolve_independently() {
+        let path = temp_config(
+            "[command.demo]\nrun = [\":open Alan Turing\", \":toc\"]\n\n\
+             [command.morning]\nrun = [\"open-feed\"]\n",
+        );
+        let r = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(
+            r.macros.get("demo"),
+            Some(&vec![":open Alan Turing".to_string(), ":toc".to_string()])
+        );
+        assert_eq!(
+            r.macros.get("morning"),
+            Some(&vec!["open-feed".to_string()])
+        );
+        cleanup(&path);
+    }
+
+    /// PRD FR-CS-5: "validate at load, warn on unknown" — an unrecognized
+    /// step still keeps the macro registered (so its other, valid steps
+    /// still run; see `resolve_macros`'s doc comment) but surfaces a warning
+    /// naming the exact bad step.
+    #[test]
+    fn an_unknown_step_warns_but_the_macro_still_registers() {
+        let path =
+            temp_config("[command.demo]\nrun = [\"open-feed\", \"this-is-not-a-real-command\"]\n");
+        let r = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(
+            r.macros.get("demo"),
+            Some(&vec![
+                "open-feed".to_string(),
+                "this-is-not-a-real-command".to_string()
+            ])
+        );
+        assert!(
+            r.issues
+                .iter()
+                .any(|i| i.message.contains("this-is-not-a-real-command")),
+            "{:?}",
+            r.issues
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_self_referential_macro_step_is_accepted_at_load_time() {
+        // A macro naming itself is only meaningfully caught at *run* time
+        // (main::run_macro's seen-set) — at load time, a macro name is just
+        // another string this loader has no registry of yet (macro names
+        // aren't `registry::Action`s or `:` commands), so it is silently
+        // accepted here, same as any other unrecognized bare word would be
+        // if it happened to match a sibling macro's name. Documented so a
+        // future reader doesn't mistake this for a missed validation.
+        let path = temp_config("[command.a]\nrun = [\"a\"]\n");
+        let r = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(r.macros.get("a"), Some(&vec!["a".to_string()]));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_run_key_that_is_not_an_array_of_strings_is_rejected_with_a_warning() {
+        let path = temp_config("[command.demo]\nrun = \"open-feed\"\n");
+        let r = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert!(!r.macros.contains_key("demo"));
+        assert!(
+            r.issues
+                .iter()
+                .any(|i| i.message.contains("command.demo.run"))
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_command_section_with_no_run_key_is_rejected_with_a_warning() {
+        let path = temp_config("[command.demo]\nnotrun = [\"open-feed\"]\n");
+        let r = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert!(!r.macros.contains_key("demo"));
+        assert!(r.issues.iter().any(|i| i.message.contains("command.demo")));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn command_as_a_non_table_is_rejected_with_a_warning() {
+        let path = temp_config("command = \"oops\"\n");
+        let r = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert!(r.macros.is_empty());
+        assert!(r.issues.iter().any(|i| i.message.contains("command")));
         cleanup(&path);
     }
 

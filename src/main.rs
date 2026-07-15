@@ -25,6 +25,7 @@ mod image;
 mod interest;
 mod jsonl;
 mod layout;
+mod macros;
 mod migrate;
 mod netqueue;
 mod offline_search;
@@ -48,6 +49,7 @@ mod target;
 mod theme;
 mod trail;
 mod trail_export;
+mod tts;
 mod ui;
 
 use anyhow::Result;
@@ -611,6 +613,8 @@ async fn main() -> Result<()> {
         resolved.watchlist_mirror_tag.value.clone(),
         resolved.active_wiki.value.clone(),
         resolved.wiki_registry.clone(),
+        resolved.tts_command.value.clone(),
+        resolved.macros.clone(),
     )
     .await
 }
@@ -2272,6 +2276,8 @@ async fn run(
     watchlist_mirror_tag: String,
     active_wiki: String,
     wiki_registry: config::ResolvedWikiRegistry,
+    tts_command: Option<String>,
+    macros: std::collections::BTreeMap<String, Vec<String>>,
 ) -> Result<()> {
     let mut app = App::new(lang, theme, no_color);
     app.keymap = keymap;
@@ -2382,6 +2388,11 @@ async fn run(
     // behind (see that function's doc comment for why incognito must not
     // also erase history it didn't ask to touch).
     app.session_path = session::resolve_session_path();
+    // PRD FR-PC-2 / FR-CS-5: both file-only, resolved once at startup —
+    // same "App::new defaults empty, main::run installs the real config"
+    // split every other config-sourced field on `App` already follows.
+    app.tts_command = tts_command;
+    app.macros = macros;
 
     // PRD FR-ACC-1 / §5.9: the OAuth client identity + endpoints `:login`
     // builds a flow from, and — if a token store already holds tokens from a
@@ -2478,6 +2489,25 @@ async fn run(
             &langlinks_tx,
         )
         .await;
+    } else if let Some(name) = cli.session.clone() {
+        // PRD FR-TB-5 / FR-CS-6: `--session <name>` loads a named session at
+        // launch — like `startpage = resume`'s auto-restore below, but from
+        // the named file instead of the continuous one. It wins over
+        // whichever `startpage`/`restore_session` config the reader has set
+        // (an explicit CLI flag naming exactly what to open outranks a
+        // blanket default, the same precedence `--incognito`/`--lang`
+        // already follow) but sits below `--search`/a TITLE argument, which
+        // name one specific thing to open and always win over any session
+        // restore.
+        let restored = session::resolve_named_session_path(&name)
+            .and_then(|path| session::load(&path))
+            .map(|state| restore_session_tabs(client, cache, &mut app, state, &open_tx))
+            .unwrap_or(false);
+        if !restored {
+            app.notice = Some(format!(
+                "no saved session named {name:?} — starting blank (see :sessions)"
+            ));
+        }
     } else if app.startpage_config == startpage::StartPageConfig::Resume || restore_session_config {
         // PRD FR-TB-5: `startpage = resume` (or the independent
         // `restore_session = true`) reopens the persisted tab set — every
@@ -3717,6 +3747,379 @@ fn restore_session_tabs(
     true
 }
 
+/// `:mksession <name>` (PRD FR-TB-5): snapshots the current tab set into a
+/// named session file, reusing `App::session_snapshot` (the exact
+/// `SessionState` shape `persist_session`'s continuous auto-restore save
+/// already builds) and `session::save`'s atomic-write contract — the only
+/// thing new here is the path.
+///
+/// PRD FR-PR-3: unlike the continuous auto-restore snapshot (denied
+/// outright in incognito — see `App::persist_session`'s doc comment),
+/// `:mksession` is an explicit, one-shot save the reader named — the same
+/// "explicit beats implicit" reasoning `m`/`S`'s bookmark/offline-save
+/// writes already apply in incognito (`privacy::Write::NamedSession`);
+/// allowed, with the same incognito warning suffix those carry, so the
+/// reader still sees that this one action left a mark on disk.
+fn cmd_mksession(app: &mut App, name: &str) {
+    if !session::is_valid_session_name(name) {
+        app.notice = Some(format!(
+            "{name:?} is not a usable session name — letters, digits, - and _ only"
+        ));
+        return;
+    }
+    let Some(path) = session::resolve_named_session_path(name) else {
+        app.notice = Some("couldn't resolve a session directory on this system".to_string());
+        return;
+    };
+    let state = app.session_snapshot();
+    let tab_count = state.tabs.len();
+    app.notice = Some(match session::save(&state, &path) {
+        Ok(()) => crate::privacy::append_warning_if_needed(
+            app.incognito,
+            crate::privacy::Write::NamedSession,
+            format!(
+                "Saved session {name:?} ({tab_count} tab{})",
+                if tab_count == 1 { "" } else { "s" }
+            ),
+        ),
+        Err(e) => format!("Couldn't save session {name:?}: {e}"),
+    });
+}
+
+/// `:session <name>` (PRD FR-TB-5): loads a named session file, replacing
+/// every currently open tab. Reuses `restore_session_tabs` (already written
+/// for `--session`/`startpage = resume` at startup) for the actual per-tab
+/// reopen, which requires exactly one existing blank tab as its
+/// precondition — `App::reset_to_single_blank_tab` (see its own doc
+/// comment for why *replace*, not merge, is the chosen semantics: the same
+/// vim `:source`-on-a-session-file behavior `:mksession`'s borrowed name
+/// implies) establishes that precondition first.
+fn switch_to_named_session(
+    client: &WikiClient,
+    cache: &PageCache,
+    app: &mut App,
+    name: &str,
+    open_tx: &UnboundedSender<TabLoadOutcome>,
+) {
+    if !session::is_valid_session_name(name) {
+        app.notice = Some(format!(
+            "{name:?} is not a usable session name — letters, digits, - and _ only"
+        ));
+        return;
+    }
+    let Some(path) = session::resolve_named_session_path(name) else {
+        app.notice = Some("couldn't resolve a session directory on this system".to_string());
+        return;
+    };
+    let Some(state) = session::load(&path) else {
+        app.notice = Some(format!("no saved session named {name:?} — see :sessions"));
+        return;
+    };
+    app.reset_to_single_blank_tab();
+    let restored = restore_session_tabs(client, cache, app, state, open_tx);
+    app.notice = Some(if restored {
+        format!("Switched to session {name:?}")
+    } else {
+        format!("Session {name:?} was empty — closed every tab")
+    });
+}
+
+/// `:sessions` (PRD FR-TB-5): lists every saved named session by name.
+/// Deliberately a status-bar notice, not a dedicated interactive picker
+/// `Mode` — `:session <name>` already covers "switch to one of them" (the
+/// PRD's own wording offers "`:session <name>` / a picker" as alternatives,
+/// not both), and a bare listing is enough to answer "what did I save"
+/// without the render/key-handling/hit-testing surface a full picker view
+/// would add for what is, so far, a low-frequency v1.x convenience. A
+/// fuzzy picker remains a documented, straightforward seam if named
+/// sessions turn out to need faster discovery in practice.
+fn cmd_list_sessions(app: &mut App) {
+    let names = session::list_named_sessions();
+    app.notice = Some(if names.is_empty() {
+        "No saved sessions yet — :mksession <name> to create one".to_string()
+    } else {
+        format!("Saved sessions: {}", names.join(", "))
+    });
+}
+
+/// `:tts`/`:speak` (PRD FR-PC-2): pipes the current article's paragraphs
+/// from the reading cursor onward to the configured `tts_command`, one
+/// child process per paragraph (SEC-5: stdin only, never argv — see
+/// `tts::speak_one`'s doc comment). Never blocks this event-loop turn: the
+/// whole walk runs on a spawned `tokio::task` (see `tts::TtsRuntime`'s doc
+/// comment for the full threading story), so a long article's playback
+/// can take minutes without stalling a keypress. There is no completion
+/// channel back to `App` (unlike every other background outcome in this
+/// file, e.g. `RevalidationOutcome`/`SaveOutcome`) — a documented,
+/// deliberately narrow scope: TTS has nothing to *install* onto `App` when
+/// a paragraph finishes (no document changes, no cache entry, nothing the
+/// UI needs to redraw for), so `app.tts_playing` simply stays `true` until
+/// the reader explicitly stops it or starts a new play; it does not flip
+/// back to `false` on its own once a full article finishes speaking. A
+/// `:tts stop` after that point is a harmless no-op (the generation bump
+/// affects nothing still running).
+fn start_tts_playback(app: &mut App) {
+    let Some(command_line) = app.tts_command.clone() else {
+        app.notice = Some(
+            "tts_command is not set — add tts_command = \"espeak-ng -s 160\" (or \"say\" on macOS) to config.toml".to_string(),
+        );
+        return;
+    };
+    let Some((program, args)) = tts::parse_command_line(&command_line) else {
+        app.notice = Some("tts_command is set but blank — nothing to run".to_string());
+        return;
+    };
+    if app.active_tab().doc.is_none() {
+        app.notice = Some("Open an article first".to_string());
+        return;
+    }
+    // `ensure_layout` needs `&mut self`, so it must run before borrowing
+    // `doc`/`app.layout` immutably below — a document is guaranteed present
+    // from the check just above, so this never regresses to "no layout".
+    app.ensure_layout();
+    let from_block = app
+        .layout
+        .as_ref()
+        .map(|l| tts::block_at_scroll(&l.block_lines, app.active_tab().scroll))
+        .unwrap_or(0);
+    let paragraphs = {
+        let doc = app
+            .active_tab()
+            .doc
+            .as_ref()
+            .expect("checked present above");
+        tts::paragraphs_from(doc, from_block)
+    };
+    if paragraphs.is_empty() {
+        app.notice = Some("Nothing left to read from here".to_string());
+        return;
+    }
+    let generation = app.tts.begin();
+    app.tts_playing = true;
+    let runtime = app.tts.clone();
+    let total = paragraphs.len();
+    tokio::spawn(async move {
+        for para in paragraphs {
+            if !runtime.is_current(generation) {
+                return;
+            }
+            // Best-effort: a paragraph that fails to spawn/exit cleanly
+            // (SEC-5's "spawn-fail handling") is skipped, not fatal — the
+            // rest of the article still gets a chance to play. Nothing here
+            // can reach `app.notice`/panic the reader's UI thread; the only
+            // consequence of a broken `tts_command` is silence.
+            let _ = tts::speak_one(&program, &args, &para).await;
+        }
+    });
+    app.notice = Some(format!(
+        "Speaking {total} paragraph{}… (:tts stop to halt)",
+        if total == 1 { "" } else { "s" }
+    ));
+}
+
+/// `:tts stop` (PRD FR-PC-2): halts playback between paragraphs (see
+/// `tts::TtsRuntime`'s doc comment for exactly what "halts" means — the
+/// currently-speaking child process is not killed mid-utterance, only the
+/// advance to the *next* paragraph is prevented).
+fn stop_tts_playback(app: &mut App) {
+    app.tts.stop();
+    app.tts_playing = false;
+    app.notice = Some("TTS stopped".to_string());
+}
+
+/// `:<macro-name>` / `:run <name>` (PRD FR-CS-5): the shared entry point
+/// both spellings dispatch through, starting a fresh recursion-guard stack
+/// (`crate::macros`' module doc comment) at depth 0.
+#[allow(clippy::too_many_arguments)]
+async fn run_named_macro(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    client: &WikiClient,
+    cache: &PageCache,
+    app: &mut App,
+    name: String,
+    revalidate_tx: &UnboundedSender<RevalidationOutcome>,
+    open_tx: &UnboundedSender<TabLoadOutcome>,
+    save_tx: &UnboundedSender<SaveOutcome>,
+    related_tx: &UnboundedSender<RelatedOutcome>,
+    langlinks_tx: &UnboundedSender<LangLinksOutcome>,
+) {
+    let mut stack = Vec::new();
+    run_macro(
+        terminal,
+        client,
+        cache,
+        app,
+        &name,
+        revalidate_tx,
+        open_tx,
+        save_tx,
+        related_tx,
+        langlinks_tx,
+        0,
+        &mut stack,
+    )
+    .await;
+}
+
+/// PRD FR-CS-5: runs macro `name`'s ordered step list, each step dispatched
+/// through the exact same paths a keypress (`dispatch_action`) or a typed
+/// `:` command (`execute_command`) already uses — see `crate::macros`'
+/// module doc comment for the recursion guard and error-continues policy
+/// this implements. `depth` is the hard nesting ceiling
+/// (`macros::MAX_DEPTH`); `stack` holds every macro name currently being
+/// expanded on this call chain, so a name reappearing on it (direct or
+/// mutual self-reference) is refused immediately rather than repeating
+/// work forever.
+#[allow(clippy::too_many_arguments)]
+async fn run_macro(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    client: &WikiClient,
+    cache: &PageCache,
+    app: &mut App,
+    name: &str,
+    revalidate_tx: &UnboundedSender<RevalidationOutcome>,
+    open_tx: &UnboundedSender<TabLoadOutcome>,
+    save_tx: &UnboundedSender<SaveOutcome>,
+    related_tx: &UnboundedSender<RelatedOutcome>,
+    langlinks_tx: &UnboundedSender<LangLinksOutcome>,
+    depth: usize,
+    stack: &mut Vec<String>,
+) {
+    if depth >= crate::macros::MAX_DEPTH {
+        app.notice = Some(format!(
+            "macro {name:?}: too deeply nested (max {}) — stopped",
+            crate::macros::MAX_DEPTH
+        ));
+        return;
+    }
+    if stack.iter().any(|s| s == name) {
+        app.notice = Some(format!(
+            "macro {name:?} calls itself — stopped to avoid an infinite loop"
+        ));
+        return;
+    }
+    let Some(steps) = app.macros.get(name).cloned() else {
+        app.notice = Some(format!(
+            "no macro named {name:?} — see config.toml [command.{name}]"
+        ));
+        return;
+    };
+    stack.push(name.to_string());
+    for step in &steps {
+        run_macro_step(
+            terminal,
+            client,
+            cache,
+            app,
+            step,
+            revalidate_tx,
+            open_tx,
+            save_tx,
+            related_tx,
+            langlinks_tx,
+            depth,
+            stack,
+        )
+        .await;
+    }
+    stack.pop();
+}
+
+/// Runs one macro step: a macro-only alias (`macros::OPEN_FEED`/
+/// `TAB_OPEN_RANDOM_GOOD`), a nested macro name (recurses through
+/// `run_macro` at `depth + 1`, boxed — see the inline comment on that call
+/// for why), a bare registry action, or a `:`-command string. Unknown/
+/// unparseable steps and a nested macro's own recursion-guard trip both
+/// report their own notice and return — PRD FR-CS-5's "report the failing
+/// step, continue with the rest" (the caller's loop moves on to the next
+/// step regardless of what happened here).
+#[allow(clippy::too_many_arguments)]
+async fn run_macro_step(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    client: &WikiClient,
+    cache: &PageCache,
+    app: &mut App,
+    step: &str,
+    revalidate_tx: &UnboundedSender<RevalidationOutcome>,
+    open_tx: &UnboundedSender<TabLoadOutcome>,
+    save_tx: &UnboundedSender<SaveOutcome>,
+    related_tx: &UnboundedSender<RelatedOutcome>,
+    langlinks_tx: &UnboundedSender<LangLinksOutcome>,
+    depth: usize,
+    stack: &mut Vec<String>,
+) {
+    let step_body = crate::macros::strip_colon(step);
+    if step_body == crate::macros::OPEN_FEED {
+        app.go_home();
+        return;
+    }
+    if step_body == crate::macros::TAB_OPEN_RANDOM_GOOD {
+        app.new_foreground_tab();
+        open_random_good_article(client, cache, app, revalidate_tx, langlinks_tx).await;
+        return;
+    }
+    if app.macros.contains_key(step_body) {
+        // Indirect recursion (`run_macro` <-> `run_macro_step`) needs
+        // boxing at exactly one edge of the cycle so the compiler can size
+        // the state machine — see `rustc`'s "recursion in an `async fn`
+        // requires boxing" for the general shape; this is that fix, not a
+        // performance choice.
+        Box::pin(run_macro(
+            terminal,
+            client,
+            cache,
+            app,
+            step_body,
+            revalidate_tx,
+            open_tx,
+            save_tx,
+            related_tx,
+            langlinks_tx,
+            depth + 1,
+            stack,
+        ))
+        .await;
+        return;
+    }
+    if let Some(action) = registry::Action::by_name(step_body) {
+        dispatch_action(
+            action,
+            client,
+            cache,
+            app,
+            revalidate_tx,
+            open_tx,
+            save_tx,
+            related_tx,
+            langlinks_tx,
+            terminal,
+        )
+        .await;
+        return;
+    }
+    let user_theme_names: Vec<String> = app.user_themes.iter().map(|t| t.name.clone()).collect();
+    match command::parse_with_user_themes(step_body, &user_theme_names) {
+        Ok(cmd) => {
+            Box::pin(execute_command(
+                terminal,
+                client,
+                cache,
+                app,
+                cmd,
+                revalidate_tx,
+                open_tx,
+                save_tx,
+                related_tx,
+                langlinks_tx,
+            ))
+            .await;
+        }
+        Err(message) => {
+            app.notice = Some(format!("macro step {step:?} failed: {message}"));
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_key(
     client: &WikiClient,
@@ -4011,13 +4414,45 @@ async fn handle_key(
                             app,
                             cmd,
                             revalidate_tx,
+                            open_tx,
                             save_tx,
                             related_tx,
                             langlinks_tx,
                         )
                         .await
                     }
-                    Err(message) => app.notice = Some(message),
+                    Err(message) => {
+                        // PRD FR-CS-5: `:<macro-name>` runs a configured
+                        // macro — resolved here rather than inside
+                        // `command::parse_with_user_themes`, since macro
+                        // names are runtime config state the pure parser has
+                        // no access to (mirrors why `user_theme_names` has
+                        // to be threaded in above rather than hardcoded,
+                        // except a macro name is looked up *after* the
+                        // ordinary grammar already reports it unknown,
+                        // rather than pre-validated the way a theme name
+                        // is — `parse_with_user_themes` already has a
+                        // perfectly good "unknown command" error to fall
+                        // back from).
+                        let word = input.split_whitespace().next().unwrap_or("");
+                        if app.macros.contains_key(word) {
+                            run_named_macro(
+                                terminal,
+                                client,
+                                cache,
+                                app,
+                                word.to_string(),
+                                revalidate_tx,
+                                open_tx,
+                                save_tx,
+                                related_tx,
+                                langlinks_tx,
+                            )
+                            .await;
+                        } else {
+                            app.notice = Some(message);
+                        }
+                    }
                 }
             }
             KeyCode::Backspace => {
@@ -6827,11 +7262,12 @@ async fn execute_command(
     app: &mut App,
     cmd: command::Command,
     revalidate_tx: &UnboundedSender<RevalidationOutcome>,
+    open_tx: &UnboundedSender<TabLoadOutcome>,
     save_tx: &UnboundedSender<SaveOutcome>,
     related_tx: &UnboundedSender<RelatedOutcome>,
     langlinks_tx: &UnboundedSender<LangLinksOutcome>,
 ) {
-    use command::{Command, LoginMode, RandomSpec, SaveSpec};
+    use command::{Command, LoginMode, RandomSpec, SaveSpec, TtsSpec};
     match cmd {
         Command::Open(raw) => {
             // Same grammar as the CLI TITLE argument: URLs, lang-prefixed
@@ -7173,6 +7609,29 @@ async fn execute_command(
         }
         // PRD FR-ML-3: the bilingual side-by-side view.
         Command::Bilingual => cmd_bilingual(client, cache, app, revalidate_tx, langlinks_tx).await,
+        // PRD FR-TB-5: named sessions.
+        Command::MkSession(name) => cmd_mksession(app, &name),
+        Command::SessionSwitch(name) => switch_to_named_session(client, cache, app, &name, open_tx),
+        Command::Sessions => cmd_list_sessions(app),
+        // PRD FR-PC-2: TTS piping.
+        Command::Tts(TtsSpec::Play) => start_tts_playback(app),
+        Command::Tts(TtsSpec::Stop) => stop_tts_playback(app),
+        // PRD FR-CS-5: `:run <name>` explicitly invokes a macro.
+        Command::RunMacro(name) => {
+            run_named_macro(
+                terminal,
+                client,
+                cache,
+                app,
+                name,
+                revalidate_tx,
+                open_tx,
+                save_tx,
+                related_tx,
+                langlinks_tx,
+            )
+            .await
+        }
         Command::Quit => app.should_quit = true,
     }
 }

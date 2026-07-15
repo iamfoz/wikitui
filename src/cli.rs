@@ -73,6 +73,15 @@ pub struct Cli {
     /// this is for an interactive session that wants to opt out.
     #[arg(long)]
     pub no_onboarding: bool,
+
+    /// PRD FR-TB-5 / FR-CS-6: load a named session (saved with `:mksession
+    /// <name>`) at launch instead of the default start page / auto-restore.
+    /// Wins over `startpage = resume`/`restore_session = true` when given;
+    /// an explicit TITLE argument or `--search` still takes priority (see
+    /// `main::run`'s startup dispatch) — an explicit "open this one thing"
+    /// always outranks a blanket session restore.
+    #[arg(long, value_name = "NAME")]
+    pub session: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]

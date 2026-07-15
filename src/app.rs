@@ -23,6 +23,7 @@ use crate::session;
 use crate::startpage::{self, OnThisDayModel, OtdType, StartPageConfig, StartPageModel};
 use crate::tab::{HistoryEntry, Tab, TabId};
 use crate::theme::{ColorDepth, LoadedUserTheme, Theme};
+use crate::tts::TtsRuntime;
 
 /// How many closed tabs the undo stack (`u` to reopen — PRD FR-TB-1) keeps.
 /// A hard cap so a long session's closed-tab snapshots — which hold whole
@@ -945,6 +946,36 @@ pub struct App {
     /// call site, never read again).
     pub pending_session_restore: HashMap<TabId, PendingSessionRestore>,
 
+    // -- TTS piping (PRD FR-PC-2, SEC-5) ------------------------------------
+    /// The resolved `tts_command` config (`main::run` sets this once at
+    /// startup from `ResolvedConfig::tts_command`); `None` means TTS is
+    /// disabled — `main::start_tts_playback` reports a notice rather than
+    /// silently doing nothing. `App::new` leaves this `None`, the same
+    /// in-memory-default convention `session_path`/`auth` already use.
+    pub tts_command: Option<String>,
+    /// Shared playback-control state (see `TtsRuntime`'s doc comment for the
+    /// full threading story) — cloned onto every spawned playback task so
+    /// `:tts stop` (or starting a fresh play) can invalidate whatever is
+    /// currently running.
+    pub tts: TtsRuntime,
+    /// Whether a playback loop is believed to be running — informational
+    /// only (status bar / `:tts stop`'s messaging), not consulted by the
+    /// playback loop itself (which reads `tts`'s generation counter, not
+    /// this flag). Set `true` by `main::start_tts_playback`, `false` by
+    /// `main::stop_tts_playback`; there is no completion callback that
+    /// clears it automatically once a full article finishes speaking on its
+    /// own (a documented, narrow gap — see `main::start_tts_playback`'s doc
+    /// comment), so a `:tts stop` after natural completion is a harmless,
+    /// silent no-op rather than an error.
+    pub tts_playing: bool,
+
+    // -- Command-sequence macros (PRD FR-CS-5) ------------------------------
+    /// Every `[command.<name>]` macro from config, name to its ordered step
+    /// list (`main::run` sets this once at startup from `ResolvedConfig::
+    /// macros`). `App::new` leaves this empty, the same in-memory-default
+    /// convention every other config-sourced `App` field above uses.
+    pub macros: std::collections::BTreeMap<String, Vec<String>>,
+
     // -- OAuth login & tokens (PRD §5.9, FR-ACC-1/9, SEC-4) -----------------
     /// The live logged-in session, or `None` when logged out (PRD FR-ACC-1).
     /// Loaded from the token store at startup (`main::run`) so the indicator
@@ -1339,6 +1370,10 @@ impl App {
             suppress_resume_once: false,
             session_path: None,
             pending_session_restore: HashMap::new(),
+            tts_command: None,
+            tts: TtsRuntime::new(),
+            tts_playing: false,
+            macros: std::collections::BTreeMap::new(),
             auth: None,
             pending_login: None,
             login_input: String::new(),
@@ -2432,6 +2467,30 @@ impl App {
         self.close_tab(self.active)
     }
 
+    /// PRD FR-TB-5: discards every open tab and returns to exactly one
+    /// blank one — the runtime `:session <name>` switch's "replace the
+    /// whole tab set" step (see `main::switch_to_named_session`'s doc
+    /// comment), the same vim `:source`-on-a-session-file semantics
+    /// `:mksession`'s own borrowed name implies: a session switch is a
+    /// wholesale replacement, not a merge with whatever was already open.
+    /// Reuses [`Self::close_tab`]'s per-tab teardown (dwell-time flush,
+    /// reading-position save, close-undo snapshot — `u` can still reopen
+    /// any of these tabs afterward) for every tab but the last, since
+    /// `close_tab` refuses to drop the app below one tab; the survivor is
+    /// torn down the same way in place (`Tab::clear_to_blank`) rather than
+    /// snapshotted, since it never actually closes.
+    pub fn reset_to_single_blank_tab(&mut self) {
+        self.split = None;
+        while self.tabs.len() > 1 {
+            self.close_tab(0);
+        }
+        self.flush_tab_dwell(0);
+        self.save_reading_position(0);
+        self.tabs[0].clear_to_blank();
+        self.active = 0;
+        self.selected_tab_pick = 0;
+    }
+
     fn push_closed(&mut self, tab: Tab) {
         self.closed_tabs.push(tab);
         // §6.8 memory note: cap the undo stack so closed tabs' `Document`s
@@ -2748,7 +2807,7 @@ impl App {
     /// as its "{title} (failed)" placeholder, so a restore never retries a
     /// title that's spelled wrong or genuinely broken on every single
     /// launch.
-    fn session_snapshot(&self) -> session::SessionState {
+    pub(crate) fn session_snapshot(&self) -> session::SessionState {
         session::SessionState {
             active: self.active,
             tabs: self
@@ -9803,6 +9862,37 @@ mod tests {
             "<html><body><p>x</p></body></html>",
         ));
         assert!(!path.exists(), "incognito must never write a session file");
+    }
+
+    /// PRD FR-TB-5: `reset_to_single_blank_tab` (the runtime `:session
+    /// <name>` switch's "discard whatever was open" step) leaves exactly
+    /// one blank tab regardless of how many were open, and the survivor is
+    /// actually blank (not just the *last* tab's stale content wearing tab
+    /// index 0).
+    #[test]
+    fn reset_to_single_blank_tab_collapses_every_tab_to_one_blank_survivor() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(crate::doc::parse_article_html(
+            "Alan Turing",
+            "<html><body><p>x</p></body></html>",
+        ));
+        app.active_tab_mut().scroll = 9;
+        app.new_foreground_tab();
+        app.set_document(crate::doc::parse_article_html(
+            "Enigma machine",
+            "<html><body><p>y</p></body></html>",
+        ));
+        app.active_tab_mut().scroll = 3;
+        app.new_foreground_tab(); // a third, blank tab.
+        assert_eq!(app.tabs.len(), 3);
+
+        app.reset_to_single_blank_tab();
+
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.active, 0);
+        assert!(app.tabs[0].doc.is_none(), "the survivor must be blank");
+        assert_eq!(app.tabs[0].scroll, 0);
+        assert!(app.split.is_none());
     }
 
     /// PRD FR-TB-5's "crash-safe continuous" guarantee: after *every*
