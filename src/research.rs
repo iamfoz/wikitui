@@ -167,6 +167,30 @@ pub fn today() -> String {
     chrono::Local::now().format("%Y-%m-%d").to_string()
 }
 
+/// PRD §10's revision-specific permalink — the `oldid=` form Wikipedia's own
+/// sidebar calls "Permanent link": it pins the exact revision a reader saw,
+/// stable even after the article is later edited, which is what an
+/// attribution reference should point at (the version the ShareAlike terms
+/// actually cover, not whatever the title currently resolves to). Shares
+/// `article_url`/`create_page_url`'s underscore-for-space convention.
+pub fn permalink_url(title: &str, lang: &str, revid: u64) -> String {
+    format!(
+        "https://{lang}.wikipedia.org/w/index.php?title={}&oldid={revid}",
+        title.replace(' ', "_")
+    )
+}
+
+/// PRD §10's "permalink to the article's history": the full revision-history
+/// listing (`action=history`) — every editor who has ever touched the
+/// article, which is the authorship record Wikimedia's reuse terms point
+/// reusers at. Distinct from [`permalink_url`]'s single pinned revision.
+pub fn history_url(title: &str, lang: &str) -> String {
+    format!(
+        "https://{lang}.wikipedia.org/w/index.php?title={}&action=history",
+        title.replace(' ', "_")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,5 +408,42 @@ mod tests {
         let parsed: SavedCitation = serde_json::from_str(old_line).expect("old format must parse");
         assert_eq!(parsed.kind, CitationKind::Reference);
         assert_eq!(parsed.text, "Old entry");
+    }
+
+    /// PRD §10's `oldid=` permalink form: pins the exact revision, not just
+    /// the title, and underscores spaces the same way `article_url` does.
+    #[test]
+    fn permalink_url_uses_the_oldid_form() {
+        assert_eq!(
+            permalink_url("Alan Turing", "en", 123456),
+            "https://en.wikipedia.org/w/index.php?title=Alan_Turing&oldid=123456"
+        );
+    }
+
+    /// A revid of 0 (no revision loaded yet) is still a well-formed URL —
+    /// callers decide whether 0 is meaningful to show, not this constructor.
+    #[test]
+    fn permalink_url_does_not_special_case_a_zero_revid() {
+        assert!(permalink_url("Stub", "en", 0).ends_with("&oldid=0"));
+    }
+
+    /// PRD §10's "permalink to the article's history": `action=history`,
+    /// distinct from the single-revision `oldid=` permalink above.
+    #[test]
+    fn history_url_uses_the_action_history_form() {
+        assert_eq!(
+            history_url("Alan Turing", "en"),
+            "https://en.wikipedia.org/w/index.php?title=Alan_Turing&action=history"
+        );
+    }
+
+    /// Non-English editions and multi-word titles both underscore correctly
+    /// in the history form (mirrors `create_page_url`'s own coverage).
+    #[test]
+    fn history_url_handles_non_english_lang_and_multiword_titles() {
+        assert_eq!(
+            history_url("New York City", "de"),
+            "https://de.wikipedia.org/w/index.php?title=New_York_City&action=history"
+        );
     }
 }

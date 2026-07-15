@@ -95,6 +95,9 @@ pub enum Action {
     LangPicker,
     Home,
     Today,
+    /// PRD §10 / Appendix B: open the `:info` article-attribution overlay
+    /// (title, canonical URL, revid, license, history permalink).
+    Info,
     Quit,
     // -- picker-generic (help only; not palette-invokable) --
     MoveDown,
@@ -536,6 +539,14 @@ pub const COMMANDS: &[Meta] = &[
         in_palette: true,
     },
     Meta {
+        action: Action::Info,
+        name: "info",
+        display: "Article info",
+        help: "show this article's attribution: title, URL, revision, license, history",
+        contexts: &[KeyContext::Reading],
+        in_palette: true,
+    },
+    Meta {
         action: Action::Quit,
         name: "quit",
         display: "Quit",
@@ -871,6 +882,8 @@ impl Keymap {
         Keymap::bind(b, Reading, Chord::prefixed('g', 'r'), RandomArticle);
         Keymap::bind(b, Reading, Chord::prefixed('g', 'R'), RelatedPanel);
         Keymap::bind(b, Reading, Chord::prefixed('g', 'h'), Home);
+        // PRD §10 / Appendix B's "Article: i article info/attribution".
+        Keymap::bind(b, Reading, Chord::ch('i'), Info);
         Keymap::bind(b, Reading, Chord::ch('Q'), Quit);
 
         // Picker-generic navigation.
@@ -1121,6 +1134,7 @@ pub const READING_HELP_ORDER: &[Action] = &[
     Action::LangPicker,
     Action::Home,
     Action::Today,
+    Action::Info,
     Action::Help,
     Action::Quit,
 ];
@@ -1242,6 +1256,7 @@ mod tests {
         assert_eq!(km.resolve(Reading, &Chord::prefixed('g', 'h')), Some(Home));
         assert_eq!(km.resolve(Reading, &Chord::ch('q')), Some(CloseTab));
         assert_eq!(km.resolve(Reading, &Chord::ch('Q')), Some(Quit));
+        assert_eq!(km.resolve(Reading, &Chord::ch('i')), Some(Info));
 
         // Global reaches Reading and pickers.
         assert_eq!(km.resolve(Reading, &Chord::ch('?')), Some(Help));

@@ -508,6 +508,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         // PRD FR-NV-4/5's `K` peek popup overlays the reading view, drawn
         // after the status bar below like the help/offline overlays.
         Mode::Peek => draw_reading(frame, app, content_area),
+        // PRD §10's `i`/`:info` overlay: same "overlay the reading view"
+        // treatment as the peek popup above.
+        Mode::Info => draw_reading(frame, app, content_area),
     }
 
     draw_status_bar(frame, app, status_area);
@@ -542,6 +545,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // PRD FR-NV-4/5's `K` peek popup: a floating card over the reading view.
     if app.mode == Mode::Peek {
         draw_peek_popup(frame, app, area);
+    }
+
+    // PRD §10's `i`/`:info` overlay: same floating-card treatment as peek.
+    if app.mode == Mode::Info {
+        draw_info_overlay(frame, app, area);
     }
 
     // PRD FR-CS-1's command palette and FR-CS-8's onboarding: modal overlays,
@@ -2281,6 +2289,62 @@ fn draw_peek_popup(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+/// PRD §10's `i`/`:info` overlay: the article-attribution card — title,
+/// canonical URL, revision id, license, and a permalink to the article's
+/// history, plus the retrieval date. Read-only, same floating-card idiom as
+/// [`draw_peek_popup`]; unlike that popup, this one never shows "loading…" —
+/// nothing here is fetched over the network (see `App::open_info`).
+fn draw_info_overlay(frame: &mut Frame, app: &App, area: Rect) {
+    let width = 76.min(area.width.saturating_sub(4)).max(24);
+    let height = 11.min(area.height.saturating_sub(2)).max(6);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    let dim = colored(app.no_color, app.theme.dim);
+    let label = |text: &'static str| RSpan::styled(text, dim.add_modifier(Modifier::BOLD));
+    let body = match &app.info {
+        Some(info) => Text::from(vec![
+            Line::from(vec![label("Title:      "), RSpan::raw(info.title.clone())]),
+            Line::from(vec![
+                label("URL:        "),
+                RSpan::raw(info.canonical_url.clone()),
+            ]),
+            Line::from(vec![
+                label("Revision:   "),
+                RSpan::raw(info.revid.to_string()),
+            ]),
+            Line::from(vec![
+                label("License:    "),
+                RSpan::raw(info.license.clone()),
+            ]),
+            Line::from(vec![
+                label("History:    "),
+                RSpan::raw(info.history_url.clone()),
+            ]),
+            Line::from(vec![
+                label("Retrieved:  "),
+                RSpan::raw(info.retrieved_on.clone()),
+            ]),
+        ]),
+        None => Text::from(""),
+    };
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(body)
+            .style(base_style(&app.theme, app.no_color))
+            .wrap(Wrap { trim: false })
+            .block(
+                UiBlock::default()
+                    .borders(Borders::ALL)
+                    .title("Article info"),
+            ),
+        popup,
+    );
+}
+
 /// PRD FR-PR-3's "visible status glyph": a persistent, plain-text
 /// `[incognito]` marker prepended to the status bar in *every* mode (not
 /// just Reading — a picker or a prompt is exactly when a reader most needs
@@ -2362,6 +2426,9 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         // PRD FR-NV-4/5: the `K` peek popup carries its own status text
         // (set by `open_peek_at_focus`/`deliver_summary`).
         Mode::Peek => app.status.clone(),
+        // PRD §10: the `:info` overlay carries its own status text (set by
+        // `open_info`).
+        Mode::Info => app.status.clone(),
         Mode::ReadingHistory => app.status.clone(),
         Mode::ReadingHistoryFilter => {
             format!("filter: {}   Esc: apply", app.history_pick_filter)

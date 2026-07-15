@@ -2,6 +2,25 @@
 name = "wikitui"
 version = "0.1.0"
 edition = "2024"
+description = "An unofficial, keyboard-first terminal (TUI) client for Wikipedia and Wikimedia sister projects"
+# The LICENSE file in this repo is the unmodified AGPL-3.0 text with no
+# project-specific "or any later version" notice attached (its own "how to
+# apply these terms" appendix is the FSF's generic template for *other*
+# projects, not this one's applied choice) — so the precise SPDX identifier
+# is the closed variant, not "-or-later" (PRD §10 just says "AGPL-3.0",
+# which this resolves unambiguously in the conservative direction).
+license = "AGPL-3.0-only"
+repository = "https://github.com/iamfoz/wikitui"
+homepage = "https://github.com/iamfoz/wikitui"
+readme = "README.md"
+authors = ["Martyn Forryan <9133432+iamfoz@users.noreply.github.com>"]
+keywords = ["wikipedia", "tui", "terminal", "cli", "reader"]
+categories = ["command-line-utilities", "text-processing"]
+# PRD §8's MSRV policy: "stable minus two" releases, bumped only as a minor-
+# version event (matters for nixpkgs/Debian/Fedora toolchain pinning). At the
+# time this was set, stable was 1.94; two releases back is 1.92 — bump this
+# alongside a new stable release, not preemptively.
+rust-version = "1.92"
 
 [dependencies]
 anyhow = "1.0.103"

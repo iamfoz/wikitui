@@ -3754,6 +3754,12 @@ async fn handle_key(
             }
             _ => {}
         },
+        // PRD §10 / Appendix B's `:info` overlay: read-only, Esc dismisses.
+        Mode::Info => {
+            if code == KeyCode::Esc {
+                app.close_info();
+            }
+        }
         Mode::Reading => {
             // g-prefix chords (PRD Appendix B): the g-latch's second key.
             // `gg` top, `gt`/`gT` next/prev tab (FR-TB-1), `gb` back-stack
@@ -4174,6 +4180,10 @@ async fn handle_key(
                     if let Some((lang, title)) = app.open_peek_at_focus() {
                         fire_summary(client, &lang, &title, summary_tx);
                     }
+                }
+                // PRD §10 / Appendix B's "Article: i article info/attribution".
+                KeyCode::Char('i') => {
+                    app.open_info();
                 }
                 // Arm the g-/b-/z-prefix latches (their second key is
                 // consumed at the top of this arm on the next keypress).
@@ -4752,6 +4762,9 @@ async fn dispatch_action(
         Action::LangPicker => open_lang_picker(app, client, langlinks_tx),
         Action::Home => app.go_home(),
         Action::Today => fetch_on_this_day(client, app).await,
+        Action::Info => {
+            app.open_info();
+        }
         Action::Quit => {
             app.pending_quit_confirm = true;
             app.notice = Some("really quit? (y/n)".to_string());
@@ -5000,6 +5013,10 @@ async fn execute_command(
         Command::Related => open_related(app, client, related_tx),
         // PRD FR-ACC-5: same action as the `T` keybinding.
         Command::Talk => toggle_talk_page(client, cache, app, revalidate_tx, langlinks_tx).await,
+        // PRD §10 / Appendix B: same action as the `i` keybinding.
+        Command::Info => {
+            app.open_info();
+        }
         // PRD FR-ML-1/2.
         Command::Lang(None) => open_lang_picker(app, client, langlinks_tx),
         Command::Lang(Some(code)) => {

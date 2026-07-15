@@ -150,6 +150,13 @@ pub enum Mode {
     /// description, lead extract). `Ctrl-o`/`Esc` close it; the content lives
     /// in `App::peek`. Drawn like the help/offline overlays, over `draw_reading`.
     Peek,
+    /// `i` / `:info` (PRD §10 "content attribution (display)", Appendix B's
+    /// `i` "article info/attribution"): a floating card over the reading view
+    /// showing the article's title, canonical URL, revision id, license, and
+    /// a permalink to its revision history — no network call, everything is
+    /// already on the tab. `Esc` closes it; the content lives in `App::info`.
+    /// Same overlay idiom as [`Mode::Peek`].
+    Info,
 }
 
 /// The content of the `K` peek popup (PRD FR-NV-4/FR-NV-5). Two visually
@@ -731,6 +738,15 @@ pub struct App {
     /// `related_loading` for the scoped-poll keep-awake.
     pub summary_loading: bool,
 
+    // -- `i` / `:info` article-attribution overlay (PRD §10, Appendix B) ----
+    /// The open `:info` overlay's content, or `None` when it isn't up. Set
+    /// by `open_info`, cleared by `close_info`. Unlike `peek`, this is never
+    /// partially filled while loading — everything it needs is already on
+    /// the tab, so there is nothing to fetch.
+    pub info: Option<crate::attribution::ArticleAttribution>,
+    /// The mode `i`/`:info` was opened from, restored when the overlay closes.
+    pub info_prior_mode: Mode,
+
     // -- Reading-position memory (PRD FR-NV-8) ------------------------------
     /// Set right after installing a document the reader has an earlier saved
     /// position for (`History::position`), when that position isn't the top —
@@ -925,6 +941,8 @@ impl App {
             peek_prior_mode: Mode::Reading,
             summary_cache: HashMap::new(),
             summary_loading: false,
+            info: None,
+            info_prior_mode: Mode::Reading,
             pending_resume: None,
             suppress_resume_once: false,
             session_path: None,
@@ -2976,6 +2994,40 @@ impl App {
             Some(i) => self.jump_to_section(i),
             None => self.status = "No references section on this page".to_string(),
         }
+    }
+
+    // -- `i` / `:info` article-attribution overlay (PRD §10, Appendix B) ----
+
+    /// `i` / `:info`: open the attribution overlay for the article on
+    /// screen — title, canonical URL, revision id, license, and a permalink
+    /// to its revision history (PRD §10's display-side attribution
+    /// requirement). Nothing to show without an article open, so this
+    /// mirrors `yank_url`'s "Open an article first" guard rather than
+    /// opening an empty card. Returns whether it opened.
+    pub fn open_info(&mut self) -> bool {
+        let tab = self.active_tab();
+        let Some(doc) = tab.doc.as_ref() else {
+            self.status = "Open an article first".to_string();
+            return false;
+        };
+        let info = crate::attribution::article_attribution(
+            &doc.title,
+            &tab.lang,
+            tab.current_revid,
+            &crate::research::today(),
+        );
+        self.info = Some(info);
+        self.info_prior_mode = self.mode;
+        self.mode = Mode::Info;
+        self.status = "Article info — Esc: close".to_string();
+        true
+    }
+
+    /// Close the `:info` overlay (`Esc`), restoring the prior mode.
+    pub fn close_info(&mut self) {
+        self.mode = self.info_prior_mode;
+        self.info = None;
+        self.refresh_reading_status();
     }
 
     // -- Reading-position memory (PRD FR-NV-8) ------------------------------
@@ -5329,6 +5381,46 @@ mod tests {
         app.active_tab_mut().focused_link = None;
         assert!(app.open_peek_at_focus().is_none());
         assert_eq!(app.mode, Mode::Reading, "no popup opens");
+    }
+
+    // ---- PRD §10 / Appendix B: `i` / `:info` article-attribution overlay --
+
+    #[test]
+    fn i_opens_the_info_overlay_populated_from_the_open_article() {
+        let html = "<html><body><p>lead paragraph</p></body></html>";
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(crate::doc::parse_article_html("Alan Turing", html));
+        app.active_tab_mut().current_revid = 123456;
+
+        assert!(app.open_info(), "an open article has attribution to show");
+        assert_eq!(app.mode, Mode::Info);
+        let info = app.info.as_ref().expect("overlay content is populated");
+        assert_eq!(info.title, "Alan Turing");
+        assert_eq!(
+            info.canonical_url,
+            "https://en.wikipedia.org/wiki/Alan_Turing"
+        );
+        assert_eq!(info.revid, 123456);
+        assert!(info.license.contains("CC BY-SA 4.0"));
+        assert!(info.permalink_url.contains("oldid=123456"));
+        assert!(info.history_url.ends_with("action=history"));
+        assert!(!info.retrieved_on.is_empty());
+
+        app.close_info();
+        assert_eq!(app.mode, Mode::Reading, "closing restores the prior mode");
+        assert!(app.info.is_none());
+    }
+
+    #[test]
+    fn info_with_no_article_open_reports_instead_of_opening() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        assert!(
+            !app.open_info(),
+            "nothing to attribute without an open article"
+        );
+        assert_eq!(app.mode, Mode::Reading, "no overlay opens");
+        assert!(app.info.is_none());
+        assert_eq!(app.status, "Open an article first");
     }
 
     // ---- PRD FR-NV-8 reading-position memory ------------------------------
