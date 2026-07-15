@@ -542,6 +542,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         // PRD FR-ML-4's bare `:wiki` picker — same list-picker idiom as
         // `Mode::TabPicker`/`Mode::HistoryPicker` above.
         Mode::WikiPicker => draw_wiki_picker(frame, app, content_area),
+        // PRD FR-HS-3's `:trail` wander-graph view.
+        Mode::Trail => draw_trail(frame, app, content_area),
     }
 
     draw_status_bar(frame, app, status_area);
@@ -2169,6 +2171,80 @@ fn draw_reading_history_picker(frame: &mut Frame, app: &App, area: Rect) {
     render_selectable_list(frame, list, area, app.history_pick_selected);
 }
 
+/// `:trail`'s wander-graph view (PRD FR-HS-3): the flattened tree
+/// (`trail::flatten`), one line per article, connectors drawn via
+/// `trail::connector` (git-log-graph aesthetics — `│`/`├─`/`└─`). Dwell is
+/// shown both as a number (`Alan Turing (4m)`, matching the PRD's own
+/// example) and a short bar scaled to the trail's own peak dwell
+/// (`trail::dwell_bar`) — an honest text-UI framing of "sized by dwell,"
+/// never a literally resized node. Reuses the shared selectable-list helper
+/// over this tree-flattened line list, the same idiom every other picker in
+/// this module uses.
+fn draw_trail(frame: &mut Frame, app: &App, area: Rect) {
+    let lines = crate::trail::flatten(&app.trail.tree);
+    if lines.is_empty() {
+        let paragraph = Paragraph::new(
+            "No trail yet — open an article and follow a few links, then :trail again.",
+        )
+        .style(colored(app.no_color, app.theme.dim))
+        .block(
+            UiBlock::default()
+                .borders(Borders::ALL)
+                .title("Trail — Esc: close"),
+        );
+        frame.render_widget(paragraph, area);
+        return;
+    }
+
+    let peak = lines.iter().map(|l| l.total_dwell_secs).max().unwrap_or(0);
+    let items: Vec<ListItem> = lines
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let mut spans = vec![RSpan::raw(crate::trail::connector(line))];
+            if !line.article.wiki.is_empty() {
+                spans.push(RSpan::styled(
+                    format!("[{}] ", line.article.wiki),
+                    colored(app.no_color, app.theme.dim),
+                ));
+            }
+            spans.push(RSpan::styled(
+                line.article.title.clone(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            let bar = crate::trail::dwell_bar(line.total_dwell_secs, peak, 6);
+            let mut detail = format!(
+                "   ({})",
+                crate::cache::age_human(line.total_dwell_secs.max(0) as u64)
+            );
+            if !bar.is_empty() {
+                detail.push_str(&format!(" {bar}"));
+            }
+            if !line.also_from.is_empty() {
+                let names: Vec<&str> = line.also_from.iter().map(|a| a.title.as_str()).collect();
+                detail.push_str(&format!("   also from: {}", names.join(", ")));
+            }
+            spans.push(RSpan::styled(detail, colored(app.no_color, app.theme.dim)));
+            let style = if i == app.trail_selected {
+                colored_bg(app.no_color, app.theme.selected_fg, app.theme.selected_bg)
+            } else {
+                Style::default()
+            };
+            ListItem::new(Line::from(spans)).style(style)
+        })
+        .collect();
+
+    let title = format!(
+        "Trail ({} article{}) — Enter: reopen  Esc: close",
+        lines.len(),
+        if lines.len() == 1 { "" } else { "s" }
+    );
+    let list = List::new(items)
+        .style(base_style(&app.theme, app.no_color))
+        .block(UiBlock::default().borders(Borders::ALL).title(title));
+    render_selectable_list(frame, list, area, app.trail_selected);
+}
+
 /// The `:saved` saved-pages browser (PRD §5.7 / FR-OFF-4): title, tier, size,
 /// saved date, and the integrity verdict (ok/corrupt — the sha256 check). The
 /// pinned store is visually distinct from the read-later/history pickers by
@@ -3296,6 +3372,9 @@ fn status_bar_text(app: &App, width: u16) -> String {
         // PRD §10: the `:info` overlay carries its own status text (set by
         // `open_info`).
         Mode::Info => app.status.clone(),
+        // `open_trail`/`close_trail` set their own status text (mirrors
+        // `Mode::ReadingHistory`/`Mode::SavedPicker` just below).
+        Mode::Trail => app.status.clone(),
         Mode::ReadingHistory => app.status.clone(),
         Mode::ReadingHistoryFilter => {
             format!("filter: {}   Esc: apply", app.history_pick_filter)
@@ -3586,6 +3665,7 @@ fn picker_help_extras(mode: Mode) -> (&'static str, &'static [(&'static str, &'s
             &[("/", "filter (autonym / langname / code)")],
         ),
         Mode::WikiPicker => ("Wiki", &[]),
+        Mode::Trail => ("Trail", &[("Enter", "reopen the selected article")]),
         _ => ("Help", &[]),
     }
 }

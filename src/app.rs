@@ -200,6 +200,15 @@ pub enum Mode {
     /// state only, no network (unlike [`Mode::LangPicker`]'s langlinks
     /// fetch) — the list is the same five entries every time.
     WikiPicker,
+    /// `:trail` (PRD FR-HS-3): the wander-graph view — this run's session
+    /// history (or a wider scope, `:trail all`/`:trail days N`) rendered as
+    /// a navigable, git-log-graph-styled tree (`trail::flatten`'s line
+    /// list). `j`/`k` move the selection, Enter reopens the selected
+    /// article (wiki-aware — `main::open_trail_node`), Esc closes. Export
+    /// (`:trail export md|dot|mermaid [path]`) is a separate command, not a
+    /// picker key, and always exports the session scope regardless of what
+    /// wider scope this view happens to be showing (see `App::export_trail`).
+    Trail,
 }
 
 /// The content of the `K` peek popup (PRD FR-NV-4/FR-NV-5). Two visually
@@ -657,6 +666,28 @@ pub struct App {
     /// The mode `open_reading_history_picker` was entered from, restored on
     /// Esc (mirrors `bookmark_prior_mode`).
     pub history_pick_prior_mode: Mode,
+    /// Unix seconds this run started (`history::now_unix()`, set once in
+    /// `App::new` and never touched again) — the default cutoff `:trail`'s
+    /// session scope filters on (PRD FR-HS-3: "session-scope is the natural
+    /// wander graph"). Deliberately a wall-clock timestamp, not a
+    /// process-lifetime flag, so it survives being read alongside
+    /// `history::Visit::opened_at` (also unix seconds) without a unit
+    /// conversion.
+    pub session_started_at: i64,
+
+    // -- Trail / wander-graph view (PRD FR-HS-3) ----------------------------
+    /// The currently-built trail (`trail::build`), rebuilt fresh every time
+    /// `open_trail` runs — never mutated incrementally, since a trail is a
+    /// point-in-time snapshot of the history table, not a live-updating
+    /// view. Defaults to an empty trail before `:trail` is ever opened.
+    pub trail: crate::trail::Trail,
+    /// Selection cursor into `trail::flatten(&self.trail.tree)`'s line list.
+    pub trail_selected: usize,
+    /// The mode `open_trail` was entered from, restored on Esc.
+    pub trail_prior_mode: Mode,
+    /// Export-overwrite confirmation for `:trail export`, mirroring
+    /// `pending_bookmark_export_overwrite`.
+    pub pending_trail_export_overwrite: Option<std::path::PathBuf>,
 
     // -- Saved pages, bulk save, offline card (PRD §5.7, FR-OFF-4..7) -------
     /// The pinned saved-pages store (PRD FR-OFF-4). Distinct from the
@@ -1248,6 +1279,11 @@ impl App {
             history_pick_selected: 0,
             history_pick_filter: String::new(),
             history_pick_prior_mode: Mode::Reading,
+            session_started_at: crate::history::now_unix(),
+            trail: crate::trail::Trail::default(),
+            trail_selected: 0,
+            trail_prior_mode: Mode::Reading,
+            pending_trail_export_overwrite: None,
             saved: SavedPages::load(),
             search_index: crate::offline_search::OfflineIndex::in_memory(),
             selected_saved: 0,
@@ -3293,7 +3329,7 @@ impl App {
             .active_tab()
             .back_stack
             .last()
-            .map(|e| (e.lang.clone(), e.title.clone()));
+            .map(|e| (e.wiki.clone(), e.lang.clone(), e.title.clone()));
 
         // Element 0 is always this article's own citation; the rest are
         // whatever it cites (Research mode, PRD-adjacent feature request).
@@ -3352,7 +3388,7 @@ impl App {
     pub(crate) fn record_history_visit(
         &mut self,
         index: usize,
-        referrer: Option<(String, String)>,
+        referrer: Option<(String, String, String)>,
     ) {
         if crate::privacy::decide(self.incognito, crate::privacy::Write::History)
             == crate::privacy::Verdict::Deny
@@ -3366,8 +3402,17 @@ impl App {
             return;
         };
         let lang = tab.lang.clone();
-        let referrer_ref = referrer.as_ref().map(|(l, t)| (l.as_str(), t.as_str()));
-        let id = self.history.record_visit(&lang, &title, referrer_ref);
+        // PRD FR-ML-4/FR-HS-3: the tab's own wiki (already stamped with this
+        // article's scope by `set_document`, which runs before this call —
+        // see its doc comment) so the trail view's nodes/edges carry the
+        // right wiki, never whichever wiki happens to be active *now*.
+        let wiki = tab.wiki.clone();
+        let referrer_ref = referrer
+            .as_ref()
+            .map(|(w, l, t)| (w.as_str(), l.as_str(), t.as_str()));
+        let id = self
+            .history
+            .record_visit(&wiki, &lang, &title, referrer_ref);
         let tab = &mut self.tabs[index];
         tab.history_visit_id = id;
         tab.visit_started_at = Some(std::time::Instant::now());
@@ -3538,6 +3583,141 @@ impl App {
         if self.mode == Mode::ReadingHistory {
             self.refresh_history_matches();
         }
+    }
+
+    // -- Trail / wander-graph view (PRD FR-HS-3) ----------------------------
+
+    /// The visits `open_trail`'s scope selects, oldest first (matching
+    /// `history::History::all_visits`'s own order, which `trail::build`
+    /// needs — see its doc comment).
+    fn trail_scoped_visits(&self, scope: crate::command::TrailScope) -> Vec<crate::history::Visit> {
+        let visits = self.history.all_visits();
+        match scope {
+            crate::command::TrailScope::Session => visits
+                .into_iter()
+                .filter(|v| v.opened_at >= self.session_started_at)
+                .collect(),
+            crate::command::TrailScope::All => visits,
+            crate::command::TrailScope::Days(days) => {
+                let cutoff = crate::history::now_unix() - i64::from(days) * 86_400;
+                visits
+                    .into_iter()
+                    .filter(|v| v.opened_at >= cutoff)
+                    .collect()
+            }
+        }
+    }
+
+    /// `:trail [all|days N]` (PRD FR-HS-3): builds the wander graph from
+    /// whichever visits `scope` selects (default, bare `:trail`: this run's
+    /// own session) and opens the navigable tree view.
+    pub fn open_trail(&mut self, scope: crate::command::TrailScope) {
+        self.trail_prior_mode = self.mode;
+        let visits = self.trail_scoped_visits(scope);
+        self.trail = crate::trail::build(&visits);
+        self.trail_selected = 0;
+        self.mode = Mode::Trail;
+        self.status = if self.trail.graph.nodes.is_empty() {
+            "No trail yet — open an article and follow a few links".to_string()
+        } else {
+            "j/k: move   Enter: reopen   Esc: close".to_string()
+        };
+    }
+
+    pub fn close_trail(&mut self) {
+        self.mode = self.trail_prior_mode;
+        self.status = match &self.active_tab().doc {
+            Some(doc) => doc.title.clone(),
+            None => "Press / to search, ? for help, q to quit".to_string(),
+        };
+    }
+
+    /// Moves the picker's selection, wrapping — a no-op with nothing shown.
+    pub fn cycle_trail(&mut self, forward: bool) {
+        let len = crate::trail::flatten(&self.trail.tree).len();
+        if len == 0 {
+            return;
+        }
+        self.trail_selected = if forward {
+            (self.trail_selected + 1) % len
+        } else {
+            (self.trail_selected + len - 1) % len
+        };
+    }
+
+    /// The `(wiki, lang, title)` of the currently-selected trail line, for
+    /// `main::handle_key`'s Enter arm to reopen (mirrors
+    /// `App::selected_saved_target`'s "plain data getter, main.rs does the
+    /// actual fetch" split).
+    pub fn selected_trail_target(&self) -> Option<(String, String, String)> {
+        let lines = crate::trail::flatten(&self.trail.tree);
+        lines.get(self.trail_selected).map(|l| {
+            (
+                l.article.wiki.clone(),
+                l.article.lang.clone(),
+                l.article.title.clone(),
+            )
+        })
+    }
+
+    /// `:trail export md|dot|mermaid [path]` (PRD FR-HS-3). Always exports
+    /// **this run's own session** trail, freshly built — independent of
+    /// whatever scope a currently-open `:trail`/`:trail all`/`:trail days`
+    /// view happens to be showing. This keeps the export predictable (it
+    /// never depends on "did I open `:trail` first, and with which scope")
+    /// and matches the PRD's stated default: session-scope is the trail
+    /// export's *only* scope, exactly as `:trail export` takes no scope
+    /// argument of its own.
+    pub fn export_trail(&mut self, format: &str, path: Option<&std::path::Path>) {
+        let visits = self.trail_scoped_visits(crate::command::TrailScope::Session);
+        let trail = crate::trail::build(&visits);
+        if trail.graph.nodes.is_empty() {
+            self.notice = Some("Nothing to export — no trail yet".to_string());
+            return;
+        }
+        let target = match path {
+            Some(p) => p.to_path_buf(),
+            None => match crate::trail_export::default_export_path(format) {
+                Some(p) => p,
+                None => {
+                    self.notice = Some(format!(
+                        "unknown export format {format:?} — one of: {}",
+                        crate::trail_export::FORMATS.join(", ")
+                    ));
+                    return;
+                }
+            },
+        };
+        let Some(content) = crate::trail_export::render(&trail, format, &crate::research::today())
+        else {
+            self.notice = Some(format!(
+                "unknown export format {format:?} — one of: {}",
+                crate::trail_export::FORMATS.join(", ")
+            ));
+            return;
+        };
+        if target.exists()
+            && self.pending_trail_export_overwrite.as_deref() != Some(target.as_path())
+        {
+            self.pending_trail_export_overwrite = Some(target.clone());
+            self.notice = Some(format!(
+                "{} already exists — run the export again to overwrite",
+                target.display()
+            ));
+            return;
+        }
+        self.pending_trail_export_overwrite = None;
+        if let Some(parent) = target.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        self.notice = Some(match std::fs::write(&target, content) {
+            Ok(()) => format!(
+                "Exported the trail ({} articles) to {}",
+                trail.graph.nodes.len(),
+                target.display()
+            ),
+            Err(e) => format!("Export failed: {e}"),
+        });
     }
 
     /// Swaps in the content a background revalidation already wrote to L2
@@ -8954,6 +9134,250 @@ mod tests {
         app.clear_history(crate::command::HistoryClearScope::All);
         assert!(app.history.recent(10).is_empty());
         assert!(app.history_pick_matches.is_empty());
+    }
+
+    // ---- Trail / wander-graph view (PRD FR-HS-3) --------------------------
+
+    #[test]
+    fn open_trail_builds_a_tree_from_real_navigation() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.open_document(doc("Alan Turing"));
+        app.open_document(doc("Enigma machine"));
+        app.open_trail(crate::command::TrailScope::Session);
+        assert_eq!(app.mode, Mode::Trail);
+        assert_eq!(app.trail.graph.nodes.len(), 2);
+        assert_eq!(app.trail.tree.roots.len(), 1);
+        assert_eq!(app.trail.tree.roots[0].article.title, "Alan Turing");
+        assert_eq!(
+            app.trail.tree.roots[0].children[0].article.title,
+            "Enigma machine"
+        );
+    }
+
+    /// PRD FR-HS-3's branching case: `A -> B`, back to `A`, `A -> C` puts
+    /// both `B` and `C` under the same root `A`.
+    #[test]
+    fn a_branching_trail_shows_two_children_under_the_same_root() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.open_document(doc("A"));
+        app.open_document(doc("B")); // A -> B
+        // "Back to A", the same install-without-touching-stacks shape
+        // `main::open_history_entry` uses (the stacks were already adjusted
+        // by `navigate_back_target`).
+        let entry = app.navigate_back_target().expect("A is on the back stack");
+        assert_eq!(entry.title, "A");
+        app.set_document(doc("A"));
+        app.open_document(doc("C")); // A -> C, a second branch off A
+
+        app.open_trail(crate::command::TrailScope::Session);
+        assert_eq!(app.trail.tree.roots.len(), 1);
+        let root = &app.trail.tree.roots[0];
+        assert_eq!(root.article.title, "A");
+        let mut child_titles: Vec<&str> = root
+            .children
+            .iter()
+            .map(|c| c.article.title.as_str())
+            .collect();
+        child_titles.sort_unstable();
+        assert_eq!(child_titles, vec!["B", "C"]);
+    }
+
+    #[test]
+    fn open_trail_with_no_history_says_no_trail_yet() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.open_trail(crate::command::TrailScope::Session);
+        assert!(app.trail.graph.nodes.is_empty());
+        assert!(app.status.contains("No trail yet"), "{:?}", app.status);
+    }
+
+    #[test]
+    fn open_and_close_trail_round_trips_the_prior_mode() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.open_document(doc("Alan Turing"));
+        app.mode = Mode::Reading;
+        app.open_trail(crate::command::TrailScope::Session);
+        assert_eq!(app.mode, Mode::Trail);
+        app.close_trail();
+        assert_eq!(app.mode, Mode::Reading);
+    }
+
+    #[test]
+    fn cycle_trail_wraps_in_both_directions() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.open_document(doc("A"));
+        app.open_document(doc("B"));
+        app.open_trail(crate::command::TrailScope::Session);
+        assert_eq!(app.trail_selected, 0);
+        app.cycle_trail(true);
+        assert_eq!(app.trail_selected, 1);
+        app.cycle_trail(true);
+        assert_eq!(app.trail_selected, 0, "wraps forward past the end");
+        app.cycle_trail(false);
+        assert_eq!(app.trail_selected, 1, "wraps backward past the start");
+    }
+
+    #[test]
+    fn cycle_trail_on_an_empty_trail_is_a_harmless_no_op() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.open_trail(crate::command::TrailScope::Session);
+        app.cycle_trail(true);
+        assert_eq!(app.trail_selected, 0);
+    }
+
+    /// The session cutoff is a real `>=` filter, not decoration: forcing it
+    /// strictly past an already-recorded visit's timestamp excludes that
+    /// visit from `Session` scope while `All` still shows it. This is the
+    /// deterministic way to exercise the boundary without reaching into
+    /// `history.rs`'s private timestamp storage (its own tests backdate rows
+    /// via raw SQL because they're *in* that module; `App`'s public surface
+    /// has no such hook, by design).
+    #[test]
+    fn open_trail_session_scope_is_a_real_cutoff_on_session_started_at() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.open_document(doc("Alan Turing"));
+        app.session_started_at = crate::history::now_unix() + 10_000;
+        app.open_trail(crate::command::TrailScope::Session);
+        assert!(
+            app.trail.graph.nodes.is_empty(),
+            "a visit recorded before the (forced) session cutoff is excluded"
+        );
+        app.open_trail(crate::command::TrailScope::All);
+        assert_eq!(
+            app.trail.graph.nodes.len(),
+            1,
+            "All scope ignores the session cutoff entirely"
+        );
+    }
+
+    #[test]
+    fn open_trail_days_scope_includes_a_visit_within_the_window() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.open_document(doc("Alan Turing"));
+        app.open_trail(crate::command::TrailScope::Days(7));
+        assert_eq!(app.trail.graph.nodes.len(), 1);
+    }
+
+    /// The trail node's wiki round-trips from `history::Visit::wiki` through
+    /// `trail::build` to `selected_trail_target` — the exact value
+    /// `main::open_trail_node`'s Enter arm reopens.
+    #[test]
+    fn selected_trail_target_carries_a_non_default_wiki() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.history
+            .record_visit("wiktionary", "en", "Mercury", None);
+        app.open_trail(crate::command::TrailScope::Session);
+        app.trail_selected = 0;
+        assert_eq!(
+            app.selected_trail_target(),
+            Some((
+                "wiktionary".to_string(),
+                "en".to_string(),
+                "Mercury".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn selected_trail_target_is_none_with_nothing_shown() {
+        let app = App::new("en".to_string(), Theme::terminal(), false);
+        assert_eq!(app.selected_trail_target(), None);
+    }
+
+    #[test]
+    fn export_trail_writes_the_file_and_requires_a_second_run_to_overwrite() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.open_document(doc("Alan Turing"));
+        app.open_document(doc("Enigma machine"));
+
+        let dir =
+            std::env::temp_dir().join(format!("wikitui-trail-export-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("trail.md");
+
+        app.export_trail("md", Some(&target));
+        let first = std::fs::read_to_string(&target).unwrap();
+        assert!(first.contains("Enigma machine"));
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("Exported the trail")
+        );
+
+        // A hand-edit shouldn't silently be clobbered without a second
+        // confirming run — same two-press pattern as `export_bookmarks_to`.
+        std::fs::write(&target, "hand-annotated").unwrap();
+        app.export_trail("md", Some(&target));
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("run the export again to overwrite"),
+            "{:?}",
+            app.notice
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "hand-annotated");
+
+        app.export_trail("md", Some(&target));
+        assert!(
+            std::fs::read_to_string(&target)
+                .unwrap()
+                .contains("Enigma machine")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_trail_with_nothing_recorded_reports_instead_of_writing() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.export_trail("md", None);
+        assert!(app.notice.as_deref().unwrap().contains("Nothing to export"));
+    }
+
+    #[test]
+    fn export_trail_rejects_an_unknown_format() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.open_document(doc("Alan Turing"));
+        app.export_trail("carrier-pigeon", None);
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("unknown export format")
+        );
+    }
+
+    /// `App::export_trail`'s documented independence from whatever scope a
+    /// currently-open `:trail` view happens to show (see its doc comment):
+    /// forcing the session cutoff past an already-recorded visit and then
+    /// opening the *wider* `All` view (which does show it) must not leak
+    /// into the export, which always rebuilds session-scope fresh.
+    #[test]
+    fn export_trail_always_uses_session_scope_regardless_of_the_open_views_scope() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.open_document(doc("Alan Turing"));
+        app.session_started_at = crate::history::now_unix() + 10_000;
+        app.open_trail(crate::command::TrailScope::All);
+        assert_eq!(
+            app.trail.graph.nodes.len(),
+            1,
+            "the wider view does show it"
+        );
+
+        let dir = std::env::temp_dir().join(format!(
+            "wikitui-trail-export-scope-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("trail.md");
+        app.export_trail("md", Some(&target));
+        assert!(
+            app.notice.as_deref().unwrap().contains("Nothing to export"),
+            "export rebuilds session scope fresh (empty here), ignoring the open All view: {:?}",
+            app.notice
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- Saved pages, offline card, bulk cost preview (PRD FR-OFF-4..7) ---

@@ -129,10 +129,16 @@ PAGES = {
       </div>
     </body></html>""",
 
+    # The link to Computer_science (PRD FR-HS-3 pty verification fixture)
+    # gives the mock a genuine two-hop chain — Alan_Turing -> Enigma_machine
+    # -> Computer_science — so a `:trail` session can be built by actually
+    # following links rather than needing a third, artificial fixture.
     "Enigma_machine": """<html><head><title>Enigma machine</title></head><body>
       <p>The Enigma machine is a cipher device developed and used in the early to mid-20th
       century to protect commercial, diplomatic, and military communication. It was employed
-      extensively by Nazi Germany during World War II, in all branches of the German military.</p>
+      extensively by Nazi Germany during World War II, in all branches of the German military.
+      Breaking it was an early triumph of what became <a href="./Computer_science">computer
+      science</a>.</p>
     </body></html>""",
 
     "Computer_science": """<html><head><title>Computer science</title></head><body>

@@ -198,10 +198,12 @@ mod tests {
     fn visit(lang: &str, title: &str, day: i64, dwell: i64) -> Visit {
         Visit {
             id: 0,
+            wiki: String::new(),
             lang: lang.to_string(),
             title: title.to_string(),
             opened_at: day * DAY + 100, // +100s so it's mid-day, not on the boundary
             dwell_secs: dwell,
+            referrer_wiki: None,
             referrer_lang: None,
             referrer_title: None,
         }

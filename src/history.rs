@@ -13,7 +13,7 @@
 //! One table, `visits`, one row per page load:
 //!
 //! ```text
-//! visits(id, lang, title, opened_at, dwell_secs, referrer_lang, referrer_title)
+//! visits(id, wiki, lang, title, opened_at, dwell_secs, referrer_wiki, referrer_lang, referrer_title)
 //! ```
 //!
 //! `referrer_*` is the article the reader navigated *from* within the same
@@ -21,6 +21,15 @@
 //! `user_version` pragma (`migrate`) rather than a sentinel row, so a schema
 //! change never has to reserve a row of its own or guess from `PRAGMA
 //! table_info`.
+//!
+//! `wiki`/`referrer_wiki` (schema v4, PRD FR-ML-4/FR-HS-3) are the same
+//! `api::wiki_scope` string every other wiki-scoped store keys on (`""` =
+//! default Wikipedia) — added after `positions` already gained the same
+//! dimension in v3, so a visit recorded before this migration backfills as
+//! the default wiki, never a lost/guessed scope. The trail view (`trail.rs`)
+//! is what actually needed this: a wander graph's nodes must carry `wiki` to
+//! keep a same-titled article on two wikis as two distinct nodes, and its
+//! edges are exactly this table's `referrer_*` columns.
 //!
 //! ## The visited cache
 //!
@@ -51,13 +60,17 @@ use rusqlite::{Connection, params};
 /// Schema version this build understands (the `PRAGMA user_version`
 /// counterpart of `config::CONFIG_VERSION`). Bump alongside a new branch in
 /// `migrate` when the shape of `visits` changes.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// One logged page view (PRD FR-HS-1's "title, wiki, timestamp, dwell time,
 /// referrer article").
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Visit {
     pub id: i64,
+    /// PRD FR-ML-4/FR-HS-3: the `api::wiki_scope` this visit was read on
+    /// (`""` = default Wikipedia), same convention as `tab::Tab::wiki` — a
+    /// visit recorded before schema v4 backfills as `""`.
+    pub wiki: String,
     pub lang: String,
     pub title: String,
     /// Unix seconds — this module's own clock access point (`now_unix`) is
@@ -65,6 +78,13 @@ pub struct Visit {
     /// never against a second, independently-read "now".
     pub opened_at: i64,
     pub dwell_secs: i64,
+    /// The referrer's wiki scope, `None` alongside `referrer_lang`/
+    /// `referrer_title` for a tab's first page. A visit recorded before
+    /// schema v4 has a referrer with no recorded wiki (`referrer_lang`/
+    /// `referrer_title` are `Some`, `referrer_wiki` is `None`) — treated as
+    /// the default wiki by every reader of this field (`trail.rs`'s
+    /// `unwrap_or_default`), rather than a distinguishable "unknown wiki".
+    pub referrer_wiki: Option<String>,
     pub referrer_lang: Option<String>,
     pub referrer_title: Option<String>,
 }
@@ -160,27 +180,28 @@ impl History {
         Self { conn, visited }
     }
 
-    /// Records a visit to `(lang, title)`, returning the new row's id (for
-    /// later `update_dwell`) or `None` if the write failed — a failure here
-    /// is swallowed to a debug-log line (see the module doc comment), never
-    /// a crash or a user-facing error, since history is non-critical.
-    /// `referrer` is `(lang, title)` of the article the reader navigated
-    /// from within the same tab, or `None` for a tab's first page.
+    /// Records a visit to `(wiki, lang, title)`, returning the new row's id
+    /// (for later `update_dwell`) or `None` if the write failed — a failure
+    /// here is swallowed to a debug-log line (see the module doc comment),
+    /// never a crash or a user-facing error, since history is non-critical.
+    /// `referrer` is `(wiki, lang, title)` of the article the reader
+    /// navigated from within the same tab, or `None` for a tab's first page.
     pub fn record_visit(
         &mut self,
+        wiki: &str,
         lang: &str,
         title: &str,
-        referrer: Option<(&str, &str)>,
+        referrer: Option<(&str, &str, &str)>,
     ) -> Option<i64> {
         let now = now_unix();
-        let (referrer_lang, referrer_title) = match referrer {
-            Some((l, t)) => (Some(l), Some(t)),
-            None => (None, None),
+        let (referrer_wiki, referrer_lang, referrer_title) = match referrer {
+            Some((w, l, t)) => (Some(w), Some(l), Some(t)),
+            None => (None, None, None),
         };
         let result = self.conn.execute(
-            "INSERT INTO visits (lang, title, opened_at, dwell_secs, referrer_lang, referrer_title)
-             VALUES (?1, ?2, ?3, 0, ?4, ?5)",
-            params![lang, title, now, referrer_lang, referrer_title],
+            "INSERT INTO visits (wiki, lang, title, opened_at, dwell_secs, referrer_wiki, referrer_lang, referrer_title)
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7)",
+            params![wiki, lang, title, now, referrer_wiki, referrer_lang, referrer_title],
         );
         match result {
             Ok(_) => {
@@ -293,18 +314,20 @@ impl History {
         }
     }
 
-    /// The most recent visit to each distinct `(lang, title)`, most-recent
-    /// first (PRD FR-HS-1's picker default, and `search`'s candidate pool
-    /// with an empty query). Dedup picks the highest `id` per article
-    /// (i.e. the latest insert) rather than `MAX(opened_at)`, so two visits
-    /// landing in the same wall-clock second never produce a spurious
-    /// second row.
+    /// The most recent visit to each distinct `(wiki, lang, title)`,
+    /// most-recent first (PRD FR-HS-1's picker default, and `search`'s
+    /// candidate pool with an empty query). Dedup picks the highest `id` per
+    /// article (i.e. the latest insert) rather than `MAX(opened_at)`, so two
+    /// visits landing in the same wall-clock second never produce a spurious
+    /// second row. Grouping includes `wiki` (PRD FR-ML-4, schema v4) so a
+    /// same-titled article read on two different wikis stays two rows, not
+    /// one collapsing the other's dwell/referrer away.
     pub fn recent(&self, limit: usize) -> Vec<Visit> {
         let limit = limit as i64;
         let query = self.conn.prepare(
-            "SELECT v.id, v.lang, v.title, v.opened_at, v.dwell_secs, v.referrer_lang, v.referrer_title
+            "SELECT v.id, v.wiki, v.lang, v.title, v.opened_at, v.dwell_secs, v.referrer_wiki, v.referrer_lang, v.referrer_title
              FROM visits v
-             WHERE v.id IN (SELECT MAX(id) FROM visits GROUP BY lang, title)
+             WHERE v.id IN (SELECT MAX(id) FROM visits GROUP BY wiki, lang, title)
              ORDER BY v.opened_at DESC, v.id DESC
              LIMIT ?1",
         );
@@ -333,7 +356,7 @@ impl History {
     /// refusing to run.
     pub fn all_visits(&self) -> Vec<Visit> {
         let query = self.conn.prepare(
-            "SELECT id, lang, title, opened_at, dwell_secs, referrer_lang, referrer_title
+            "SELECT id, wiki, lang, title, opened_at, dwell_secs, referrer_wiki, referrer_lang, referrer_title
              FROM visits ORDER BY opened_at ASC, id ASC",
         );
         let mut stmt = match query {
@@ -461,12 +484,14 @@ const SEARCH_CANDIDATE_POOL: usize = 10_000;
 fn row_to_visit(row: &rusqlite::Row) -> rusqlite::Result<Visit> {
     Ok(Visit {
         id: row.get(0)?,
-        lang: row.get(1)?,
-        title: row.get(2)?,
-        opened_at: row.get(3)?,
-        dwell_secs: row.get(4)?,
-        referrer_lang: row.get(5)?,
-        referrer_title: row.get(6)?,
+        wiki: row.get(1)?,
+        lang: row.get(2)?,
+        title: row.get(3)?,
+        opened_at: row.get(4)?,
+        dwell_secs: row.get(5)?,
+        referrer_wiki: row.get(6)?,
+        referrer_lang: row.get(7)?,
+        referrer_title: row.get(8)?,
     })
 }
 
@@ -562,6 +587,21 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             DROP TABLE positions;
             ALTER TABLE positions_v3 RENAME TO positions;
             PRAGMA user_version = 3;",
+        )?;
+    }
+    if version < 4 {
+        // PRD FR-ML-4/FR-HS-3: `visits` gains the same wiki dimension
+        // `positions` got in v3 — plain `ADD COLUMN`s suffice here (unlike
+        // v3's rebuild) since `visits`' primary key is just `id`, no
+        // composite key to widen. Every existing row backfills as the
+        // default wiki (`''`) for `wiki` and `NULL` (no recorded wiki) for
+        // `referrer_wiki` — a pre-v4 visit's referrer is still known by
+        // lang/title, just not by wiki, so it isn't lost, only less precise
+        // (`trail.rs` treats a `None` referrer_wiki as the default wiki).
+        conn.execute_batch(
+            "ALTER TABLE visits ADD COLUMN wiki TEXT NOT NULL DEFAULT '';
+            ALTER TABLE visits ADD COLUMN referrer_wiki TEXT;
+            PRAGMA user_version = 4;",
         )?;
     }
     Ok(())
@@ -776,18 +816,64 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Migration proof (PRD FR-ML-4/FR-HS-3): a v3 database (`visits` with no
+    /// wiki columns at all) migrates to v4 with every existing row preserved
+    /// under the default wiki — no visit is lost when the trail view's wiki
+    /// dimension is introduced, and a referrer recorded before v4 comes back
+    /// with a wiki-less (`None`) referrer rather than a guessed one.
+    #[test]
+    fn a_v3_visit_migrates_forward_as_the_default_wiki() {
+        let path = temp_path();
+        {
+            // Hand-build the exact pre-v4 `visits` shape and seed two rows
+            // (one with a referrer), bypassing the v4-aware `record_visit`.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE visits (
+                    id INTEGER PRIMARY KEY,
+                    lang TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    opened_at INTEGER NOT NULL,
+                    dwell_secs INTEGER NOT NULL DEFAULT 0,
+                    referrer_lang TEXT,
+                    referrer_title TEXT
+                );
+                INSERT INTO visits (lang, title, opened_at, dwell_secs, referrer_lang, referrer_title)
+                    VALUES ('en', 'Alan Turing', 100, 30, NULL, NULL);
+                INSERT INTO visits (lang, title, opened_at, dwell_secs, referrer_lang, referrer_title)
+                    VALUES ('en', 'Enigma machine', 200, 15, 'en', 'Alan Turing');
+                PRAGMA user_version = 3;",
+            )
+            .unwrap();
+        }
+        // Opening runs the v3 -> v4 migration.
+        let history = History::open_at(&path);
+        let visits = history.all_visits();
+        assert_eq!(visits.len(), 2, "no pre-v4 visit is lost");
+        let turing = visits.iter().find(|v| v.title == "Alan Turing").unwrap();
+        assert_eq!(turing.wiki, "", "backfills as the default wiki");
+        let enigma = visits.iter().find(|v| v.title == "Enigma machine").unwrap();
+        assert_eq!(enigma.wiki, "");
+        assert_eq!(enigma.referrer_title.as_deref(), Some("Alan Turing"));
+        assert_eq!(
+            enigma.referrer_wiki, None,
+            "a pre-v4 referrer has no recorded wiki — not lost, just less precise"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn opening_the_same_file_twice_is_idempotent() {
         let path = temp_path();
         {
             let mut history = History::open_at(&path);
-            history.record_visit("en", "Alan Turing", None);
+            history.record_visit("", "en", "Alan Turing", None);
         }
         // Re-opening must not fail, wipe, or duplicate the schema — the
         // migration's `IF NOT EXISTS`/version-gate must make this a no-op.
         let mut reopened = History::open_at(&path);
         assert_eq!(reopened.recent(10).len(), 1);
-        reopened.record_visit("en", "Enigma machine", None);
+        reopened.record_visit("", "en", "Enigma machine", None);
         assert_eq!(History::open_at(&path).recent(10).len(), 2);
 
         let _ = std::fs::remove_file(&path);
@@ -806,7 +892,7 @@ mod tests {
     fn record_visit_returns_an_id_and_appears_in_recent() {
         let mut history = History::in_memory();
         let id = history
-            .record_visit("en", "Alan Turing", None)
+            .record_visit("", "en", "Alan Turing", None)
             .expect("write must succeed against an in-memory db");
         assert!(id > 0);
         let recent = history.recent(10);
@@ -819,20 +905,60 @@ mod tests {
     #[test]
     fn record_visit_stores_the_referrer() {
         let mut history = History::in_memory();
-        history.record_visit("en", "Alan Turing", None);
-        history.record_visit("en", "Enigma machine", Some(("en", "Alan Turing")));
+        history.record_visit("", "en", "Alan Turing", None);
+        history.record_visit("", "en", "Enigma machine", Some(("", "en", "Alan Turing")));
         let recent = history.recent(10);
         let enigma = recent.iter().find(|v| v.title == "Enigma machine").unwrap();
+        assert_eq!(enigma.referrer_wiki.as_deref(), Some(""));
         assert_eq!(enigma.referrer_lang.as_deref(), Some("en"));
         assert_eq!(enigma.referrer_title.as_deref(), Some("Alan Turing"));
+    }
+
+    /// PRD FR-ML-4/FR-HS-3: a visit's own wiki and its referrer's wiki both
+    /// round-trip through `record_visit` -> `all_visits`/`recent` — the
+    /// trail view's node/edge identity depends on both surviving intact.
+    #[test]
+    fn record_visit_stores_a_non_default_wiki_and_its_referrers_wiki() {
+        let mut history = History::in_memory();
+        history.record_visit("wiktionary", "en", "Mercury", None);
+        history.record_visit(
+            "wiktionary",
+            "en",
+            "Quicksilver",
+            Some(("wiktionary", "en", "Mercury")),
+        );
+        let all = history.all_visits();
+        let quicksilver = all.iter().find(|v| v.title == "Quicksilver").unwrap();
+        assert_eq!(quicksilver.wiki, "wiktionary");
+        assert_eq!(quicksilver.referrer_wiki.as_deref(), Some("wiktionary"));
+        assert_eq!(quicksilver.referrer_title.as_deref(), Some("Mercury"));
+    }
+
+    /// PRD FR-ML-4: `recent`'s per-article dedup groups on `(wiki, lang,
+    /// title)`, not just `(lang, title)` — a same-titled article read on two
+    /// different wikis must stay two distinct rows, never one collapsing
+    /// the other's dwell/referrer away.
+    #[test]
+    fn recent_keeps_a_same_titled_article_on_two_wikis_as_two_rows() {
+        let mut history = History::in_memory();
+        history.record_visit("", "en", "Mercury", None);
+        history.record_visit("wiktionary", "en", "Mercury", None);
+        let recent = history.recent(10);
+        assert_eq!(
+            recent.len(),
+            2,
+            "two wikis' Mercury are two distinct history rows"
+        );
+        assert!(recent.iter().any(|v| v.wiki.is_empty()));
+        assert!(recent.iter().any(|v| v.wiki == "wiktionary"));
     }
 
     #[test]
     fn recent_dedups_to_the_most_recent_visit_per_article() {
         let mut history = History::in_memory();
-        history.record_visit("en", "Alan Turing", None);
-        history.record_visit("en", "Enigma machine", None);
-        history.record_visit("en", "Alan Turing", None); // revisit
+        history.record_visit("", "en", "Alan Turing", None);
+        history.record_visit("", "en", "Enigma machine", None);
+        history.record_visit("", "en", "Alan Turing", None); // revisit
 
         let recent = history.recent(10);
         let titles: Vec<&str> = recent.iter().map(|v| v.title.as_str()).collect();
@@ -847,7 +973,7 @@ mod tests {
     fn recent_orders_most_recent_first_and_respects_the_limit() {
         let mut history = History::in_memory();
         for title in ["A", "B", "C"] {
-            history.record_visit("en", title, None);
+            history.record_visit("", "en", title, None);
         }
         let all = history.recent(10);
         let titles: Vec<&str> = all.iter().map(|v| v.title.as_str()).collect();
@@ -864,7 +990,7 @@ mod tests {
     #[test]
     fn update_dwell_accumulates_across_multiple_calls() {
         let mut history = History::in_memory();
-        let id = history.record_visit("en", "Alan Turing", None).unwrap();
+        let id = history.record_visit("", "en", "Alan Turing", None).unwrap();
         history.update_dwell(id, 30);
         history.update_dwell(id, 15);
         let visit = history.recent(10).into_iter().find(|v| v.id == id).unwrap();
@@ -874,7 +1000,7 @@ mod tests {
     #[test]
     fn update_dwell_of_zero_is_a_harmless_no_op() {
         let mut history = History::in_memory();
-        let id = history.record_visit("en", "Alan Turing", None).unwrap();
+        let id = history.record_visit("", "en", "Alan Turing", None).unwrap();
         history.update_dwell(id, 0);
         let visit = history.recent(10).into_iter().next().unwrap();
         assert_eq!(visit.dwell_secs, 0);
@@ -885,8 +1011,8 @@ mod tests {
     #[test]
     fn empty_query_search_matches_recent() {
         let mut history = History::in_memory();
-        history.record_visit("en", "Alan Turing", None);
-        history.record_visit("en", "Enigma machine", None);
+        history.record_visit("", "en", "Alan Turing", None);
+        history.record_visit("", "en", "Enigma machine", None);
         assert_eq!(history.search("", 10), history.recent(10));
         assert_eq!(history.search("   ", 10), history.recent(10));
     }
@@ -894,8 +1020,8 @@ mod tests {
     #[test]
     fn search_excludes_non_matching_titles() {
         let mut history = History::in_memory();
-        history.record_visit("en", "Alan Turing", None);
-        history.record_visit("en", "Enigma machine", None);
+        history.record_visit("", "en", "Alan Turing", None);
+        history.record_visit("", "en", "Enigma machine", None);
         let hits = history.search("turing", 10);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].title, "Alan Turing");
@@ -910,7 +1036,7 @@ mod tests {
     #[test]
     fn search_ranks_a_strong_old_match_above_a_weak_recent_one() {
         let mut history = History::in_memory();
-        let old_id = history.record_visit("en", "abc project", None).unwrap();
+        let old_id = history.record_visit("", "en", "abc project", None).unwrap();
         history
             .conn
             .execute(
@@ -921,7 +1047,7 @@ mod tests {
         // "a" then 30 filler chars then "b" then 30 filler chars then "c":
         // a very weak, heavily-scattered match on "abc", visited just now.
         let weak_title = format!("a{}b{}c", "x".repeat(30), "x".repeat(30));
-        history.record_visit("en", &weak_title, None);
+        history.record_visit("", "en", &weak_title, None);
 
         let ranked = history.search("abc", 10);
         assert_eq!(
@@ -934,7 +1060,9 @@ mod tests {
     #[test]
     fn search_prefers_more_recent_among_equal_quality_matches() {
         let mut history = History::in_memory();
-        let old_id = history.record_visit("en", "Turing Award", None).unwrap();
+        let old_id = history
+            .record_visit("", "en", "Turing Award", None)
+            .unwrap();
         history
             .conn
             .execute(
@@ -942,7 +1070,7 @@ mod tests {
                 params![now_unix() - 100 * 86_400, old_id],
             )
             .unwrap();
-        history.record_visit("en", "Turing Machine", None); // just now, same quality
+        history.record_visit("", "en", "Turing Machine", None); // just now, same quality
 
         let ranked = history.search("turing", 10);
         assert_eq!(
@@ -957,7 +1085,7 @@ mod tests {
     fn record_visit_makes_is_visited_true_immediately() {
         let mut history = History::in_memory();
         assert!(!history.is_visited("en", "Alan Turing"));
-        history.record_visit("en", "Alan Turing", None);
+        history.record_visit("", "en", "Alan Turing", None);
         assert!(history.is_visited("en", "Alan Turing"));
         assert!(
             !history.is_visited("de", "Alan Turing"),
@@ -970,7 +1098,7 @@ mod tests {
         let path = temp_path();
         {
             let mut history = History::open_at(&path);
-            history.record_visit("en", "Alan Turing", None);
+            history.record_visit("", "en", "Alan Turing", None);
         }
         let reopened = History::open_at(&path);
         assert!(reopened.is_visited("en", "Alan Turing"));
@@ -987,8 +1115,8 @@ mod tests {
     #[test]
     fn clear_all_empties_history_and_the_visited_cache() {
         let mut history = History::in_memory();
-        history.record_visit("en", "Alan Turing", None);
-        history.record_visit("en", "Enigma machine", None);
+        history.record_visit("", "en", "Alan Turing", None);
+        history.record_visit("", "en", "Enigma machine", None);
         let removed = history.clear(ClearRange::All).unwrap();
         assert_eq!(removed, 2);
         assert!(history.recent(10).is_empty());
@@ -998,7 +1126,7 @@ mod tests {
     #[test]
     fn clear_before_a_cutoff_keeps_newer_rows() {
         let mut history = History::in_memory();
-        let old_id = history.record_visit("en", "Old Article", None).unwrap();
+        let old_id = history.record_visit("", "en", "Old Article", None).unwrap();
         history
             .conn
             .execute(
@@ -1006,7 +1134,7 @@ mod tests {
                 params![now_unix() - 10 * 86_400, old_id],
             )
             .unwrap();
-        history.record_visit("en", "New Article", None);
+        history.record_visit("", "en", "New Article", None);
 
         let cutoff = now_unix() - 5 * 86_400;
         let removed = history.clear(ClearRange::Before(cutoff)).unwrap();
@@ -1021,8 +1149,8 @@ mod tests {
     #[test]
     fn clear_one_article_leaves_the_rest() {
         let mut history = History::in_memory();
-        history.record_visit("en", "Alan Turing", None);
-        history.record_visit("en", "Enigma machine", None);
+        history.record_visit("", "en", "Alan Turing", None);
+        history.record_visit("", "en", "Enigma machine", None);
         let removed = history
             .clear(ClearRange::Article {
                 lang: "en".to_string(),
@@ -1039,7 +1167,7 @@ mod tests {
     #[test]
     fn retention_prune_of_zero_days_keeps_forever() {
         let mut history = History::in_memory();
-        let old_id = history.record_visit("en", "Ancient", None).unwrap();
+        let old_id = history.record_visit("", "en", "Ancient", None).unwrap();
         history
             .conn
             .execute(
@@ -1054,7 +1182,7 @@ mod tests {
     #[test]
     fn retention_prune_drops_old_rows_and_keeps_new_ones() {
         let mut history = History::in_memory();
-        let old_id = history.record_visit("en", "Old Article", None).unwrap();
+        let old_id = history.record_visit("", "en", "Old Article", None).unwrap();
         history
             .conn
             .execute(
@@ -1062,7 +1190,7 @@ mod tests {
                 params![now_unix() - 90 * 86_400, old_id],
             )
             .unwrap();
-        history.record_visit("en", "New Article", None);
+        history.record_visit("", "en", "New Article", None);
 
         history.retention_prune(30);
         let recent = history.recent(10);

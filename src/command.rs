@@ -171,8 +171,38 @@ pub enum Command {
     /// resolve is checked at execution time (`main::switch_wiki`), the same
     /// split `:lang <code>` uses for its own deeper validation.
     Wiki(Option<String>),
+    /// `:trail [all|days N]` (PRD FR-HS-3): opens the wander-graph tree
+    /// view. Bare `:trail` uses [`TrailScope::Session`] (this run's own
+    /// history) — "session-scope is the natural wander graph."
+    Trail(TrailScope),
+    /// `:trail export md|dot|mermaid [path]` (PRD FR-HS-3): exports the
+    /// trail — always the session scope, regardless of what scope a
+    /// currently-open `:trail` view is showing (see `App::export_trail`'s
+    /// doc comment for why). `format` is one of `trail_export::FORMATS`;
+    /// `path` overrides the default timestamped location under the data
+    /// dir's `exports/`.
+    TrailExport {
+        format: String,
+        path: Option<String>,
+    },
     /// `:q` / `:quit` — exit.
     Quit,
+}
+
+/// `:trail`'s scope argument (PRD FR-HS-3). Kept separate from
+/// `history::ClearRange` — this describes which visits to *include*, not a
+/// deletion range, and (like `HistoryClearScope::Today`) resolving `Days`
+/// into an actual cutoff happens at execution time (`App::open_trail`), not
+/// here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrailScope {
+    /// Bare `:trail`: this run's own session (`App::session_started_at`
+    /// onward) — the PRD's "natural wander graph."
+    Session,
+    /// `:trail all`: the entire reading history, unbounded.
+    All,
+    /// `:trail days <N>`: every visit in the last `N` days.
+    Days(u32),
 }
 
 /// `:login`'s two forms (PRD §5.9).
@@ -396,7 +426,7 @@ fn validate_set_value(
     }
 }
 
-pub const USAGE: &str = "commands: open <title>, lang [<code>], theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, prefetch-log, interests, not-interested, stats, start, today, random [good], related, talk, info, set theme=<name>|images=on|off|prefetch=on|off|measure=N|ambiguous_width=1|2|reading_wpm=N|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N, set-tab measure=N|images=on|off|ambiguous_width=1|2|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N (or set-tab key= to reset), config reload, vsplit, only, bilingual, wiki [<name>], set scrollbind, watchlist, notifications, contribs [username], prefs, sync, mirror-watchlist, search-offline, help, quit";
+pub const USAGE: &str = "commands: open <title>, lang [<code>], theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, prefetch-log, interests, not-interested, stats, start, today, random [good], related, talk, info, set theme=<name>|images=on|off|prefetch=on|off|measure=N|ambiguous_width=1|2|reading_wpm=N|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N, set-tab measure=N|images=on|off|ambiguous_width=1|2|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N (or set-tab key= to reset), config reload, vsplit, only, bilingual, wiki [<name>], set scrollbind, watchlist, notifications, contribs [username], prefs, sync, mirror-watchlist, search-offline, trail [all|days N|export md|dot|mermaid [path]], help, quit";
 
 /// Parses one `:` command line. `user_theme_names` are accepted alongside
 /// the six built-ins for `:theme <name>` and `:set theme=<name>` (PRD
@@ -452,6 +482,52 @@ pub fn parse_with_user_themes(input: &str, user_theme_names: &[String]) -> Resul
                 Ok(Command::Wiki(None))
             } else {
                 Ok(Command::Wiki(Some(arg.to_string())))
+            }
+        }
+        // `:trail` (PRD FR-HS-3): bare opens the session-scoped tree view;
+        // `all`/`days <N>` widen the scope; `export md|dot|mermaid [path]`
+        // writes it out — same two-level `sub`/`rest` split as `:bookmarks
+        // export`/`:save export`.
+        "trail" => {
+            let (sub, rest) = match arg.split_once(char::is_whitespace) {
+                Some((s, r)) => (s, r.trim()),
+                None => (arg, ""),
+            };
+            match sub {
+                "" => Ok(Command::Trail(TrailScope::Session)),
+                "all" => Ok(Command::Trail(TrailScope::All)),
+                "days" => {
+                    if rest.is_empty() {
+                        return Err("usage: :trail days <N>".to_string());
+                    }
+                    match rest.parse::<u32>() {
+                        Ok(0) => Err("trail days must be at least 1".to_string()),
+                        Ok(n) => Ok(Command::Trail(TrailScope::Days(n))),
+                        Err(_) => Err(format!("trail days must be an integer (got {rest:?})")),
+                    }
+                }
+                "export" => {
+                    let (format, path) = match rest.split_once(char::is_whitespace) {
+                        Some((f, p)) => (f, Some(p.trim()).filter(|p| !p.is_empty())),
+                        None => (rest, None),
+                    };
+                    if format.is_empty() {
+                        return Err("usage: :trail export md|dot|mermaid [path]".to_string());
+                    }
+                    if !crate::trail_export::FORMATS.contains(&format) {
+                        return Err(format!(
+                            "unknown export format {format:?} — one of: {}",
+                            crate::trail_export::FORMATS.join(", ")
+                        ));
+                    }
+                    Ok(Command::TrailExport {
+                        format: format.to_string(),
+                        path: path.map(str::to_string),
+                    })
+                }
+                other => Err(format!(
+                    "unknown trail subcommand {other:?} — try: trail, trail all, trail days <N>, trail export md|dot|mermaid [path]"
+                )),
             }
         }
         "theme" => {
@@ -1486,5 +1562,49 @@ mod tests {
     #[test]
     fn info_parses_bare() {
         assert_eq!(parse("info"), Ok(Command::Info));
+    }
+
+    // ---- PRD FR-HS-3: :trail --------------------------------------------------
+
+    #[test]
+    fn trail_bare_opens_the_session_scoped_view() {
+        assert_eq!(parse("trail"), Ok(Command::Trail(TrailScope::Session)));
+        assert_eq!(parse("trail   "), Ok(Command::Trail(TrailScope::Session)));
+    }
+
+    #[test]
+    fn trail_all_and_days_widen_the_scope() {
+        assert_eq!(parse("trail all"), Ok(Command::Trail(TrailScope::All)));
+        assert_eq!(
+            parse("trail days 7"),
+            Ok(Command::Trail(TrailScope::Days(7)))
+        );
+        assert!(parse("trail days").is_err());
+        assert!(parse("trail days 0").is_err(), "0 days is meaningless");
+        assert!(parse("trail days soon").is_err());
+        assert!(parse("trail frobnicate").is_err());
+    }
+
+    #[test]
+    fn trail_export_parses_format_and_optional_path() {
+        assert_eq!(
+            parse("trail export md"),
+            Ok(Command::TrailExport {
+                format: "md".to_string(),
+                path: None
+            })
+        );
+        assert_eq!(
+            parse("trail export dot /tmp/out.dot"),
+            Ok(Command::TrailExport {
+                format: "dot".to_string(),
+                path: Some("/tmp/out.dot".to_string())
+            })
+        );
+        for format in ["md", "dot", "mermaid"] {
+            assert!(parse(&format!("trail export {format}")).is_ok());
+        }
+        assert!(parse("trail export").is_err());
+        assert!(parse("trail export pdf").is_err());
     }
 }

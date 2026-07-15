@@ -46,6 +46,8 @@ mod tab;
 mod talk;
 mod target;
 mod theme;
+mod trail;
+mod trail_export;
 mod ui;
 
 use anyhow::Result;
@@ -3566,6 +3568,80 @@ async fn open_history_entry(
     app.loading = false;
 }
 
+/// `:trail`'s Enter-to-reopen (PRD FR-HS-3): a fresh navigation — pushes the
+/// tab's current article onto its back stack and clears the forward stack,
+/// like `open_document`/`open_title` — but explicitly scoped to the trail
+/// node's own `(wiki, lang, title)`, never the client's *currently active*
+/// wiki, the same FR-ML-4 correctness `open_history_entry` gives back/
+/// forward. A trail node is always something this session already read, so
+/// in practice this is an L2 cache hit; on a genuine miss the request still
+/// goes out through the client's process-global active wiki (the same
+/// pre-existing `WikiClient`/`fetch_page` limitation `open_history_entry`
+/// has — this chunk does not attempt to fix that).
+async fn open_trail_node(
+    client: &WikiClient,
+    cache: &PageCache,
+    app: &mut App,
+    wiki: &str,
+    lang: &str,
+    title: &str,
+    revalidate_tx: &UnboundedSender<RevalidationOutcome>,
+) {
+    app.loading = true;
+    let outcome = {
+        let _fg = app
+            .prefetch
+            .as_ref()
+            .map(netqueue::SubstrateHandle::foreground_guard);
+        fetch_page(client, cache, &app.search_index, wiki, lang, title).await
+    };
+    match outcome {
+        Ok(outcome) => {
+            // PRD §5.7: prefer a pinned saved copy over a stale offline
+            // degrade — same precedence `open_title` gives it.
+            if matches!(outcome.source, PageSource::Offline { .. })
+                && app.saved.is_saved(wiki, lang, title)
+            {
+                app.loading = false;
+                open_saved(app, wiki, lang, title);
+                return;
+            }
+            let document = doc::parse_article_html(title, &outcome.html);
+            app.lang = lang.to_string();
+            {
+                let tab = app.active_tab_mut();
+                tab.page_source = outcome.source;
+                tab.current_revid = outcome.revid;
+            }
+            app.open_document(document);
+            // `open_document`/`set_document` stamps the tab with the app's
+            // *active* wiki scope; this reopen targets the trail node's own
+            // wiki instead — restore it, the same correction
+            // `open_history_entry` applies after `set_document`.
+            app.active_tab_mut().wiki = wiki.to_string();
+            if let Some(cached_revid) = outcome.revalidate {
+                let tab_id = app.active_tab().id;
+                if fire_revalidation(
+                    app,
+                    client,
+                    tab_id,
+                    lang.to_string(),
+                    title.to_string(),
+                    cached_revid,
+                    revalidate_tx,
+                ) {
+                    app.pending_revalidations += 1;
+                }
+            }
+            schedule_link_prefetch(app);
+        }
+        Err(e) => {
+            app.status = format!("Error: {e}");
+        }
+    }
+    app.loading = false;
+}
+
 /// PRD FR-TB-5: reopens a persisted tab set at startup. Every tab's content
 /// loads lazily through the exact same background-tab machinery `Ctrl-Enter`
 /// background opens use (`fire_background_load`/`apply_tab_load_outcome`),
@@ -4279,6 +4355,27 @@ async fn handle_key(
                     switch_wiki(client, app, &name);
                 }
                 app.mode = Mode::Reading;
+            }
+            KeyCode::Char('?') => {
+                app.prior_mode = app.mode;
+                app.mode = Mode::Help;
+            }
+            _ => {}
+        },
+        // `:trail`'s wander-graph view (PRD FR-HS-3): `j`/`k` move the
+        // selection through the flattened tree, Enter reopens the selected
+        // node wiki-aware (`open_trail_node`, not `open_title` — a trail
+        // node is never assumed to be on the app's *currently active* wiki),
+        // Esc closes.
+        Mode::Trail => match code {
+            KeyCode::Esc => app.close_trail(),
+            KeyCode::Char('j') | KeyCode::Down => app.cycle_trail(true),
+            KeyCode::Char('k') | KeyCode::Up => app.cycle_trail(false),
+            KeyCode::Enter => {
+                if let Some((wiki, lang, title)) = app.selected_trail_target() {
+                    app.mode = Mode::Reading;
+                    open_trail_node(client, cache, app, &wiki, &lang, &title, revalidate_tx).await;
+                }
             }
             KeyCode::Char('?') => {
                 app.prior_mode = app.mode;
@@ -7024,6 +7121,12 @@ async fn execute_command(
         Command::Wiki(Some(name)) => {
             switch_wiki(client, app, &name);
         }
+        // PRD FR-HS-3: the trail/wander-graph view and its export.
+        Command::Trail(scope) => app.open_trail(scope),
+        Command::TrailExport { format, path } => {
+            let path = path.map(std::path::PathBuf::from);
+            app.export_trail(&format, path.as_deref());
+        }
         // PRD FR-SR-7: flips the explicit offline-search toggle; the next
         // `run_search` (Tab in Mode::Search, or a redlink card's `s`) reads
         // it fresh, so this never has to reach into an in-flight search.
@@ -7843,6 +7946,129 @@ mod tests {
             app.tabs.len() - 1,
             "an out-of-range active index clamps to the last tab, never panics"
         );
+    }
+
+    // ---- PRD FR-HS-3: :trail's Enter-to-reopen is wiki-aware ----------------
+
+    fn temp_cache_dir(tag: &str) -> (PageCache, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "wikitui-trail-node-test-{tag}-{}",
+            std::process::id()
+        ));
+        (
+            PageCache::at(
+                dir.clone(),
+                cache::DEFAULT_MAX_BYTES,
+                cache::FRESH_TTL_SECS,
+                cache::DEFAULT_FORCE_REFETCH_SECS,
+            ),
+            dir,
+        )
+    }
+
+    /// PRD FR-HS-3 / FR-ML-4: reopening a trail node fetches (and, on the L2
+    /// hit this always is for an already-visited article, serves) from *that
+    /// node's own wiki*, never whatever wiki happens to be active right now
+    /// — `open_trail_node` must behave like `open_history_entry`'s back/
+    /// forward correctness, not `open_title`'s "client's current wiki"
+    /// shortcut. A dead-port client (`test_client`) proves the network is
+    /// never touched: the sister-wiki article is served purely from the
+    /// pre-populated L2 cache.
+    #[tokio::test]
+    async fn open_trail_node_reopens_the_nodes_own_wiki_from_cache() {
+        let client = test_client();
+        let (cache, dir) = temp_cache_dir("wiki-correct");
+        cache.put(
+            "wiktionary",
+            "en",
+            "Mercury",
+            "<html><body><p>quicksilver</p></body></html>",
+            42,
+            None,
+        );
+        let (revalidate_tx, _rrx) = mpsc::unbounded_channel::<RevalidationOutcome>();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        // The active wiki is the default (Wikipedia) throughout — proving
+        // the reopen doesn't depend on it having been switched first.
+        assert_eq!(app.active_tab().wiki, "");
+
+        open_trail_node(
+            &client,
+            &cache,
+            &mut app,
+            "wiktionary",
+            "en",
+            "Mercury",
+            &revalidate_tx,
+        )
+        .await;
+
+        assert_eq!(
+            app.active_tab().doc.as_ref().map(|d| d.title.as_str()),
+            Some("Mercury")
+        );
+        assert_eq!(
+            app.active_tab().wiki,
+            "wiktionary",
+            "the tab is stamped with the trail node's OWN wiki, not the \
+             client's active one"
+        );
+        assert!(
+            matches!(
+                app.active_tab().page_source,
+                PageSource::Cached { .. } | PageSource::Live
+            ),
+            "served from the pre-populated cache, never a network attempt \
+             against the dead-port client: {:?}",
+            app.active_tab().page_source
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reopen is a fresh navigation (PRD FR-HS-3's "via the normal open
+    /// path"): whatever was on screen before is pushed onto the back stack,
+    /// same as `open_document`/`open_title`.
+    #[tokio::test]
+    async fn open_trail_node_pushes_the_prior_article_onto_the_back_stack() {
+        let client = test_client();
+        let (cache, dir) = temp_cache_dir("back-stack");
+        cache.put(
+            "",
+            "en",
+            "Enigma machine",
+            "<html><body><p>x</p></body></html>",
+            7,
+            None,
+        );
+        let (revalidate_tx, _rrx) = mpsc::unbounded_channel::<RevalidationOutcome>();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.open_document(crate::doc::parse_article_html(
+            "Alan Turing",
+            "<html><body><p>x</p></body></html>",
+        ));
+
+        open_trail_node(
+            &client,
+            &cache,
+            &mut app,
+            "",
+            "en",
+            "Enigma machine",
+            &revalidate_tx,
+        )
+        .await;
+
+        assert_eq!(
+            app.active_tab().doc.as_ref().map(|d| d.title.as_str()),
+            Some("Enigma machine")
+        );
+        assert_eq!(
+            app.active_tab().back_stack.last().map(|e| e.title.as_str()),
+            Some("Alan Turing")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
