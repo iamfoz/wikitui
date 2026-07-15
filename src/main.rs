@@ -22,6 +22,7 @@ mod hyperlink;
 mod image;
 mod jsonl;
 mod layout;
+mod migrate;
 mod netqueue;
 mod prefetch;
 mod privacy;
@@ -248,6 +249,31 @@ async fn main() -> Result<()> {
         std::process::exit(cleardata::run(&resolved, scope, *yes));
     }
 
+    // PRD FR-TH-8 / goal G3: `wikitui import-wiki-tui <path>` is the third
+    // standalone, TUI-free subcommand alongside `config doctor` and
+    // `clear-data` above — converting a config file has no business
+    // touching the network, the cache, or the terminal either.
+    if let Some(Commands::ImportWikiTui { path }) = &cli.command {
+        let config_path =
+            config::resolve_config_path(cli.config.clone(), std::env::var("WIKITUI_CONFIG").ok());
+        let Some(config_dir) = config_path.as_deref().and_then(|p| p.parent()) else {
+            eprintln!(
+                "wikitui: import-wiki-tui: no config directory available (no --config, $WIKITUI_CONFIG, or platform config dir)"
+            );
+            std::process::exit(1);
+        };
+        match migrate::import_to_config_dir(path, config_dir) {
+            Ok(written) => {
+                print!("{}", migrate::summarize(&written));
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("wikitui: import-wiki-tui: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     let mut cli_overrides = cli_overrides_from(&cli);
 
     // The TITLE argument may be a full wikipedia.org URL or a
@@ -297,6 +323,20 @@ async fn main() -> Result<()> {
     }
     if let Some(summary) = &resolved.migration_summary {
         eprintln!("wikitui: config: {summary}");
+    }
+
+    // PRD FR-TH-1: user theme files, a `themes/` subdirectory sibling of
+    // config.toml — loaded once, here, before the theme name is resolved
+    // below (so `theme::resolve_named` can find a user theme by name) and
+    // before the terminal is touched (so parse/contrast warnings print
+    // alongside the config issues above, not garbled by raw mode).
+    let themes_dir = config_path
+        .as_deref()
+        .and_then(|p| p.parent())
+        .map(|d| d.join("themes"));
+    let (user_themes, theme_warnings) = theme::load_user_themes(themes_dir.as_deref());
+    for warning in &theme_warnings {
+        eprintln!("wikitui: theme: {warning}");
     }
 
     // PRD FR-CS-3: build the active keymap — the selected preset (vim/emacs)
@@ -373,10 +413,20 @@ async fn main() -> Result<()> {
     // `mut`: PRD FR-TH-4's auto light/dark may override this pick below,
     // once the terminal is in raw mode and only when the reader hasn't
     // pinned an explicit theme of their own (see the `auto_theme` block).
-    let mut theme = Theme::by_name(&resolved.theme.value).unwrap_or_else(Theme::terminal);
+    let mut theme =
+        theme::resolve_named(&resolved.theme.value, &user_themes).unwrap_or_else(Theme::terminal);
     let cite_style = CiteStyle::by_name(&resolved.cite_style.value).unwrap_or(CiteStyle::Apa);
     let no_color = no_color_active();
     let accessible = accessible_active();
+    // PRD FR-TH-3: NO_COLOR (FR-TH-5's own policy override, owned by
+    // `no_color_active` above) forces `Mono` regardless of `color_depth`;
+    // otherwise the configured value resolves via `theme::resolve_color_depth`
+    // (an explicit depth, or `auto`'s `$COLORTERM`/`$TERM` detection).
+    let color_depth = if no_color {
+        theme::ColorDepth::Mono
+    } else {
+        theme::resolve_color_depth(&resolved.terminal.color_depth.value)
+    };
 
     let config_ctx = ConfigContext {
         cli: cli_overrides,
@@ -430,7 +480,7 @@ async fn main() -> Result<()> {
                 autotheme::BgMode::Light => &resolved.terminal.theme_light.value,
                 autotheme::BgMode::Dark => &resolved.terminal.theme_dark.value,
             };
-            if let Some(picked) = Theme::by_name(picked_name) {
+            if let Some(picked) = theme::resolve_named(picked_name, &user_themes) {
                 theme = picked;
             }
         }
@@ -445,6 +495,8 @@ async fn main() -> Result<()> {
         resolved.languages.value.clone(),
         theme,
         no_color,
+        color_depth,
+        user_themes,
         accessible,
         resolved.terminal.clone(),
         resolved.measure.value,
@@ -1706,6 +1758,8 @@ async fn run(
     languages: Vec<String>,
     theme: Theme,
     no_color: bool,
+    color_depth: theme::ColorDepth,
+    user_themes: Vec<theme::LoadedUserTheme>,
     accessible: bool,
     terminal_cfg: config::ResolvedTerminal,
     measure: u16,
@@ -1728,6 +1782,14 @@ async fn run(
     app.keymap = keymap;
     app.languages = languages;
     app.accessible = accessible;
+    // PRD FR-TH-3: `color_depth`/`user_themes` must be in place *before*
+    // `set_theme` re-adapts the already-truecolor `theme` `App::new` just
+    // stored — otherwise the very first paint would be truecolor regardless
+    // of the configured depth, only correcting itself on the next theme
+    // change.
+    app.color_depth = color_depth;
+    app.user_themes = user_themes;
+    app.set_theme(app.theme);
     // PRD FR-NV-9 / FR-ACS-4 / FR-RD-2: the terminal-integration settings
     // this chunk adds. `mouse_enabled` mirrors the real
     // `EnableMouseCapture`/`DisableMouseCapture` state `main` already
@@ -2466,7 +2528,20 @@ fn apply_config_reload(app: &mut App) {
         &app.config_ctx.env,
         app.config_ctx.config_path.as_deref(),
     );
-    if let Some(theme) = Theme::by_name(&resolved.theme.value) {
+    // PRD FR-TH-1/3: re-scan `themes/` and re-resolve `color_depth` too — a
+    // reload might add a new user theme file or change the configured depth,
+    // and `theme` (reloaded right below) needs both already in place to
+    // resolve/adapt correctly.
+    let themes_dir = app
+        .config_ctx
+        .config_path
+        .as_deref()
+        .and_then(|p| p.parent())
+        .map(|d| d.join("themes"));
+    let (user_themes, theme_warnings) = theme::load_user_themes(themes_dir.as_deref());
+    app.user_themes = user_themes;
+    app.color_depth = theme::resolve_color_depth(&resolved.terminal.color_depth.value);
+    if let Some(theme) = theme::resolve_named(&resolved.theme.value, &app.user_themes) {
         app.set_theme(theme);
     }
     app.measure = resolved.measure.value;
@@ -2489,13 +2564,11 @@ fn apply_config_reload(app: &mut App) {
     // layout so the next `ensure_layout` recomputes instead of reusing a
     // stale one keyed on the old options.
     app.layout = None;
-    app.notice = Some(if resolved.issues.is_empty() {
+    let total_warnings = resolved.issues.len() + theme_warnings.len();
+    app.notice = Some(if total_warnings == 0 {
         "Config reloaded".to_string()
     } else {
-        format!(
-            "Config reloaded ({} warning(s) — see `wikitui config doctor`)",
-            resolved.issues.len()
-        )
+        format!("Config reloaded ({total_warnings} warning(s) — see `wikitui config doctor`)")
     });
 }
 
@@ -3006,7 +3079,11 @@ async fn handle_key(
                 let input = app.command_input.clone();
                 app.command_input.clear();
                 app.mode = Mode::Reading;
-                match command::parse(&input) {
+                // PRD FR-TH-1: `:theme`/`:set theme=` also validate against
+                // any loaded user theme names, not just the six built-ins.
+                let user_theme_names: Vec<String> =
+                    app.user_themes.iter().map(|t| t.name.clone()).collect();
+                match command::parse_with_user_themes(&input, &user_theme_names) {
                     Ok(cmd) => {
                         execute_command(
                             client,
@@ -4559,7 +4636,7 @@ async fn execute_command(
             .await;
         }
         Command::Theme(name) => {
-            if let Some(theme) = Theme::by_name(&name) {
+            if let Some(theme) = theme::resolve_named(&name, &app.user_themes) {
                 app.set_theme(theme);
                 app.notice = Some(format!("Theme: {name}"));
             }
@@ -4575,7 +4652,7 @@ async fn execute_command(
             // PRD FR-TH-2: live theme switch (value already validated by the
             // parser, so `by_name` cannot fail here).
             "theme" => {
-                if let Some(theme) = Theme::by_name(&value) {
+                if let Some(theme) = theme::resolve_named(&value, &app.user_themes) {
                     app.set_theme(theme);
                     app.notice = Some(format!("theme={value}"));
                 }

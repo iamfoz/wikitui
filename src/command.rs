@@ -147,7 +147,17 @@ const SAVE_EXPORT_FORMATS: [&str; 3] = ["md", "txt", "html"];
 
 pub const USAGE: &str = "commands: open <title>, lang [<code>], theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, prefetch-log, start, today, random [good], related, set theme=<name>|images=on|off|prefetch=on|off|measure=N|ambiguous_width=1|2|reading_wpm=N, config reload, help, quit";
 
-pub fn parse(input: &str) -> Result<Command, String> {
+/// Parses one `:` command line. `user_theme_names` are accepted alongside
+/// the six built-ins for `:theme <name>` and `:set theme=<name>` (PRD
+/// FR-TH-1's "a user theme's name joins `Theme::NAMES`-equivalent
+/// resolution") — exactly the same names `theme::resolve_named` accepts at
+/// theme-*application* time; this is that requirement's *validation* half.
+/// Pass an empty slice when no user themes are loaded (or none are relevant,
+/// as in every test below that only exercises built-in names).
+pub fn parse_with_user_themes(input: &str, user_theme_names: &[String]) -> Result<Command, String> {
+    let theme_name_is_known = |s: &str| -> bool {
+        Theme::by_name(s).is_some() || user_theme_names.iter().any(|n| n == s)
+    };
     let input = input.trim();
     let (name, arg) = match input.split_once(char::is_whitespace) {
         Some((name, rest)) => (name, rest.trim()),
@@ -180,11 +190,11 @@ pub fn parse(input: &str) -> Result<Command, String> {
         }
         "theme" => {
             let theme = require_arg("name")?;
-            if Theme::by_name(&theme).is_some() {
+            if theme_name_is_known(&theme) {
                 Ok(Command::Theme(theme))
             } else {
                 Err(format!(
-                    "unknown theme {theme:?} — one of: {}",
+                    "unknown theme {theme:?} — one of: {} (or a themes/*.toml name)",
                     Theme::NAMES.join(", ")
                 ))
             }
@@ -389,14 +399,14 @@ pub fn parse(input: &str) -> Result<Command, String> {
                 // PRD FR-TH-2: live theme switch, same validation as
                 // `:theme <name>` and the config loader.
                 "theme" => {
-                    if Theme::by_name(value).is_some() {
+                    if theme_name_is_known(value) {
                         Ok(Command::Set {
                             key: "theme".to_string(),
                             value: value.to_string(),
                         })
                     } else {
                         Err(format!(
-                            "unknown theme {value:?} — one of: {}",
+                            "unknown theme {value:?} — one of: {} (or a themes/*.toml name)",
                             Theme::NAMES.join(", ")
                         ))
                     }
@@ -510,6 +520,14 @@ pub fn parse(input: &str) -> Result<Command, String> {
 mod tests {
     use super::*;
 
+    /// Every test below exercises built-in theme names only, so this local
+    /// shorthand (no user theme list to thread through 100+ call sites)
+    /// stands in for `parse_with_user_themes(input, &[])` — the dedicated
+    /// `..._with_user_themes` tests further down cover the non-empty case.
+    fn parse(input: &str) -> Result<Command, String> {
+        parse_with_user_themes(input, &[])
+    }
+
     #[test]
     fn open_takes_the_rest_of_the_line_as_the_title() {
         assert_eq!(
@@ -547,6 +565,28 @@ mod tests {
         assert!(parse("theme sepia").is_err());
         assert_eq!(parse("style mla"), Ok(Command::Style("mla".to_string())));
         assert!(parse("style vancouver").is_err());
+    }
+
+    /// PRD FR-TH-1: `:theme <name>` and `:set theme=<name>` both accept a
+    /// loaded user theme's name, not just the six built-ins.
+    #[test]
+    fn theme_and_set_theme_accept_a_user_theme_name() {
+        let user_themes = vec!["solar".to_string()];
+        assert_eq!(
+            parse_with_user_themes("theme solar", &user_themes),
+            Ok(Command::Theme("solar".to_string()))
+        );
+        assert_eq!(
+            parse_with_user_themes("set theme=solar", &user_themes),
+            Ok(Command::Set {
+                key: "theme".to_string(),
+                value: "solar".to_string(),
+            })
+        );
+        // Still rejected without the user theme list.
+        assert!(parse_with_user_themes("theme solar", &[]).is_err());
+        // Still rejected regardless of the list, if truly unknown.
+        assert!(parse_with_user_themes("theme nonexistent", &user_themes).is_err());
     }
 
     #[test]

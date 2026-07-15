@@ -20,7 +20,7 @@ use crate::research::{ResearchStore, SavedCitation};
 use crate::saved::{SavedPages, Tier};
 use crate::startpage::{self, OnThisDayModel, OtdType, StartPageConfig, StartPageModel};
 use crate::tab::{HistoryEntry, Tab, TabId};
-use crate::theme::Theme;
+use crate::theme::{ColorDepth, LoadedUserTheme, Theme};
 
 /// How many closed tabs the undo stack (`u` to reopen — PRD FR-TB-1) keeps.
 /// A hard cap so a long session's closed-tab snapshots — which hold whole
@@ -305,6 +305,20 @@ pub struct App {
     /// FR-TH-5): when true, every style still applies but with colors
     /// stripped, regardless of which theme is selected.
     pub no_color: bool,
+    /// PRD FR-TH-3: the terminal color depth every theme change degrades
+    /// `theme`'s colors to (`set_theme`'s job) — resolved once at startup
+    /// from `color_depth = auto|truecolor|256|16|mono` (`main::run`), and
+    /// re-read on every `set_theme` call thereafter (`T`-cycling, `:theme`,
+    /// `:set theme=`, `:config reload`) rather than only at startup, so a
+    /// mid-session theme change still respects it.
+    pub color_depth: ColorDepth,
+    /// PRD FR-TH-1: user theme files loaded once at startup
+    /// (`theme::load_user_themes`) from `$XDG_CONFIG_HOME/wikitui/themes/`.
+    /// `set_theme`/`:theme <name>` resolve against this list after the six
+    /// built-ins (`theme::resolve_named`); a theme's own declared
+    /// `[fallback]` (if any) is what `set_theme` looks up here for
+    /// `Theme::adapt`'s precedence-over-computed-quantization rule.
+    pub user_themes: Vec<LoadedUserTheme>,
     /// PRD FR-ACS-6 (`ACCESSIBLE=1`): drives the layout's collapse-to-list
     /// table path (and could gate further linear-leaning behavior). Set once
     /// at startup from the `ACCESSIBLE` environment variable; part of
@@ -781,6 +795,13 @@ impl App {
             pending_g: false,
             theme,
             no_color,
+            // Truecolor is the identity mapping (`Theme::adapt` is a no-op
+            // at this depth), so a caller that never touches this field —
+            // every existing `App::new` test call site — sees exactly the
+            // pre-FR-TH-3 behavior. `main::run` overwrites both before the
+            // first paint, same as `measure`/`mouse_enabled` below.
+            color_depth: ColorDepth::Truecolor,
+            user_themes: Vec::new(),
             accessible: false,
             mouse_enabled: false,
             no_motion: false,
@@ -1835,9 +1856,24 @@ impl App {
     /// images render (PRD FR-TH-7): image boxes depend on the theme's
     /// `images` default, so a text↔image theme swap must rebuild the layout,
     /// while any other theme swap stays O(paint) as before.
+    ///
+    /// PRD FR-TH-3: also the single choke point capability degradation runs
+    /// through — every caller (startup, `T`-cycling, `:theme`, `:set
+    /// theme=`, `:config reload`) hands this an always-truecolor `Theme`
+    /// (from `Theme::by_name`/`theme::resolve_named`/`Theme::next`), and
+    /// this maps it down to `self.color_depth` before storing it, honoring
+    /// the theme's own declared `[fallback]` (found by name in
+    /// `self.user_themes`) ahead of computed quantization. `ui::colored`/
+    /// `base_style` never see a depth or a fallback table — only the
+    /// already-adapted colors on `self.theme`.
     pub fn set_theme(&mut self, theme: Theme) {
         let before = self.images_enabled();
-        self.theme = theme;
+        let fallback = self
+            .user_themes
+            .iter()
+            .find(|t| t.name == theme.name)
+            .map(|t| &t.fallback);
+        self.theme = theme.adapt(self.color_depth, fallback);
         if self.images_enabled() != before {
             self.note_image_state_change();
         }

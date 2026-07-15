@@ -111,6 +111,19 @@ pub enum Commands {
         #[arg(long)]
         yes: bool,
     },
+    /// PRD FR-TH-8 (backs goal G3): best-effort migration from wiki-tui
+    /// (github.com/Builditluc/wiki-tui) — reads its `config.toml`'s
+    /// `[theme]` and `[keybindings]` tables and writes a converted
+    /// `themes/*.toml` and `keymap.toml` into this build's own config
+    /// directory. Never overwrites an existing `keymap.toml` (writes
+    /// `keymap.from-wiki-tui.toml` instead when one is already present).
+    /// Prints a summary of what mapped and what didn't; see `migrate`'s
+    /// module doc comment for this build's documented assumptions about
+    /// wiki-tui's config shape.
+    ImportWikiTui {
+        /// A wiki-tui `config.toml` file, or a directory containing one.
+        path: PathBuf,
+    },
 }
 
 #[derive(Subcommand, Debug)]

@@ -137,6 +137,10 @@ pub struct EnvOverrides {
     pub contact: Option<String>,
     /// PRD FR-ACS-4's `WIKITUI_ANIMATIONS=none` no-motion override.
     pub animations: Option<String>,
+    /// PRD FR-TH-3's `color_depth` override via `WIKITUI_COLOR_DEPTH`
+    /// (`auto`/`truecolor`/`256`/`16`/`mono`) — for testing and user control
+    /// over capability degradation, same env-first pattern as `animations`.
+    pub color_depth: Option<String>,
 }
 
 impl EnvOverrides {
@@ -158,6 +162,7 @@ impl EnvOverrides {
             prefetch: get("WIKITUI_PREFETCH"),
             contact: get("WIKITUI_CONTACT"),
             animations: get("WIKITUI_ANIMATIONS"),
+            color_depth: get("WIKITUI_COLOR_DEPTH"),
         }
     }
 }
@@ -313,6 +318,13 @@ pub struct ResolvedTerminal {
     /// FR-RD-2 / SEC-2: `auto` (the default), `on`, or `off` — see
     /// `hyperlink::HyperlinkMode`.
     pub hyperlinks: Valued<String>,
+    /// FR-TH-3: `auto` (the default, `theme::detect_color_depth`),
+    /// `truecolor`, `256`, `16`, or `mono` — an explicit value overrides
+    /// auto-detection for testing or a terminal this build's heuristic
+    /// misjudges. Resolved to a `theme::ColorDepth` by `main`, not here
+    /// (this module has no reason to depend on `theme`'s degradation code,
+    /// only to validate the string against the closed set).
+    pub color_depth: Valued<String>,
 }
 
 /// A schema migration from `from` to `from + 1`, run over the raw table
@@ -414,6 +426,11 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = "\
 # theme_light = \"paper\"
 # theme_dark = \"terminal\"
 
+# Color depth (FR-TH-3): auto | truecolor | 256 | 16 | mono. auto detects
+# from $COLORTERM/$TERM; an explicit value overrides detection (also honors
+# WIKITUI_COLOR_DEPTH). Every theme's colors are mapped down to this depth.
+# color_depth = \"auto\"
+
 # OSC 8 terminal hyperlinks (FR-RD-2): auto | on | off. ACCESSIBLE=1 implies
 # off (plain link text) unless overridden here.
 # hyperlinks = \"auto\"
@@ -451,6 +468,25 @@ pub fn resolve(
     let mut issues = Vec::new();
     let table = load_table(config_path, &mut issues);
 
+    // PRD FR-TH-1: "a user theme's name joins Theme::NAMES-equivalent
+    // resolution" — `theme`/`theme_light`/`theme_dark` below all validate
+    // against the built-ins *plus* whatever `themes/*.toml` the config
+    // directory holds. A cheap re-scan (parse errors and low-contrast
+    // findings are silently discarded here — the real load, which warns on
+    // both, happens once at startup in `main`; this is a name-membership
+    // pre-check only) rather than threading a pre-loaded theme list through
+    // `resolve`'s signature, which every existing caller (including every
+    // test in this module) would otherwise have to grow a new parameter for.
+    let user_theme_names: Vec<String> = crate::theme::user_theme_names(
+        config_path
+            .and_then(Path::parent)
+            .map(|d| d.join("themes"))
+            .as_deref(),
+    );
+    let theme_name_is_known = |s: &str| -> bool {
+        Theme::by_name(s).is_some() || user_theme_names.iter().any(|n| n == s)
+    };
+
     let known_top_level: BTreeSet<&str> = [
         "config_version",
         "lang",
@@ -477,6 +513,7 @@ pub fn resolve(
         "theme_light",
         "theme_dark",
         "hyperlinks",
+        "color_depth",
     ]
     .into_iter()
     .collect();
@@ -504,11 +541,11 @@ pub fn resolve(
         table.get("theme"),
         "terminal",
         |s| {
-            if Theme::by_name(s).is_some() {
+            if theme_name_is_known(s) {
                 Ok(s.to_string())
             } else {
                 Err(format!(
-                    "unknown theme {s:?} — one of: {}",
+                    "unknown theme {s:?} — one of: {} (or a themes/*.toml name)",
                     Theme::NAMES.join(", ")
                 ))
             }
@@ -560,7 +597,7 @@ pub fn resolve(
     let reading_wpm = resolve_reading_wpm(&table, &mut issues);
     let prefetch = resolve_prefetch(env, &table, &mut issues);
     let network_contact = resolve_network_contact(env, &table, &mut issues);
-    let terminal = resolve_terminal(env, &table, &mut issues);
+    let terminal = resolve_terminal(env, &table, &user_theme_names, &mut issues);
 
     ResolvedConfig {
         config_version: Valued {
@@ -1370,8 +1407,12 @@ fn resolve_network_contact(
 fn resolve_terminal(
     env: &EnvOverrides,
     table: &toml::Table,
+    user_theme_names: &[String],
     issues: &mut Vec<Issue>,
 ) -> ResolvedTerminal {
+    let theme_name_is_known = |s: &str| -> bool {
+        Theme::by_name(s).is_some() || user_theme_names.iter().any(|n| n == s)
+    };
     ResolvedTerminal {
         mouse: resolve_bool_field("mouse", None, table.get("mouse"), false, issues),
         animations: resolve_closed_string_field(
@@ -1390,11 +1431,11 @@ fn resolve_terminal(
             table.get("theme_light"),
             "paper",
             |s| {
-                if Theme::by_name(s).is_some() {
+                if theme_name_is_known(s) {
                     Ok(s.to_string())
                 } else {
                     Err(format!(
-                        "unknown theme {s:?} — one of: {}",
+                        "unknown theme {s:?} — one of: {} (or a themes/*.toml name)",
                         Theme::NAMES.join(", ")
                     ))
                 }
@@ -1408,11 +1449,11 @@ fn resolve_terminal(
             table.get("theme_dark"),
             "terminal",
             |s| {
-                if Theme::by_name(s).is_some() {
+                if theme_name_is_known(s) {
                     Ok(s.to_string())
                 } else {
                     Err(format!(
-                        "unknown theme {s:?} — one of: {}",
+                        "unknown theme {s:?} — one of: {} (or a themes/*.toml name)",
                         Theme::NAMES.join(", ")
                     ))
                 }
@@ -1425,6 +1466,14 @@ fn resolve_terminal(
             table.get("hyperlinks"),
             "auto",
             &["auto", "on", "off"],
+            issues,
+        ),
+        color_depth: resolve_closed_string_field(
+            "color_depth",
+            env.color_depth.as_deref(),
+            table.get("color_depth"),
+            "auto",
+            &["auto", "truecolor", "256", "16", "mono"],
             issues,
         ),
     }
@@ -3041,6 +3090,93 @@ mod tests {
                 .iter()
                 .any(|i| i.message.contains("theme_light"))
         );
+        cleanup(&path);
+    }
+
+    /// PRD FR-TH-1: "a user theme's name joins Theme::NAMES-equivalent
+    /// resolution" — `theme = "solar"` validates against a `themes/solar.toml`
+    /// sitting next to `config.toml`, the same directory relationship
+    /// `keymap.toml` already has with `config.toml` (`main::run`).
+    #[test]
+    fn theme_field_accepts_a_user_theme_name_from_the_themes_directory() {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "wikitui-config-themes-test-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(dir.join("themes")).unwrap();
+        std::fs::write(
+            dir.join("themes").join("solar.toml"),
+            "[meta]\nname = \"solar\"\n[colors]\nbg = \"#222222\"\nfg = \"#eeeeee\"\nlink = \"#4488ff\"\n",
+        )
+        .unwrap();
+        let config_path = dir.join("config.toml");
+        std::fs::write(&config_path, "theme = \"solar\"\n").unwrap();
+
+        let resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&config_path),
+        );
+        assert_eq!(resolved.theme.value, "solar");
+        assert_eq!(resolved.theme.source, Source::File);
+        assert!(resolved.issues.is_empty(), "{:?}", resolved.issues);
+
+        // theme_light/theme_dark share the exact same resolution.
+        std::fs::write(
+            &config_path,
+            "theme_light = \"solar\"\ntheme_dark = \"solar\"\n",
+        )
+        .unwrap();
+        let resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&config_path),
+        );
+        assert_eq!(resolved.terminal.theme_light.value, "solar");
+        assert_eq!(resolved.terminal.theme_dark.value, "solar");
+        assert!(resolved.issues.is_empty(), "{:?}", resolved.issues);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// PRD FR-TH-3: `color_depth` is file/env-resolved against the closed
+    /// `auto|truecolor|256|16|mono` set, same pattern as `hyperlinks`.
+    #[test]
+    fn color_depth_reads_from_file_env_and_validates_the_closed_set() {
+        let path = temp_config("color_depth = \"256\"\n");
+        let resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(resolved.terminal.color_depth.value, "256");
+        assert_eq!(resolved.terminal.color_depth.source, Source::File);
+        cleanup(&path);
+
+        let path = temp_config("color_depth = \"bogus\"\n");
+        let resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(resolved.terminal.color_depth.value, "auto");
+        assert!(
+            resolved
+                .issues
+                .iter()
+                .any(|i| i.message.contains("color_depth"))
+        );
+        cleanup(&path);
+
+        let path = temp_config("color_depth = \"256\"\n");
+        let env = EnvOverrides {
+            color_depth: Some("mono".to_string()),
+            ..EnvOverrides::default()
+        };
+        let resolved = resolve(&CliOverrides::default(), &env, Some(&path));
+        assert_eq!(resolved.terminal.color_depth.value, "mono");
+        assert_eq!(resolved.terminal.color_depth.source, Source::Env);
         cleanup(&path);
     }
 

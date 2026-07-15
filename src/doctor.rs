@@ -1,8 +1,10 @@
 //! `wikitui config doctor` (PRD §6.7): a plain-stdout report that runs
 //! before any TUI initialization — a broken terminal state must never be
-//! the reason a config problem is hard to see. Four sections, in order:
-//! resolved config (with per-value provenance), config problems, the
-//! FR-TH-6 theme-contrast lint, and a terminal-capability report.
+//! the reason a config problem is hard to see. Five sections, in order:
+//! resolved config (with per-value provenance), config problems, user theme
+//! files (FR-TH-1/6), the FR-TH-6 contrast lint (built-ins and user themes
+//! both), and a terminal-capability report (including FR-TH-3's resolved
+//! color depth).
 //!
 //! Exit code is the only thing anything else should depend on: 0 when
 //! nothing rose to `IssueLevel::Error` (unknown keys and rejected values
@@ -16,15 +18,51 @@ use crate::theme;
 
 /// Prints the full report to stdout and returns the process exit code.
 pub fn run(resolved: &ResolvedConfig) -> i32 {
+    // PRD FR-TH-1: the same `themes/` directory `main::run` loads from —
+    // `doctor` is a standalone entry point (PRD §6.7), so it re-loads here
+    // rather than depending on a prior load having happened in this process.
+    let themes_dir = resolved
+        .config_path
+        .as_deref()
+        .and_then(|p| p.parent())
+        .map(|d| d.join("themes"));
+    let (user_themes, theme_warnings) = theme::load_user_themes(themes_dir.as_deref());
+
     print_resolved_config(resolved);
     println!();
     print_problems(resolved);
     println!();
-    print_contrast_lint();
+    print_user_themes(&user_themes, &theme_warnings);
     println!();
-    print_capabilities();
+    print_contrast_lint(&user_themes);
+    println!();
+    print_capabilities(&resolved.terminal.color_depth.value);
 
     if resolved.has_errors() { 1 } else { 0 }
+}
+
+/// PRD FR-TH-1: lists every theme file `load_user_themes` found under
+/// `themes_dir`, its declared `dark`/`allow_low_contrast` metadata and
+/// source path, and any parse warning (a bad file is never fatal here
+/// either — see that function's own doc comment).
+fn print_user_themes(user_themes: &[theme::LoadedUserTheme], warnings: &[String]) {
+    println!("User theme files (FR-TH-1):");
+    if user_themes.is_empty() && warnings.is_empty() {
+        println!("  none found");
+        return;
+    }
+    for t in user_themes {
+        println!(
+            "  {:?}: {} ({}, allow_low_contrast={})",
+            t.name,
+            t.source.display(),
+            if t.dark { "dark" } else { "light" },
+            t.allow_low_contrast
+        );
+    }
+    for warning in warnings {
+        println!("  [warning] {warning}");
+    }
 }
 
 fn print_resolved_config(resolved: &ResolvedConfig) {
@@ -192,7 +230,14 @@ fn print_problems(resolved: &ResolvedConfig) {
     }
 }
 
-fn print_contrast_lint() {
+/// FR-TH-6, extended (deliverable 3) to user theme files: built-ins first
+/// (unchanged from before this chunk), then every loaded user theme's own
+/// fg/bg, link/bg, dim/bg ratios. A user theme with `[meta]
+/// allow_low_contrast = true` still shows its ratio (so the number is never
+/// hidden) but never the `<-- WARN` flag — the same suppression
+/// `load_user_themes` itself already applies to the startup warning this
+/// report is the on-demand equivalent of.
+fn print_contrast_lint(user_themes: &[theme::LoadedUserTheme]) {
     println!(
         "Theme contrast lint (FR-TH-6, warns below {:.1}:1):",
         theme::ContrastCheck::AA_THRESHOLD
@@ -223,15 +268,49 @@ fn print_contrast_lint() {
     {
         println!("  note: night's fg/bg clears AA but not AAA by design (Appendix C) — not a bug");
     }
+
+    if !user_themes.is_empty() {
+        println!("  -- user themes --");
+        let user_report = theme::user_contrast_report(user_themes);
+        for t in user_themes {
+            for check in user_report.iter().filter(|c| c.theme == t.name.as_str()) {
+                let flag = if check.passes() || t.allow_low_contrast {
+                    ""
+                } else {
+                    " <-- WARN"
+                };
+                println!(
+                    "  {}: {} = {:.2}:1 [{}]{flag}",
+                    check.theme,
+                    check.pair,
+                    check.ratio,
+                    check.level()
+                );
+            }
+        }
+    }
 }
 
-fn print_capabilities() {
+fn print_capabilities(configured_color_depth: &str) {
     println!("Terminal capabilities:");
     let colorterm = std::env::var("COLORTERM").unwrap_or_default();
     let truecolor = colorterm == "truecolor" || colorterm == "24bit";
     println!("  truecolor ($COLORTERM={colorterm:?}): {truecolor}");
     println!("  $TERM: {:?}", std::env::var("TERM").unwrap_or_default());
     println!("  NO_COLOR active: {}", crate::no_color_active());
+    // PRD FR-TH-3: the depth every theme's colors actually get mapped to —
+    // NO_COLOR forces mono the same way it does everywhere else (FR-TH-5's
+    // policy layer), otherwise `color_depth` resolves `auto` against the
+    // env pair printed just above.
+    let depth = if crate::no_color_active() {
+        theme::ColorDepth::Mono
+    } else {
+        theme::resolve_color_depth(configured_color_depth)
+    };
+    println!(
+        "  color_depth = {configured_color_depth:?} -> resolved: {}",
+        depth.label()
+    );
     let stdout_is_tty = std::io::stdout().is_terminal();
     println!("  stdout is a tty: {stdout_is_tty}");
     match crossterm::terminal::size() {
