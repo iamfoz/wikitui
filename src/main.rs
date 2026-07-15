@@ -37,6 +37,7 @@ mod saved;
 mod saved_export;
 mod search_ops;
 mod session;
+mod sisters;
 mod split;
 mod startpage;
 mod stats;
@@ -304,6 +305,14 @@ async fn main() -> Result<()> {
         if let Some(lang) = target.lang {
             cli_overrides.lang = Some(lang);
         }
+        // PRD FR-ML-4: a sister-project URL/prefix (`wikt:Word`,
+        // `en.wiktionary.org/wiki/Word`) starts the whole session on that
+        // wiki, not just this one fetch — same "the argument overrides
+        // everything else" precedence as its language prefix, just one
+        // layer up (`config::resolve_wiki`'s `cli.active_wiki`).
+        if let Some(project) = target.project {
+            cli_overrides.active_wiki = Some(project);
+        }
         cli.title = Some(target.title);
     }
 
@@ -378,16 +387,29 @@ async fn main() -> Result<()> {
         && std::io::IsTerminal::is_terminal(&std::io::stdout())
         && config::first_run(config_path.as_deref());
 
-    // NF-NET-2: the default contact needs no rebuild of the UA string; only a
-    // configured `[network] contact` takes the `with_contact` path.
-    let client = if resolved.network_contact.source == config::Source::Default {
-        WikiClient::new(resolved.base_url_template.value.clone())?
-    } else {
-        WikiClient::with_contact(
-            resolved.base_url_template.value.clone(),
-            &resolved.network_contact.value,
-        )?
+    // PRD FR-ML-4/5: the client starts already knowing the active wiki's
+    // name, host template, and feature-degradation matrix — no separate
+    // "probe the wiki" round trip before the first real request.
+    let wiki_capabilities = api::WikiCapabilities {
+        parser: api::ParserMode::parse(&resolved.wiki_capabilities.parser.value)
+            .unwrap_or(api::ParserMode::Auto),
+        wikifeeds: resolved.wiki_capabilities.wikifeeds.value,
+        pageviews: resolved.wiki_capabilities.pageviews.value,
+        pageassessments: resolved.wiki_capabilities.pageassessments.value,
     };
+    // NF-NET-2: the default contact needs no rebuild of the UA string; only a
+    // configured `[network] contact` takes a non-default one.
+    let contact = if resolved.network_contact.source == config::Source::Default {
+        api::DEFAULT_CONTACT
+    } else {
+        &resolved.network_contact.value
+    };
+    let client = WikiClient::with_wiki(
+        resolved.active_wiki.value.clone(),
+        resolved.base_url_template.value.clone(),
+        wiki_capabilities,
+        contact,
+    )?;
     let page_cache = PageCache::open(
         resolved.cache_dir.value.clone(),
         resolved.cache_max_mb.value.saturating_mul(1024 * 1024),
@@ -540,6 +562,8 @@ async fn main() -> Result<()> {
         resolved.auth.clone(),
         resolved.network_contact.value.clone(),
         resolved.watchlist_mirror_tag.value.clone(),
+        resolved.active_wiki.value.clone(),
+        resolved.wiki_registry.clone(),
     )
     .await
 }
@@ -578,6 +602,11 @@ fn cli_overrides_from(cli: &Cli) -> config::CliOverrides {
         measure: cli.measure,
         ambiguous_width: cli.ambiguous_width,
         cite_style: cli.cite_style.clone(),
+        // Filled in by the TITLE-argument handling just below, once the
+        // argument itself has been parsed (a sister-project URL/prefix
+        // can't be known until then) — matching `lang`'s own split for the
+        // exact same reason.
+        active_wiki: None,
     }
 }
 
@@ -1001,6 +1030,36 @@ async fn execute_rank_links(
     weights: netqueue::RankWeights,
     top_n: usize,
 ) -> netqueue::ExecResult {
+    // PRD FR-ML-5's degradation matrix: a wiki without `prop=pageviews`
+    // skips the request entirely rather than making a call it knows will
+    // never carry that data — `rank_links` already degrades to
+    // lead-position-only when the pageviews map is empty (every candidate's
+    // views default to 0, so the pageviews term is 0 too — the same math an
+    // unseen title already gets), so no separate "degraded" ranking path is
+    // needed here, only the skipped request.
+    if !client.capabilities().pageviews {
+        let ranked = prefetch::rank_links(
+            article_title,
+            candidates,
+            &std::collections::HashMap::new(),
+            affinity,
+            weights,
+            top_n,
+        );
+        let follow_ups = ranked
+            .into_iter()
+            .map(|r| netqueue::Job::PrefetchArticle {
+                lang: lang.to_string(),
+                title: r.title,
+                reason: r.reason,
+                log_id: 0,
+            })
+            .collect();
+        return netqueue::ExecResult {
+            outcome: netqueue::Outcome::Done { bytes: 0 },
+            follow_ups,
+        };
+    }
     match client.fetch_link_pageviews(lang, article_title).await {
         Ok((pageviews, bytes)) => {
             let ranked = prefetch::rank_links(
@@ -1041,6 +1100,22 @@ async fn execute_featured(
     lang: &str,
     date: &str,
 ) -> netqueue::ExecResult {
+    // PRD FR-ML-5: no Wikifeeds on this wiki means no daily feed to fetch —
+    // `feed_cache` stays empty, which `App::start_page_model` already reads
+    // as "the feed never showed up," falling back to
+    // `StartPageModel::offline_fallback`'s simpler view (recent history /
+    // saved pages), the exact same degradation an offline reader already
+    // sees. Checked before `should_fetch` so a capability change mid-session
+    // (`:wiki`) is picked up immediately rather than waiting for the date to
+    // roll over.
+    if !client.capabilities().wikifeeds {
+        return netqueue::ExecResult {
+            outcome: netqueue::Outcome::Skipped {
+                note: "Wikifeeds not supported on this wiki".to_string(),
+            },
+            follow_ups: Vec::new(),
+        };
+    }
     if !feed_cache.lock().unwrap().should_fetch(date) {
         return netqueue::ExecResult {
             outcome: netqueue::Outcome::Skipped {
@@ -2008,9 +2083,37 @@ async fn run(
     auth_cfg: config::ResolvedAuth,
     contact: String,
     watchlist_mirror_tag: String,
+    active_wiki: String,
+    wiki_registry: config::ResolvedWikiRegistry,
 ) -> Result<()> {
     let mut app = App::new(lang, theme, no_color);
     app.keymap = keymap;
+    // PRD FR-ML-4/5: mirrors what `client` was already constructed with
+    // (`main`'s `WikiClient::with_wiki` call) plus every other name `:wiki`
+    // can switch to — see `App::wiki_registry`'s own doc comment for why
+    // this lives on `App` too instead of requiring `&WikiClient` everywhere
+    // a name needs resolving.
+    app.active_wiki_name = active_wiki;
+    app.wiki_registry = wiki_registry
+        .entries
+        .into_iter()
+        .map(|(name, entry)| {
+            let caps = entry.capabilities;
+            (
+                name,
+                api::WikiRegistryEntry {
+                    base_url_template: entry.base_url_template.value,
+                    capabilities: api::WikiCapabilities {
+                        parser: api::ParserMode::parse(&caps.parser.value)
+                            .unwrap_or(api::ParserMode::Auto),
+                        wikifeeds: caps.wikifeeds.value,
+                        pageviews: caps.pageviews.value,
+                        pageassessments: caps.pageassessments.value,
+                    },
+                },
+            )
+        })
+        .collect();
     app.languages = languages;
     app.accessible = accessible;
     // PRD FR-TH-3: `color_depth`/`user_themes` must be in place *before*
@@ -2633,6 +2736,35 @@ fn open_lang_picker(app: &mut App, client: &WikiClient, tx: &UnboundedSender<Lan
     }
 }
 
+/// PRD FR-ML-4/5's `:wiki <name>` switch: looks `name` up in the
+/// config-resolved registry (Wikipedia, the four sister projects, and every
+/// `[wiki.<name>]` section — `config::resolve_wiki`) and repoints the
+/// client's host + capability matrix at it (`WikiClient::switch_wiki`).
+/// Mirrors `:lang`'s "no cached edition" branch: changes the default for
+/// *future* searches/opens rather than force-navigating the active tab —
+/// nothing about the article on screen changes. Returns whether the switch
+/// happened, so `Command::Wiki`'s caller can decide whether to also show a
+/// success notice or leave the "unknown wiki" one this sets on failure.
+fn switch_wiki(client: &WikiClient, app: &mut App, name: &str) -> bool {
+    let Some(entry) = app.wiki_registry.get(name).cloned() else {
+        app.notice = Some(format!(
+            "unknown wiki {name:?} — configure [wiki.{name}] in config.toml, or :wiki to pick a known project"
+        ));
+        return false;
+    };
+    client.switch_wiki(
+        name.to_string(),
+        entry.base_url_template,
+        entry.capabilities,
+    );
+    app.active_wiki_name = name.to_string();
+    app.notice = Some(format!(
+        "Wiki: {name} — searches and opens now use {}",
+        client.wiki_origin(&app.lang)
+    ));
+    true
+}
+
 /// Enter on a language-picker row, and `:lang <code>`'s switch branch (PRD
 /// FR-ML-1): opens `title` in `lang` as a fresh navigation in the active
 /// tab — pushes the tab's current article onto its back stack (so `H`
@@ -2999,7 +3131,12 @@ async fn toggle_talk_page(
 /// "skippable when the reader already said no to background traffic."
 async fn enrich_article(client: &WikiClient, app: &mut App, lang: &str, title: &str) {
     let key = (lang.to_string(), title.to_string());
-    if !app.quality_cache.contains_key(&key)
+    // PRD FR-ML-5: a wiki without PageAssessments never gets the lookup
+    // attempted, so `quality_cache` simply never gains an entry for it — the
+    // same visible result (no badge) as a wiki that has the extension but no
+    // assessment for this one title.
+    if client.capabilities().pageassessments
+        && !app.quality_cache.contains_key(&key)
         && let Ok(assessments) = client.page_assessments(lang, &[title.to_string()]).await
         && let Some(class) = assessments.get(title)
     {
@@ -3865,6 +4002,25 @@ async fn handle_key(
                 if let Some(entry) = app.jump_to_back_entry(index) {
                     open_history_entry(client, cache, app, entry, revalidate_tx).await;
                 }
+            }
+            KeyCode::Char('?') => {
+                app.prior_mode = app.mode;
+                app.mode = Mode::Help;
+            }
+            _ => {}
+        },
+        // PRD FR-ML-4's bare `:wiki` picker: Wikipedia + the four sister
+        // projects. Enter switches (same state change `:wiki <name>` makes),
+        // Esc cancels. No fetch to kick off — the list never changes.
+        Mode::WikiPicker => match code {
+            KeyCode::Esc => app.mode = Mode::Reading,
+            KeyCode::Char('j') | KeyCode::Down => app.cycle_wiki_pick(true),
+            KeyCode::Char('k') | KeyCode::Up => app.cycle_wiki_pick(false),
+            KeyCode::Enter => {
+                if let Some(name) = app.wiki_picker_target() {
+                    switch_wiki(client, app, &name);
+                }
+                app.mode = Mode::Reading;
             }
             KeyCode::Char('?') => {
                 app.prior_mode = app.mode;
@@ -5247,6 +5403,8 @@ async fn dispatch_action(
         }
         Action::RelatedPanel => open_related(app, client, related_tx),
         Action::LangPicker => open_lang_picker(app, client, langlinks_tx),
+        // PRD FR-ML-4: same picker `:wiki` (bare) opens.
+        Action::WikiPicker => app.open_wiki_picker(),
         Action::Home => app.go_home(),
         Action::Today => fetch_on_this_day(client, app).await,
         Action::Info => {
@@ -6303,9 +6461,13 @@ async fn execute_command(
     use command::{Command, LoginMode, RandomSpec, SaveSpec};
     match cmd {
         Command::Open(raw) => {
-            // Same grammar as the CLI TITLE argument: URLs and
-            // lang-prefixed titles work here too.
+            // Same grammar as the CLI TITLE argument: URLs, lang-prefixed
+            // titles, and now sister-project URLs/interwiki prefixes
+            // (PRD FR-ML-4) all work here too.
             let target = target::parse(&raw);
+            if let Some(project) = target.project {
+                switch_wiki(client, app, &project);
+            }
             if let Some(lang) = target.lang {
                 app.lang = lang;
             }
@@ -6483,6 +6645,9 @@ async fn execute_command(
             app.new_foreground_tab();
             if let Some(raw) = title {
                 let target = target::parse(&raw);
+                if let Some(project) = target.project {
+                    switch_wiki(client, app, &project);
+                }
                 if let Some(lang) = target.lang {
                     app.lang = lang;
                 }
@@ -6577,6 +6742,11 @@ async fn execute_command(
         Command::Lang(None) => open_lang_picker(app, client, langlinks_tx),
         Command::Lang(Some(code)) => {
             set_or_switch_lang(client, cache, app, code, revalidate_tx, langlinks_tx).await
+        }
+        // PRD FR-ML-4/5.
+        Command::Wiki(None) => app.open_wiki_picker(),
+        Command::Wiki(Some(name)) => {
+            switch_wiki(client, app, &name);
         }
         // PRD FR-ACC-1 / §5.9.
         Command::Login(LoginMode::Loopback) => cmd_login_loopback(terminal, client, app).await,
@@ -6748,7 +6918,11 @@ async fn run_search(client: &WikiClient, app: &mut App) {
                 .map(|r| r.title.clone())
                 .filter(|t| !app.quality_cache.contains_key(&(lang.clone(), t.clone())))
                 .collect();
+            // PRD FR-ML-5: same capability gate as `enrich_article` — a wiki
+            // without PageAssessments never gets the batched lookup
+            // attempted, so no result row ever shows a badge for it.
             if !uncached.is_empty()
+                && client.capabilities().pageassessments
                 && let Ok(assessments) = client.page_assessments(&lang, &uncached).await
             {
                 app.quality_cache.extend(
@@ -6830,6 +7004,168 @@ mod tests {
         // A never-contacted client: the routing tests set `revalidate: None`
         // so no request is ever made through it.
         WikiClient::new("http://127.0.0.1:1/{lang}".to_string()).unwrap()
+    }
+
+    /// A dead-port client with an explicit capability matrix (PRD FR-ML-5) —
+    /// used by the degradation-decision tests below, where the whole point
+    /// is that a gated capability means the network is never touched at
+    /// all: if the gate were bypassed, the unreachable port would surface
+    /// as a `BgFailure`/error instead of the graceful degradation this
+    /// module documents.
+    fn test_client_with_capabilities(capabilities: api::WikiCapabilities) -> WikiClient {
+        WikiClient::with_wiki(
+            "test-wiki".to_string(),
+            "http://127.0.0.1:1/{lang}".to_string(),
+            capabilities,
+            api::DEFAULT_CONTACT,
+        )
+        .unwrap()
+    }
+
+    /// PRD FR-ML-5's degradation matrix: a wiki without Wikifeeds never even
+    /// attempts the daily feed request — `execute_featured` reports
+    /// `Skipped` immediately instead of hitting the network (which, against
+    /// this dead-port client, would otherwise surface as a failure).
+    #[tokio::test]
+    async fn execute_featured_skips_without_touching_the_network_when_wikifeeds_is_unsupported() {
+        let client = test_client_with_capabilities(api::WikiCapabilities {
+            parser: api::ParserMode::Auto,
+            wikifeeds: false,
+            pageviews: true,
+            pageassessments: true,
+        });
+        let feed_cache = Arc::new(std::sync::Mutex::new(prefetch::FeedCache::default()));
+        let result = execute_featured(&client, &feed_cache, "en", "2026-07-15").await;
+        match result.outcome {
+            netqueue::Outcome::Skipped { note } => {
+                assert!(note.contains("Wikifeeds"), "{note:?}")
+            }
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+        assert!(result.follow_ups.is_empty());
+    }
+
+    /// PRD FR-ML-5's degradation matrix: a wiki without `prop=pageviews`
+    /// never attempts the batched pageviews request — ranking still runs,
+    /// on lead position alone (the same math an unseen title's pageviews
+    /// term already reduces to: `rank_links` treats an absent title as 0
+    /// views, so this isn't a separate code path, just an empty map).
+    #[tokio::test]
+    async fn execute_rank_links_falls_back_to_lead_only_ranking_when_pageviews_is_unsupported() {
+        let client = test_client_with_capabilities(api::WikiCapabilities {
+            parser: api::ParserMode::Auto,
+            wikifeeds: true,
+            pageviews: false,
+            pageassessments: true,
+        });
+        let candidates = vec![
+            netqueue::LinkCandidate {
+                title: "Second link".to_string(),
+                lead_position: 1,
+                is_cursor: false,
+            },
+            netqueue::LinkCandidate {
+                title: "First link".to_string(),
+                lead_position: 0,
+                is_cursor: false,
+            },
+        ];
+        let result = execute_rank_links(
+            &client,
+            "en",
+            "Source Article",
+            &candidates,
+            &std::collections::HashMap::new(),
+            netqueue::RankWeights::default(),
+            10,
+        )
+        .await;
+        match result.outcome {
+            netqueue::Outcome::Done { bytes } => assert_eq!(bytes, 0),
+            other => panic!("expected Done{{bytes:0}}, got {other:?}"),
+        }
+        // Lead position alone (no pageviews term) ranks the earlier link
+        // first — deterministic without any network data.
+        let titles: Vec<&str> = result
+            .follow_ups
+            .iter()
+            .map(|j| match j {
+                netqueue::Job::PrefetchArticle { title, reason, .. } => {
+                    assert!(
+                        !reason.contains("views/day"),
+                        "no pageviews term expected: {reason:?}"
+                    );
+                    title.as_str()
+                }
+                other => panic!("expected PrefetchArticle, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(titles, vec!["First link", "Second link"]);
+    }
+
+    /// PRD FR-ML-5's degradation matrix: a wiki without PageAssessments
+    /// never attempts the lookup, so `quality_cache` gains no entry for the
+    /// article — the same visible result as "no badge" (`enrich_article`'s
+    /// own doc comment covers why this is folded into the same gate as the
+    /// redlink/interest work rather than a separate function).
+    #[tokio::test]
+    async fn enrich_article_skips_the_quality_lookup_when_pageassessments_is_unsupported() {
+        let client = test_client_with_capabilities(api::WikiCapabilities {
+            parser: api::ParserMode::Auto,
+            wikifeeds: false,
+            pageviews: false,
+            pageassessments: false,
+        });
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.interest_learning = false; // isolates this test from the categories fetch
+        enrich_article(&client, &mut app, "en", "Some Article").await;
+        assert!(app.quality_cache.is_empty());
+    }
+
+    /// PRD FR-ML-4/5's `:wiki <name>` switch: a name in the registry
+    /// repoints both `app.active_wiki_name` and the shared client state
+    /// (`WikiClient::active_wiki_name`/`host`) at once.
+    #[test]
+    fn switch_wiki_updates_app_and_client_for_a_known_name() {
+        let client = WikiClient::new(config::DEFAULT_BASE_URL_TEMPLATE.to_string()).unwrap();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.wiki_registry.insert(
+            "archwiki".to_string(),
+            api::WikiRegistryEntry {
+                base_url_template: "https://wiki.archlinux.org".to_string(),
+                capabilities: api::WikiCapabilities {
+                    parser: api::ParserMode::Legacy,
+                    wikifeeds: false,
+                    pageviews: false,
+                    pageassessments: false,
+                },
+            },
+        );
+
+        assert!(switch_wiki(&client, &mut app, "archwiki"));
+        assert_eq!(app.active_wiki_name, "archwiki");
+        assert_eq!(client.active_wiki_name(), "archwiki");
+        assert_eq!(client.wiki_origin("en"), "https://wiki.archlinux.org");
+        assert_eq!(client.capabilities().parser, api::ParserMode::Legacy);
+        assert!(app.notice.as_deref().unwrap().contains("archwiki"));
+    }
+
+    /// An unrecognized name leaves everything unchanged and explains why,
+    /// rather than silently doing nothing (PRD FR-ML-5's config-driven
+    /// registry: the reader needs to know to add a `[wiki.<name>]` section).
+    #[test]
+    fn switch_wiki_reports_an_unknown_name_without_changing_state() {
+        let client = WikiClient::new(config::DEFAULT_BASE_URL_TEMPLATE.to_string()).unwrap();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        assert!(!switch_wiki(&client, &mut app, "not-configured"));
+        assert_eq!(app.active_wiki_name, "wikipedia");
+        assert_eq!(client.active_wiki_name(), "wikipedia");
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("unknown wiki \"not-configured\"")
+        );
     }
 
     #[test]

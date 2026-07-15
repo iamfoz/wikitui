@@ -64,6 +64,39 @@ Math and redlink fixtures (PRD FR-RD-7, FR-DL-5):
   `"missing": true`, the same technique a real wiki's `generator=links&
   prop=info` responds with.
 
+Sister-project and arbitrary-MediaWiki fixtures (PRD FR-ML-4/5, §6.2 rule 3):
+
+- `computer_(word)` — a Wiktionary-shaped dictionary entry (etymology,
+  part-of-speech headers, a numbered sense list, a "Related terms" section)
+  proving sister-project articles render "as-is" through the same `doc.rs`
+  pipeline, no per-project special-casing. This mock has one flat article
+  namespace regardless of which path prefix a `[wiki.<name>]` section's
+  `base_url` points at (matching how a language prefix already works — see
+  `_lang_prefix`'s own comment), so pointing a `wiktionary` wiki at
+  `http://127.0.0.1:8943/wiktionary` resolves this title exactly like any
+  other `[wiki.*]` config does.
+- **The legacy-parser fallback** (§6.2 rule 3's core degradation path):
+  any `base_url` whose path contains `/legacywiki/` gets its Parsoid REST
+  route (`/rest.php/v1/page/{title}/html`) intercepted into a bare, bodyless
+  404 — simulating a wiki that doesn't run Parsoid REST at all. Contrast a
+  *genuine* missing-title 404 elsewhere on this mock (`_serve_genuine_miss_404`),
+  which always carries a JSON error envelope (`errorKey`) the real core REST
+  API sends for that case — that's the exact distinction
+  `api::WikiClient::fetch_article_html`'s auto-fallback logic keys on to
+  decide "try legacy `action=parse` instead" versus "report the article
+  missing." A `[wiki.<name>] base_url = "http://127.0.0.1:8943/legacywiki"`
+  config (with no other capability keys — `parser` defaults to `"auto"`)
+  makes every article open fall through to the legacy endpoint below and
+  still render, links/sections intact.
+- `GET .../w/api.php?action=parse&prop=text&page=` — the legacy
+  `action=parse` endpoint, served from the *same* `PAGES` dict as the
+  Parsoid endpoint (so a legacy-only wiki's articles are byte-identical to
+  their Parsoid counterparts, just fetched a different way), in the real
+  `formatversion=2` shape (`parse.text` is a raw HTML string, `parse.revid`
+  the fixture's usual revid). A missing title reports `{"error":
+  {"code": "missingtitle", ...}}` at HTTP 200 — matching how the real Action
+  API answers `action=parse`, never a 404 (unlike the core REST endpoint).
+
 Two-layer cache / stale-while-revalidate fixtures (PRD FR-OFF-1/2):
 
 - `GET /w/rest.php/v1/page/{title}/html` also sends an `ETag: W/"{revid}/mock-etag"`
@@ -292,6 +325,27 @@ Note the env var is `WIKITUI_BASE_URL`, not `WIKITUI_TEST_BASE_URL` — an
 earlier, unsupported name used only while this override didn't exist yet.
 `WIKITUI_TEST_BASE_URL` is not read by wikitui and never will be; don't
 resurrect it.
+
+`[wiki.<name>]` sections also take the FR-ML-5 capability keys (`parser`,
+`wikifeeds`, `pageviews`, `pageassessments`) alongside `base_url` — see
+`config::resolve_wiki`'s doc comment for what each defaults to. Two
+end-to-end examples against this mock:
+
+```toml
+# A sister project (PRD FR-ML-4), reached via the flat namespace above.
+active_wiki = "wiktionary"
+[wiki.wiktionary]
+base_url = "http://127.0.0.1:8943/wiktionary"
+
+# A wiki with no Parsoid REST at all (PRD FR-ML-5 / §6.2 rule 3): the
+# `/legacywiki/` path segment is what this mock keys the bare-404 simulation
+# on (see this file's own fixture section above); `parser` is left at its
+# `"auto"` default, so the client discovers the fallback itself rather than
+# needing to be told about it.
+active_wiki = "legacywiki"
+[wiki.legacywiki]
+base_url = "http://127.0.0.1:8943/legacywiki"
+```
 
 ## Extending it
 

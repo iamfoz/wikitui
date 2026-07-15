@@ -123,17 +123,111 @@ fn decode_lossy_utf8(bytes: Vec<u8>) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+/// PRD FR-ML-5's per-wiki feature-degradation matrix: which optional
+/// endpoints/parser the active wiki is declared to support. Wikipedia's own
+/// defaults (`parser: Auto, wikifeeds/pageviews/pageassessments: true`) are
+/// the unconditional pre-this-chunk behavior; every other wiki (a sister
+/// project or a third-party `[wiki.<name>]` site) defaults the latter three
+/// off (`config::resolve_wiki`), so degradation only ever engages away from
+/// the default install.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WikiCapabilities {
+    pub parser: ParserMode,
+    /// Wikifeeds (`feed/featured`, `feed/onthisday`) — gates the FR-DL-1
+    /// start-page feed / FR-PF-2 trending prefetch (`execute_featured`).
+    pub wikifeeds: bool,
+    /// `prop=pageviews` — gates FR-PF-1's link-rank pageviews term
+    /// (`execute_rank_links`); false degrades ranking to lead-position-only.
+    pub pageviews: bool,
+    /// `prop=pageassessments` — gates the FR-DL-3 quality badge
+    /// (`enrich_article`); false means no badge is ever looked up.
+    pub pageassessments: bool,
+}
+
+impl WikiCapabilities {
+    /// Every feature on, Parsoid-first — the implicit behavior every wiki
+    /// had before this chunk, and still the built-in `wikipedia` default.
+    /// Only reachable today via [`WikiClient::new`]/[`WikiClient::
+    /// with_contact`] (production always resolves real capabilities through
+    /// [`WikiClient::with_wiki`] instead — see their own doc comments for
+    /// why they're kept anyway).
+    #[allow(dead_code)]
+    pub fn full() -> Self {
+        Self {
+            parser: ParserMode::Auto,
+            wikifeeds: true,
+            pageviews: true,
+            pageassessments: true,
+        }
+    }
+}
+
+/// PRD §6.2 rule 3's article-HTML source selector. `Auto` (the default) is
+/// what makes third-party wikis (FR-ML-5) work with zero config: try Parsoid
+/// REST first, and only pay for a second request when the first one comes
+/// back in a shape that means "this wiki doesn't run Parsoid REST" rather
+/// than "this article doesn't exist" (see [`parsoid_404_is_genuine_miss`]).
+/// `Parsoid`/`Legacy` are the explicit per-wiki `[wiki.<name>] parser =`
+/// overrides: `Parsoid` disables the fallback (surface the real error
+/// instead of silently masking a misconfigured wiki as "unsupported");
+/// `Legacy` skips the Parsoid attempt entirely, saving a doomed request on a
+/// wiki already known to lack it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParserMode {
+    Auto,
+    Parsoid,
+    Legacy,
+}
+
+impl ParserMode {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "auto" => Some(Self::Auto),
+            "parsoid" => Some(Self::Parsoid),
+            "legacy" => Some(Self::Legacy),
+            _ => None,
+        }
+    }
+}
+
+/// One entry in the client's wiki registry (PRD FR-ML-4/5): everything
+/// needed to point requests at a wiki by name — built once at startup from
+/// `config::ResolvedWikiRegistry` (Wikipedia, the four sister projects, and
+/// every `[wiki.<name>]` section) and consulted by `:wiki <name>`
+/// (`main::switch_wiki`) without re-reading the config file.
+#[derive(Debug, Clone)]
+pub struct WikiRegistryEntry {
+    pub base_url_template: String,
+    pub capabilities: WikiCapabilities,
+}
+
+/// The wiki a [`WikiClient`] currently addresses: its registry name (for
+/// `:wiki`'s "already on this wiki" check and `doctor`'s report), the host
+/// template, and its capability matrix. Shared, mutable client state (see
+/// `WikiClient`'s own doc comment) so `:wiki` can repoint every clone of the
+/// client at once without rebuilding the `reqwest::Client` underneath it.
+#[derive(Debug, Clone)]
+struct ActiveWiki {
+    name: String,
+    base_url_template: String,
+    capabilities: WikiCapabilities,
+}
+
 /// Cloned to hand a copy to a spawned background task (PRD FR-SR-1's
 /// typeahead can't block the UI thread on the loop's redraw/`event::poll`
-/// cycle) — cheap, since `reqwest::Client` is itself an `Arc` internally
-/// and `base_url_template` is a small `String`. Mirrors reqwest's own
+/// cycle) — cheap, since `reqwest::Client` is itself an `Arc` internally and
+/// the active wiki is behind an `Arc<RwLock<_>>`. Mirrors reqwest's own
 /// documented pattern of cloning the client rather than wrapping it.
+///
+/// The active wiki (host template + capability matrix) is `RwLock`-guarded
+/// rather than a plain field because PRD FR-ML-4's `:wiki` switch must
+/// repoint *every* clone of the client at once — the event loop threads
+/// `&WikiClient`/cloned `WikiClient`s through many spawned tasks, and a
+/// plain field would only ever update the one clone `:wiki` was called on.
 #[derive(Clone)]
 pub struct WikiClient {
     http: reqwest::Client,
-    /// The resolved `[wiki.*].base_url` / `WIKITUI_BASE_URL` template
-    /// (config.rs's `DEFAULT_BASE_URL_TEMPLATE` absent an override).
-    base_url_template: String,
+    active: std::sync::Arc<std::sync::RwLock<ActiveWiki>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -517,6 +611,77 @@ fn parse_revid_from_etag(etag: &str) -> Option<u64> {
     first.parse::<u64>().ok()
 }
 
+/// PRD §6.2 rule 3's fallback trigger, shared by the foreground and
+/// background Parsoid attempts: a 404 from a wiki that genuinely runs
+/// Parsoid REST carries MediaWiki's own JSON error envelope (an `errorKey`
+/// field, e.g. `rest-nonexistent-title`) — that shape means "this article
+/// doesn't exist," the same answer as today, unchanged. Any other 404 shape
+/// (no body at all, an HTML error page from a web server that never routed
+/// to MediaWiki, or JSON missing that field) means "this wiki doesn't run
+/// Parsoid REST" — §6.2 rule 3's documented cue to fall back to legacy
+/// `action=parse` instead of reporting a false "doesn't exist."
+fn parsoid_404_is_genuine_miss(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .is_some_and(|v| v.get("errorKey").is_some())
+}
+
+/// The outcome of one Parsoid REST attempt (fg/bg share this shape — see
+/// `fetch_article_html_parsoid`/`fetch_article_html_parsoid_bg`). Only a
+/// genuine transport/5xx failure propagates as an `Err` from those methods;
+/// a plain 404 always resolves to `Missing` or `Unsupported` here so the
+/// caller decides what it means without re-deriving the classification.
+enum ParsoidOutcome<T> {
+    Found(T),
+    /// PRD §6.2 rule 3: a genuinely nonexistent title (unchanged Wikipedia
+    /// behavior).
+    Missing,
+    /// This wiki doesn't run Parsoid REST at all — the FR-ML-5 fallback
+    /// trigger.
+    Unsupported,
+}
+
+/// Legacy `action=parse&prop=text` request URL (PRD §6.2 rule 3's
+/// third-party fallback) — `page=` rather than `titles=` (the single-page
+/// form `action=parse` actually accepts), `redirects=1` so a redirect
+/// resolves the same way Parsoid's own REST endpoint already does.
+fn legacy_parse_url(host: &str, title: &str) -> String {
+    format!(
+        "{host}/w/api.php?action=parse&format=json&formatversion=2&prop=text&redirects=1&page={}",
+        urlencoding::encode(&title.replace(' ', "_"))
+    )
+}
+
+/// `action=parse`'s response shape (formatversion=2): either a `parse`
+/// object (`text` is a raw HTML string in this format version, not the
+/// formatversion=1 `{"*": ...}` wrapper) or an `error` object for a missing
+/// title — MediaWiki reports that as HTTP 200 with `error.code ==
+/// "missingtitle"`, never a 404, unlike the core REST endpoint.
+#[derive(Debug, Deserialize, Default)]
+struct LegacyParseResponse {
+    #[serde(default)]
+    parse: Option<LegacyParse>,
+    #[serde(default)]
+    error: Option<LegacyParseError>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct LegacyParse {
+    #[serde(default)]
+    text: String,
+    /// Present on a real deployment's `action=parse` response even without
+    /// requesting `prop=revid` explicitly; `None` degrades to revid 0, the
+    /// same documented fallback as a missing Parsoid `ETag`.
+    #[serde(default)]
+    revid: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct LegacyParseError {
+    #[serde(default)]
+    info: String,
+}
+
 /// Full-text search results plus the did-you-mean suggestion, when the
 /// server offered one (PRD FR-SR-4).
 #[derive(Debug, Clone)]
@@ -530,13 +695,43 @@ impl WikiClient {
     /// `{lang}` is substituted per-request when present, else used
     /// verbatim — arbitrary MediaWiki sites (FR-ML-5) aren't per-language
     /// subdomains, so a template without `{lang}` addresses one fixed host.
+    /// Defaults to [`WikiCapabilities::full`] — every existing caller (tests
+    /// included) that only ever addressed Wikipedia keeps that unconditional
+    /// behavior; a real per-wiki matrix comes from [`Self::with_wiki`].
+    /// Production (`main::run`) always has a config-resolved matrix in hand
+    /// and calls [`Self::with_wiki`] directly, so this simpler constructor is
+    /// test-support surface today — kept public rather than `#[cfg(test)]`
+    /// since it's a legitimate, documented API a caller with no capability
+    /// data of its own can still reach for.
+    #[allow(dead_code)]
     pub fn new(base_url_template: String) -> Result<Self> {
         Self::with_contact(base_url_template, DEFAULT_CONTACT)
     }
 
     /// Like [`new`](Self::new) but with a configured contact channel for the
-    /// User-Agent (PRD NF-NET-2 / §6.2 rule 2's config-overridable networking).
+    /// User-Agent (PRD NF-NET-2 / §6.2 rule 2's config-overridable
+    /// networking) — same test-support scope as `new`.
+    #[allow(dead_code)]
     pub fn with_contact(base_url_template: String, contact: &str) -> Result<Self> {
+        Self::with_wiki(
+            "wikipedia".to_string(),
+            base_url_template,
+            WikiCapabilities::full(),
+            contact,
+        )
+    }
+
+    /// The real startup path (PRD FR-ML-4/5): `name` and `capabilities` come
+    /// from `config::ResolvedConfig`'s active-wiki resolution, so the client
+    /// starts already knowing whether this wiki has Wikifeeds/pageviews/
+    /// pageassessments and which parser to try first — no separate "probe
+    /// the wiki" round trip before the first real request.
+    pub fn with_wiki(
+        name: String,
+        base_url_template: String,
+        capabilities: WikiCapabilities,
+        contact: &str,
+    ) -> Result<Self> {
         let http = reqwest::Client::builder()
             .user_agent(build_user_agent(contact))
             .gzip(true)
@@ -549,15 +744,68 @@ impl WikiClient {
             .context("building HTTP client")?;
         Ok(Self {
             http,
-            base_url_template,
+            active: std::sync::Arc::new(std::sync::RwLock::new(ActiveWiki {
+                name,
+                base_url_template,
+                capabilities,
+            })),
         })
     }
 
+    /// PRD FR-ML-4's `:wiki <name>` switch: repoints every clone of this
+    /// client at a different wiki's host + capability matrix at once (see
+    /// the struct doc comment for why this is `RwLock`-guarded rather than a
+    /// plain field). Takes effect on the very next request — nothing needs
+    /// to be rebuilt or re-cloned.
+    pub fn switch_wiki(
+        &self,
+        name: String,
+        base_url_template: String,
+        capabilities: WikiCapabilities,
+    ) {
+        let mut guard = self.active.write().unwrap_or_else(|e| e.into_inner());
+        *guard = ActiveWiki {
+            name,
+            base_url_template,
+            capabilities,
+        };
+    }
+
+    /// The registry name of the wiki this client currently addresses
+    /// (`"wikipedia"`, `"wiktionary"`, or a custom `[wiki.<name>]` name).
+    /// `App::active_wiki_name` mirrors this for code that only has `&App`
+    /// (every current caller); kept as a client accessor too since it's the
+    /// authoritative value `switch_wiki` actually set, exercised directly by
+    /// this module's own tests.
+    #[allow(dead_code)]
+    pub fn active_wiki_name(&self) -> String {
+        self.active
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .name
+            .clone()
+    }
+
+    /// The current wiki's feature-degradation matrix (PRD FR-ML-5) — cheap
+    /// to call per-request since `WikiCapabilities` is `Copy`.
+    pub fn capabilities(&self) -> WikiCapabilities {
+        self.active
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .capabilities
+    }
+
     fn host(&self, lang: &str) -> String {
-        if self.base_url_template.contains("{lang}") {
-            self.base_url_template.replace("{lang}", lang)
+        let template = self
+            .active
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .base_url_template
+            .clone();
+        if template.contains("{lang}") {
+            template.replace("{lang}", lang)
         } else {
-            self.base_url_template.clone()
+            template
         }
     }
 
@@ -573,9 +821,48 @@ impl WikiClient {
         urlencoding::encode(&title.replace(' ', "_")).into_owned()
     }
 
-    /// Fetch Parsoid HTML for an article (PRD §6.2 rule 3: core REST
-    /// `/w/rest.php/v1/page/{title}/html` is the primary content source).
+    /// Fetch an article's HTML (PRD §6.2 rule 3). Tries Parsoid REST core
+    /// REST `/w/rest.php/v1/page/{title}/html` — the primary content source
+    /// — first unless this wiki's `parser` capability is `Legacy`; on an
+    /// unsupported-shaped 404 (see [`parsoid_404_is_genuine_miss`]) falls
+    /// back to legacy `action=parse&prop=text`, the documented FR-ML-5
+    /// fallback for third-party wikis that don't run Parsoid REST at all.
+    /// Wikipedia (and any wiki that does answer Parsoid) never pays for the
+    /// second request — this is the "keep working exactly as before"
+    /// path (PRD deliverable: no regression).
     pub async fn fetch_article_html(&self, lang: &str, title: &str) -> Result<FetchedArticle> {
+        let caps = self.capabilities();
+        if caps.parser != ParserMode::Legacy {
+            match self.fetch_article_html_parsoid(lang, title).await? {
+                ParsoidOutcome::Found(article) => return Ok(article),
+                ParsoidOutcome::Missing => {
+                    bail!("no article named {title:?} on {lang}.wikipedia.org")
+                }
+                ParsoidOutcome::Unsupported => {
+                    if caps.parser == ParserMode::Parsoid {
+                        bail!(
+                            "{lang} wiki has no Parsoid REST HTML for {title:?}, and \
+                             parser=parsoid disables the legacy fallback"
+                        );
+                    }
+                    // Auto mode: PRD §6.2 rule 3's documented third-party
+                    // fallback — fall through to legacy below.
+                }
+            }
+        }
+        self.fetch_article_html_legacy(lang, title).await
+    }
+
+    /// The Parsoid REST attempt shared by [`Self::fetch_article_html`] and
+    /// [`Self::fetch_article_html_bg`]. Only a genuine network/5xx failure is
+    /// an `Err`; a 404 always resolves to one of the two [`ParsoidOutcome`]
+    /// variants so the caller can decide what it means (missing article vs.
+    /// unsupported wiki) without re-deriving the classification itself.
+    async fn fetch_article_html_parsoid(
+        &self,
+        lang: &str,
+        title: &str,
+    ) -> Result<ParsoidOutcome<FetchedArticle>> {
         let url = format!(
             "{}/w/rest.php/v1/page/{}/html",
             self.host(lang),
@@ -589,7 +876,14 @@ impl WikiClient {
             .with_context(|| format!("requesting article HTML for {title:?}"))?;
 
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            bail!("no article named {title:?} on {lang}.wikipedia.org");
+            let body = read_capped(resp, MAX_SEARCH_RESPONSE_BYTES)
+                .await
+                .unwrap_or_default();
+            return Ok(if parsoid_404_is_genuine_miss(&body) {
+                ParsoidOutcome::Missing
+            } else {
+                ParsoidOutcome::Unsupported
+            });
         }
         let resp = resp.error_for_status().context("fetching article HTML")?;
         // Captured before the body read below consumes `resp` — PRD
@@ -610,7 +904,51 @@ impl WikiClient {
             .await
             .context("reading article HTML body")?;
         let html = decode_lossy_utf8(bytes);
-        Ok(FetchedArticle { html, revid, etag })
+        Ok(ParsoidOutcome::Found(FetchedArticle { html, revid, etag }))
+    }
+
+    /// PRD §6.2 rule 3's fallback: legacy `action=parse&prop=text`, the same
+    /// article-HTML request shape MediaWiki has answered since long before
+    /// Parsoid REST existed. `doc::parse_article_html` reads whatever HTML
+    /// comes back the same way regardless of source — legacy HTML just
+    /// carries none of Parsoid's RDFa/`data-mw` annotations, so
+    /// template-name-based features (infobox/citation-needed detection)
+    /// degrade gracefully rather than erroring (§7-adjacent, same posture as
+    /// `QualityClass`'s "no data, no badge").
+    async fn fetch_article_html_legacy(&self, lang: &str, title: &str) -> Result<FetchedArticle> {
+        let url = legacy_parse_url(&self.host(lang), title);
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("requesting legacy parse for {title:?}"))?
+            .error_for_status()
+            .context("legacy parse request failed")?;
+        let bytes = read_capped(resp, crate::doc::MAX_ARTICLE_HTML_BYTES)
+            .await
+            .context("reading legacy parse response body")?;
+        let parsed: LegacyParseResponse =
+            serde_json::from_slice(&bytes).context("parsing legacy parse response")?;
+        if let Some(err) = parsed.error {
+            let info = if err.info.is_empty() {
+                "legacy parser".to_string()
+            } else {
+                err.info
+            };
+            bail!("no article named {title:?} on {lang} ({info})");
+        }
+        let parse = parsed.parse.ok_or_else(|| {
+            anyhow!("legacy parse response for {title:?} had neither 'parse' nor 'error'")
+        })?;
+        Ok(FetchedArticle {
+            html: parse.text,
+            revid: parse.revid.unwrap_or(0),
+            // Legacy `action=parse` carries no `ETag` — the cache degrades
+            // to title-keyed, always-revalidated storage for this wiki
+            // (`FetchedArticle`'s own doc comment covers this fallback).
+            etag: None,
+        })
     }
 
     /// Fetch a raw image (thumbnail) by absolute URL for inline rendering
@@ -1511,17 +1849,57 @@ impl WikiClient {
     /// re-fetch): Parsoid HTML with `maxlag=5` (NF-NET-3) and failures
     /// classified for the substrate breaker (NF-NET-4). Returns the byte size
     /// so the queue can charge it against the daily prefetch budget (FR-PF-5).
+    /// Falls back to legacy `action=parse` the same way the foreground
+    /// [`Self::fetch_article_html`] does (PRD §6.2 rule 3 / FR-ML-5) — a
+    /// wiki without Parsoid REST still prefetches, it just costs a little
+    /// more (the failed Parsoid attempt) the first time on `Auto`.
     pub async fn fetch_article_html_bg(
         &self,
         lang: &str,
         title: &str,
     ) -> std::result::Result<BgArticle, BgFailure> {
+        let caps = self.capabilities();
+        if caps.parser != ParserMode::Legacy {
+            match self.fetch_article_html_parsoid_bg(lang, title).await? {
+                ParsoidOutcome::Found(article) => return Ok(article),
+                // A background prefetch has no user waiting on a specific
+                // "doesn't exist" message — both classify as a plain network
+                // failure, same as any other non-2xx (`bg_status_failure`'s
+                // own posture for a 404).
+                ParsoidOutcome::Missing => return Err(BgFailure::Network),
+                ParsoidOutcome::Unsupported => {
+                    if caps.parser == ParserMode::Parsoid {
+                        return Err(BgFailure::Network);
+                    }
+                }
+            }
+        }
+        self.fetch_article_html_legacy_bg(lang, title).await
+    }
+
+    /// The background counterpart of [`Self::fetch_article_html_parsoid`] —
+    /// same 404 classification, `BgFailure` instead of `anyhow::Error`.
+    async fn fetch_article_html_parsoid_bg(
+        &self,
+        lang: &str,
+        title: &str,
+    ) -> std::result::Result<ParsoidOutcome<BgArticle>, BgFailure> {
         let url = format!(
             "{}/w/rest.php/v1/page/{}/html?maxlag={MAXLAG}",
             self.host(lang),
             Self::title_path(title)
         );
         let resp = self.http.get(&url).send().await.map_err(bg_send_error)?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            let body = read_capped(resp, MAX_SEARCH_RESPONSE_BYTES)
+                .await
+                .unwrap_or_default();
+            return Ok(if parsoid_404_is_genuine_miss(&body) {
+                ParsoidOutcome::Missing
+            } else {
+                ParsoidOutcome::Unsupported
+            });
+        }
         if let Some(fail) = bg_status_failure(&resp) {
             return Err(fail);
         }
@@ -1536,10 +1914,42 @@ impl WikiClient {
             .map_err(|_| BgFailure::Network)?;
         let len = bytes.len() as u64;
         let html = decode_lossy_utf8(bytes);
-        Ok(BgArticle {
+        Ok(ParsoidOutcome::Found(BgArticle {
             html,
             revid,
             etag,
+            bytes: len,
+        }))
+    }
+
+    /// The background counterpart of [`Self::fetch_article_html_legacy`].
+    async fn fetch_article_html_legacy_bg(
+        &self,
+        lang: &str,
+        title: &str,
+    ) -> std::result::Result<BgArticle, BgFailure> {
+        let url = format!(
+            "{}&maxlag={MAXLAG}",
+            legacy_parse_url(&self.host(lang), title)
+        );
+        let resp = self.http.get(&url).send().await.map_err(bg_send_error)?;
+        if let Some(fail) = bg_status_failure(&resp) {
+            return Err(fail);
+        }
+        let bytes = read_capped(resp, crate::doc::MAX_ARTICLE_HTML_BYTES)
+            .await
+            .map_err(|_| BgFailure::Network)?;
+        let len = bytes.len() as u64;
+        let parsed: LegacyParseResponse =
+            serde_json::from_slice(&bytes).map_err(|_| BgFailure::Network)?;
+        if parsed.error.is_some() {
+            return Err(BgFailure::Network);
+        }
+        let parse = parsed.parse.ok_or(BgFailure::Network)?;
+        Ok(BgArticle {
+            html: parse.text,
+            revid: parse.revid.unwrap_or(0),
+            etag: None,
             bytes: len,
         })
     }
@@ -1975,6 +2385,335 @@ mod tests {
         let fetched = client.fetch_article_html("en", "Test").await.unwrap();
         assert_eq!(fetched.etag, None);
         assert_eq!(fetched.revid, 0);
+    }
+
+    /// [`parsoid_404_is_genuine_miss`]'s classification table: a real core
+    /// REST error envelope (`errorKey` present) is a genuine miss; anything
+    /// else — no body, an unrelated JSON shape, an HTML error page — means
+    /// "this wiki doesn't run Parsoid REST" (PRD §6.2 rule 3 / FR-ML-5).
+    #[test]
+    fn parsoid_404_classification_table() {
+        assert!(parsoid_404_is_genuine_miss(
+            br#"{"httpCode":404,"httpReason":"Not Found","errorKey":"rest-nonexistent-title"}"#
+        ));
+        assert!(!parsoid_404_is_genuine_miss(b""));
+        assert!(!parsoid_404_is_genuine_miss(b"<html>404 Not Found</html>"));
+        assert!(!parsoid_404_is_genuine_miss(br#"{"error":"not found"}"#));
+    }
+
+    /// PRD §6.2 rule 3: a genuinely missing title on a Parsoid-capable wiki
+    /// still bails the way it always has — the mock's 404 carries the real
+    /// core-REST error envelope (`errorKey`), so no legacy fallback engages
+    /// and only one request is ever made.
+    #[tokio::test]
+    async fn fetch_article_html_genuine_miss_bails_without_a_legacy_fallback() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let hits2 = hits.clone();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                hits2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut discard = [0u8; 4096];
+                let _ = stream.read(&mut discard);
+                let body =
+                    br#"{"httpCode":404,"httpReason":"Not Found","errorKey":"rest-nonexistent-title"}"#;
+                let header = format!(
+                    "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+        let client = WikiClient::new(format!("http://127.0.0.1:{port}")).unwrap();
+        let err = client
+            .fetch_article_html("en", "Nonexistent")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no article named"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// PRD §6.2 rule 3 / FR-ML-5's core degradation: a wiki whose Parsoid
+    /// REST 404s in a shape that doesn't look like a genuine miss (here, a
+    /// bare body — exactly what a route that doesn't exist at all returns)
+    /// falls back to legacy `action=parse`, in `Auto` mode, and still
+    /// renders — the fixture a third-party wiki without Parsoid REST hits.
+    #[tokio::test]
+    async fn fetch_article_html_falls_back_to_legacy_parse_when_parsoid_is_unsupported() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let requests2 = requests.clone();
+        std::thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let first_line = head.lines().next().unwrap_or_default().to_string();
+                requests2.lock().unwrap().push(first_line.clone());
+                if first_line.contains("/rest.php/v1/page/") {
+                    // No body at all — the "route doesn't exist" shape.
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                } else {
+                    let body = br#"{"parse":{"title":"Test","revid":55,"text":"<p>Legacy body with a <a href=\"./Other\">link</a>.</p><h2>Section</h2>"}}"#;
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes());
+                    let _ = stream.write_all(body);
+                }
+            }
+        });
+        let client = WikiClient::new(format!("http://127.0.0.1:{port}")).unwrap();
+        let fetched = client
+            .fetch_article_html("en", "Test")
+            .await
+            .expect("auto mode must fall back to legacy, not error");
+        assert_eq!(fetched.revid, 55);
+        assert_eq!(fetched.etag, None);
+        assert!(fetched.html.contains("Legacy body"));
+        let seen = requests.lock().unwrap().clone();
+        assert_eq!(
+            seen.len(),
+            2,
+            "expected one Parsoid attempt then one legacy fallback: {seen:?}"
+        );
+        assert!(seen[0].contains("/rest.php/v1/page/"));
+        assert!(seen[1].contains("action=parse"));
+    }
+
+    /// The legacy-HTML fixture above, run through the same `doc.rs` pipeline
+    /// every Parsoid response goes through (PRD §6.2 rule 3: "parse the
+    /// legacy HTML through the same doc.rs pipeline") — links and sections
+    /// still resolve even without Parsoid's RDFa/`data-mw` annotations.
+    #[tokio::test]
+    async fn legacy_parse_html_parses_to_blocks_links_and_sections_via_doc_rs() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+                if head.contains("/rest.php/v1/page/") {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                } else {
+                    let body = br#"{"parse":{"title":"Legacy Article","revid":7,"text":"<div class=\"mw-parser-output\"><p>Intro paragraph linking to <a href=\"/wiki/Other_Page\" title=\"Other Page\">Other Page</a>.</p><h2><span class=\"mw-headline\" id=\"A_section\">A section</span></h2><p>More text.</p></div>"}}"#;
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes());
+                    let _ = stream.write_all(body);
+                }
+            }
+        });
+        let client = WikiClient::new(format!("http://127.0.0.1:{port}")).unwrap();
+        let fetched = client
+            .fetch_article_html("en", "Legacy Article")
+            .await
+            .unwrap();
+        let doc = crate::doc::parse_article_html("Legacy Article", &fetched.html);
+        assert!(
+            doc.blocks
+                .iter()
+                .any(|b| format!("{b:?}").contains("Intro paragraph")),
+            "lead paragraph text must survive: {:?}",
+            doc.blocks
+        );
+        let links = crate::doc::collect_links(&doc);
+        assert!(
+            links
+                .iter()
+                .any(|l| l.internal_title.as_deref() == Some("Other Page")),
+            "internal link must still resolve without Parsoid annotations: {links:?}"
+        );
+        let sections = crate::doc::section_outline(&doc);
+        assert!(
+            !sections.is_empty(),
+            "a legacy <h2> must still produce a section: {sections:?}"
+        );
+    }
+
+    /// PRD §6.2 rule 3's per-wiki override: `parser = "legacy"` skips the
+    /// Parsoid attempt entirely — only one request is ever made, straight to
+    /// `action=parse`, saving the doomed round trip on a wiki already known
+    /// to lack Parsoid REST.
+    #[tokio::test]
+    async fn fetch_article_html_with_parser_legacy_never_attempts_parsoid() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let hits2 = hits.clone();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let requests2 = requests.clone();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                hits2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                *requests2.lock().unwrap() = String::from_utf8_lossy(&buf[..n])
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                let body = br#"{"parse":{"title":"Test","revid":9,"text":"<p>Legacy only.</p>"}}"#;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+        let client = WikiClient::with_wiki(
+            "legacywiki".to_string(),
+            format!("http://127.0.0.1:{port}"),
+            WikiCapabilities {
+                parser: ParserMode::Legacy,
+                wikifeeds: false,
+                pageviews: false,
+                pageassessments: false,
+            },
+            DEFAULT_CONTACT,
+        )
+        .unwrap();
+        let fetched = client.fetch_article_html("en", "Test").await.unwrap();
+        assert_eq!(fetched.revid, 9);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(requests.lock().unwrap().contains("action=parse"));
+    }
+
+    /// PRD §6.2 rule 3's opposite override: `parser = "parsoid"` disables
+    /// the fallback — an unsupported-shaped 404 surfaces as an error instead
+    /// of silently trying legacy, and only one request is made.
+    #[tokio::test]
+    async fn fetch_article_html_with_parser_parsoid_never_falls_back() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let hits2 = hits.clone();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                hits2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut discard = [0u8; 4096];
+                let _ = stream.read(&mut discard);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        let client = WikiClient::with_wiki(
+            "forced-parsoid".to_string(),
+            format!("http://127.0.0.1:{port}"),
+            WikiCapabilities {
+                parser: ParserMode::Parsoid,
+                wikifeeds: false,
+                pageviews: false,
+                pageassessments: false,
+            },
+            DEFAULT_CONTACT,
+        )
+        .unwrap();
+        let err = client.fetch_article_html("en", "Test").await.unwrap_err();
+        assert!(err.to_string().contains("parser=parsoid"), "{err}");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Background prefetch (PRD FR-PF-1/2) gets the same Parsoid→legacy
+    /// fallback as the foreground fetch, so a wiki without Parsoid REST can
+    /// still be prefetched, not just opened interactively.
+    #[tokio::test]
+    async fn fetch_article_html_bg_falls_back_to_legacy_parse_when_parsoid_is_unsupported() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+                if head.contains("/rest.php/v1/page/") {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                } else {
+                    let body =
+                        br#"{"parse":{"title":"Test","revid":3,"text":"<p>bg legacy body</p>"}}"#;
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes());
+                    let _ = stream.write_all(body);
+                }
+            }
+        });
+        let client = WikiClient::new(format!("http://127.0.0.1:{port}")).unwrap();
+        let fetched = client
+            .fetch_article_html_bg("en", "Test")
+            .await
+            .expect("bg fetch must fall back to legacy too");
+        assert_eq!(fetched.revid, 3);
+        assert!(fetched.html.contains("bg legacy body"));
+    }
+
+    /// PRD FR-ML-4's `:wiki` switch: repointing the client's host and
+    /// capabilities is visible on the very next request, through every clone
+    /// (the `Arc<RwLock<_>>` this is the whole reason for).
+    #[test]
+    fn switch_wiki_repoints_every_clone() {
+        let client = WikiClient::new("https://{lang}.wikipedia.org".to_string()).unwrap();
+        let clone = client.clone();
+        assert_eq!(client.active_wiki_name(), "wikipedia");
+        assert!(client.capabilities().wikifeeds);
+
+        client.switch_wiki(
+            "wiktionary".to_string(),
+            "https://{lang}.wiktionary.org".to_string(),
+            WikiCapabilities {
+                parser: ParserMode::Auto,
+                wikifeeds: false,
+                pageviews: false,
+                pageassessments: false,
+            },
+        );
+
+        assert_eq!(clone.active_wiki_name(), "wiktionary");
+        assert_eq!(clone.host("en"), "https://en.wiktionary.org");
+        assert!(!clone.capabilities().wikifeeds);
+    }
+
+    #[test]
+    fn parser_mode_parses_the_three_documented_values() {
+        assert_eq!(ParserMode::parse("auto"), Some(ParserMode::Auto));
+        assert_eq!(ParserMode::parse("parsoid"), Some(ParserMode::Parsoid));
+        assert_eq!(ParserMode::parse("legacy"), Some(ParserMode::Legacy));
+        assert_eq!(ParserMode::parse("bogus"), None);
     }
 
     /// PRD Appendix A's cheap "Page metadata / latest revid" call.

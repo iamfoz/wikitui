@@ -93,6 +93,10 @@ pub enum Action {
     RandomArticle,
     RelatedPanel,
     LangPicker,
+    /// PRD FR-ML-4: bare `:wiki`'s picker — Wikipedia + the four sister
+    /// projects. No default keybinding (same as `LangPicker`, which also
+    /// has none); reachable via `:wiki` or the command palette.
+    WikiPicker,
     Home,
     Today,
     /// PRD §10 / Appendix B: open the `:info` article-attribution overlay
@@ -535,6 +539,14 @@ pub const COMMANDS: &[Meta] = &[
         display: "Language editions",
         help: "switch to another language edition",
         contexts: &[KeyContext::Reading],
+        in_palette: true,
+    },
+    Meta {
+        action: Action::WikiPicker,
+        name: "wiki-picker",
+        display: "Wiki",
+        help: "switch to Wikipedia or a sister project",
+        contexts: &[KeyContext::Reading, KeyContext::StartPage],
         in_palette: true,
     },
     Meta {
@@ -1209,6 +1221,7 @@ pub const READING_HELP_ORDER: &[Action] = &[
     Action::RandomArticle,
     Action::RelatedPanel,
     Action::LangPicker,
+    Action::WikiPicker,
     Action::Home,
     Action::Today,
     Action::Info,

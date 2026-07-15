@@ -538,6 +538,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Mode::Contribs => draw_contribs(frame, app, content_area),
         // PRD FR-ACC-7: a floating card, same treatment as `Mode::Info`.
         Mode::Prefs => draw_reading(frame, app, content_area),
+        // PRD FR-ML-4's bare `:wiki` picker — same list-picker idiom as
+        // `Mode::TabPicker`/`Mode::HistoryPicker` above.
+        Mode::WikiPicker => draw_wiki_picker(frame, app, content_area),
     }
 
     draw_status_bar(frame, app, status_area);
@@ -1821,6 +1824,51 @@ fn draw_history_picker(frame: &mut Frame, app: &App, area: Rect) {
         .style(base_style(&app.theme, app.no_color))
         .block(UiBlock::default().borders(Borders::ALL).title(title));
     render_selectable_list(frame, list, area, app.selected_history);
+}
+
+/// Bare `:wiki`'s picker (PRD FR-ML-4): Wikipedia + the four sister
+/// projects, each row showing its display name and interwiki prefix
+/// (`wikt`/`voy`/`q`/`n` — the deep-link forms `target::parse` accepts); the
+/// currently active wiki is marked, not just highlighted, so it's still
+/// visible after the selection cursor moves off it.
+fn draw_wiki_picker(frame: &mut Frame, app: &App, area: Rect) {
+    let items: Vec<ListItem> = crate::sisters::all_known_projects()
+        .iter()
+        .enumerate()
+        .map(|(i, project)| {
+            let active_marker = if project.name == app.active_wiki_name {
+                "● "
+            } else {
+                "  "
+            };
+            let prefix = project
+                .interwiki_prefix
+                .map(|p| format!("   {p}:"))
+                .unwrap_or_default();
+            let line = Line::from(vec![
+                RSpan::styled(
+                    format!("{active_marker}{}", project.display_name),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                RSpan::styled(prefix, colored(app.no_color, app.theme.dim)),
+            ]);
+            let style = if i == app.selected_wiki_pick {
+                colored_bg(app.no_color, app.theme.selected_fg, app.theme.selected_bg)
+            } else {
+                Style::default()
+            };
+            ListItem::new(line).style(style)
+        })
+        .collect();
+
+    let title = format!(
+        "Wiki (active: {}) — Enter: switch  Esc: cancel",
+        app.active_wiki_name
+    );
+    let list = List::new(items)
+        .style(base_style(&app.theme, app.no_color))
+        .block(UiBlock::default().borders(Borders::ALL).title(title));
+    render_selectable_list(frame, list, area, app.selected_wiki_pick);
 }
 
 fn draw_research(frame: &mut Frame, app: &App, area: Rect) {
@@ -3183,6 +3231,7 @@ fn status_bar_text(app: &App, width: u16) -> String {
         Mode::Toc => "Enter: jump to section   Esc: cancel   j/k: move".to_string(),
         Mode::TabPicker => "Enter: switch tab   d: close   Esc: cancel   j/k: move".to_string(),
         Mode::HistoryPicker => "Enter: jump   Esc: cancel   j/k: move".to_string(),
+        Mode::WikiPicker => "Enter: switch wiki   Esc: cancel   j/k: move".to_string(),
         Mode::Research => "Enter/s: save citation   R: library   Esc: done   j/k: move".to_string(),
         // The library's status line carries transient action feedback
         // (delete/export/style outcomes overwrite it) — see open_library.
@@ -3500,6 +3549,7 @@ fn picker_help_extras(mode: Mode) -> (&'static str, &'static [(&'static str, &'s
             "Language editions",
             &[("/", "filter (autonym / langname / code)")],
         ),
+        Mode::WikiPicker => ("Wiki", &[]),
         _ => ("Help", &[]),
     }
 }

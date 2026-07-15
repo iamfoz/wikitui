@@ -158,6 +158,13 @@ pub enum Command {
     /// `:bilingual` / `:bi` (PRD FR-ML-3) — open the current article in a split
     /// alongside the same article in another language (via langlinks).
     Bilingual,
+    /// `:wiki` (bare) — opens the wiki-switcher picker (PRD FR-ML-4):
+    /// Wikipedia and the four sister projects. `:wiki <name>` switches
+    /// directly, without the picker — `name` may be a sister project or any
+    /// configured `[wiki.<name>]` site (FR-ML-5); which names actually
+    /// resolve is checked at execution time (`main::switch_wiki`), the same
+    /// split `:lang <code>` uses for its own deeper validation.
+    Wiki(Option<String>),
     /// `:q` / `:quit` — exit.
     Quit,
 }
@@ -383,7 +390,7 @@ fn validate_set_value(
     }
 }
 
-pub const USAGE: &str = "commands: open <title>, lang [<code>], theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, prefetch-log, interests, not-interested, stats, start, today, random [good], related, talk, info, set theme=<name>|images=on|off|prefetch=on|off|measure=N|ambiguous_width=1|2|reading_wpm=N|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N, set-tab measure=N|images=on|off|ambiguous_width=1|2|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N (or set-tab key= to reset), config reload, vsplit, only, bilingual, set scrollbind, watchlist, notifications, contribs [username], prefs, sync, mirror-watchlist, help, quit";
+pub const USAGE: &str = "commands: open <title>, lang [<code>], theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, prefetch-log, interests, not-interested, stats, start, today, random [good], related, talk, info, set theme=<name>|images=on|off|prefetch=on|off|measure=N|ambiguous_width=1|2|reading_wpm=N|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N, set-tab measure=N|images=on|off|ambiguous_width=1|2|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N (or set-tab key= to reset), config reload, vsplit, only, bilingual, wiki [<name>], set scrollbind, watchlist, notifications, contribs [username], prefs, sync, mirror-watchlist, help, quit";
 
 /// Parses one `:` command line. `user_theme_names` are accepted alongside
 /// the six built-ins for `:theme <name>` and `:set theme=<name>` (PRD
@@ -424,6 +431,17 @@ pub fn parse_with_user_themes(input: &str, user_theme_names: &[String]) -> Resul
                 Err(format!(
                     "{arg:?} doesn't look like a language code (e.g. en, de, zh-yue)"
                 ))
+            }
+        }
+        // Bare `:wiki` opens the picker (PRD FR-ML-4); `:wiki <name>`
+        // switches directly. Unlike `:lang`, there's no shape check here —
+        // a wiki name has no fixed format the way a language code does, so
+        // "known or not" is entirely `main::switch_wiki`'s call.
+        "wiki" => {
+            if arg.is_empty() {
+                Ok(Command::Wiki(None))
+            } else {
+                Ok(Command::Wiki(Some(arg.to_string())))
             }
         }
         "theme" => {
@@ -810,6 +828,24 @@ mod tests {
     fn bare_lang_opens_the_picker() {
         assert_eq!(parse("lang"), Ok(Command::Lang(None)));
         assert_eq!(parse("lang   "), Ok(Command::Lang(None)));
+    }
+
+    /// PRD FR-ML-4: bare `:wiki` opens the picker; `:wiki <name>` switches
+    /// directly to any name at all — unlike `:lang`, there is no shape
+    /// validation here (a wiki name has no fixed format), so an unknown name
+    /// still parses; whether it resolves is `main::switch_wiki`'s job.
+    #[test]
+    fn bare_wiki_opens_the_picker_and_named_wiki_switches_directly() {
+        assert_eq!(parse("wiki"), Ok(Command::Wiki(None)));
+        assert_eq!(parse("wiki   "), Ok(Command::Wiki(None)));
+        assert_eq!(
+            parse("wiki wiktionary"),
+            Ok(Command::Wiki(Some("wiktionary".to_string())))
+        );
+        assert_eq!(
+            parse("wiki archwiki"),
+            Ok(Command::Wiki(Some("archwiki".to_string())))
+        );
     }
 
     #[test]

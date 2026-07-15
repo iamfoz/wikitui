@@ -125,6 +125,12 @@ pub struct CliOverrides {
     pub measure: Option<u16>,
     pub ambiguous_width: Option<u8>,
     pub cite_style: Option<String>,
+    /// PRD FR-ML-4: set when the TITLE argument itself named a sister
+    /// project (`wikt:Word`, an `en.wiktionary.org` URL — `target::parse`'s
+    /// `project` field) — the whole session starts on that wiki, not just
+    /// this one fetch, same as how the TITLE argument's own language prefix
+    /// already overrides `--lang`/`lang` (`main`'s CLI-target handling).
+    pub active_wiki: Option<String>,
 }
 
 /// Environment-variable overrides. Kept as raw strings (mirroring how
@@ -223,6 +229,12 @@ pub struct ResolvedConfig {
     /// is substituted by `api::WikiClient` when present, else used
     /// verbatim (arbitrary MediaWiki sites, FR-ML-5, aren't per-language).
     pub base_url_template: Valued<String>,
+    /// PRD FR-ML-5's feature-degradation matrix for `active_wiki`.
+    pub wiki_capabilities: ResolvedWikiCapabilities,
+    /// PRD FR-ML-4's `:wiki <name>` switch target list, resolved once at
+    /// startup: Wikipedia, the four sister projects, and every
+    /// `[wiki.<name>]` section — see [`resolve_wiki`]'s doc comment.
+    pub wiki_registry: ResolvedWikiRegistry,
     /// PRD FR-BM-3's "(config)" read-later behavior: whether opening a
     /// queued entry removes it. Defaults to `true`.
     pub readlater_auto_dequeue: Valued<bool>,
@@ -294,6 +306,72 @@ impl ResolvedConfig {
     pub fn has_errors(&self) -> bool {
         self.issues.iter().any(|i| i.level == IssueLevel::Error)
     }
+}
+
+/// PRD FR-ML-5's per-wiki feature-degradation matrix, resolved for one
+/// wiki (`active_wiki`, or one [`ResolvedWikiEntry`] in the registry).
+/// Defaults follow whether the wiki is the built-in `wikipedia`: that one
+/// gets every feature (today's unconditional pre-FR-ML-5 behavior,
+/// unchanged); every other wiki — a sister project or a third-party
+/// `[wiki.<name>]` site — defaults the three optional endpoints off, on the
+/// grounds that Wikifeeds and PageAssessments in particular are close to
+/// Wikipedia-only in practice (§6.2 rule 6 / Appendix A "Quality"). A
+/// `[wiki.<name>]` section overrides any of the four explicitly, e.g.:
+///
+/// ```toml
+/// [wiki.dewiktionary]
+/// base_url = "https://de.wiktionary.org"
+/// pageviews = true       # this deployment's PageViewInfo does work
+/// ```
+///
+/// `parser` alone always defaults to `"auto"` regardless of which wiki —
+/// the try-Parsoid-then-detect-and-fall-back behavior
+/// (`api::WikiClient::fetch_article_html`) costs nothing extra once Parsoid
+/// answers, so there is no reason to default it off the way the other three
+/// are.
+#[derive(Debug, Clone)]
+pub struct ResolvedWikiCapabilities {
+    /// `"auto"` (try Parsoid REST, fall back to legacy `action=parse` on an
+    /// unsupported-shaped 404 — PRD §6.2 rule 3), `"parsoid"` (Parsoid only,
+    /// no fallback — surfaces a misconfigured wiki's real error instead of
+    /// masking it), or `"legacy"` (skip Parsoid entirely, straight to
+    /// `action=parse` — saves a request on a wiki already known to lack it).
+    pub parser: Valued<String>,
+    /// Wikifeeds (`feed/featured`/`feed/onthisday`) — gates the FR-DL-1
+    /// start-page feed and FR-PF-2 trending prefetch. `false` degrades the
+    /// start page to `StartPageModel::offline_fallback`'s simpler view
+    /// (recent history / saved pages) — the same view an offline reader
+    /// already sees, not a new code path.
+    pub wikifeeds: Valued<bool>,
+    /// `prop=pageviews` — gates FR-PF-1's link-rank pageviews term. `false`
+    /// degrades ranking to lead-position-only (the pageviews term is 0 for
+    /// every candidate, the same math `rank_links` already does for an
+    /// unseen title — no separate "degraded" code path there either).
+    pub pageviews: Valued<bool>,
+    /// `prop=pageassessments` — gates the FR-DL-3 quality badge. `false`
+    /// means the lookup is never attempted, so no badge ever shows for this
+    /// wiki (same visible result as a wiki that has the extension but no
+    /// assessment for one particular title).
+    pub pageassessments: Valued<bool>,
+}
+
+/// One entry in the FR-ML-4/5 wiki registry: a resolvable `:wiki <name>`
+/// target's host template plus its own capability matrix.
+#[derive(Debug, Clone)]
+pub struct ResolvedWikiEntry {
+    pub base_url_template: Valued<String>,
+    pub capabilities: ResolvedWikiCapabilities,
+}
+
+/// Every wiki `:wiki <name>` can switch to, resolved once at startup
+/// (`resolve_wiki`): the built-in `wikipedia` plus its four sister projects
+/// (FR-ML-4), and every `[wiki.<name>]` section the config file defines
+/// (FR-ML-5, arbitrary MediaWiki sites) — even ones that aren't the
+/// currently active wiki, so a runtime switch never re-parses the config
+/// file.
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedWikiRegistry {
+    pub entries: std::collections::BTreeMap<String, ResolvedWikiEntry>,
 }
 
 /// The resolved `[prefetch]` table (PRD §5.8, FR-PF-1/5/6). Each field carries
@@ -691,7 +769,8 @@ pub fn resolve(
     let ambiguous_wide = resolve_ambiguous_width(cli, env, &table, &mut issues);
     let (cache_max_mb, cache_fresh_ttl_hours, cache_force_refetch_days, cache_dir) =
         resolve_cache(&table, &mut issues);
-    let (active_wiki, base_url_template) = resolve_wiki(env, &table, &mut issues);
+    let (active_wiki, base_url_template, wiki_capabilities, wiki_registry) =
+        resolve_wiki(cli, env, &table, &mut issues);
     let readlater_auto_dequeue = resolve_readlater_auto_dequeue(env, &table, &mut issues);
     let history_retention_days = resolve_history(&table, &mut issues);
     let interest_learning = resolve_interest_learning(&table, &mut issues);
@@ -730,6 +809,8 @@ pub fn resolve(
         cache_dir,
         active_wiki,
         base_url_template,
+        wiki_capabilities,
+        wiki_registry,
         readlater_auto_dequeue,
         history_retention_days,
         interest_learning,
@@ -2223,11 +2304,154 @@ fn resolve_positive_int(
     }
 }
 
+/// PRD §6.2 rule 2 / FR-ML-4/5: which config keys a `[wiki.<name>]` section
+/// may set. `base_url` is A2's original key; the other four are this
+/// chunk's feature-degradation matrix (`ResolvedWikiCapabilities`).
+const KNOWN_WIKI_SECTION_KEYS: [&str; 5] = [
+    "base_url",
+    "parser",
+    "wikifeeds",
+    "pageviews",
+    "pageassessments",
+];
+
+/// Reads one `wiki.<name>.<key>` boolean, warning and falling back to
+/// `default_value` on anything present but not a bool. `section` is the
+/// whole `[wiki.<name>]` table (or `None` for a name with no section at
+/// all, e.g. a sister project nobody configured) — shared by every one of
+/// [`ResolvedWikiCapabilities`]'s three boolean fields so the "must be a
+/// boolean" validation lives in exactly one place.
+fn resolve_wiki_bool(
+    section: Option<&toml::Table>,
+    wiki_name: &str,
+    key: &str,
+    default_value: bool,
+    issues: &mut Vec<Issue>,
+) -> Valued<bool> {
+    match section.and_then(|s| s.get(key)) {
+        None => Valued {
+            value: default_value,
+            source: Source::Default,
+        },
+        Some(v) => match v.as_bool() {
+            Some(value) => Valued {
+                value,
+                source: Source::File,
+            },
+            None => {
+                issues.push(Issue::warning(format!(
+                    "wiki.{wiki_name}.{key} must be a boolean; using default"
+                )));
+                Valued {
+                    value: default_value,
+                    source: Source::Default,
+                }
+            }
+        },
+    }
+}
+
+/// Resolves one wiki's full entry (host template + capability matrix) by
+/// registry name — shared by every name `:wiki`/the picker can switch to, so
+/// the resolution logic (built-in template, section override, capability
+/// defaults) lives in exactly one place regardless of whether the name is
+/// the active wiki or just one more registry candidate.
+fn resolve_wiki_entry(
+    name: &str,
+    wiki_sections: Option<&toml::Table>,
+    issues: &mut Vec<Issue>,
+) -> ResolvedWikiEntry {
+    let is_wikipedia = name == DEFAULT_WIKI_NAME;
+    // PRD FR-ML-4: a known sister project gets its own `{lang}.<project>.org`
+    // template even with no `[wiki.<name>]` section at all; an arbitrary
+    // name (FR-ML-5's third-party sites) has no built-in template and must
+    // supply `base_url` itself, else it falls back to the same
+    // `DEFAULT_BASE_URL_TEMPLATE` the built-in wiki uses (matching this
+    // function's pre-FR-ML-4 behavior for an active_wiki with no base_url).
+    let mut base_url = match crate::sisters::by_name(name) {
+        Some(project) => Valued {
+            value: project.base_url_template(),
+            source: if is_wikipedia {
+                Source::Default
+            } else {
+                Source::File
+            },
+        },
+        None => Valued {
+            value: DEFAULT_BASE_URL_TEMPLATE.to_string(),
+            source: Source::Default,
+        },
+    };
+    let section = wiki_sections
+        .and_then(|s| s.get(name))
+        .and_then(toml::Value::as_table);
+    if let Some(url) = section
+        .and_then(|t| t.get("base_url"))
+        .and_then(toml::Value::as_str)
+    {
+        base_url = Valued {
+            value: url.to_string(),
+            source: Source::File,
+        };
+    }
+
+    let wikifeeds = resolve_wiki_bool(section, name, "wikifeeds", is_wikipedia, issues);
+    let pageviews = resolve_wiki_bool(section, name, "pageviews", is_wikipedia, issues);
+    let pageassessments = resolve_wiki_bool(section, name, "pageassessments", is_wikipedia, issues);
+    let parser = match section.and_then(|t| t.get("parser")) {
+        None => Valued {
+            value: "auto".to_string(),
+            source: Source::Default,
+        },
+        Some(v) => match v.as_str() {
+            Some(s) if matches!(s, "auto" | "parsoid" | "legacy") => Valued {
+                value: s.to_string(),
+                source: Source::File,
+            },
+            _ => {
+                issues.push(Issue::warning(format!(
+                    "wiki.{name}.parser must be one of auto, parsoid, legacy; using 'auto'"
+                )));
+                Valued {
+                    value: "auto".to_string(),
+                    source: Source::Default,
+                }
+            }
+        },
+    };
+
+    ResolvedWikiEntry {
+        base_url_template: base_url,
+        capabilities: ResolvedWikiCapabilities {
+            parser,
+            wikifeeds,
+            pageviews,
+            pageassessments,
+        },
+    }
+}
+
+/// PRD §6.2 rule 1/2, FR-ML-4/5: resolves the active wiki's name and host
+/// template (`CliOverrides::active_wiki` > `WIKITUI_BASE_URL`/config file >
+/// the built-in `wikipedia` default), its feature-degradation matrix, and
+/// the full switch-target registry every `:wiki <name>` invocation consults
+/// (`main::switch_wiki`) without re-reading the config file.
+///
+/// `active_wiki` may name the built-in `wikipedia`, one of the four sister
+/// projects ([`crate::sisters`]) with no section required, or any
+/// `[wiki.<name>]` section defined in the file — anything else warns and
+/// falls back to `wikipedia`, exactly as before this chunk.
 fn resolve_wiki(
+    cli: &CliOverrides,
     env: &EnvOverrides,
     table: &toml::Table,
     issues: &mut Vec<Issue>,
-) -> (Valued<String>, Valued<String>) {
+) -> (
+    Valued<String>,
+    Valued<String>,
+    ResolvedWikiCapabilities,
+    ResolvedWikiRegistry,
+) {
     let wiki_sections = table.get("wiki").and_then(toml::Value::as_table);
     if table.get("wiki").is_some() && wiki_sections.is_none() {
         issues.push(Issue::warning(
@@ -2243,7 +2467,7 @@ fn resolve_wiki(
                 continue;
             };
             for key in section_table.keys() {
-                if key != "base_url" {
+                if !KNOWN_WIKI_SECTION_KEYS.contains(&key.as_str()) {
                     issues.push(Issue::warning(format!(
                         "unknown config key 'wiki.{name}.{key}' — ignored"
                     )));
@@ -2262,64 +2486,117 @@ fn resolve_wiki(
         }
     }
 
-    let active_name = match table.get("active_wiki") {
-        Some(v) => match v.as_str() {
-            Some(name) => {
-                let known = name == DEFAULT_WIKI_NAME
-                    || wiki_sections.is_some_and(|s| s.contains_key(name));
-                if known {
-                    Valued {
-                        value: name.to_string(),
-                        source: Source::File,
+    let known_name = |name: &str| {
+        name == DEFAULT_WIKI_NAME
+            || crate::sisters::by_name(name).is_some()
+            || wiki_sections.is_some_and(|s| s.contains_key(name))
+    };
+
+    let active_name = if let Some(name) = &cli.active_wiki {
+        // PRD FR-ML-4: the TITLE argument's own sister-project URL/prefix
+        // (`target::parse`'s `project` field) always names a known sister
+        // project, so this branch never actually hits the warning path in
+        // practice — kept for the same "never silently do something
+        // surprising" reason the file-sourced branch below has one.
+        if known_name(name) {
+            Valued {
+                value: name.clone(),
+                source: Source::Cli,
+            }
+        } else {
+            issues.push(Issue::warning(format!(
+                "active_wiki {name:?} has no matching [wiki.{name}] section; using '{DEFAULT_WIKI_NAME}'"
+            )));
+            Valued {
+                value: DEFAULT_WIKI_NAME.to_string(),
+                source: Source::Default,
+            }
+        }
+    } else {
+        match table.get("active_wiki") {
+            Some(v) => match v.as_str() {
+                Some(name) => {
+                    if known_name(name) {
+                        Valued {
+                            value: name.to_string(),
+                            source: Source::File,
+                        }
+                    } else {
+                        issues.push(Issue::warning(format!(
+                            "active_wiki {name:?} has no matching [wiki.{name}] section; using '{DEFAULT_WIKI_NAME}'"
+                        )));
+                        Valued {
+                            value: DEFAULT_WIKI_NAME.to_string(),
+                            source: Source::Default,
+                        }
                     }
-                } else {
-                    issues.push(Issue::warning(format!(
-                        "active_wiki {name:?} has no matching [wiki.{name}] section; using '{DEFAULT_WIKI_NAME}'"
-                    )));
+                }
+                None => {
+                    issues.push(Issue::warning("active_wiki must be a string; ignoring"));
                     Valued {
                         value: DEFAULT_WIKI_NAME.to_string(),
                         source: Source::Default,
                     }
                 }
-            }
-            None => {
-                issues.push(Issue::warning("active_wiki must be a string; ignoring"));
-                Valued {
-                    value: DEFAULT_WIKI_NAME.to_string(),
-                    source: Source::Default,
-                }
-            }
-        },
-        None => Valued {
-            value: DEFAULT_WIKI_NAME.to_string(),
-            source: Source::Default,
-        },
+            },
+            None => Valued {
+                value: DEFAULT_WIKI_NAME.to_string(),
+                source: Source::Default,
+            },
+        }
     };
 
-    let mut base_url = Valued {
-        value: DEFAULT_BASE_URL_TEMPLATE.to_string(),
-        source: Source::Default,
-    };
-    if let Some(sections) = wiki_sections
-        && let Some(section) = sections.get(&active_name.value)
-        && let Some(url) = section
-            .as_table()
-            .and_then(|t| t.get("base_url"))
-            .and_then(toml::Value::as_str)
-    {
-        base_url = Valued {
-            value: url.to_string(),
-            source: Source::File,
-        };
+    // Every name the registry needs an entry for: the five built-ins plus
+    // whatever custom sections the file defines (a name appearing in both,
+    // e.g. an explicit `[wiki.wiktionary]` override, resolves once, its
+    // section applied on top of the built-in template).
+    let mut names: std::collections::BTreeSet<String> = crate::sisters::all_known_projects()
+        .into_iter()
+        .map(|p| p.name.to_string())
+        .collect();
+    if let Some(sections) = wiki_sections {
+        names.extend(sections.keys().cloned());
     }
-    if let Some(url) = &env.base_url {
-        base_url = Valued {
+    let mut entries: std::collections::BTreeMap<String, ResolvedWikiEntry> = names
+        .into_iter()
+        .map(|name| {
+            let entry = resolve_wiki_entry(&name, wiki_sections, issues);
+            (name, entry)
+        })
+        .collect();
+
+    // PRD §6.2 rule 2: `WIKITUI_BASE_URL` always wins for whichever wiki
+    // actually starts active — the supported mock/third-party override —
+    // but it repoints only that one registry entry, not every possible
+    // `:wiki` target (a later `:wiki wiktionary` still resolves to the real
+    // `wiktionary.org`, not the mock, unless a `[wiki.wiktionary]` section
+    // itself points there).
+    if let Some(url) = &env.base_url
+        && let Some(active_entry) = entries.get_mut(&active_name.value)
+    {
+        active_entry.base_url_template = Valued {
             value: url.clone(),
             source: Source::Env,
         };
     }
 
-    (active_name, base_url)
+    // `active_name.value` is always one of the built-ins or an existing
+    // section name (the `known_name` check above guarantees it), so this
+    // entry always exists; the fallback is defensive, never reachable.
+    let active_entry = entries
+        .get(&active_name.value)
+        .cloned()
+        .unwrap_or_else(|| resolve_wiki_entry(DEFAULT_WIKI_NAME, wiki_sections, issues));
+
+    let base_url_template = active_entry.base_url_template;
+    let wiki_capabilities = active_entry.capabilities;
+
+    (
+        active_name,
+        base_url_template,
+        wiki_capabilities,
+        ResolvedWikiRegistry { entries },
+    )
 }
 
 #[cfg(test)]
@@ -3460,6 +3737,201 @@ mod tests {
                 .issues
                 .iter()
                 .any(|i| i.message.contains("nonexistent"))
+        );
+        cleanup(&path);
+    }
+
+    /// PRD FR-ML-4: the built-in `wikipedia` default gets every feature —
+    /// today's unconditional pre-FR-ML-5 behavior, unchanged.
+    #[test]
+    fn wikipedia_default_capabilities_are_full() {
+        let resolved = resolve(&CliOverrides::default(), &EnvOverrides::default(), None);
+        let caps = &resolved.wiki_capabilities;
+        assert_eq!(caps.parser.value, "auto");
+        assert!(caps.wikifeeds.value);
+        assert!(caps.pageviews.value);
+        assert!(caps.pageassessments.value);
+        assert_eq!(caps.wikifeeds.source, Source::Default);
+    }
+
+    /// PRD FR-ML-4: a sister project resolves its own `{lang}.<project>.org`
+    /// template with no `[wiki.<name>]` section at all, and defaults its
+    /// three optional endpoints off (FR-ML-5's degradation matrix) — only
+    /// `wikipedia` gets them for free.
+    #[test]
+    fn sister_project_resolves_its_domain_with_degraded_defaults() {
+        let path = temp_config("active_wiki = \"wiktionary\"\n");
+        let resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(resolved.active_wiki.value, "wiktionary");
+        assert_eq!(
+            resolved.base_url_template.value,
+            "https://{lang}.wiktionary.org"
+        );
+        assert!(resolved.issues.is_empty(), "{:?}", resolved.issues);
+        let caps = &resolved.wiki_capabilities;
+        assert_eq!(caps.parser.value, "auto");
+        assert!(!caps.wikifeeds.value);
+        assert!(!caps.pageviews.value);
+        assert!(!caps.pageassessments.value);
+        cleanup(&path);
+    }
+
+    /// PRD FR-ML-5: a `[wiki.<name>]` section can override any one of the
+    /// four capability keys independently, each landing at `Source::File`.
+    #[test]
+    fn wiki_section_overrides_individual_capabilities() {
+        let path = temp_config(
+            "active_wiki = \"archwiki\"\n\
+             [wiki.archwiki]\n\
+             base_url = \"https://wiki.archlinux.org\"\n\
+             parser = \"legacy\"\n\
+             pageviews = true\n",
+        );
+        let resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        let caps = &resolved.wiki_capabilities;
+        assert_eq!(caps.parser.value, "legacy");
+        assert_eq!(caps.parser.source, Source::File);
+        assert!(caps.pageviews.value);
+        assert_eq!(caps.pageviews.source, Source::File);
+        // Untouched keys keep the non-wikipedia default.
+        assert!(!caps.wikifeeds.value);
+        assert!(!caps.pageassessments.value);
+        cleanup(&path);
+    }
+
+    /// An unrecognized `parser` value warns and falls back to `"auto"`
+    /// rather than being silently ignored or crashing.
+    #[test]
+    fn wiki_section_rejects_an_unknown_parser_value() {
+        let path = temp_config("active_wiki = \"archwiki\"\n[wiki.archwiki]\nparser = \"bogus\"\n");
+        let resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(resolved.wiki_capabilities.parser.value, "auto");
+        assert!(resolved.issues.iter().any(|i| i.message.contains("parser")));
+        cleanup(&path);
+    }
+
+    /// A non-boolean `wikifeeds`/`pageviews`/`pageassessments` value warns
+    /// and falls back to the name-based default instead of crashing.
+    #[test]
+    fn wiki_section_rejects_a_non_boolean_capability_value() {
+        let path =
+            temp_config("active_wiki = \"archwiki\"\n[wiki.archwiki]\nwikifeeds = \"yes\"\n");
+        let resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert!(!resolved.wiki_capabilities.wikifeeds.value);
+        assert!(
+            resolved
+                .issues
+                .iter()
+                .any(|i| i.message.contains("wikifeeds"))
+        );
+        cleanup(&path);
+    }
+
+    /// PRD FR-ML-4: `:wiki <name>`'s switch-target registry carries every
+    /// built-in project plus every configured `[wiki.<name>]` section, even
+    /// when it isn't the currently active wiki — a runtime switch never
+    /// re-reads the config file.
+    #[test]
+    fn wiki_registry_carries_every_built_in_and_custom_wiki() {
+        let path = temp_config(
+            "active_wiki = \"wikipedia\"\n[wiki.archwiki]\nbase_url = \"https://wiki.archlinux.org\"\n",
+        );
+        let resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        let names: Vec<&str> = resolved
+            .wiki_registry
+            .entries
+            .keys()
+            .map(String::as_str)
+            .collect();
+        for expected in [
+            "wikipedia",
+            "wiktionary",
+            "wikivoyage",
+            "wikiquote",
+            "wikinews",
+            "archwiki",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "missing {expected:?} in {names:?}"
+            );
+        }
+        let archwiki = &resolved.wiki_registry.entries["archwiki"];
+        assert_eq!(
+            archwiki.base_url_template.value,
+            "https://wiki.archlinux.org"
+        );
+        let wikt = &resolved.wiki_registry.entries["wiktionary"];
+        assert_eq!(
+            wikt.base_url_template.value,
+            "https://{lang}.wiktionary.org"
+        );
+        assert!(!wikt.capabilities.wikifeeds.value);
+        cleanup(&path);
+    }
+
+    /// PRD FR-ML-4: `WIKITUI_BASE_URL` overrides only the *active* wiki's
+    /// registry entry — a later `:wiki wiktionary` still resolves to the
+    /// real domain, not the mock, unless a `[wiki.wiktionary]` section
+    /// itself points there.
+    #[test]
+    fn env_base_url_only_overrides_the_active_registry_entry() {
+        let env = EnvOverrides {
+            base_url: Some("http://127.0.0.1:8943".into()),
+            ..Default::default()
+        };
+        let resolved = resolve(&CliOverrides::default(), &env, None);
+        assert_eq!(resolved.active_wiki.value, "wikipedia");
+        assert_eq!(
+            resolved.wiki_registry.entries["wikipedia"]
+                .base_url_template
+                .value,
+            "http://127.0.0.1:8943"
+        );
+        assert_eq!(
+            resolved.wiki_registry.entries["wiktionary"]
+                .base_url_template
+                .value,
+            "https://{lang}.wiktionary.org"
+        );
+    }
+
+    /// PRD FR-ML-4: `CliOverrides::active_wiki` (the TITLE argument's own
+    /// sister-project URL/prefix) outranks the config file, at `Source::Cli`
+    /// — the same precedence `lang`'s own CLI override already has.
+    #[test]
+    fn cli_active_wiki_override_wins_over_the_file() {
+        let path = temp_config("active_wiki = \"wikiquote\"\n");
+        let cli = CliOverrides {
+            active_wiki: Some("wiktionary".to_string()),
+            ..Default::default()
+        };
+        let resolved = resolve(&cli, &EnvOverrides::default(), Some(&path));
+        assert_eq!(resolved.active_wiki.value, "wiktionary");
+        assert_eq!(resolved.active_wiki.source, Source::Cli);
+        assert_eq!(
+            resolved.base_url_template.value,
+            "https://{lang}.wiktionary.org"
         );
         cleanup(&path);
     }

@@ -329,6 +329,33 @@ PAGES["Redlink_Showcase"] = """<html><head><title>Redlink Showcase</title></head
   which must render and follow as an ordinary link.</p>
 </body></html>"""
 
+# PRD FR-ML-4 pty-verification fixture: a Wiktionary-shaped dictionary entry
+# (etymology, part-of-speech headers, a numbered sense list, a "Related
+# terms" section) — proves sister-project articles render "as-is" through
+# the same doc.rs pipeline rather than needing per-project special-casing.
+# Reachable at the flat PAGES namespace regardless of which `base_url` path
+# prefix a `[wiki.<name>]` section points at (this mock has one flat article
+# namespace behind any prefix — see `_lang_prefix`'s own comment), so a
+# `[wiki.wiktionary] base_url = ".../wiktionary"` config resolves it exactly
+# like any other title.
+PAGES["computer_(word)"] = """<html><head><title>computer (word)</title></head><body>
+  <h2>English</h2>
+  <p><i>Etymology:</i> From <a href="./compute">compute</a> +‎ <a href="./-er">-er</a>.</p>
+  <h3>Noun</h3>
+  <p><b>computer</b> (plural <b>computers</b>)</p>
+  <ol>
+    <li>A person or thing that computes or calculates.</li>
+    <li>An electronic device for storing and processing data, typically in
+      binary form, according to instructions given to it in a variable
+      program.</li>
+  </ol>
+  <h3>Related terms</h3>
+  <ul>
+    <li><a href="./Computer_science">computer science</a></li>
+    <li><a href="./computing">computing</a></li>
+  </ul>
+</body></html>"""
+
 # PRD FR-ML-1/2 (Appendix A "Langlinks") fixture: `action=query&
 # prop=langlinks&llprop=autonym|langname|url`, keyed by the display title
 # (spaces, matching how `titles=` arrives after this file's usual `_`->` `
@@ -884,6 +911,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "ua": self.headers.get('User-Agent', ''),
             })
 
+        # PRD FR-ML-5 / §6.2 rule 3 fixture: a "wiki" (any base_url ending in
+        # this path segment) with NO Parsoid REST at all — a bare 404, no
+        # body, exactly the shape `api::WikiClient::fetch_article_html`'s
+        # `parsoid_404_is_genuine_miss` must treat as "try legacy
+        # action=parse instead," never as "this article doesn't exist"
+        # (contrast `_serve_article`'s 404 below, which always carries a
+        # JSON error envelope). Checked first so it intercepts before the
+        # generic `/page/.../html` dispatch would otherwise serve it.
+        if '/legacywiki/' in parsed.path and '/rest.php/v1/page/' in parsed.path and parsed.path.endswith('/html'):
+            self.send_response(404)
+            self.end_headers()
+            return
+
         if parsed.path == '/debug/media-hits':
             self._send_json({"hits": MEDIA_HITS})
         elif parsed.path == '/debug/requests':
@@ -1013,6 +1053,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
         generator = params.get('generator', [''])[0]
         prop = params.get('prop', [''])[0]
         meta = params.get('meta', [''])[0]
+        # PRD §6.2 rule 3 / FR-ML-5: the legacy `action=parse&prop=text`
+        # fallback `api::WikiClient::fetch_article_html_legacy` uses when
+        # Parsoid REST is unsupported (or `parser = "legacy"` skips it
+        # outright). Served from the SAME `PAGES` dict as the Parsoid
+        # endpoint — the point of this fixture is that opening an article on
+        # a legacy-only wiki renders identical content, just via a different
+        # request shape (formatversion=2's `parse.text` is a raw HTML
+        # string, not the formatversion=1 `{"*": ...}` wrapper).
+        if action == 'parse':
+            title = urllib.parse.unquote(params.get('page', [''])[0])
+            key = title.replace(' ', '_')
+            html = PAGES.get(key)
+            if html is None:
+                self._send_json({
+                    "error": {"code": "missingtitle", "info": "The page you specified doesn't exist."}
+                })
+                return
+            self._send_json({
+                "parse": {
+                    "title": title.replace('_', ' '),
+                    "revid": current_revid(key),
+                    "text": current_html(key, html),
+                }
+            })
+            return
         # PRD FR-ACC-1: the authenticated whoami. A Bearer token this OAuth
         # provider issued resolves to MOCK_USERNAME; anything else is an
         # anonymous session (which the client rejects, never mistaking it for
@@ -1415,19 +1480,36 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(QUAD_PNG)
 
+    def _serve_genuine_miss_404(self, title):
+        # PRD §6.2 rule 3: the real core REST API's 404 shape for a title
+        # that genuinely doesn't exist — a JSON error envelope carrying
+        # `errorKey`. This is what `api::WikiClient::
+        # parsoid_404_is_genuine_miss` keys on to tell "doesn't exist" apart
+        # from "this wiki doesn't run Parsoid REST at all" (the bare,
+        # bodyless 404 the `/legacywiki/` route above sends instead).
+        body = json.dumps({
+            "httpCode": 404,
+            "httpReason": "Not Found",
+            "errorKey": "rest-nonexistent-title",
+            "messageTranslations": {"en": f"The page you specified, {title!r}, doesn't exist."},
+        }).encode()
+        self.send_response(404)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _serve_article(self, parts):
         title = urllib.parse.unquote(parts[-2])
         lang = _lang_prefix(parts)
         # PRD FR-ML-2: this one language edition doesn't have this one
         # title, even though the flat PAGES dict does — see LANG_MISSING.
         if lang and title in LANG_MISSING.get(lang, ()):
-            self.send_response(404)
-            self.end_headers()
+            self._serve_genuine_miss_404(title)
             return
         html = PAGES.get(title)
         if html is None:
-            self.send_response(404)
-            self.end_headers()
+            self._serve_genuine_miss_404(title)
             return
         body = current_html(title, html).encode()
         self.send_response(200)

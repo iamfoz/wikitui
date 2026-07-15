@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::api::{SearchResult, TitleSuggestion};
+use crate::api::{SearchResult, TitleSuggestion, WikiRegistryEntry};
 use crate::bookmarks::{
     self, Bookmark, BookmarkStore, ReadLaterEntry, ReadLaterStore, ToggleOutcome,
 };
@@ -194,6 +194,12 @@ pub enum Mode {
     /// email-confirmed, edit count. Nothing here is ever written back. Esc
     /// closes. Same overlay idiom as [`Mode::Info`].
     Prefs,
+    /// Bare `:wiki` (PRD FR-ML-4): a selectable list of known wikis —
+    /// Wikipedia and the four sister projects — highlighting the currently
+    /// active one. Enter switches (`main::switch_wiki`), Esc cancels. Local
+    /// state only, no network (unlike [`Mode::LangPicker`]'s langlinks
+    /// fetch) — the list is the same five entries every time.
+    WikiPicker,
 }
 
 /// The content of the `K` peek popup (PRD FR-NV-4/FR-NV-5). Two visually
@@ -354,6 +360,20 @@ pub struct App {
     /// switching tabs; each tab additionally records the language its own
     /// article was fetched in (for history restore and background routing).
     pub lang: String,
+    /// PRD FR-ML-4/5: the registry name of the wiki `client`'s host template
+    /// currently addresses (`"wikipedia"`, a sister project, or a custom
+    /// `[wiki.<name>]` name) — mirrors `client.active_wiki_name()`, kept on
+    /// `App` too so status-bar/picker/`:wiki` code that only has `&App` (no
+    /// `&WikiClient`) doesn't need one threaded in just to read it.
+    pub active_wiki_name: String,
+    /// PRD FR-ML-4/5's `:wiki <name>` switch targets, resolved once at
+    /// startup (`config::ResolvedWikiRegistry`) and converted to the
+    /// `api`-facing shape here: Wikipedia, the four sister projects, and
+    /// every `[wiki.<name>]` config section. `main::switch_wiki` looks a
+    /// name up here rather than re-reading the config file.
+    pub wiki_registry: std::collections::BTreeMap<String, WikiRegistryEntry>,
+    /// Selection cursor for the `:wiki` picker (bare `:wiki`, PRD FR-ML-4).
+    pub selected_wiki_pick: usize,
     /// A foreground blocking operation (search, initial open) is in progress.
     /// Distinct from a [`Tab`]'s own `loading` flag, which tracks a
     /// *background* tab's in-flight fetch and drives the tab bar's "…"
@@ -1127,6 +1147,14 @@ impl App {
             search_operator_help: false,
             should_quit: false,
             lang,
+            // PRD FR-ML-4/5: `main::run` overwrites both from the resolved
+            // config before the first paint (same "App::new is Wikipedia by
+            // default, main wires the real config in" split as `theme`/
+            // `color_depth` above) — every existing `App::new` call site
+            // (every test included) sees exactly the pre-FR-ML-4 behavior.
+            active_wiki_name: "wikipedia".to_string(),
+            wiki_registry: std::collections::BTreeMap::new(),
+            selected_wiki_pick: 0,
             loading: false,
             pending_g: false,
             theme,
@@ -2379,6 +2407,42 @@ impl App {
             self.active = index;
             self.sync_active_tab();
         }
+    }
+
+    // -- Wiki switcher (PRD FR-ML-4/5) ---------------------------------------
+
+    /// Bare `:wiki` (PRD FR-ML-4): opens the picker over Wikipedia and the
+    /// four sister projects, selecting the row for the currently active wiki
+    /// so a reader who already switched sees where they are rather than the
+    /// cursor resetting to the top. Local state only, unlike
+    /// `open_lang_picker`'s langlinks fetch — the list is the same five
+    /// entries every time (`main::switch_wiki` supports switching to a
+    /// custom `[wiki.<name>]` site too, via `:wiki <name>`, just not through
+    /// this picker — see its own doc comment).
+    pub fn open_wiki_picker(&mut self) {
+        self.prior_mode = self.mode;
+        self.mode = Mode::WikiPicker;
+        self.selected_wiki_pick = crate::sisters::all_known_projects()
+            .iter()
+            .position(|p| p.name == self.active_wiki_name)
+            .unwrap_or(0);
+    }
+
+    /// Moves the picker's selection, wrapping over the five known projects.
+    pub fn cycle_wiki_pick(&mut self, forward: bool) {
+        let len = crate::sisters::all_known_projects().len();
+        self.selected_wiki_pick = if forward {
+            (self.selected_wiki_pick + 1) % len
+        } else {
+            (self.selected_wiki_pick + len - 1) % len
+        };
+    }
+
+    /// Enter's target: the registry name of the picker's highlighted row.
+    pub fn wiki_picker_target(&self) -> Option<String> {
+        crate::sisters::all_known_projects()
+            .get(self.selected_wiki_pick)
+            .map(|p| p.name.to_string())
     }
 
     // -- Splits & bilingual view (PRD FR-TB-4, FR-ML-3) ---------------------
@@ -6111,6 +6175,41 @@ mod tests {
             app.lang_picker_target(),
             Some(("ja".to_string(), "アラン・チューリング".to_string()))
         );
+    }
+
+    /// PRD FR-ML-4: bare `:wiki` opens the picker with the cursor already on
+    /// the currently active wiki, not reset to the top — a reader who
+    /// already switched sees where they are.
+    #[test]
+    fn open_wiki_picker_selects_the_currently_active_wiki() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.active_wiki_name = "wikiquote".to_string();
+        app.open_wiki_picker();
+        assert_eq!(app.mode, Mode::WikiPicker);
+        assert_eq!(app.wiki_picker_target(), Some("wikiquote".to_string()));
+    }
+
+    /// An unrecognized `active_wiki_name` (shouldn't normally happen, but
+    /// `App::new`'s own default before `main::run` wires the real config in
+    /// is one — see its doc comment) degrades to selecting the first row
+    /// rather than panicking on `.unwrap()`.
+    #[test]
+    fn open_wiki_picker_defaults_to_the_first_row_for_an_unknown_active_wiki() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.active_wiki_name = "some-custom-site".to_string();
+        app.open_wiki_picker();
+        assert_eq!(app.selected_wiki_pick, 0);
+    }
+
+    #[test]
+    fn cycle_wiki_pick_wraps_over_the_five_known_projects() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.open_wiki_picker(); // wikipedia, index 0
+        assert_eq!(app.wiki_picker_target(), Some("wikipedia".to_string()));
+        app.cycle_wiki_pick(false); // wraps backward to the last row
+        assert_eq!(app.wiki_picker_target(), Some("wikinews".to_string()));
+        app.cycle_wiki_pick(true);
+        assert_eq!(app.wiki_picker_target(), Some("wikipedia".to_string()));
     }
 
     #[test]

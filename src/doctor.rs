@@ -30,6 +30,8 @@ pub fn run(resolved: &ResolvedConfig) -> i32 {
 
     print_resolved_config(resolved);
     println!();
+    print_wiki_capabilities(resolved);
+    println!();
     print_problems(resolved);
     println!();
     print_user_themes(&user_themes, &theme_warnings);
@@ -220,6 +222,51 @@ fn print_resolved_config(resolved: &ResolvedConfig) {
         r.line_spacing.source,
         r.word_spacing.value,
         r.word_spacing.source
+    );
+}
+
+/// PRD FR-ML-5's feature-degradation matrix, for the wiki `active_wiki`
+/// resolved to — the concrete answer to "why doesn't this wiki show
+/// badges/a feed/a pageviews-ranked prefetch" without reading source.
+/// `Parsoid REST` reports the *policy* (`auto`/`parsoid`/`legacy`), not
+/// whether the wiki actually answers Parsoid at request time — that's only
+/// known once a request is made (`api::WikiClient::fetch_article_html`'s
+/// try-then-fall-back), which `doctor` never does (§6.7: no network).
+fn print_wiki_capabilities(resolved: &ResolvedConfig) {
+    let caps = &resolved.wiki_capabilities;
+    println!(
+        "Wiki capability matrix (FR-ML-5) — active wiki: {:?}",
+        resolved.active_wiki.value
+    );
+    println!(
+        "  parser = {:?} ({}) -- auto: try Parsoid REST, fall back to legacy action=parse on an unsupported 404",
+        caps.parser.value, caps.parser.source
+    );
+    let feature = |label: &str, v: &crate::config::Valued<bool>, on_note: &str, off_note: &str| {
+        println!(
+            "  {label} = {} ({}) -- {}",
+            v.value,
+            v.source,
+            if v.value { on_note } else { off_note }
+        );
+    };
+    feature(
+        "wikifeeds",
+        &caps.wikifeeds,
+        "start page shows the daily feed",
+        "start page falls back to recent history / saved pages",
+    );
+    feature(
+        "pageviews",
+        &caps.pageviews,
+        "link-rank prefetch weighs pageviews",
+        "link-rank prefetch is lead-position-only (no pageviews term)",
+    );
+    feature(
+        "pageassessments",
+        &caps.pageassessments,
+        "quality badges (\u{2605}FA/+GA/B/C/Start/Stub) can show",
+        "no quality badge ever shows for this wiki",
     );
 }
 
