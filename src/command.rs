@@ -118,6 +118,18 @@ pub enum Command {
     /// `:logout` (PRD FR-ACC-9) — revoke locally (delete stored tokens) and
     /// link to `Special:OAuthManageMyGrants` for server-side revocation.
     Logout,
+    /// `:watchlist` (PRD FR-ACC-2, logged in only) — the watched-pages list
+    /// plus the "what changed" activity feed. Same view as `gW`.
+    Watchlist,
+    /// `:notifications` (PRD FR-ACC-3, logged in only) — the Echo alerts/
+    /// messages pane.
+    Notifications,
+    /// `:contribs [username]` (PRD FR-ACC-4) — recent edits; the logged-in
+    /// user's own by default, or any given username (works logged out too).
+    Contribs(Option<String>),
+    /// `:prefs` (PRD FR-ACC-7, logged in only) — the read-only preferences
+    /// card.
+    Prefs,
     /// `:q` / `:quit` — exit.
     Quit,
 }
@@ -341,7 +353,7 @@ fn validate_set_value(
     }
 }
 
-pub const USAGE: &str = "commands: open <title>, lang [<code>], theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, prefetch-log, start, today, random [good], related, talk, info, set theme=<name>|images=on|off|prefetch=on|off|measure=N|ambiguous_width=1|2|reading_wpm=N|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N, set-tab measure=N|images=on|off|ambiguous_width=1|2|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N (or set-tab key= to reset), config reload, help, quit";
+pub const USAGE: &str = "commands: open <title>, lang [<code>], theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, prefetch-log, start, today, random [good], related, talk, info, set theme=<name>|images=on|off|prefetch=on|off|measure=N|ambiguous_width=1|2|reading_wpm=N|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N, set-tab measure=N|images=on|off|ambiguous_width=1|2|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N (or set-tab key= to reset), config reload, watchlist, notifications, contribs [username], prefs, help, quit";
 
 /// Parses one `:` command line. `user_theme_names` are accepted alongside
 /// the six built-ins for `:theme <name>` and `:set theme=<name>` (PRD
@@ -640,6 +652,18 @@ pub fn parse_with_user_themes(input: &str, user_theme_names: &[String]) -> Resul
         },
         // PRD FR-ACC-9.
         "logout" => Ok(Command::Logout),
+        // PRD FR-ACC-2.
+        "watchlist" => Ok(Command::Watchlist),
+        // PRD FR-ACC-3.
+        "notifications" => Ok(Command::Notifications),
+        // PRD FR-ACC-4: bare form defaults to the logged-in user (resolved at
+        // execution time, since parsing has no session to consult); a given
+        // username is used verbatim.
+        "contribs" => Ok(Command::Contribs(
+            (!arg.is_empty()).then(|| arg.to_string()),
+        )),
+        // PRD FR-ACC-7.
+        "prefs" => Ok(Command::Prefs),
         "help" | "h" => Ok(Command::Help),
         "q" | "quit" => Ok(Command::Quit),
         "" => Err(USAGE.to_string()),
@@ -1252,6 +1276,38 @@ mod tests {
     #[test]
     fn talk_parses_bare() {
         assert_eq!(parse("talk"), Ok(Command::Talk));
+    }
+
+    // ---- PRD FR-ACC-2/3/4/7: watchlist / notifications / contribs / prefs --
+
+    #[test]
+    fn watchlist_notifications_and_prefs_parse_bare() {
+        assert_eq!(parse("watchlist"), Ok(Command::Watchlist));
+        assert_eq!(parse("notifications"), Ok(Command::Notifications));
+        assert_eq!(parse("prefs"), Ok(Command::Prefs));
+    }
+
+    #[test]
+    fn contribs_parses_bare_as_the_logged_in_user() {
+        // Resolving "bare = the logged-in user" needs a session, which
+        // parsing doesn't have — `None` here just means "not specified,"
+        // resolved at execution time (`main::open_contribs`).
+        assert_eq!(parse("contribs"), Ok(Command::Contribs(None)));
+    }
+
+    #[test]
+    fn contribs_parses_an_explicit_username() {
+        assert_eq!(
+            parse("contribs OtherEditor"),
+            Ok(Command::Contribs(Some("OtherEditor".to_string())))
+        );
+        // A username may itself contain spaces (real MediaWiki usernames
+        // can) — everything after the command name is the username, not
+        // just its first word.
+        assert_eq!(
+            parse("contribs Jane Q. Editor"),
+            Ok(Command::Contribs(Some("Jane Q. Editor".to_string())))
+        );
     }
 
     #[test]

@@ -103,6 +103,16 @@ pub enum Action {
     /// PRD FR-ACC-9: local logout (delete stored tokens) + link to
     /// server-side grant revocation.
     Logout,
+    /// PRD FR-ACC-2: toggle watch/unwatch on the article on screen.
+    WatchToggle,
+    /// PRD FR-ACC-2: open the watchlist pane (watched pages + activity feed).
+    WatchlistOpen,
+    /// PRD FR-ACC-3: open the notifications (Echo) pane.
+    NotificationsOpen,
+    /// PRD FR-ACC-4: open the logged-in user's own contributions.
+    ContribsOpen,
+    /// PRD FR-ACC-7: open the read-only preferences card.
+    PrefsOpen,
     Quit,
     // -- picker-generic (help only; not palette-invokable) --
     MoveDown,
@@ -568,6 +578,46 @@ pub const COMMANDS: &[Meta] = &[
         in_palette: true,
     },
     Meta {
+        action: Action::WatchToggle,
+        name: "watch-toggle",
+        display: "Watch / unwatch",
+        help: "toggle watching this article for edits (logged in)",
+        contexts: &[KeyContext::Reading],
+        in_palette: true,
+    },
+    Meta {
+        action: Action::WatchlistOpen,
+        name: "watchlist",
+        display: "Watchlist",
+        help: "watched pages and recent changes to them (logged in)",
+        contexts: &[KeyContext::Reading, KeyContext::StartPage],
+        in_palette: true,
+    },
+    Meta {
+        action: Action::NotificationsOpen,
+        name: "notifications",
+        display: "Notifications",
+        help: "Echo alerts and messages (logged in)",
+        contexts: &[KeyContext::Reading, KeyContext::StartPage],
+        in_palette: true,
+    },
+    Meta {
+        action: Action::ContribsOpen,
+        name: "contribs",
+        display: "Contributions",
+        help: "your recent edits (or :contribs <username> for anyone's)",
+        contexts: &[KeyContext::Reading, KeyContext::StartPage],
+        in_palette: true,
+    },
+    Meta {
+        action: Action::PrefsOpen,
+        name: "prefs",
+        display: "Preferences",
+        help: "your account preferences, read-only (logged in)",
+        contexts: &[KeyContext::Reading, KeyContext::StartPage],
+        in_palette: true,
+    },
+    Meta {
         action: Action::Quit,
         name: "quit",
         display: "Quit",
@@ -905,6 +955,12 @@ impl Keymap {
         Keymap::bind(b, Reading, Chord::prefixed('g', 'h'), Home);
         // PRD §10 / Appendix B's "Article: i article info/attribution".
         Keymap::bind(b, Reading, Chord::ch('i'), Info);
+        // PRD FR-ACC-2 / Appendix B: watch/unwatch the article on screen.
+        Keymap::bind(b, Reading, Chord::ch('w'), WatchToggle);
+        // PRD FR-ACC-2: `gW` opens the watchlist pane — the `g`-prefix
+        // panel-open convention `gr`/`gR`/`gb` already established, since
+        // Appendix B documents no dedicated single-letter open key for it.
+        Keymap::bind(b, Reading, Chord::prefixed('g', 'W'), WatchlistOpen);
         Keymap::bind(b, Reading, Chord::ch('Q'), Quit);
 
         // Picker-generic navigation.
@@ -1158,6 +1214,11 @@ pub const READING_HELP_ORDER: &[Action] = &[
     Action::Info,
     Action::Login,
     Action::Logout,
+    Action::WatchToggle,
+    Action::WatchlistOpen,
+    Action::NotificationsOpen,
+    Action::ContribsOpen,
+    Action::PrefsOpen,
     Action::Help,
     Action::Quit,
 ];

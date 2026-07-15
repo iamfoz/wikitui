@@ -9,7 +9,7 @@ use ratatui::widgets::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::app::{App, Mode};
+use crate::app::{self, App, Mode};
 use crate::doc::LinkRef;
 use crate::layout::{
     FLOOR_MIN_HEIGHT, FLOOR_MIN_WIDTH, LaidLine, MatchSpan, SizeTier, SpanKind, size_tier,
@@ -517,6 +517,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         // PRD §10's `i`/`:info` overlay: same "overlay the reading view"
         // treatment as the peek popup above.
         Mode::Info => draw_reading(frame, app, content_area),
+        // PRD FR-ACC-2/3/4: three picker-style views, same idiom as
+        // `Mode::OnThisDay`/`Mode::Related` above.
+        Mode::Watchlist => draw_watchlist(frame, app, content_area),
+        Mode::Notifications => draw_notifications(frame, app, content_area),
+        Mode::Contribs => draw_contribs(frame, app, content_area),
+        // PRD FR-ACC-7: a floating card, same treatment as `Mode::Info`.
+        Mode::Prefs => draw_reading(frame, app, content_area),
     }
 
     draw_status_bar(frame, app, status_area);
@@ -556,6 +563,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // PRD §10's `i`/`:info` overlay: same floating-card treatment as peek.
     if app.mode == Mode::Info {
         draw_info_overlay(frame, app, area);
+    }
+
+    // PRD FR-ACC-7's read-only prefs card: same floating-card treatment.
+    if app.mode == Mode::Prefs {
+        draw_prefs_overlay(frame, app, area);
     }
 
     // PRD FR-CS-1's command palette and FR-CS-8's onboarding: modal overlays,
@@ -2085,6 +2097,258 @@ fn draw_related(frame: &mut Frame, app: &App, area: Rect) {
     render_selectable_list(frame, list, area, app.selected_related);
 }
 
+/// PRD FR-ACC-2's watchlist pane: two tabs, same layout as `draw_on_this_day`
+/// (a one-row tab strip over a selectable list) — "Watched pages" (the raw
+/// list) and "Recent changes" (the since-last-seen activity feed).
+fn draw_watchlist(frame: &mut Frame, app: &App, area: Rect) {
+    let chunks = UiLayout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(area);
+
+    let tabs = [app::WatchlistTab::Pages, app::WatchlistTab::Changes];
+    let tab_spans: Vec<RSpan> = tabs
+        .iter()
+        .map(|&t| {
+            let style = if t == app.watchlist_tab {
+                colored_bg(app.no_color, app.theme.selected_fg, app.theme.selected_bg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                colored(app.no_color, app.theme.dim)
+            };
+            RSpan::styled(format!(" {} ", t.label()), style)
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(Line::from(tab_spans)).style(base_style(&app.theme, app.no_color)),
+        chunks[0],
+    );
+
+    let (items, len): (Vec<ListItem>, usize) = match app.watchlist_tab {
+        app::WatchlistTab::Pages => {
+            let items = app
+                .watchlist_raw
+                .iter()
+                .enumerate()
+                .map(|(i, title)| {
+                    let style = if i == app.watchlist_selected {
+                        colored_bg(app.no_color, app.theme.selected_fg, app.theme.selected_bg)
+                    } else {
+                        Style::default()
+                    };
+                    ListItem::new(Line::from(title.clone())).style(style)
+                })
+                .collect();
+            (items, app.watchlist_raw.len())
+        }
+        app::WatchlistTab::Changes => {
+            let items = app
+                .watchlist_changes
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let mut lines = vec![Line::from(RSpan::styled(
+                        c.title.clone(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ))];
+                    let comment = c.comment.as_deref().unwrap_or("");
+                    lines.push(Line::from(RSpan::styled(
+                        format!("{} · {} · {comment}", c.timestamp, c.user),
+                        colored(app.no_color, app.theme.dim),
+                    )));
+                    let style = if i == app.watchlist_selected {
+                        colored_bg(app.no_color, app.theme.selected_fg, app.theme.selected_bg)
+                    } else {
+                        Style::default()
+                    };
+                    ListItem::new(lines).style(style)
+                })
+                .collect();
+            (items, app.watchlist_changes.len())
+        }
+    };
+    let title = format!(
+        "Watchlist — {} ({len}) — Enter: open  Tab/h/l: switch  Esc: close",
+        app.watchlist_tab.label()
+    );
+    let list = List::new(items)
+        .style(base_style(&app.theme, app.no_color))
+        .block(UiBlock::default().borders(Borders::ALL).title(title));
+    render_selectable_list(frame, list, chunks[1], app.watchlist_selected);
+}
+
+/// PRD FR-ACC-3's notifications pane: two tabs (Alerts / Messages), same
+/// shape as `draw_watchlist` above. An already-read entry renders dimmed so
+/// unread ones stand out at a glance, mirroring the visited-link styling
+/// convention (FR-HS-2) rather than inventing a new one.
+fn draw_notifications(frame: &mut Frame, app: &App, area: Rect) {
+    let chunks = UiLayout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(area);
+
+    let tabs = [app::NotifTab::Alerts, app::NotifTab::Messages];
+    let tab_spans: Vec<RSpan> = tabs
+        .iter()
+        .map(|&t| {
+            let style = if t == app.notif_tab {
+                colored_bg(app.no_color, app.theme.selected_fg, app.theme.selected_bg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                colored(app.no_color, app.theme.dim)
+            };
+            RSpan::styled(format!(" {} ", t.label()), style)
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(Line::from(tab_spans)).style(base_style(&app.theme, app.no_color)),
+        chunks[0],
+    );
+
+    let list_data = match app.notif_tab {
+        app::NotifTab::Alerts => &app.notif_alerts,
+        app::NotifTab::Messages => &app.notif_messages,
+    };
+    let items: Vec<ListItem> = list_data
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            let base = if n.read {
+                colored(app.no_color, app.theme.dim)
+            } else {
+                Style::default()
+            };
+            let mark = if n.read { "  " } else { "\u{25cf} " };
+            let style = if i == app.notif_selected {
+                colored_bg(app.no_color, app.theme.selected_fg, app.theme.selected_bg)
+            } else {
+                base
+            };
+            ListItem::new(Line::from(format!("{mark}{}", n.text))).style(style)
+        })
+        .collect();
+    let title = format!(
+        "Notifications — {} ({}) — d: mark read  A: mark all  Tab/h/l: switch  Esc: close",
+        app.notif_tab.label(),
+        list_data.len()
+    );
+    let list = List::new(items)
+        .style(base_style(&app.theme, app.no_color))
+        .block(UiBlock::default().borders(Borders::ALL).title(title));
+    render_selectable_list(frame, list, chunks[1], app.notif_selected);
+}
+
+/// PRD FR-ACC-4's contributions view: a single selectable list (no tabs),
+/// each row the title plus a dimmed second line of timestamp/comment/size
+/// delta — the size delta signed and colored the way a diff stat reads
+/// everywhere else (`+N` grown, `-N` shrunk).
+fn draw_contribs(frame: &mut Frame, app: &App, area: Rect) {
+    let heading = if app.contribs_username.is_empty() {
+        "Contributions".to_string()
+    } else {
+        format!("Contributions — {}", app.contribs_username)
+    };
+    if app.contribs.is_empty() {
+        let text = Text::from(vec![Line::from(""), Line::from(app.status.clone())]);
+        frame.render_widget(
+            Paragraph::new(text)
+                .style(base_style(&app.theme, app.no_color))
+                .block(UiBlock::default().borders(Borders::ALL).title(heading)),
+            area,
+        );
+        return;
+    }
+    let items: Vec<ListItem> = app
+        .contribs
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let mut lines = vec![Line::from(RSpan::styled(
+                c.title.clone(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ))];
+            let comment = c.comment.as_deref().unwrap_or("");
+            let delta = if c.sizediff >= 0 {
+                format!("+{}", c.sizediff)
+            } else {
+                c.sizediff.to_string()
+            };
+            lines.push(Line::from(RSpan::styled(
+                format!("{} · {delta} · {comment}", c.timestamp),
+                colored(app.no_color, app.theme.dim),
+            )));
+            let style = if i == app.contribs_selected {
+                colored_bg(app.no_color, app.theme.selected_fg, app.theme.selected_bg)
+            } else {
+                Style::default()
+            };
+            ListItem::new(lines).style(style)
+        })
+        .collect();
+    let list = List::new(items)
+        .style(base_style(&app.theme, app.no_color))
+        .block(UiBlock::default().borders(Borders::ALL).title(heading));
+    render_selectable_list(frame, list, area, app.contribs_selected);
+}
+
+/// PRD FR-ACC-7's read-only prefs card: same floating-card treatment as
+/// `draw_info_overlay` (title/URL/... key-value block) — skin, language,
+/// email-confirmed, edit count, and nothing writable anywhere on it.
+fn draw_prefs_overlay(frame: &mut Frame, app: &App, area: Rect) {
+    let width = 60.min(area.width.saturating_sub(4)).max(24);
+    let height = 9.min(area.height.saturating_sub(2)).max(6);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    let dim = colored(app.no_color, app.theme.dim);
+    let label = |text: &'static str| RSpan::styled(text, dim.add_modifier(Modifier::BOLD));
+    let body = match &app.prefs {
+        Some(prefs) => Text::from(vec![
+            Line::from(vec![
+                label("Skin:       "),
+                RSpan::raw(prefs.skin.clone().unwrap_or_else(|| "—".to_string())),
+            ]),
+            Line::from(vec![
+                label("Language:   "),
+                RSpan::raw(prefs.language.clone().unwrap_or_else(|| "—".to_string())),
+            ]),
+            Line::from(vec![
+                label("Email:      "),
+                RSpan::raw(if prefs.email_confirmed {
+                    "confirmed".to_string()
+                } else {
+                    "not confirmed".to_string()
+                }),
+            ]),
+            Line::from(vec![
+                label("Edit count: "),
+                RSpan::raw(
+                    prefs
+                        .editcount
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "—".to_string()),
+                ),
+            ]),
+        ]),
+        None => Text::from(""),
+    };
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(body)
+            .style(base_style(&app.theme, app.no_color))
+            .wrap(Wrap { trim: false })
+            .block(
+                UiBlock::default()
+                    .borders(Borders::ALL)
+                    .title("Preferences (read-only)"),
+            ),
+        popup,
+    );
+}
+
 /// PRD FR-ML-1's `:lang` picker: the article on screen's langlinks,
 /// preferred-pinned and fuzzy-filtered (`App::lang_picker_rows`). Each row
 /// shows the autonym plus the English langname in parentheses ("Deutsch
@@ -2373,9 +2637,16 @@ fn with_incognito_glyph(text: String, incognito: bool) -> String {
 /// they're logged in as (and that they are logged in at all). Absent when
 /// logged out. Prefixed like the incognito glyph so it survives whatever
 /// segment (`notice`/focused link/breadcrumb) fills the rest of the bar.
-fn with_login_glyph(text: String, username: Option<&str>) -> String {
+/// `badge` is PRD FR-ACC-3's unread-notification suffix (`✉N`, `App::
+/// notification_badge`) — folded into the same bracket rather than a second
+/// prefix, so a logged-in-with-unread reader sees one glyph, `[@user ✉3]`,
+/// not two competing ones.
+fn with_login_glyph(text: String, username: Option<&str>, badge: Option<&str>) -> String {
     match username {
-        Some(user) => format!("[@{user}] {text}"),
+        Some(user) => match badge {
+            Some(b) => format!("[@{user} {b}] {text}"),
+            None => format!("[@{user}] {text}"),
+        },
         None => text,
     }
 }
@@ -2519,6 +2790,15 @@ fn status_bar_text(app: &App, width: u16) -> String {
         Mode::Related => app.status.clone(),
         Mode::LangPicker => app.status.clone(),
         Mode::LangFilter => format!("filter: {}   Esc: apply", app.lang_filter_input),
+        // PRD FR-ACC-2/3/4/7: each of these carries its own transient status
+        // text (set by `main.rs`'s `open_watchlist`/`open_notifications`/
+        // `open_contribs`/`open_prefs`, and overwritten by `w`/`d`/`A`/`t`'s
+        // own confirmations via `notice`, which the priority check above
+        // already outranks this with).
+        Mode::Watchlist => app.status.clone(),
+        Mode::Notifications => app.status.clone(),
+        Mode::Contribs => app.status.clone(),
+        Mode::Prefs => app.status.clone(),
         Mode::Help => "j/k: scroll   Esc/?/q: close".to_string(),
         Mode::Palette => format!(
             "> {}   Enter: run   \u{2191}/\u{2193}: move   Esc: cancel",
@@ -2609,7 +2889,11 @@ fn status_bar_text(app: &App, width: u16) -> String {
 
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let text = status_bar_text(app, area.width);
-    let text = with_login_glyph(text, app.logged_in_username());
+    let text = with_login_glyph(
+        text,
+        app.logged_in_username(),
+        app.notification_badge().as_deref(),
+    );
     let text = with_incognito_glyph(text, app.incognito);
     let style = if matches!(
         app.mode,
@@ -3716,12 +4000,33 @@ mod tests {
     #[test]
     fn login_glyph_prefixes_the_status_only_when_logged_in() {
         assert_eq!(
-            with_login_glyph("Alan Turing".to_string(), None),
+            with_login_glyph("Alan Turing".to_string(), None, None),
             "Alan Turing"
         );
         assert_eq!(
-            with_login_glyph("Alan Turing".to_string(), Some("MockWikipedian")),
+            with_login_glyph("Alan Turing".to_string(), Some("MockWikipedian"), None),
             "[@MockWikipedian] Alan Turing"
+        );
+    }
+
+    /// PRD FR-ACC-3: the unread-notification badge folds into the same
+    /// bracket as the username rather than adding a second prefix, and is
+    /// simply absent (not an empty `[@user ]`) for a logged-out reader even
+    /// if a badge string were somehow supplied.
+    #[test]
+    fn login_glyph_folds_the_notification_badge_into_the_same_bracket() {
+        assert_eq!(
+            with_login_glyph(
+                "Alan Turing".to_string(),
+                Some("MockWikipedian"),
+                Some("\u{2709}3")
+            ),
+            "[@MockWikipedian \u{2709}3] Alan Turing"
+        );
+        assert_eq!(
+            with_login_glyph("Alan Turing".to_string(), None, Some("\u{2709}3")),
+            "Alan Turing",
+            "no badge is ever shown while logged out"
         );
     }
 

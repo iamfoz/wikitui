@@ -1,3 +1,4 @@
+mod account;
 mod api;
 mod app;
 mod attribution;
@@ -1882,6 +1883,20 @@ async fn run(
     };
     if let Some(state) = load_auth_state(&app.auth_runtime) {
         app.auth = Some(state);
+    }
+    // PRD FR-ACC-2: where the watchlist's last-seen cursor persists
+    // (`$XDG_STATE_HOME/wikitui/watchlist.json`), loaded now the same way
+    // `session_path`/`auth_path` are — a fast local read, never blocking on
+    // network.
+    app.watchlist_state_path = account::watchlist_state_path();
+    if let Some(path) = &app.watchlist_state_path {
+        app.watchlist_last_seen = account::load_last_seen(path);
+    }
+    // PRD FR-ACC-3's login/startup poll (see `account.rs`'s poll-cadence
+    // doc): a restored session gets its unread-count badge without waiting
+    // for the reader to open `:notifications` first.
+    if app.auth.is_some() {
+        poll_notifications_count(client, &mut app).await;
     }
 
     // Delivers typeahead responses, background revalidation outcomes, and
@@ -3850,6 +3865,74 @@ async fn handle_key(
                 app.close_info();
             }
         }
+        // PRD FR-ACC-2's watchlist pane: same two-tab navigation shape as
+        // `Mode::OnThisDay` above (j/k move, Tab/h/l switch tab, Enter opens).
+        Mode::Watchlist => match code {
+            KeyCode::Esc => app.close_watchlist(),
+            KeyCode::Char('j') | KeyCode::Down => app.watchlist_move(1),
+            KeyCode::Char('k') | KeyCode::Up => app.watchlist_move(-1),
+            KeyCode::Tab | KeyCode::Char('l') | KeyCode::Right => app.watchlist_next_tab(),
+            KeyCode::BackTab | KeyCode::Char('h') | KeyCode::Left => app.watchlist_prev_tab(),
+            KeyCode::Enter => {
+                if let Some(title) = app.watchlist_open_target() {
+                    app.close_watchlist();
+                    open_title(client, cache, app, &title, revalidate_tx, langlinks_tx).await;
+                } else {
+                    app.status = "Nothing to open".to_string();
+                }
+            }
+            KeyCode::Char('?') => {
+                app.prior_mode = app.mode;
+                app.mode = Mode::Help;
+            }
+            _ => {}
+        },
+        // PRD FR-ACC-3's notifications pane: `d` marks the focused entry
+        // read, `A` marks every entry read (both are the one real write this
+        // mode makes — a fresh network round trip only for the write itself,
+        // never a re-poll of the count, per `account.rs`'s poll-cadence doc).
+        Mode::Notifications => match code {
+            KeyCode::Esc => app.close_notifications(),
+            KeyCode::Char('j') | KeyCode::Down => app.notif_move(1),
+            KeyCode::Char('k') | KeyCode::Up => app.notif_move(-1),
+            KeyCode::Tab | KeyCode::Char('l') | KeyCode::Right => app.notif_next_tab(),
+            KeyCode::BackTab | KeyCode::Char('h') | KeyCode::Left => app.notif_prev_tab(),
+            KeyCode::Char('d') => mark_notification_read(client, app).await,
+            KeyCode::Char('A') => mark_all_notifications_read(client, app).await,
+            KeyCode::Char('?') => {
+                app.prior_mode = app.mode;
+                app.mode = Mode::Help;
+            }
+            _ => {}
+        },
+        // PRD FR-ACC-4/6's contributions view: Enter opens the edited
+        // article, `t` thanks the focused edit (logged in only).
+        Mode::Contribs => match code {
+            KeyCode::Esc => app.close_contribs(),
+            KeyCode::Char('j') | KeyCode::Down => app.contribs_move(1),
+            KeyCode::Char('k') | KeyCode::Up => app.contribs_move(-1),
+            KeyCode::Enter => {
+                if let Some(title) = app.contribs_open_target() {
+                    app.close_contribs();
+                    open_title(client, cache, app, &title, revalidate_tx, langlinks_tx).await;
+                } else {
+                    app.status = "Nothing to open".to_string();
+                }
+            }
+            KeyCode::Char('t') => cmd_thank(client, app).await,
+            KeyCode::Char('?') => {
+                app.prior_mode = app.mode;
+                app.mode = Mode::Help;
+            }
+            _ => {}
+        },
+        // PRD FR-ACC-7's read-only prefs card: same overlay idiom as
+        // `Mode::Info` above.
+        Mode::Prefs => {
+            if code == KeyCode::Esc {
+                app.close_prefs();
+            }
+        }
         Mode::Reading => {
             // g-prefix chords (PRD Appendix B): the g-latch's second key.
             // `gg` top, `gt`/`gT` next/prev tab (FR-TB-1), `gb` back-stack
@@ -3899,6 +3982,11 @@ async fn handle_key(
                         // PRD FR-NV-4: `gK` jumps to the References section.
                         app::GPrefixAction::References => {
                             app.jump_to_references();
+                            return;
+                        }
+                        // PRD FR-ACC-2: `gW` opens the watchlist pane.
+                        app::GPrefixAction::Watchlist => {
+                            open_watchlist(client, app).await;
                             return;
                         }
                         app::GPrefixAction::PassThrough => {} // handle this key normally below.
@@ -4276,6 +4364,8 @@ async fn handle_key(
                 KeyCode::Char('i') => {
                     app.open_info();
                 }
+                // PRD FR-ACC-2 / Appendix B's "Library: w watch/unwatch".
+                KeyCode::Char('w') => cmd_watch_toggle(client, app).await,
                 // Arm the g-/b-/z-prefix latches (their second key is
                 // consumed at the top of this arm on the next keypress).
                 KeyCode::Char('g') => app.pending_g = true,
@@ -4863,6 +4953,18 @@ async fn dispatch_action(
         Action::Login => cmd_login_loopback(terminal, client, app).await,
         // PRD FR-ACC-9.
         Action::Logout => cmd_logout(app),
+        // PRD FR-ACC-2.
+        Action::WatchToggle => cmd_watch_toggle(client, app).await,
+        Action::WatchlistOpen => open_watchlist(client, app).await,
+        // PRD FR-ACC-3.
+        Action::NotificationsOpen => open_notifications(client, app).await,
+        // PRD FR-ACC-4: the palette/keybind entry always shows the
+        // logged-in user's own contributions — `:contribs <username>` (a
+        // parsed argument, not reachable from a bare Action) is the only way
+        // to view someone else's.
+        Action::ContribsOpen => open_contribs(client, app, None).await,
+        // PRD FR-ACC-7.
+        Action::PrefsOpen => open_prefs(client, app).await,
         Action::Quit => {
             app.pending_quit_confirm = true;
             app.notice = Some("really quit? (y/n)".to_string());
@@ -5129,6 +5231,10 @@ async fn finish_login(
     } else {
         format!("Logged in as {username}  (tokens stored in {store_desc})")
     });
+    // PRD FR-ACC-3's login/startup poll (see `account.rs`'s poll-cadence
+    // doc): the unread badge shows up right away, without waiting for the
+    // reader to open `:notifications` first.
+    poll_notifications_count(client, app).await;
 }
 
 /// PRD §5.9's transparent refresh in action: re-fetches `meta=userinfo`
@@ -5168,6 +5274,10 @@ fn cmd_logout(app: &mut App) {
             let who = auth_state.username().to_string();
             let deleted = auth_state.logout();
             app.mode = Mode::Reading;
+            // PRD §6.2 rule 8: a session's cached csrf/watch tokens are
+            // meaningless once it ends — a future login gets its own.
+            app.tokens.clear();
+            app.notif_counts = account::NotifCounts::default();
             let base = match deleted {
                 Ok(()) => format!(
                     "Logged out {who}. Revoke server-side at {}",
@@ -5181,6 +5291,350 @@ fn cmd_logout(app: &mut App) {
             app.notice = Some(base);
         }
         None => app.notice = Some("Not logged in".to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PRD FR-ACC-2/3/4/6/7: watchlist, notifications, contributions, thank, prefs
+// ---------------------------------------------------------------------------
+
+/// The shared login gate every feature in this section routes through
+/// (PRD's "degrade to a friendly login prompt, never an error, and never
+/// make an authed request" contract). Returns `None` — having made no
+/// request at all — when logged out; otherwise a valid (transparently
+/// refreshed) access token. A refresh failure logs the reader out, mirroring
+/// `reverify_session`'s own handling of the same failure mode.
+async fn require_login(app: &mut App, feature_prompt: &str) -> Option<String> {
+    let now = chrono::Utc::now().timestamp();
+    let Some(auth_state) = app.auth.as_mut() else {
+        app.notice = Some(format!("Log in to {feature_prompt} (:login)"));
+        return None;
+    };
+    match auth_state.valid_access_token(now).await {
+        Ok(token) => Some(token),
+        Err(e) => {
+            let _ = auth_state.logout();
+            app.auth = None;
+            app.notice = Some(format!("Session expired — logged out ({e})"));
+            None
+        }
+    }
+}
+
+/// PRD §6.2 rule 8's badtoken retry, for `action=watch`: fetches (or reuses)
+/// the cached watch token, attempts the write, and — only if that response
+/// is a `badtoken` error — invalidates the cache, fetches one fresh token,
+/// and retries exactly once more. `access_token` is the OAuth Bearer token
+/// (already resolved by `require_login`); `write_token` is the csrf/watch
+/// token this one action needs.
+async fn watch_with_retry(
+    app: &mut App,
+    client: &WikiClient,
+    lang: &str,
+    access_token: &str,
+    title: &str,
+    unwatch: bool,
+) -> Result<Vec<u8>> {
+    let write_token = app.tokens.watch_token(client, lang, access_token).await?;
+    let body = client
+        .watch_raw(lang, access_token, title, &write_token, unwatch)
+        .await?;
+    if !account::is_badtoken_response(&body) {
+        return Ok(body);
+    }
+    app.tokens.invalidate_watch();
+    let fresh = app.tokens.watch_token(client, lang, access_token).await?;
+    client
+        .watch_raw(lang, access_token, title, &fresh, unwatch)
+        .await
+}
+
+/// PRD FR-ACC-2's `:watchlist` / `gW`: fetches the raw watched-pages list and
+/// the "since last seen" activity feed, then advances the persisted
+/// last-seen timestamp to the newest change just shown (so the *next* open
+/// only shows what's new since this one). Logged-out shows the login prompt
+/// and makes no request at all.
+async fn open_watchlist(client: &WikiClient, app: &mut App) {
+    let Some(token) = require_login(app, "view your watchlist").await else {
+        return;
+    };
+    app.enter_watchlist();
+    let lang = app.lang.clone();
+    let raw = match client.fetch_watchlistraw(&lang, &token).await {
+        Ok(body) => account::parse_watchlistraw(&body).unwrap_or_default(),
+        Err(e) => {
+            app.status = format!("Couldn't load the watchlist: {e}");
+            Vec::new()
+        }
+    };
+    let changes = match client.fetch_watchlist_changes(&lang, &token, 50).await {
+        Ok(body) => account::parse_watchlist_changes(&body).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    let since: Vec<account::WatchlistChange> =
+        account::changes_since(&changes, app.watchlist_last_seen.as_deref())
+            .into_iter()
+            .cloned()
+            .collect();
+    // Advance the cursor to the newest change in THIS fetch (not just the
+    // "since" subset) — a page with no new changes today must not make
+    // tomorrow's open re-show today's changes it never had.
+    if let Some(newest) = account::newest_timestamp(&changes) {
+        let newest = newest.to_string();
+        if let Some(path) = &app.watchlist_state_path {
+            let _ = account::save_last_seen(path, &newest);
+        }
+        app.watchlist_last_seen = Some(newest);
+    }
+    app.watchlist_raw = raw;
+    app.watchlist_changes = since;
+    app.status = "j/k: move  Tab/h/l: switch  Enter: open  Esc: close".to_string();
+}
+
+/// PRD FR-ACC-2's `w`: toggles watch/unwatch on the article currently on
+/// screen. Reads the server's own current-watched status first (never a
+/// stale local guess) to decide which way to toggle, then writes through
+/// `watch_with_retry`.
+async fn cmd_watch_toggle(client: &WikiClient, app: &mut App) {
+    let Some(access_token) = require_login(app, "watch articles").await else {
+        return;
+    };
+    let Some(doc) = app.active_tab().doc.as_ref() else {
+        app.status = "Open an article first".to_string();
+        return;
+    };
+    let title = doc.title.clone();
+    let lang = app.active_tab().lang.clone();
+    let currently_watched = client
+        .fetch_watched_status(&lang, &access_token, &title)
+        .await
+        .unwrap_or(false);
+    let result = watch_with_retry(
+        app,
+        client,
+        &lang,
+        &access_token,
+        &title,
+        currently_watched, // toggle: unwatch iff it's currently watched
+    )
+    .await;
+    app.notice = Some(match result {
+        Ok(body) => match account::parse_watch_outcome(&body) {
+            Some(account::WatchOutcome::Watched) => format!("Watching {title}"),
+            Some(account::WatchOutcome::Unwatched) => format!("Unwatched {title}"),
+            None => format!("Watch toggle failed for {title}"),
+        },
+        Err(e) => format!("Watch toggle failed: {e}"),
+    });
+}
+
+/// PRD FR-ACC-3's `:notifications`: fetches the unread-count badge and the
+/// full alerts/messages list. Logged-out shows the login prompt and makes no
+/// request.
+async fn open_notifications(client: &WikiClient, app: &mut App) {
+    let Some(token) = require_login(app, "view your notifications").await else {
+        return;
+    };
+    app.enter_notifications();
+    let lang = app.lang.clone();
+    // Per `account.rs`'s poll-cadence doc: the count is polled again here
+    // (opening the pane), on top of the login/startup poll — never on a
+    // timer.
+    if let Ok(body) = client.fetch_notifications_count(&lang, &token).await
+        && let Ok(counts) = account::parse_notif_count(&body)
+    {
+        app.notif_counts = counts;
+    }
+    match client.fetch_notifications_list(&lang, &token).await {
+        Ok(body) => {
+            let list = account::parse_notif_list(&body).unwrap_or_default();
+            app.notif_alerts = list
+                .iter()
+                .filter(|n| n.kind == account::NotifKind::Alert)
+                .cloned()
+                .collect();
+            app.notif_messages = list
+                .iter()
+                .filter(|n| n.kind == account::NotifKind::Message)
+                .cloned()
+                .collect();
+            app.status = "j/k: move  Tab/h/l: switch  d: mark read  A: mark all read  Esc: close"
+                .to_string();
+        }
+        Err(e) => app.status = format!("Couldn't load notifications: {e}"),
+    }
+}
+
+/// PRD §6.2 rule 8's badtoken retry for `action=echomarkread`: fetches (or
+/// reuses) the cached csrf token, attempts the mark-read, and retries once
+/// more on a `badtoken` response — the csrf-token counterpart of
+/// `watch_with_retry`. `all` marks every notification read; otherwise `ids`
+/// (non-empty) marks just those.
+async fn echomarkread_with_retry(
+    app: &mut App,
+    client: &WikiClient,
+    lang: &str,
+    access_token: &str,
+    all: bool,
+    ids: &[String],
+) -> Result<Vec<u8>> {
+    let write_token = app.tokens.csrf_token(client, lang, access_token).await?;
+    let body = client
+        .echomarkread_raw(lang, access_token, &write_token, all, ids)
+        .await?;
+    if !account::is_badtoken_response(&body) {
+        return Ok(body);
+    }
+    app.tokens.invalidate_csrf();
+    let fresh = app.tokens.csrf_token(client, lang, access_token).await?;
+    client
+        .echomarkread_raw(lang, access_token, &fresh, all, ids)
+        .await
+}
+
+/// PRD FR-ACC-3's `d`: marks the focused notification read, then updates the
+/// badge locally from the in-memory lists (no extra network round trip).
+async fn mark_notification_read(client: &WikiClient, app: &mut App) {
+    let Some(id) = app.notif_focused_id() else {
+        app.status = "Nothing to mark read".to_string();
+        return;
+    };
+    let Some(access_token) = require_login(app, "manage your notifications").await else {
+        return;
+    };
+    let lang = app.lang.clone();
+    let ids = [id.clone()];
+    let result = echomarkread_with_retry(app, client, &lang, &access_token, false, &ids).await;
+    match result {
+        Ok(_) => {
+            app.mark_notif_read_locally(&id);
+            app.notice = Some("Marked read".to_string());
+        }
+        Err(e) => app.notice = Some(format!("Mark-read failed: {e}")),
+    }
+}
+
+/// PRD FR-ACC-3's `A`: marks every notification read.
+async fn mark_all_notifications_read(client: &WikiClient, app: &mut App) {
+    let Some(access_token) = require_login(app, "manage your notifications").await else {
+        return;
+    };
+    let lang = app.lang.clone();
+    let result = echomarkread_with_retry(app, client, &lang, &access_token, true, &[]).await;
+    match result {
+        Ok(_) => {
+            app.mark_all_notifs_read_locally();
+            app.notice = Some("Marked all read".to_string());
+        }
+        Err(e) => app.notice = Some(format!("Mark-all-read failed: {e}")),
+    }
+}
+
+/// PRD FR-ACC-4's `:contribs [username]`: `username` defaults to the
+/// logged-in user (showing the login prompt, and making no request, if
+/// that's requested but no session exists); an explicit username works
+/// logged out too, since `usercontribs` is public.
+async fn open_contribs(client: &WikiClient, app: &mut App, username: Option<String>) {
+    let resolved = match username {
+        Some(name) => name,
+        None => match app.logged_in_username() {
+            Some(name) => name.to_string(),
+            None => {
+                app.notice = Some(
+                    "Log in to view your contributions, or specify one: :contribs <username>"
+                        .to_string(),
+                );
+                return;
+            }
+        },
+    };
+    app.enter_contribs(resolved.clone());
+    let lang = app.lang.clone();
+    match client.fetch_usercontribs(&lang, &resolved, 50).await {
+        Ok(body) => {
+            app.contribs = account::parse_usercontribs(&body).unwrap_or_default();
+            app.status = "j/k: move  Enter: open  t: thank  Esc: close".to_string();
+        }
+        Err(e) => app.status = format!("Couldn't load contributions for {resolved:?}: {e}"),
+    }
+}
+
+/// PRD §6.2 rule 8's badtoken retry for `action=thank` — the csrf-token
+/// counterpart of `watch_with_retry`, mirroring `echomarkread_with_retry`.
+async fn thank_with_retry(
+    app: &mut App,
+    client: &WikiClient,
+    lang: &str,
+    access_token: &str,
+    revid: u64,
+) -> Result<Vec<u8>> {
+    let write_token = app.tokens.csrf_token(client, lang, access_token).await?;
+    let body = client
+        .thank_raw(lang, access_token, revid, &write_token)
+        .await?;
+    if !account::is_badtoken_response(&body) {
+        return Ok(body);
+    }
+    app.tokens.invalidate_csrf();
+    let fresh = app.tokens.csrf_token(client, lang, access_token).await?;
+    client.thank_raw(lang, access_token, revid, &fresh).await
+}
+
+/// PRD FR-ACC-6's `t` (from the contributions view): thanks the focused
+/// edit's revision — purely positive, one-way, never reciprocated.
+async fn cmd_thank(client: &WikiClient, app: &mut App) {
+    let Some(revid) = app.contribs_focused_revid() else {
+        app.status = "Nothing to thank".to_string();
+        return;
+    };
+    let Some(access_token) = require_login(app, "thank an editor").await else {
+        return;
+    };
+    let lang = app.lang.clone();
+    let result = thank_with_retry(app, client, &lang, &access_token, revid).await;
+    app.notice = Some(match result {
+        Ok(body) if account::thank_succeeded(&body) => "Thanked".to_string(),
+        Ok(_) => "Thank failed".to_string(),
+        Err(e) => format!("Thank failed: {e}"),
+    });
+}
+
+/// PRD FR-ACC-7's `:prefs`: the read-only preferences card.
+async fn open_prefs(client: &WikiClient, app: &mut App) {
+    let Some(token) = require_login(app, "view your preferences").await else {
+        return;
+    };
+    app.enter_prefs();
+    let lang = app.lang.clone();
+    match client.fetch_userinfo_options(&lang, &token).await {
+        Ok(body) => match account::parse_userinfo_options(&body) {
+            Ok(prefs) => {
+                app.prefs = Some(prefs);
+                app.status = "Esc: close".to_string();
+            }
+            Err(e) => app.status = format!("Couldn't parse preferences: {e}"),
+        },
+        Err(e) => app.status = format!("Couldn't load preferences: {e}"),
+    }
+}
+
+/// PRD FR-ACC-3's login/startup poll (see `account.rs`'s poll-cadence doc):
+/// fetches the unread-count badge once, right after a session is
+/// established. Best-effort — a failure here just leaves the badge absent
+/// until the reader opens `:notifications`, never a login-blocking error.
+async fn poll_notifications_count(client: &WikiClient, app: &mut App) {
+    let Some(auth_state) = app.auth.as_mut() else {
+        return;
+    };
+    let now = chrono::Utc::now().timestamp();
+    let Ok(token) = auth_state.valid_access_token(now).await else {
+        return;
+    };
+    let lang = app.lang.clone();
+    if let Ok(body) = client.fetch_notifications_count(&lang, &token).await
+        && let Ok(counts) = account::parse_notif_count(&body)
+    {
+        app.notif_counts = counts;
     }
 }
 
@@ -5477,6 +5931,14 @@ async fn execute_command(
         Command::Login(LoginMode::Paste) => cmd_login_paste(app),
         // PRD FR-ACC-9.
         Command::Logout => cmd_logout(app),
+        // PRD FR-ACC-2. Same action as `gW`.
+        Command::Watchlist => open_watchlist(client, app).await,
+        // PRD FR-ACC-3.
+        Command::Notifications => open_notifications(client, app).await,
+        // PRD FR-ACC-4.
+        Command::Contribs(username) => open_contribs(client, app, username).await,
+        // PRD FR-ACC-7.
+        Command::Prefs => open_prefs(client, app).await,
         Command::Quit => app.should_quit = true,
     }
 }
@@ -5901,5 +6363,283 @@ mod tests {
         // Switching to tab 1 re-arms the notice.
         app.switch_to_tab(bg);
         assert_eq!(app.notice.as_deref(), Some("updated — r to reload"));
+    }
+
+    // ---- PRD FR-ACC-2/3/4/6/7: watchlist, notifications, contribs, thank, prefs
+
+    /// `require_login` is the one gate every feature in this section shares:
+    /// logged out, it must show the login prompt and touch nothing else —
+    /// no mode change, no network (it takes no `client` at all, so there is
+    /// nothing it even *could* call).
+    #[tokio::test]
+    async fn require_login_prompts_and_returns_none_when_logged_out() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        let token = require_login(&mut app, "view your watchlist").await;
+        assert!(token.is_none());
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("Log in to view your watchlist (:login)")
+        );
+    }
+
+    /// PRD FR-ACC-2: logged out, `:watchlist` shows the login prompt and
+    /// makes no request — proven by `test_client()` pointing at a port
+    /// nothing listens on (`http://127.0.0.1:1`): if the gate were bypassed,
+    /// the fetch would fail and land a *different* ("Couldn't load the
+    /// watchlist: ...") message instead, and `enter_watchlist` would have
+    /// already flipped the mode before that failure was even known.
+    #[tokio::test]
+    async fn open_watchlist_logged_out_shows_the_login_prompt_and_makes_no_request() {
+        let client = test_client();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        open_watchlist(&client, &mut app).await;
+        assert_eq!(app.mode, Mode::Reading, "the pane must never open");
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("Log in to view your watchlist (:login)")
+        );
+        assert!(app.watchlist_raw.is_empty());
+        assert!(app.watchlist_changes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cmd_watch_toggle_logged_out_shows_the_login_prompt_and_makes_no_request() {
+        let client = test_client();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        cmd_watch_toggle(&client, &mut app).await;
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("Log in to watch articles (:login)")
+        );
+    }
+
+    #[tokio::test]
+    async fn open_notifications_logged_out_shows_the_login_prompt_and_makes_no_request() {
+        let client = test_client();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        open_notifications(&client, &mut app).await;
+        assert_eq!(app.mode, Mode::Reading, "the pane must never open");
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("Log in to view your notifications (:login)")
+        );
+        assert!(app.notif_alerts.is_empty());
+        assert!(app.notif_messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mark_notification_read_logged_out_shows_the_login_prompt() {
+        let client = test_client();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        // A focused notification would normally come from an open pane;
+        // this asserts the login gate is checked regardless.
+        mark_notification_read(&client, &mut app).await;
+        assert_eq!(app.status, "Nothing to mark read", "no focused entry yet");
+        app.notif_alerts.push(account::Notification {
+            id: "1".to_string(),
+            kind: account::NotifKind::Alert,
+            text: "x".to_string(),
+            read: false,
+            timestamp: String::new(),
+        });
+        mark_notification_read(&client, &mut app).await;
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("Log in to manage your notifications (:login)")
+        );
+        assert!(!app.notif_alerts[0].read, "nothing was actually marked");
+    }
+
+    #[tokio::test]
+    async fn open_contribs_bare_logged_out_shows_the_login_prompt_and_makes_no_request() {
+        let client = test_client();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        open_contribs(&client, &mut app, None).await;
+        assert_eq!(app.mode, Mode::Reading, "the view must never open");
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("Log in to view your contributions"),
+            "{:?}",
+            app.notice
+        );
+        assert!(app.contribs.is_empty());
+    }
+
+    /// PRD FR-ACC-4: an explicit username is public — it must NOT show the
+    /// login prompt even logged out, and it DOES open the view (the fetch
+    /// itself fails against `test_client()`'s unreachable port, which is a
+    /// distinct, expected failure mode from being gated).
+    #[tokio::test]
+    async fn open_contribs_with_a_username_is_never_gated_by_login() {
+        let client = test_client();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        open_contribs(&client, &mut app, Some("OtherEditor".to_string())).await;
+        assert_eq!(
+            app.mode,
+            Mode::Contribs,
+            "a named user's contribs always open"
+        );
+        assert_eq!(app.contribs_username, "OtherEditor");
+        assert!(
+            app.notice.is_none(),
+            "no login prompt for a public, explicitly-named user's contributions"
+        );
+    }
+
+    #[tokio::test]
+    async fn cmd_thank_logged_out_shows_the_login_prompt() {
+        let client = test_client();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        cmd_thank(&client, &mut app).await;
+        assert_eq!(app.status, "Nothing to thank", "no focused edit yet");
+        app.contribs.push(account::Contribution {
+            title: "Alan Turing".to_string(),
+            timestamp: String::new(),
+            comment: None,
+            revid: 42,
+            sizediff: 1,
+        });
+        cmd_thank(&client, &mut app).await;
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("Log in to thank an editor (:login)")
+        );
+    }
+
+    #[tokio::test]
+    async fn open_prefs_logged_out_shows_the_login_prompt_and_makes_no_request() {
+        let client = test_client();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        open_prefs(&client, &mut app).await;
+        assert_eq!(app.mode, Mode::Reading, "the card must never open");
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("Log in to view your preferences (:login)")
+        );
+        assert!(app.prefs.is_none());
+    }
+
+    /// PRD FR-ACC-3's login/startup poll must be a silent no-op when logged
+    /// out — never an error, never a request (there's no `auth_state` to
+    /// even get a token from).
+    #[tokio::test]
+    async fn poll_notifications_count_is_a_no_op_when_logged_out() {
+        let client = test_client();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        poll_notifications_count(&client, &mut app).await;
+        assert_eq!(app.notif_counts, account::NotifCounts::default());
+    }
+
+    // ---- PRD §6.2 rule 8: CSRF/watch token fetch + badtoken retry ---------
+
+    /// A tiny scripted server: replies to each accepted connection in turn
+    /// with the next `responses` entry, all HTTP 200 — real MediaWiki
+    /// reports action-API errors (including `badtoken`) as 200 with an
+    /// `{"error":...}` body, never a 4xx (see `api::WikiClient::
+    /// authed_post_form`'s doc comment), so every scripted reply here uses
+    /// that same shape.
+    fn spawn_scripted_server(responses: Vec<&'static str>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for body in responses {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut discard = [0u8; 4096];
+                    let _ = stream.read(&mut discard);
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes());
+                    let _ = stream.write_all(body.as_bytes());
+                }
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// End-to-end proof that `watch_with_retry` really performs PRD §6.2
+    /// rule 8's contract: the first write with the (freshly fetched) token
+    /// comes back `badtoken`, which must invalidate the cache, fetch
+    /// exactly one fresh token, and retry exactly once more — landing on
+    /// success with the SECOND token, not the first. Four scripted
+    /// responses in order: token fetch, failed write, re-fetched token,
+    /// successful write; a 5th (unscripted) request would hang the test
+    /// (the listener thread only serves four), so a wrong retry count fails
+    /// loudly rather than silently passing.
+    #[tokio::test]
+    async fn watch_with_retry_refetches_once_on_badtoken_and_succeeds() {
+        let base = spawn_scripted_server(vec![
+            r#"{"query":{"tokens":{"watchtoken":"STALE"}}}"#,
+            r#"{"error":{"code":"badtoken","info":"stale token"}}"#,
+            r#"{"query":{"tokens":{"watchtoken":"FRESH"}}}"#,
+            r#"{"watch":[{"ns":0,"title":"Alan Turing","watched":true}]}"#,
+        ]);
+        let client = WikiClient::new(base).unwrap();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        let body = watch_with_retry(&mut app, &client, "en", "access-tok", "Alan Turing", false)
+            .await
+            .unwrap();
+        assert_eq!(
+            account::parse_watch_outcome(&body),
+            Some(account::WatchOutcome::Watched)
+        );
+        // The cache now holds the token from the retry's re-fetch, not the
+        // stale one — reading it makes no further request (already cached),
+        // so this doesn't need a 5th scripted response.
+        let cached = app
+            .tokens
+            .watch_token(&client, "en", "access-tok")
+            .await
+            .unwrap();
+        assert_eq!(cached, "FRESH");
+    }
+
+    /// The csrf-token counterpart of the watch test above, exercising
+    /// `echomarkread_with_retry` (shared by mark-read/mark-all-read/thank).
+    #[tokio::test]
+    async fn echomarkread_with_retry_refetches_the_csrf_token_once_on_badtoken() {
+        let base = spawn_scripted_server(vec![
+            r#"{"query":{"tokens":{"csrftoken":"STALE"}}}"#,
+            r#"{"error":{"code":"badtoken","info":"stale token"}}"#,
+            r#"{"query":{"tokens":{"csrftoken":"FRESH"}}}"#,
+            r#"{"query":{"echomarkread":{"result":"success"}}}"#,
+        ]);
+        let client = WikiClient::new(base).unwrap();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        let ids = ["1".to_string()];
+        let body = echomarkread_with_retry(&mut app, &client, "en", "access-tok", false, &ids)
+            .await
+            .unwrap();
+        assert!(!account::is_badtoken_response(&body));
+        let cached = app
+            .tokens
+            .csrf_token(&client, "en", "access-tok")
+            .await
+            .unwrap();
+        assert_eq!(cached, "FRESH");
+    }
+
+    /// A non-badtoken failure (e.g. a permission error) must NOT trigger a
+    /// retry — retrying only ever makes sense for a stale token, never for
+    /// any other error, per §6.2 rule 8's "never loop" contract.
+    #[tokio::test]
+    async fn watch_with_retry_does_not_retry_a_non_badtoken_error() {
+        let base = spawn_scripted_server(vec![
+            r#"{"query":{"tokens":{"watchtoken":"T1"}}}"#,
+            r#"{"error":{"code":"permissiondenied","info":"blocked"}}"#,
+        ]);
+        let client = WikiClient::new(base).unwrap();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        let body = watch_with_retry(&mut app, &client, "en", "access-tok", "X", false)
+            .await
+            .unwrap();
+        assert!(!account::is_badtoken_response(&body));
+        // Confirms only 2 requests were made (token + one write): a 3rd
+        // request against this two-response server would hang, so reaching
+        // this assertion at all proves no retry was attempted.
     }
 }

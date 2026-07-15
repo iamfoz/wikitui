@@ -172,6 +172,47 @@ Talk-page fixture (PRD FR-ACC-5):
   `:talk` toggle (`src/talk.rs`) fetches and renders a talk page through the
   exact same path as any article — no separate endpoint or mock behavior.
 
+Account-features fixtures (PRD FR-ACC-2/3/4/6/7 — watchlist, notifications,
+contributions, thank, prefs), all building on the OAuth session above:
+
+- `GET .../api.php?...&list=watchlistraw` / `&list=watchlist` — the raw
+  watched-pages list and the "what changed" recent-changes feed
+  (`WATCHED_TITLES`, mutably updated by `action=watch` below, and
+  `WATCHLIST_CHANGES`, filtered to currently-watched titles only).
+- `GET .../api.php?...&meta=tokens&type=csrf|watch` — mints
+  `f"{type}TOKEN-{epoch}"`; see `TOKEN_EPOCH` below for how a test invalidates
+  one.
+- `GET .../api.php?...&prop=info&inprop=watched` — the authenticated
+  watched-status check `w` reads before deciding which way to toggle.
+- `POST .../api.php` `action=watch` (`unwatch=1` to remove) — adds/removes
+  from `WATCHED_TITLES`, so a picker reopened after `w` reflects the change.
+- `GET .../api.php?...&meta=notifications&notprop=count|list` /
+  `POST action=echomarkread` — `NOTIFICATIONS`' mutable `read` flags, seeded
+  with one already-read alert, one unread alert, and one unread message.
+- `GET .../api.php?...&list=usercontribs&ucuser=` — `USER_CONTRIBS`, keyed by
+  username: `MockWikipedian`'s own edits plus a second user (`OtherEditor`)
+  so ":contribs" (self) and ":contribs OtherEditor" both resolve to
+  something real, public and unauthenticated either way.
+- `POST .../api.php` `action=thank` — always succeeds for a logged-in Bearer
+  token; purely positive, tracks nothing.
+- `GET .../api.php?...&meta=userinfo&uiprop=options` — folds `USER_PREFS`
+  (skin/language/editcount/emailauthenticated) onto the same authenticated
+  whoami response `meta=userinfo` alone already serves.
+- Every write above (`watch`/`thank`/`echomarkread`) requires BOTH the OAuth
+  Bearer token and a matching csrf/watch token; a mismatched token gets a
+  real `{"error":{"code":"badtoken",...}}` body at HTTP 200 (never a 4xx —
+  matching the classic Action API), so the client's refetch-and-retry-once
+  path is exercisable against this mock, not just unit-tested in isolation.
+- `GET /debug/expire-tokens` bumps `TOKEN_EPOCH`, instantly invalidating
+  every token minted before the call — force a `badtoken` on the next write
+  to drive that retry path interactively.
+- `GET /debug/watchlist` — the server's current `WATCHED_TITLES`, for
+  confirming a `w` toggle actually mutated server-side state.
+- `GET /debug/reset` additionally restores `WATCHED_TITLES`/`NOTIFICATIONS`/
+  `TOKEN_EPOCH` to their seeded values (on top of its pre-existing
+  `REQUEST_LOG` clear), so a test can isolate phases the same way it already
+  could for the request log.
+
 ## Running it
 
 ```sh

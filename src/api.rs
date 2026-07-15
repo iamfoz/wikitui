@@ -24,7 +24,7 @@
 //! here: it is still raw markup at this point, and `doc::parse_article_html`
 //! is the module responsible for turning it into sanitized `Document` text.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -974,6 +974,264 @@ impl WikiClient {
             bail!("the access token did not authenticate (userinfo returned an anonymous session)");
         }
         Ok(crate::sanitize::sanitize_single_line(&parsed.query.userinfo.name).into_owned())
+    }
+
+    /// PRD §6.2 rule 8: `meta=tokens&type=csrf|watch` — the token every
+    /// write action (`watch`, `thank`, `echomarkread`) needs. `kind` is
+    /// `"csrf"` or `"watch"`; the response's own key is `{kind}token`, read
+    /// back generically rather than one struct per kind since the shape is
+    /// otherwise identical. Cached by `account::TokenCache`, not here — this
+    /// method always hits the network, matching every other `fetch_*` in
+    /// this module.
+    pub async fn fetch_token(&self, lang: &str, access_token: &str, kind: &str) -> Result<String> {
+        let url = format!(
+            "{}/w/api.php?action=query&format=json&formatversion=2&meta=tokens&type={kind}",
+            self.host(lang)
+        );
+        let resp = self.authed_get(&url, access_token).await?;
+        let bytes = read_capped(resp, MAX_SEARCH_RESPONSE_BYTES)
+            .await
+            .context("reading tokens response body")?;
+        #[derive(Deserialize)]
+        struct TokensResponse {
+            query: TokensQuery,
+        }
+        #[derive(Deserialize)]
+        struct TokensQuery {
+            tokens: HashMap<String, String>,
+        }
+        let parsed: TokensResponse =
+            serde_json::from_slice(&bytes).context("parsing tokens response")?;
+        parsed
+            .query
+            .tokens
+            .get(&format!("{kind}token"))
+            .cloned()
+            .ok_or_else(|| anyhow!("tokens response carried no {kind}token"))
+    }
+
+    /// PRD FR-ACC-2's `w` toggle: whether the current session already
+    /// watches `title` (`prop=info&inprop=watched`), read fresh immediately
+    /// before every toggle so the watch/unwatch decision is never made from
+    /// a stale local guess. Defaults to not-watched on any unparseable
+    /// response — the safer of the two guesses (worst case `w` watches an
+    /// already-watched page again, a harmless no-op on the real API).
+    pub async fn fetch_watched_status(
+        &self,
+        lang: &str,
+        access_token: &str,
+        title: &str,
+    ) -> Result<bool> {
+        let url = format!(
+            "{}/w/api.php?action=query&format=json&formatversion=2&prop=info&inprop=watched&titles={}",
+            self.host(lang),
+            urlencoding::encode(&title.replace(' ', "_"))
+        );
+        let resp = self.authed_get(&url, access_token).await?;
+        let bytes = read_capped(resp, MAX_SEARCH_RESPONSE_BYTES)
+            .await
+            .context("reading watched-status response body")?;
+        Ok(crate::account::parse_watched_status(&bytes))
+    }
+
+    /// A `POST` carrying `Authorization: Bearer` plus a form body, for the
+    /// write actions (PRD §6.2 rule 8: `watch`, `thank`, `echomarkread`).
+    /// Deliberately does **not** call `error_for_status`: the classic Action
+    /// API reports its own errors (including `badtoken`) as HTTP 200 with an
+    /// `{"error":{...}}` body, so the caller must be able to read that body
+    /// — an early `error_for_status` would only fire on a genuine transport-
+    /// level failure (connection reset, 5xx from a proxy), which is exactly
+    /// when propagating an error, rather than a body, is correct.
+    async fn authed_post_form(
+        &self,
+        url: &str,
+        access_token: &str,
+        form: &[(&str, &str)],
+    ) -> Result<Vec<u8>> {
+        let body = form
+            .iter()
+            .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
+            .collect::<Vec<_>>()
+            .join("&");
+        let resp = self
+            .http
+            .post(url)
+            .bearer_auth(access_token)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body(body)
+            .send()
+            .await
+            .with_context(|| format!("posting to {url}"))?;
+        read_capped(resp, MAX_SEARCH_RESPONSE_BYTES)
+            .await
+            .context("reading write-action response body")
+    }
+
+    /// PRD FR-ACC-2: `action=watch` (`unwatch=1` to remove instead of add).
+    /// Returns the raw response body — a badtoken error and a success both
+    /// parse from it (see `account::is_badtoken_response`/
+    /// `account::parse_watch_outcome`).
+    pub async fn watch_raw(
+        &self,
+        lang: &str,
+        access_token: &str,
+        title: &str,
+        token: &str,
+        unwatch: bool,
+    ) -> Result<Vec<u8>> {
+        let url = format!("{}/w/api.php?format=json&formatversion=2", self.host(lang));
+        let mut form = vec![("action", "watch"), ("title", title), ("token", token)];
+        if unwatch {
+            form.push(("unwatch", "1"));
+        }
+        self.authed_post_form(&url, access_token, &form).await
+    }
+
+    /// PRD FR-ACC-2: the raw watched-pages list (`list=watchlistraw`).
+    pub async fn fetch_watchlistraw(&self, lang: &str, access_token: &str) -> Result<Vec<u8>> {
+        let url = format!(
+            "{}/w/api.php?action=query&format=json&formatversion=2&list=watchlistraw",
+            self.host(lang)
+        );
+        let resp = self.authed_get(&url, access_token).await?;
+        read_capped(resp, MAX_SEARCH_RESPONSE_BYTES)
+            .await
+            .context("reading watchlistraw response body")
+    }
+
+    /// PRD FR-ACC-2: the "what changed" activity feed (`list=watchlist`),
+    /// most-recent changes to every currently-watched page.
+    pub async fn fetch_watchlist_changes(
+        &self,
+        lang: &str,
+        access_token: &str,
+        limit: u32,
+    ) -> Result<Vec<u8>> {
+        let url = format!(
+            "{}/w/api.php?action=query&format=json&formatversion=2&list=watchlist&wlprop=title|timestamp|user|comment|ids&wllimit={limit}",
+            self.host(lang)
+        );
+        let resp = self.authed_get(&url, access_token).await?;
+        read_capped(resp, MAX_SEARCH_RESPONSE_BYTES)
+            .await
+            .context("reading watchlist response body")
+    }
+
+    /// PRD FR-ACC-3: the unread-count badge (`meta=notifications&
+    /// notprop=count`) — fetched at login and on opening the pane only, per
+    /// this module's poll-cadence contract (see `account.rs`'s doc comment).
+    pub async fn fetch_notifications_count(
+        &self,
+        lang: &str,
+        access_token: &str,
+    ) -> Result<Vec<u8>> {
+        let url = format!(
+            "{}/w/api.php?action=query&format=json&formatversion=2&meta=notifications&notprop=count",
+            self.host(lang)
+        );
+        let resp = self.authed_get(&url, access_token).await?;
+        read_capped(resp, MAX_SEARCH_RESPONSE_BYTES)
+            .await
+            .context("reading notifications-count response body")
+    }
+
+    /// PRD FR-ACC-3: the alerts/messages list (`notprop=list`).
+    pub async fn fetch_notifications_list(
+        &self,
+        lang: &str,
+        access_token: &str,
+    ) -> Result<Vec<u8>> {
+        let url = format!(
+            "{}/w/api.php?action=query&format=json&formatversion=2&meta=notifications&notprop=list",
+            self.host(lang)
+        );
+        let resp = self.authed_get(&url, access_token).await?;
+        read_capped(resp, MAX_SEARCH_RESPONSE_BYTES)
+            .await
+            .context("reading notifications-list response body")
+    }
+
+    /// PRD FR-ACC-3: `action=echomarkread`. `ids` is ignored when `all` is
+    /// set (mark-all-read); otherwise it's the `|`-joined id list to mark.
+    pub async fn echomarkread_raw(
+        &self,
+        lang: &str,
+        access_token: &str,
+        token: &str,
+        all: bool,
+        ids: &[String],
+    ) -> Result<Vec<u8>> {
+        let url = format!("{}/w/api.php?format=json&formatversion=2", self.host(lang));
+        let joined_ids = ids.join("|");
+        let mut form = vec![("action", "echomarkread"), ("token", token)];
+        if all {
+            form.push(("all", "1"));
+        } else {
+            form.push(("list", joined_ids.as_str()));
+        }
+        self.authed_post_form(&url, access_token, &form).await
+    }
+
+    /// PRD FR-ACC-4: `list=usercontribs` — public, no auth token needed;
+    /// works for any username, logged in or not.
+    pub async fn fetch_usercontribs(
+        &self,
+        lang: &str,
+        username: &str,
+        limit: u32,
+    ) -> Result<Vec<u8>> {
+        let url = format!(
+            "{}/w/api.php?action=query&format=json&formatversion=2&list=usercontribs&ucuser={}&uclimit={limit}&ucprop=title|timestamp|comment|ids|sizediff",
+            self.host(lang),
+            urlencoding::encode(username)
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("requesting contributions for {username:?}"))?
+            .error_for_status()
+            .context("usercontribs request failed")?;
+        read_capped(resp, MAX_SEARCH_RESPONSE_BYTES)
+            .await
+            .context("reading usercontribs response body")
+    }
+
+    /// PRD FR-ACC-6: `action=thank&rev={revid}`, a purely positive one-way
+    /// gesture (never a reciprocal notification back to this client).
+    pub async fn thank_raw(
+        &self,
+        lang: &str,
+        access_token: &str,
+        revid: u64,
+        token: &str,
+    ) -> Result<Vec<u8>> {
+        let url = format!("{}/w/api.php?format=json&formatversion=2", self.host(lang));
+        let revid_str = revid.to_string();
+        let form = [
+            ("action", "thank"),
+            ("rev", revid_str.as_str()),
+            ("token", token),
+        ];
+        self.authed_post_form(&url, access_token, &form).await
+    }
+
+    /// PRD FR-ACC-7: `meta=userinfo&uiprop=options` — the read-only prefs
+    /// surface. Never paired with a write; this build has no `action=
+    /// options` call anywhere.
+    pub async fn fetch_userinfo_options(&self, lang: &str, access_token: &str) -> Result<Vec<u8>> {
+        let url = format!(
+            "{}/w/api.php?action=query&format=json&formatversion=2&meta=userinfo&uiprop=options",
+            self.host(lang)
+        );
+        let resp = self.authed_get(&url, access_token).await?;
+        read_capped(resp, MAX_SEARCH_RESPONSE_BYTES)
+            .await
+            .context("reading userinfo-options response body")
     }
 
     /// Full-text search (PRD Appendix A: `GET /w/rest.php/v1/search/page`).
@@ -2122,5 +2380,267 @@ mod tests {
         let client = WikiClient::new(format!("http://127.0.0.1:{port}")).unwrap();
         let links = client.fetch_langlinks("en", "Some Stub").await.unwrap();
         assert!(links.is_empty());
+    }
+
+    // ---- PRD FR-ACC-2/3/4/6/7: watchlist/notifications/contribs/thank/prefs
+
+    /// Captures one HTTP request's path+query (for a GET) or body (for a
+    /// POST), plus its `Authorization` header — the request-shape assertion
+    /// every write-action test below needs. Mirrors `auth.rs`'s own
+    /// `read_http_request`, kept local here rather than shared across
+    /// modules since each is a small, throwaway test fixture.
+    struct CapturedRequest {
+        request_line: String,
+        body: String,
+        authorization: String,
+    }
+
+    fn spawn_one_shot_server(
+        response_json: &'static str,
+    ) -> (String, std::sync::mpsc::Receiver<CapturedRequest>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                loop {
+                    let n = stream.read(&mut tmp).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    let text = String::from_utf8_lossy(&buf);
+                    if let Some(hdr_end) = text.find("\r\n\r\n") {
+                        let content_len = text
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= hdr_end + 4 + content_len {
+                            break;
+                        }
+                    }
+                }
+                let text = String::from_utf8_lossy(&buf).into_owned();
+                let (headers, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+                let request_line = headers.lines().next().unwrap_or("").to_string();
+                let authorization = headers
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("authorization:")
+                            .map(|_| {
+                                l.split_once(':')
+                                    .map(|x| x.1)
+                                    .unwrap_or("")
+                                    .trim()
+                                    .to_string()
+                            })
+                    })
+                    .unwrap_or_default();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_json}",
+                    response_json.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+                let _ = tx.send(CapturedRequest {
+                    request_line,
+                    body: body.to_string(),
+                    authorization,
+                });
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), rx)
+    }
+
+    #[tokio::test]
+    async fn fetch_token_reads_the_named_token_and_carries_the_bearer_header() {
+        let (base, rx) =
+            spawn_one_shot_server(r#"{"query":{"tokens":{"csrftoken":"CSRF123+\\"}}}"#);
+        let client = WikiClient::new(base).unwrap();
+        let token = client
+            .fetch_token("en", "access-tok", "csrf")
+            .await
+            .unwrap();
+        assert_eq!(token, "CSRF123+\\");
+        let req = rx.recv().unwrap();
+        assert!(
+            req.request_line.contains("meta=tokens"),
+            "{}",
+            req.request_line
+        );
+        assert!(
+            req.request_line.contains("type=csrf"),
+            "{}",
+            req.request_line
+        );
+        assert_eq!(req.authorization, "Bearer access-tok");
+    }
+
+    #[tokio::test]
+    async fn watch_raw_request_carries_action_title_and_token() {
+        let (base, rx) =
+            spawn_one_shot_server(r#"{"watch":[{"ns":0,"title":"Alan Turing","watched":true}]}"#);
+        let client = WikiClient::new(base).unwrap();
+        let body = client
+            .watch_raw("en", "access-tok", "Alan Turing", "WATCHTOK", false)
+            .await
+            .unwrap();
+        assert!(crate::account::parse_watch_outcome(&body).is_some());
+        let req = rx.recv().unwrap();
+        assert!(req.request_line.starts_with("POST"), "{}", req.request_line);
+        assert!(req.body.contains("action=watch"), "{}", req.body);
+        assert!(
+            req.body.contains("title=Alan%20Turing") || req.body.contains("title=Alan+Turing"),
+            "{}",
+            req.body
+        );
+        assert!(req.body.contains("token=WATCHTOK"), "{}", req.body);
+        assert!(
+            !req.body.contains("unwatch"),
+            "a watch (not unwatch) must not send the flag"
+        );
+        assert_eq!(req.authorization, "Bearer access-tok");
+    }
+
+    #[tokio::test]
+    async fn watch_raw_sends_unwatch_when_requested() {
+        let (base, rx) =
+            spawn_one_shot_server(r#"{"watch":[{"ns":0,"title":"X","unwatched":true}]}"#);
+        let client = WikiClient::new(base).unwrap();
+        let _ = client
+            .watch_raw("en", "access-tok", "X", "WATCHTOK", true)
+            .await
+            .unwrap();
+        let req = rx.recv().unwrap();
+        assert!(req.body.contains("unwatch=1"), "{}", req.body);
+    }
+
+    #[tokio::test]
+    async fn echomarkread_raw_request_carries_the_id_list_and_token() {
+        let (base, rx) =
+            spawn_one_shot_server(r#"{"query":{"echomarkread":{"result":"success"}}}"#);
+        let client = WikiClient::new(base).unwrap();
+        let ids = vec!["101".to_string(), "201".to_string()];
+        let _ = client
+            .echomarkread_raw("en", "access-tok", "CSRFTOK", false, &ids)
+            .await
+            .unwrap();
+        let req = rx.recv().unwrap();
+        assert!(req.body.contains("action=echomarkread"), "{}", req.body);
+        assert!(req.body.contains("token=CSRFTOK"), "{}", req.body);
+        assert!(req.body.contains("list=101%7C201"), "{}", req.body);
+        assert!(!req.body.contains("all="), "{}", req.body);
+    }
+
+    #[tokio::test]
+    async fn echomarkread_raw_sends_all_when_marking_everything_read() {
+        let (base, rx) =
+            spawn_one_shot_server(r#"{"query":{"echomarkread":{"result":"success"}}}"#);
+        let client = WikiClient::new(base).unwrap();
+        let _ = client
+            .echomarkread_raw("en", "access-tok", "CSRFTOK", true, &[])
+            .await
+            .unwrap();
+        let req = rx.recv().unwrap();
+        assert!(req.body.contains("all=1"), "{}", req.body);
+    }
+
+    #[tokio::test]
+    async fn thank_raw_request_carries_the_revid_and_csrf_token() {
+        let (base, rx) = spawn_one_shot_server(r#"{"result":{"success":1}}"#);
+        let client = WikiClient::new(base).unwrap();
+        let body = client
+            .thank_raw("en", "access-tok", 5103, "CSRFTOK")
+            .await
+            .unwrap();
+        assert!(crate::account::thank_succeeded(&body));
+        let req = rx.recv().unwrap();
+        assert!(req.body.contains("action=thank"), "{}", req.body);
+        assert!(req.body.contains("rev=5103"), "{}", req.body);
+        assert!(req.body.contains("token=CSRFTOK"), "{}", req.body);
+    }
+
+    #[tokio::test]
+    async fn fetch_usercontribs_encodes_the_requested_username() {
+        let (base, rx) = spawn_one_shot_server(r#"{"query":{"usercontribs":[]}}"#);
+        let client = WikiClient::new(base).unwrap();
+        let _ = client
+            .fetch_usercontribs("en", "Jane Q. Editor", 10)
+            .await
+            .unwrap();
+        let req = rx.recv().unwrap();
+        assert!(
+            req.request_line.contains("list=usercontribs"),
+            "{}",
+            req.request_line
+        );
+        assert!(
+            req.request_line.contains("ucuser=Jane") && req.request_line.contains("Editor"),
+            "{}",
+            req.request_line
+        );
+        // Public endpoint — no Bearer header at all (works logged out).
+        assert!(req.authorization.is_empty(), "{}", req.authorization);
+    }
+
+    #[tokio::test]
+    async fn fetch_watchlistraw_and_watchlist_changes_send_the_bearer_token() {
+        let (base, rx) =
+            spawn_one_shot_server(r#"{"watchlistraw":[{"ns":0,"title":"Alan Turing"}]}"#);
+        let client = WikiClient::new(base).unwrap();
+        let body = client.fetch_watchlistraw("en", "access-tok").await.unwrap();
+        assert_eq!(
+            crate::account::parse_watchlistraw(&body).unwrap(),
+            vec!["Alan Turing".to_string()]
+        );
+        let req = rx.recv().unwrap();
+        assert!(
+            req.request_line.contains("list=watchlistraw"),
+            "{}",
+            req.request_line
+        );
+        assert_eq!(req.authorization, "Bearer access-tok");
+    }
+
+    #[tokio::test]
+    async fn fetch_watched_status_parses_the_authed_response() {
+        let (base, _rx) = spawn_one_shot_server(
+            r#"{"query":{"pages":[{"title":"Alan Turing","watched":true}]}}"#,
+        );
+        let client = WikiClient::new(base).unwrap();
+        let watched = client
+            .fetch_watched_status("en", "access-tok", "Alan Turing")
+            .await
+            .unwrap();
+        assert!(watched);
+    }
+
+    #[tokio::test]
+    async fn fetch_userinfo_options_round_trips_prefs() {
+        let (base, rx) = spawn_one_shot_server(
+            r#"{"query":{"userinfo":{"id":42,"name":"MockWikipedian","options":{"skin":"vector-2022","language":"en"},"editcount":7,"emailauthenticated":"2020-01-01T00:00:00Z"}}}"#,
+        );
+        let client = WikiClient::new(base).unwrap();
+        let body = client
+            .fetch_userinfo_options("en", "access-tok")
+            .await
+            .unwrap();
+        let prefs = crate::account::parse_userinfo_options(&body).unwrap();
+        assert_eq!(prefs.skin.as_deref(), Some("vector-2022"));
+        assert_eq!(prefs.editcount, Some(7));
+        let req = rx.recv().unwrap();
+        assert!(
+            req.request_line.contains("uiprop=options"),
+            "{}",
+            req.request_line
+        );
     }
 }

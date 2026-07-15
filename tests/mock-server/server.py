@@ -689,6 +689,128 @@ RELATED_ARTICLES = {
     ],
 }
 
+# ---------------------------------------------------------------------------
+# PRD FR-ACC-2/3/4/6/7 (the account-features chunk that builds on the FR-ACC-1
+# OAuth substrate above): watchlist, notifications (Echo), contributions,
+# thanks, and read-only prefs. Every write here (`action=watch`, `thank`,
+# `echomarkread`) requires the same Bearer token this file's OAuth provider
+# issued (`OAUTH_ACCESS`) AND a matching CSRF/watch token minted below — see
+# TOKEN_EPOCH's own comment for how a test forces a real `badtoken` error to
+# exercise the client's refetch-and-retry-once behavior.
+
+# `list=watchlistraw`/`list=watchlist` (FR-ACC-2) both read this mutable set;
+# `action=watch` adds/removes from it, so a picker reopened after `w` reflects
+# the toggle without any extra plumbing. Seeded with two real PAGES titles.
+WATCHED_TITLES_SEED = {"Alan Turing", "Enigma machine"}
+WATCHED_TITLES = set(WATCHED_TITLES_SEED)
+
+# `list=watchlist`'s recent-changes fixture (the "what changed" activity
+# feed): fixed timestamps spanning both sides of a plausible "last seen"
+# cutoff, so `account::changes_since`'s pure since-last-seen filter has real
+# data to split on. Only entries whose title is currently in WATCHED_TITLES
+# are served, matching a real watchlist (unwatching a page drops it from the
+# feed too).
+WATCHLIST_CHANGES = [
+    {
+        "title": "Alan Turing", "user": "Historian1",
+        "timestamp": "2026-07-10T09:00:00Z", "comment": "copyedit lead section",
+        "revid": 5101, "old_revid": 5100,
+    },
+    {
+        "title": "Enigma machine", "user": "CryptoFan",
+        "timestamp": "2026-07-14T15:30:00Z", "comment": "add postwar section",
+        "revid": 5202, "old_revid": 5201,
+    },
+    {
+        "title": "Alan Turing", "user": "Historian1",
+        "timestamp": "2026-07-15T08:00:00Z", "comment": "fix citation",
+        "revid": 5103, "old_revid": 5101,
+    },
+]
+
+# Echo notifications fixture (FR-ACC-3): mutable `read` flags so
+# `action=echomarkread` visibly changes both `notprop=list` and the
+# `notprop=count` badge on the next fetch. Restored by /debug/reset.
+NOTIFICATIONS_SEED = [
+    {
+        "id": "101", "type": "alert",
+        "text": "Historian1 thanked you for your edit on Alan Turing",
+        "read": False, "timestamp": "2026-07-14T09:00:00Z",
+    },
+    {
+        "id": "102", "type": "alert",
+        "text": "Your edit on Enigma machine was reverted",
+        "read": True, "timestamp": "2026-07-10T09:00:00Z",
+    },
+    {
+        "id": "201", "type": "message",
+        "text": "You have a new message on your talk page",
+        "read": False, "timestamp": "2026-07-13T09:00:00Z",
+    },
+]
+NOTIFICATIONS = [dict(n) for n in NOTIFICATIONS_SEED]
+
+# `list=usercontribs` fixture (FR-ACC-4), keyed by username — public, no auth
+# required, matching the real endpoint. MOCK_USERNAME's own edits (so
+# `:contribs` while logged in resolves) plus a second editor's (so
+# `:contribs OtherEditor` — the "works for any username" case — resolves too).
+USER_CONTRIBS = {
+    "MockWikipedian": [
+        {
+            "title": "Alan Turing", "timestamp": "2026-07-15T08:00:00Z",
+            "comment": "fix citation", "revid": 5103, "sizediff": 12,
+        },
+        {
+            "title": "Computer science", "timestamp": "2026-07-12T11:00:00Z",
+            "comment": "expand history section", "revid": 4801, "sizediff": 340,
+        },
+        {
+            "title": "Enigma machine", "timestamp": "2026-07-01T10:00:00Z",
+            "comment": "typo", "revid": 4500, "sizediff": -4,
+        },
+    ],
+    "OtherEditor": [
+        {
+            "title": "Computer science", "timestamp": "2026-07-11T09:00:00Z",
+            "comment": "add reference", "revid": 4790, "sizediff": 88,
+        },
+    ],
+}
+
+# Read-only prefs fixture (FR-ACC-7): `meta=userinfo&uiprop=options`. Only
+# ever read, never written — this build never calls `action=options`.
+USER_PREFS = {
+    "skin": "vector-2022",
+    "language": "en",
+    "editcount": 1234,
+    "emailauthenticated": "2020-05-01T00:00:00Z",
+}
+
+# CSRF/watch token epoch (PRD §6.2 rule 8's badtoken-retry contract). Tokens
+# are minted `f"{kind}TOKEN-{epoch}"`; `/debug/expire-tokens` bumps the epoch,
+# instantly invalidating every token issued before the bump, so a test can:
+# fetch a token (epoch N) -> call /debug/expire-tokens (epoch N+1) -> attempt
+# a write with the now-stale token -> get a real `badtoken` error -> confirm
+# the client refetches (gets epoch N+1) and retries successfully.
+TOKEN_EPOCH = [0]
+
+
+def _mint_token(kind):
+    return f"{kind}TOKEN-{TOKEN_EPOCH[0]}"
+
+
+def _token_valid(kind, token):
+    return token == _mint_token(kind)
+
+
+def _bearer_username(headers):
+    """The username a request's `Authorization: Bearer` header resolves to,
+    or `None` if it's missing/unrecognized — shared by every account-feature
+    write action's login check below."""
+    auth_header = headers.get('Authorization', '')
+    token = auth_header[7:].strip() if auth_header.lower().startswith('bearer ') else ''
+    return OAUTH_ACCESS.get(token)
+
 
 def make_excerpt(text, query):
     """Wraps the first case-insensitive occurrence of `query` in `text` with
@@ -729,7 +851,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_json({"stats": OAUTH_STATS})
         elif parsed.path == '/debug/reset':
             REQUEST_LOG.clear()
+            # PRD FR-ACC-2/3: restore the account-feature fixtures' mutable
+            # state (watched titles, notification read-flags, token epoch) so
+            # a pty/test run can isolate phases exactly like it already does
+            # for REQUEST_LOG — nothing pre-existing depended on these globals
+            # being reset, since this call added them.
+            WATCHED_TITLES.clear()
+            WATCHED_TITLES.update(WATCHED_TITLES_SEED)
+            NOTIFICATIONS[:] = [dict(n) for n in NOTIFICATIONS_SEED]
+            TOKEN_EPOCH[0] = 0
             self._send_json({"ok": True})
+        elif parsed.path == '/debug/expire-tokens':
+            # PRD §6.2 rule 8: bump the token epoch, instantly invalidating
+            # every csrf/watch token minted before this call — the fixture a
+            # test uses to force a real `badtoken` response and exercise the
+            # client's refetch-and-retry-once path end to end.
+            TOKEN_EPOCH[0] += 1
+            self._send_json({"epoch": TOKEN_EPOCH[0]})
+        elif parsed.path == '/debug/watchlist':
+            # Introspection for pty verification: the server's current
+            # watched-titles set, so a test can confirm a `w` toggle actually
+            # mutated server-side state without re-deriving it from the
+            # picker's rendered text.
+            self._send_json({"watched": sorted(WATCHED_TITLES)})
         elif parsed.path.endswith('/oauth2/authorize'):
             self._serve_oauth_authorize(params)
         elif '/page/summary/' in parsed.path:
@@ -807,13 +951,79 @@ class Handler(http.server.BaseHTTPRequestHandler):
             auth_header = self.headers.get('Authorization', '')
             token = auth_header[7:].strip() if auth_header.lower().startswith('bearer ') else ''
             if token and token in OAUTH_ACCESS:
-                self._send_json({
-                    "query": {"userinfo": {"id": 42, "name": OAUTH_ACCESS[token]}}
-                })
+                payload = {"id": 42, "name": OAUTH_ACCESS[token]}
+                # PRD FR-ACC-7: `uiprop=options` additionally asks for the
+                # read-only prefs surface — folded onto the same whoami
+                # response rather than a second endpoint, matching how the
+                # real `meta=userinfo` accretes fields per requested `uiprop`.
+                if 'options' in params.get('uiprop', [''])[0]:
+                    payload["options"] = {
+                        "skin": USER_PREFS["skin"],
+                        "language": USER_PREFS["language"],
+                    }
+                    payload["editcount"] = USER_PREFS["editcount"]
+                    payload["emailauthenticated"] = USER_PREFS["emailauthenticated"]
+                self._send_json({"query": {"userinfo": payload}})
             else:
                 self._send_json({
                     "query": {"userinfo": {"id": 0, "name": "127.0.0.1", "anon": True}}
                 })
+            return
+        # PRD FR-ACC-2's watch-toggle status check: `prop=info&inprop=
+        # watched` on the article the reader has open, authenticated. A
+        # request from a token this provider never issued (or an anonymous
+        # one) simply never matches WATCHED_TITLES's membership test, same
+        # as a real logged-out `watched` check reporting false.
+        if action == 'query' and prop == 'info' and 'watched' in params.get('inprop', [''])[0]:
+            title = urllib.parse.unquote(params.get('titles', [''])[0]).replace('_', ' ')
+            watched = _bearer_username(self.headers) is not None and title in WATCHED_TITLES
+            self._send_json({"query": {"pages": [{"title": title, "watched": watched}]}})
+            return
+        # PRD Appendix A "Auth (Wikimedia)" / §6.2 rule 8: `meta=tokens&
+        # type=csrf|watch`. Real MediaWiki also accepts `|`-joined multiple
+        # types in one call; this mock only ever receives one at a time (see
+        # `account::TokenCache`), so only the single-type shape is served.
+        if action == 'query' and meta == 'tokens':
+            ttype = params.get('type', ['csrf'])[0]
+            self._send_json({"query": {"tokens": {f"{ttype}token": _mint_token(ttype)}}})
+            return
+        # PRD FR-ACC-2: the raw watched-pages list.
+        if action == 'query' and listing == 'watchlistraw':
+            self._send_json({
+                "watchlistraw": [{"ns": 0, "title": t} for t in sorted(WATCHED_TITLES)]
+            })
+            return
+        # PRD FR-ACC-2: the "what changed" activity feed — recent changes to
+        # currently-watched pages only (unwatching drops a title's entries,
+        # matching a real watchlist).
+        if action == 'query' and listing == 'watchlist':
+            entries = [c for c in WATCHLIST_CHANGES if c["title"] in WATCHED_TITLES]
+            self._send_json({"query": {"watchlist": entries}})
+            return
+        # PRD FR-ACC-3: the unread-count badge and the split alerts/messages
+        # list, both derived from the same mutable NOTIFICATIONS fixture so
+        # `action=echomarkread` visibly changes both on the next fetch.
+        if action == 'query' and meta == 'notifications':
+            notprop = params.get('notprop', [''])[0]
+            if notprop == 'count':
+                alert = sum(1 for n in NOTIFICATIONS if n["type"] == "alert" and not n["read"])
+                message = sum(1 for n in NOTIFICATIONS if n["type"] == "message" and not n["read"])
+                self._send_json({
+                    "query": {"notifications": {"alert": {"count": alert}, "message": {"count": message}}}
+                })
+                return
+            self._send_json({"query": {"notifications": {"list": NOTIFICATIONS}}})
+            return
+        # PRD FR-ACC-4: public, no auth required — works for any username,
+        # including one that never logged in here at all (empty list, not
+        # an error, matching a real editor with zero contributions on this
+        # wiki rather than a nonexistent account).
+        if action == 'query' and listing == 'usercontribs':
+            user = params.get('ucuser', [''])[0]
+            limit = int(params.get('uclimit', ['50'])[0])
+            self._send_json({
+                "query": {"usercontribs": USER_CONTRIBS.get(user, [])[:limit]}
+            })
             return
         # PRD FR-OFF-5 bulk-save-by-category: list=categorymembers, depth 1.
         if action == 'query' and listing == 'categorymembers':
@@ -919,9 +1129,59 @@ class Handler(http.server.BaseHTTPRequestHandler):
         REQUEST_LOG.append({"path": self.path, "ua": self.headers.get('User-Agent', '')})
         if parsed.path.endswith('/oauth2/access_token'):
             self._serve_oauth_token(form)
+        elif parsed.path.endswith('/api.php'):
+            self._serve_action_api_write(form)
         else:
             self.send_response(404)
             self.end_headers()
+
+    def _serve_action_api_write(self, form):
+        # PRD §6.2 rule 8: every write here (`action=watch`/`thank`/
+        # `echomarkread`) needs both the OAuth Bearer token (login) and a
+        # matching csrf/watch token (`_token_valid`) — a real MediaWiki-shaped
+        # `{"error":{"code":...}}` body with HTTP 200, never a 4xx, so the
+        # client's badtoken-retry path can actually read and classify it (the
+        # same posture `_serve_oauth_token`'s 400s deliberately do NOT share —
+        # OAuth token-endpoint errors and action-API errors are different
+        # wire shapes on the real APIs too).
+        action = form.get('action', '')
+        username = _bearer_username(self.headers)
+        if action not in ('watch', 'thank', 'echomarkread'):
+            self.send_response(404)
+            self.end_headers()
+            return
+        if username is None:
+            self._send_json({"error": {"code": "notloggedin", "info": "Must be logged in"}})
+            return
+        token_kind = 'watch' if action == 'watch' else 'csrf'
+        if not _token_valid(token_kind, form.get('token', '')):
+            self._send_json({"error": {"code": "badtoken", "info": "Invalid CSRF token"}})
+            return
+        if action == 'watch':
+            title = form.get('title', '').replace('_', ' ')
+            if form.get('unwatch', '') in ('1', 'true'):
+                WATCHED_TITLES.discard(title)
+                self._send_json({"watch": [{"ns": 0, "title": title, "unwatched": True}]})
+            else:
+                WATCHED_TITLES.add(title)
+                self._send_json({"watch": [{"ns": 0, "title": title, "watched": True}]})
+            return
+        if action == 'thank':
+            # PRD FR-ACC-6: purely positive, one-way — nothing here tracks
+            # who's been thanked for what, only that the request succeeded.
+            self._send_json({"result": {"success": 1, "recipient": username}})
+            return
+        # action == 'echomarkread' (FR-ACC-3): `all=1` marks every
+        # notification read; otherwise `list` is a `|`-joined id set.
+        if form.get('all', '') in ('1', 'true'):
+            for n in NOTIFICATIONS:
+                n["read"] = True
+        else:
+            ids = set(form.get('list', '').split('|'))
+            for n in NOTIFICATIONS:
+                if n["id"] in ids:
+                    n["read"] = True
+        self._send_json({"query": {"echomarkread": {"result": "success"}}})
 
     def _serve_oauth_token(self, form):
         # PRD §5.9: the token endpoint. `authorization_code` enforces PKCE;

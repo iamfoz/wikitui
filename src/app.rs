@@ -164,6 +164,27 @@ pub enum Mode {
     /// exchange, Esc cancels. The loopback path does *not* use this mode — it
     /// completes inside the one blocking `:login` call.
     Login,
+    /// `:watchlist` (PRD FR-ACC-2, logged in only): the watchlist pane, two
+    /// tabs — the raw watched-pages list and the "what changed" activity
+    /// feed since last seen. `Tab`/`h`/`l` switch tabs, `j`/`k` move, Enter
+    /// opens the focused entry's article, Esc closes. Mirrors
+    /// [`Mode::OnThisDay`]'s two-tab shape.
+    Watchlist,
+    /// `:notifications` (PRD FR-ACC-3, logged in only): the Echo pane, two
+    /// tabs — alerts and messages. `Tab`/`h`/`l` switch, `j`/`k` move, `d`
+    /// marks the focused entry read, `A` marks every entry read, Esc closes.
+    Notifications,
+    /// `:contribs [username]` (PRD FR-ACC-4): a selectable list of recent
+    /// edits — the logged-in user's own by default, or any given username
+    /// (works logged out too, since `usercontribs` is public). Enter opens
+    /// the edited article, `t` thanks the focused edit (logged in only,
+    /// FR-ACC-6), Esc closes.
+    Contribs,
+    /// `:prefs` (PRD FR-ACC-7, logged in only): a read-only card of a
+    /// curated subset of `meta=userinfo&uiprop=options` — skin, language,
+    /// email-confirmed, edit count. Nothing here is ever written back. Esc
+    /// closes. Same overlay idiom as [`Mode::Info`].
+    Prefs,
 }
 
 /// The content of the `K` peek popup (PRD FR-NV-4/FR-NV-5). Two visually
@@ -830,6 +851,131 @@ pub struct App {
     /// run` overrides it from `[auth]` config, the same convention
     /// `history`/`session_path` use for their real values.
     pub auth_runtime: AuthRuntime,
+
+    // -- Watchlist (PRD FR-ACC-2) --------------------------------------------
+    /// The raw watched-pages list, refetched fresh every time the pane opens
+    /// (so a `w` toggle followed by reopening the pane always shows the
+    /// server's current state — no client-side cache to drift out of sync).
+    pub watchlist_raw: Vec<String>,
+    /// The "what changed" activity feed: changes to watched pages since
+    /// `watchlist_last_seen`, computed by `account::changes_since` at fetch
+    /// time.
+    pub watchlist_changes: Vec<crate::account::WatchlistChange>,
+    /// Which of the watchlist pane's two tabs is focused.
+    pub watchlist_tab: WatchlistTab,
+    /// Selection cursor into whichever list `watchlist_tab` names — reset to
+    /// 0 on every tab switch and every fresh open.
+    pub watchlist_selected: usize,
+    /// The mode `:watchlist` was opened from, restored on close.
+    pub watchlist_prior_mode: Mode,
+    /// The last-seen timestamp loaded from `$XDG_STATE_HOME/wikitui/
+    /// watchlist.json` at startup (`main::run`) — `None` until the pane has
+    /// ever been opened once. `App::new` leaves this `None`, matching every
+    /// other on-disk store's in-memory-default test convention.
+    pub watchlist_last_seen: Option<String>,
+    /// Where `watchlist_last_seen` persists to (`account::watchlist_state_path`),
+    /// or `None` when no platform state directory resolves. `App::new` leaves
+    /// this `None` — `main::run` installs the real path.
+    pub watchlist_state_path: Option<PathBuf>,
+
+    // -- Notifications / Echo (PRD FR-ACC-3) --------------------------------
+    /// The alerts list, populated when `:notifications` opens.
+    pub notif_alerts: Vec<crate::account::Notification>,
+    /// The messages list, populated when `:notifications` opens.
+    pub notif_messages: Vec<crate::account::Notification>,
+    /// Which of the notifications pane's two tabs is focused.
+    pub notif_tab: NotifTab,
+    /// Selection cursor into whichever list `notif_tab` names.
+    pub notif_selected: usize,
+    /// The mode `:notifications` was opened from, restored on close.
+    pub notif_prior_mode: Mode,
+    /// The unread-count badge's source of truth (PRD FR-ACC-3): fetched at
+    /// login/startup and on opening the pane (see `account.rs`'s poll-cadence
+    /// doc comment), then kept current locally by mark-read/mark-all-read
+    /// without a further network call. Zero (the default) shows no badge.
+    pub notif_counts: crate::account::NotifCounts,
+
+    // -- Contributions (PRD FR-ACC-4) ---------------------------------------
+    /// The contributions list for `contribs_username`.
+    pub contribs: Vec<crate::account::Contribution>,
+    /// Whose contributions are on screen — the logged-in user by default, or
+    /// whatever username `:contribs <name>` gave.
+    pub contribs_username: String,
+    /// Selection cursor into `contribs`.
+    pub contribs_selected: usize,
+    /// The mode `:contribs` was opened from, restored on close.
+    pub contribs_prior_mode: Mode,
+
+    // -- CSRF / watch tokens (PRD §6.2 rule 8) ------------------------------
+    /// Every write action (`w`, thank, mark-read) shares one cache so a
+    /// session's csrf/watch tokens are fetched at most once each — cleared
+    /// on `:logout` (`cmd_logout`), since a new session needs its own.
+    pub tokens: crate::account::TokenCache,
+
+    // -- Preferences (PRD FR-ACC-7, read-only) ------------------------------
+    /// The curated prefs card's content, `None` until `:prefs` has fetched
+    /// once.
+    pub prefs: Option<crate::account::UserPrefs>,
+    /// The mode `:prefs` was opened from, restored on close.
+    pub prefs_prior_mode: Mode,
+}
+
+/// The watchlist pane's two tabs (PRD FR-ACC-2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WatchlistTab {
+    #[default]
+    Pages,
+    Changes,
+}
+
+impl WatchlistTab {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pages => "Watched pages",
+            Self::Changes => "Recent changes",
+        }
+    }
+
+    /// `Tab`/`l` (PRD FR-ACC-2, mirroring `OtdType::next`).
+    pub fn next(self) -> Self {
+        match self {
+            Self::Pages => Self::Changes,
+            Self::Changes => Self::Pages,
+        }
+    }
+
+    /// `Shift-Tab`/`h`.
+    pub fn prev(self) -> Self {
+        self.next() // exactly two tabs: next and prev coincide
+    }
+}
+
+/// The notifications pane's two tabs (PRD FR-ACC-3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NotifTab {
+    #[default]
+    Alerts,
+    Messages,
+}
+
+impl NotifTab {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Alerts => "Alerts",
+            Self::Messages => "Messages",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Alerts => Self::Messages,
+            Self::Messages => Self::Alerts,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        self.next()
+    }
 }
 
 /// PRD §5.9 / FR-ACC-1: the OAuth client identity and endpoints a login flow
@@ -1047,6 +1193,26 @@ impl App {
                 token_url: crate::auth::DEFAULT_TOKEN_URL.to_string(),
                 contact: crate::api::DEFAULT_CONTACT.to_string(),
             },
+            watchlist_raw: Vec::new(),
+            watchlist_changes: Vec::new(),
+            watchlist_tab: WatchlistTab::default(),
+            watchlist_selected: 0,
+            watchlist_prior_mode: Mode::Reading,
+            watchlist_last_seen: None,
+            watchlist_state_path: None,
+            notif_alerts: Vec::new(),
+            notif_messages: Vec::new(),
+            notif_tab: NotifTab::default(),
+            notif_selected: 0,
+            notif_prior_mode: Mode::Reading,
+            notif_counts: crate::account::NotifCounts::default(),
+            contribs: Vec::new(),
+            contribs_username: String::new(),
+            contribs_selected: 0,
+            contribs_prior_mode: Mode::Reading,
+            tokens: crate::account::TokenCache::new(),
+            prefs: None,
+            prefs_prior_mode: Mode::Reading,
         }
     }
 
@@ -1352,6 +1518,223 @@ impl App {
         self.otd
             .open_target(self.otd_tab, self.otd_selected)
             .map(str::to_string)
+    }
+
+    // -- Watchlist (PRD FR-ACC-2) ---------------------------------------------
+    //
+    // Every method below is mode/selection bookkeeping only, exactly like
+    // `open_on_this_day`/`otd_move` above — the login gate and the network
+    // fetch both live in `main.rs` (`require_login`, `open_watchlist`), which
+    // calls `App::enter_watchlist` only *after* confirming a session exists.
+    // This mirrors `open_info`'s "no article, no mode change" gate: a logged-
+    // out `:watchlist` never touches `self.mode` at all, so there is nothing
+    // here that could accidentally show the pane before the guard runs.
+
+    /// Enters the watchlist pane's mode/selection state (mirrors
+    /// `open_on_this_day`). Called by `main::open_watchlist` once login is
+    /// confirmed and the fetch is about to start.
+    pub fn enter_watchlist(&mut self) {
+        self.watchlist_prior_mode = self.mode;
+        self.mode = Mode::Watchlist;
+        self.watchlist_tab = WatchlistTab::default();
+        self.watchlist_selected = 0;
+        self.status = "Loading watchlist…".to_string();
+    }
+
+    /// Closes the watchlist pane, restoring the prior mode.
+    pub fn close_watchlist(&mut self) {
+        self.mode = self.watchlist_prior_mode;
+        self.refresh_reading_status();
+    }
+
+    /// Moves the selection within the current tab, wrapping.
+    pub fn watchlist_move(&mut self, delta: i32) {
+        let len = match self.watchlist_tab {
+            WatchlistTab::Pages => self.watchlist_raw.len(),
+            WatchlistTab::Changes => self.watchlist_changes.len(),
+        };
+        self.watchlist_selected = wrap_move(self.watchlist_selected, len, delta);
+    }
+
+    /// Switches to the other tab, resetting the selection.
+    pub fn watchlist_next_tab(&mut self) {
+        self.watchlist_tab = self.watchlist_tab.next();
+        self.watchlist_selected = 0;
+    }
+
+    /// The `Shift-Tab`/`h` counterpart of `watchlist_next_tab`.
+    pub fn watchlist_prev_tab(&mut self) {
+        self.watchlist_tab = self.watchlist_tab.prev();
+        self.watchlist_selected = 0;
+    }
+
+    /// The article title Enter should open for the focused entry, or `None`
+    /// on an empty list.
+    pub fn watchlist_open_target(&self) -> Option<String> {
+        match self.watchlist_tab {
+            WatchlistTab::Pages => self.watchlist_raw.get(self.watchlist_selected).cloned(),
+            WatchlistTab::Changes => self
+                .watchlist_changes
+                .get(self.watchlist_selected)
+                .map(|c| c.title.clone()),
+        }
+    }
+
+    // -- Notifications / Echo (PRD FR-ACC-3) -----------------------------------
+    //
+    // Same "bookkeeping here, login gate + network in main.rs" split as the
+    // watchlist section above.
+
+    /// Enters the notifications pane's mode/selection state.
+    pub fn enter_notifications(&mut self) {
+        self.notif_prior_mode = self.mode;
+        self.mode = Mode::Notifications;
+        self.notif_tab = NotifTab::default();
+        self.notif_selected = 0;
+        self.status = "Loading notifications…".to_string();
+    }
+
+    /// Closes the notifications pane, restoring the prior mode.
+    pub fn close_notifications(&mut self) {
+        self.mode = self.notif_prior_mode;
+        self.refresh_reading_status();
+    }
+
+    fn notif_list(&self) -> &[crate::account::Notification] {
+        match self.notif_tab {
+            NotifTab::Alerts => &self.notif_alerts,
+            NotifTab::Messages => &self.notif_messages,
+        }
+    }
+
+    fn notif_list_mut(&mut self) -> &mut Vec<crate::account::Notification> {
+        match self.notif_tab {
+            NotifTab::Alerts => &mut self.notif_alerts,
+            NotifTab::Messages => &mut self.notif_messages,
+        }
+    }
+
+    /// Moves the selection within the current tab, wrapping.
+    pub fn notif_move(&mut self, delta: i32) {
+        let len = self.notif_list().len();
+        self.notif_selected = wrap_move(self.notif_selected, len, delta);
+    }
+
+    /// Switches to the other tab, resetting the selection.
+    pub fn notif_next_tab(&mut self) {
+        self.notif_tab = self.notif_tab.next();
+        self.notif_selected = 0;
+    }
+
+    /// The `Shift-Tab`/`h` counterpart of `notif_next_tab`.
+    pub fn notif_prev_tab(&mut self) {
+        self.notif_tab = self.notif_tab.prev();
+        self.notif_selected = 0;
+    }
+
+    /// The focused notification's id, for a mark-read request — `None` on
+    /// an empty list.
+    pub fn notif_focused_id(&self) -> Option<String> {
+        self.notif_list()
+            .get(self.notif_selected)
+            .map(|n| n.id.clone())
+    }
+
+    /// Marks one notification read *locally* (PRD FR-ACC-3 / the module's
+    /// poll-cadence contract: no network round trip just to reflect what the
+    /// write we already made changed) and recomputes the badge from the
+    /// union of both lists — the caller (`main::mark_notification_read`)
+    /// only invokes this after the `echomarkread` write itself succeeded.
+    pub fn mark_notif_read_locally(&mut self, id: &str) {
+        for n in self.notif_list_mut() {
+            if n.id == id {
+                n.read = true;
+            }
+        }
+        self.recompute_notif_counts();
+    }
+
+    /// Marks every notification read locally, the mark-all-read counterpart
+    /// of `mark_notif_read_locally`.
+    pub fn mark_all_notifs_read_locally(&mut self) {
+        for n in self
+            .notif_alerts
+            .iter_mut()
+            .chain(self.notif_messages.iter_mut())
+        {
+            n.read = true;
+        }
+        self.recompute_notif_counts();
+    }
+
+    fn recompute_notif_counts(&mut self) {
+        let mut combined: Vec<crate::account::Notification> =
+            Vec::with_capacity(self.notif_alerts.len() + self.notif_messages.len());
+        combined.extend(self.notif_alerts.iter().cloned());
+        combined.extend(self.notif_messages.iter().cloned());
+        self.notif_counts = crate::account::counts_from_list(&combined);
+    }
+
+    /// The status-bar badge (PRD FR-ACC-3), `None` when nothing is unread —
+    /// the `[@user …]` indicator's source for the `✉N` suffix.
+    pub fn notification_badge(&self) -> Option<String> {
+        crate::account::format_badge(self.notif_counts)
+    }
+
+    // -- Contributions (PRD FR-ACC-4) -------------------------------------------
+
+    /// Enters the contributions view's mode/selection state for `username`.
+    /// Unlike watchlist/notifications, this has no login gate of its own —
+    /// `usercontribs` is public (FR-ACC-4) — so `main::open_contribs` calls
+    /// this unconditionally once it has resolved which username to show.
+    pub fn enter_contribs(&mut self, username: String) {
+        self.contribs_prior_mode = self.mode;
+        self.mode = Mode::Contribs;
+        self.contribs_username = username;
+        self.contribs_selected = 0;
+        self.status = "Loading contributions…".to_string();
+    }
+
+    /// Closes the contributions view, restoring the prior mode.
+    pub fn close_contribs(&mut self) {
+        self.mode = self.contribs_prior_mode;
+        self.refresh_reading_status();
+    }
+
+    /// Moves the selection, wrapping.
+    pub fn contribs_move(&mut self, delta: i32) {
+        self.contribs_selected = wrap_move(self.contribs_selected, self.contribs.len(), delta);
+    }
+
+    /// The article title Enter should open for the focused edit, or `None`
+    /// on an empty list.
+    pub fn contribs_open_target(&self) -> Option<String> {
+        self.contribs
+            .get(self.contribs_selected)
+            .map(|c| c.title.clone())
+    }
+
+    /// The focused edit's revision id, for `t` (PRD FR-ACC-6's thank).
+    pub fn contribs_focused_revid(&self) -> Option<u64> {
+        self.contribs.get(self.contribs_selected).map(|c| c.revid)
+    }
+
+    // -- Preferences (PRD FR-ACC-7, read-only) ----------------------------------
+
+    /// Enters the read-only prefs card's mode state (mirrors `open_info`'s
+    /// overlay shape). `main::open_prefs` calls this once login is confirmed
+    /// and the fetch is about to start.
+    pub fn enter_prefs(&mut self) {
+        self.prefs_prior_mode = self.mode;
+        self.mode = Mode::Prefs;
+        self.status = "Loading preferences…".to_string();
+    }
+
+    /// Closes the prefs card, restoring the prior mode.
+    pub fn close_prefs(&mut self) {
+        self.mode = self.prefs_prior_mode;
+        self.prefs = None;
+        self.refresh_reading_status();
     }
 
     // -- Related panel (PRD FR-SR-6) -----------------------------------------
@@ -4208,6 +4591,11 @@ pub enum GPrefixAction {
     Related,
     /// `gK` (PRD FR-NV-4): jump to the References/Notes section.
     References,
+    /// `gW` (PRD FR-ACC-2): open the watchlist pane — the one keybinding
+    /// this chunk adds a default for (Appendix B lists `w` for watch/unwatch
+    /// but no dedicated open key; `gW` fits the existing `g`-prefix
+    /// panel-open convention `gr`/`gR`/`gb` already established).
+    Watchlist,
     /// Any other second key: dead prefix — `handle_key` processes it as if
     /// `g` had never been typed (e.g. `gj` still scrolls).
     PassThrough,
@@ -4223,8 +4611,23 @@ pub fn resolve_g_prefix(second_key: char) -> GPrefixAction {
         'r' => GPrefixAction::Random,
         'R' => GPrefixAction::Related,
         'K' => GPrefixAction::References,
+        'W' => GPrefixAction::Watchlist,
         _ => GPrefixAction::PassThrough,
     }
+}
+
+/// Moves a selection index by `delta`, wrapping in both directions — shared
+/// by every picker-style list this chunk adds (watchlist, notifications,
+/// contributions) instead of each reimplementing `OnThisDayModel::
+/// move_selection`'s same three-line `rem_euclid` dance. A no-op (stays 0)
+/// on an empty list, matching that function's own contract.
+fn wrap_move(current: usize, len: usize, delta: i32) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let len = len as i32;
+    let cur = (current as i32).rem_euclid(len);
+    (cur + delta).rem_euclid(len) as usize
 }
 
 /// PRD FR-ML-1's picker ordering: rows whose code appears in `preferred`
