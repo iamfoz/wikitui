@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::api::{SearchResult, TitleSuggestion, WikiRegistryEntry};
+use crate::bidi;
 use crate::bookmarks::{
     self, Bookmark, BookmarkStore, ReadLaterEntry, ReadLaterStore, ToggleOutcome,
 };
@@ -449,6 +450,33 @@ pub struct App {
     /// (`hyperlink::active` resolves `Auto` against the live terminal/
     /// ACCESSIBLE state at emission time in `main::emit_hyperlinks`).
     pub hyperlinks_mode: HyperlinkMode,
+    /// PRD FR-ML-7 (experimental RTL): `config bidi = auto|on|off`. Read
+    /// alongside [`Self::bidi_terminal_active`] (the resolved, env-checked
+    /// verdict `main::emit_bidi_mode` acts on) rather than re-deriving env
+    /// state on every draw.
+    pub bidi_mode: bidi::BidiMode,
+    /// Whether this *session* manages the terminal's bidi mode at all —
+    /// `bidi::active(bidi_mode, env_supported)`, resolved once at startup
+    /// (`main::run`) from `bidi_mode` plus the `VTE_VERSION`/`TERM` env
+    /// heuristic. `ui.rs`'s `bidi::should_app_reorder` reads this to enforce
+    /// FR-ML-7's double-reordering hazard gate: app-side `rtl_reorder` must
+    /// never engage while this is true.
+    pub bidi_terminal_active: bool,
+    /// Whether `main::emit_bidi_mode` has already sent
+    /// [`bidi::VTE_BIDI_AUTODETECT_ENABLE`] this run — sent lazily, exactly
+    /// once, the first time an RTL tab is actually on screen (never
+    /// speculatively at startup), so this flips permanently `true` on first
+    /// use rather than toggling per tab switch (see that function's own doc
+    /// comment for why toggling isn't needed: the escape is a session-wide
+    /// "turn on auto-bidi" switch, harmless to leave on while reading LTR
+    /// content afterward).
+    pub bidi_terminal_sent: bool,
+    /// PRD FR-ML-7's **off-by-default** app-side logical→visual reorder
+    /// fallback (`config rtl_reorder`). Only actually engages through
+    /// `bidi::should_app_reorder`'s gate (`ui::draw_reading`/`paint_pane`),
+    /// which also checks [`Self::bidi_terminal_active`] — never this field
+    /// alone — to avoid the double-reordering hazard.
+    pub rtl_reorder: bool,
     /// PRD FR-NV-9: the reading/content area's rect as of the most recent
     /// draw, so a mouse click's absolute terminal `(row, col)` can be
     /// translated into the reading view's own line/column coordinate space.
@@ -1315,6 +1343,10 @@ impl App {
             mouse_enabled: false,
             no_motion: false,
             hyperlinks_mode: HyperlinkMode::Auto,
+            bidi_mode: bidi::BidiMode::Auto,
+            bidi_terminal_active: false,
+            bidi_terminal_sent: false,
+            rtl_reorder: false,
             last_content_area: ratatui::layout::Rect::default(),
             last_tab_bar_area: None,
             citations: Vec::new(),

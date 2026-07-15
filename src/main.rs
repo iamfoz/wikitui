@@ -5,6 +5,7 @@ mod app;
 mod attribution;
 mod auth;
 mod autotheme;
+mod bidi;
 mod bookmark_export;
 mod bookmarks;
 mod cache;
@@ -45,6 +46,7 @@ mod sisters;
 mod split;
 mod startpage;
 mod stats;
+mod strings;
 mod tab;
 mod talk;
 mod target;
@@ -2330,6 +2332,21 @@ async fn run(
     app.no_motion = terminal_cfg.animations.value == "none";
     app.hyperlinks_mode =
         HyperlinkMode::parse(&terminal_cfg.hyperlinks.value).unwrap_or(HyperlinkMode::Auto);
+    // PRD FR-ML-7 (experimental RTL): resolve once at startup, not re-derived
+    // every draw — `bidi_terminal_active` folds the config mode together
+    // with the (unreliable, env-only — see `bidi::auto_env_supported`'s own
+    // doc comment) capability heuristic so `emit_bidi_mode`/`ui::draw_reading`
+    // both read one already-decided bool instead of re-checking the
+    // environment on every frame.
+    app.bidi_mode = bidi::BidiMode::parse(&terminal_cfg.bidi.value).unwrap_or(bidi::BidiMode::Auto);
+    app.rtl_reorder = terminal_cfg.rtl_reorder.value;
+    app.bidi_terminal_active = bidi::active(
+        app.bidi_mode,
+        bidi::auto_env_supported(
+            std::env::var("VTE_VERSION").ok().as_deref(),
+            std::env::var("TERM").ok().as_deref(),
+        ),
+    );
     app.measure = measure;
     app.ambiguous_wide = ambiguous_wide;
     app.reading_wpm = reading_wpm;
@@ -2599,6 +2616,12 @@ async fn run(
         // folded into it. Best-effort: a write failure here (e.g. stdout
         // gone) is no worse than the plain styled text already on screen.
         let _ = emit_hyperlinks(&app);
+
+        // PRD FR-ML-7 (experimental RTL): lazily turn on the terminal's own
+        // bidi handling the first time an RTL article is actually on screen
+        // — see `emit_bidi_mode`'s own doc comment. Best-effort, same
+        // reasoning as `emit_hyperlinks` just above.
+        let _ = emit_bidi_mode(&mut app);
 
         // PRD FR-RD-8: after each draw, lazily kick off fetches for any
         // not-yet-loaded images the active document references (a no-op when
@@ -6067,6 +6090,47 @@ fn emit_hyperlinks(app: &App) -> io::Result<()> {
         }
     }
     out.flush()
+}
+
+/// PRD FR-ML-7 (experimental RTL): hands reordering to the terminal itself
+/// by sending [`bidi::VTE_BIDI_AUTODETECT_ENABLE`] — but only once, lazily,
+/// the first time the reading view actually shows an RTL-language tab (per
+/// the PRD's own framing: "when an RTL article is opened, the app is in RTL
+/// mode for that content" — nothing about the terminal is touched before
+/// that happens, and never for a reader who opens no RTL content all
+/// session).
+///
+/// Sent exactly once, not toggled back off when the reader switches to an
+/// LTR tab: the escape means "apply the Unicode Bidi Algorithm to whatever
+/// text follows", a session-wide switch, not a per-paragraph direction
+/// marker — a capable terminal auto-detects RTL runs from the Unicode
+/// strong-direction properties of the characters themselves and is a no-op
+/// on plain LTR text, so leaving it on while reading an LTR article
+/// afterward changes nothing on screen. The disabling counterpart is instead
+/// sent unconditionally on terminal restore
+/// (`crashguard::restore_terminal_best_effort`), exactly like
+/// `autotheme::DISABLE_COLOR_SCHEME_NOTIFICATIONS` — see that function's own
+/// doc comment.
+///
+/// **Unverifiable in this environment**: this function's *decision* (send
+/// or don't, exactly once) is unit-tested via `bidi::should_emit_terminal_enable`,
+/// and the exact bytes are locked by `bidi`'s own byte tests, but whether a
+/// real VTE-family terminal (or mlterm) actually reorders anything on screen
+/// in response cannot be proven from this sandbox's plain-Python pty harness
+/// — see `bidi::VTE_BIDI_AUTODETECT_ENABLE`'s doc comment.
+fn emit_bidi_mode(app: &mut App) -> io::Result<()> {
+    if app.mode != Mode::Reading {
+        return Ok(());
+    }
+    let dir = bidi::direction(&app.active_tab().lang);
+    if !bidi::should_emit_terminal_enable(app.bidi_terminal_active, app.bidi_terminal_sent, dir) {
+        return Ok(());
+    }
+    use crossterm::execute;
+    use crossterm::style::Print;
+    execute!(io::stdout(), Print(bidi::VTE_BIDI_AUTODETECT_ENABLE))?;
+    app.bidi_terminal_sent = true;
+    Ok(())
 }
 
 /// The modes `Ctrl-p` opens the command palette from (PRD FR-CS-1). The

@@ -462,6 +462,22 @@ pub struct ResolvedTerminal {
     /// (this module has no reason to depend on `theme`'s degradation code,
     /// only to validate the string against the closed set).
     pub color_depth: Valued<String>,
+    /// PRD FR-ML-7 (experimental RTL): `auto` (the default), `on`, or `off` —
+    /// see `bidi::BidiMode`. Gates whether this session emits the VTE bidi
+    /// escape sequence at all; `auto`'s own env heuristic is unreliable by
+    /// nature (there is no query/response capability probe for terminal
+    /// bidi the way OSC 11 has DA1), so in practice this resolves to "don't
+    /// emit" for most sessions unless a reader who knows their terminal
+    /// supports it sets `on` explicitly.
+    pub bidi: Valued<String>,
+    /// PRD FR-ML-7's **off-by-default** app-side logical→visual reorder
+    /// fallback for a terminal that does no bidi of its own. Default
+    /// **false** is load-bearing, not a stylistic choice: if both the
+    /// terminal (`bidi`) and this app reordered the same RTL text, the
+    /// result would be reordered *twice* (FR-ML-7's named "double-reordering
+    /// hazard") — `bidi::should_app_reorder` is the one place that gate is
+    /// enforced regardless of what this value says.
+    pub rtl_reorder: Valued<bool>,
 }
 
 /// PRD FR-PC-1's `[reading]` table: the "honestly marketed spacing options"
@@ -649,6 +665,21 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = "\
 # OSC 8 terminal hyperlinks (FR-RD-2): auto | on | off. ACCESSIBLE=1 implies
 # off (plain link text) unless overridden here.
 # hyperlinks = \"auto\"
+
+# RTL support (FR-ML-7, EXPERIMENTAL, v2-directional — full bidi is not
+# promised; see `wikitui config doctor` for this session's resolved state).
+# bidi: auto | on | off — whether to ask a capable terminal (documented:
+# mlterm, the VTE family) to reorder right-to-left articles itself. auto's
+# own detection is unreliable (no capability probe exists for this the way
+# OSC 11 has one), so in practice this means \"off\" unless you know your
+# terminal supports it and set it explicitly.
+# bidi = \"auto\"
+# rtl_reorder: off by default, ON PURPOSE. An optional app-side fallback
+# that reorders RTL text itself for a terminal that does no bidi at all —
+# but if BOTH the terminal (bidi) and this app reorder the same text, it is
+# reordered twice (wrong in a new way). Only turn this on together with
+# `bidi = \"off\"`; the app enforces that gate regardless of this value.
+# rtl_reorder = false
 ";
 
 /// Write [`DEFAULT_CONFIG_TEMPLATE`] to `config_path`, creating parent
@@ -731,6 +762,8 @@ pub fn resolve(
         "theme_dark",
         "hyperlinks",
         "color_depth",
+        "bidi",
+        "rtl_reorder",
         "reading",
         "watchlist_mirror_tag",
         "tts_command",
@@ -1935,6 +1968,21 @@ fn resolve_terminal(
             table.get("color_depth"),
             "auto",
             &["auto", "truecolor", "256", "16", "mono"],
+            issues,
+        ),
+        bidi: resolve_closed_string_field(
+            "bidi",
+            None,
+            table.get("bidi"),
+            "auto",
+            &["auto", "on", "off"],
+            issues,
+        ),
+        rtl_reorder: resolve_bool_field(
+            "rtl_reorder",
+            None,
+            table.get("rtl_reorder"),
+            false,
             issues,
         ),
     }
@@ -4618,6 +4666,22 @@ mod tests {
         assert_eq!(t.theme_light.value, "paper");
         assert_eq!(t.theme_dark.value, "terminal");
         assert_eq!(t.hyperlinks.value, "auto");
+        assert_eq!(
+            t.bidi,
+            Valued {
+                value: "auto".to_string(),
+                source: Source::Default,
+            },
+            "PRD FR-ML-7: bidi defaults to auto"
+        );
+        assert_eq!(
+            t.rtl_reorder,
+            Valued {
+                value: false,
+                source: Source::Default,
+            },
+            "PRD FR-ML-7: rtl_reorder defaults off — the double-reordering hazard"
+        );
     }
 
     #[test]
@@ -4843,6 +4907,74 @@ mod tests {
         cleanup(&path);
     }
 
+    /// PRD FR-ML-7 (experimental RTL): `bidi` validates against the closed
+    /// `auto|on|off` set, same pattern as `hyperlinks`.
+    #[test]
+    fn bidi_reads_and_validates_the_closed_set() {
+        let path = temp_config("bidi = \"on\"\n");
+        let resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(
+            resolved.terminal.bidi,
+            Valued {
+                value: "on".to_string(),
+                source: Source::File
+            }
+        );
+        cleanup(&path);
+
+        let path = temp_config("bidi = \"sometimes\"\n");
+        let resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(resolved.terminal.bidi.value, "auto");
+        assert_eq!(resolved.terminal.bidi.source, Source::Default);
+        assert!(resolved.issues.iter().any(|i| i.message.contains("bidi")));
+        cleanup(&path);
+    }
+
+    /// PRD FR-ML-7's double-reordering hazard starts at config resolution:
+    /// `rtl_reorder` must default off and must be independently settable
+    /// from `bidi` (the two are read from separate keys, never coupled).
+    #[test]
+    fn rtl_reorder_reads_from_file_and_rejects_non_booleans() {
+        let path = temp_config("rtl_reorder = true\n");
+        let resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(
+            resolved.terminal.rtl_reorder,
+            Valued {
+                value: true,
+                source: Source::File
+            }
+        );
+        cleanup(&path);
+
+        let path = temp_config("rtl_reorder = \"yes\"\n");
+        let resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert!(!resolved.terminal.rtl_reorder.value);
+        assert_eq!(resolved.terminal.rtl_reorder.source, Source::Default);
+        assert!(
+            resolved
+                .issues
+                .iter()
+                .any(|i| i.message.contains("rtl_reorder"))
+        );
+        cleanup(&path);
+    }
+
     /// PRD FR-ACS-6: `ACCESSIBLE=1` implies the no-motion/plain-link bundle,
     /// but only for keys the reader didn't already pin explicitly.
     #[test]
@@ -4900,6 +5032,8 @@ mod tests {
         assert!(DEFAULT_CONFIG_TEMPLATE.contains("# animations = "));
         assert!(DEFAULT_CONFIG_TEMPLATE.contains("# auto_theme = false"));
         assert!(DEFAULT_CONFIG_TEMPLATE.contains("# hyperlinks = "));
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("# bidi = "));
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("# rtl_reorder = false"));
 
         let path = absent_config_path();
         write_default_config(Some(&path)).expect("write ok");
@@ -4911,6 +5045,8 @@ mod tests {
         assert!(resolved.issues.is_empty(), "{:?}", resolved.issues);
         assert!(!resolved.terminal.mouse.value);
         assert_eq!(resolved.terminal.animations.value, "full");
+        assert_eq!(resolved.terminal.bidi.value, "auto");
+        assert!(!resolved.terminal.rtl_reorder.value);
         cleanup(&path);
     }
 }

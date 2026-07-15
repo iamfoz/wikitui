@@ -38,7 +38,10 @@ pub fn run(resolved: &ResolvedConfig) -> i32 {
     println!();
     print_contrast_lint(&user_themes);
     println!();
-    print_capabilities(&resolved.terminal.color_depth.value);
+    print_capabilities(
+        &resolved.terminal.color_depth.value,
+        &resolved.terminal.bidi.value,
+    );
 
     if resolved.has_errors() { 1 } else { 0 }
 }
@@ -209,6 +212,10 @@ fn print_resolved_config(resolved: &ResolvedConfig) {
         "  hyperlinks = {:?} ({})",
         t.hyperlinks.value, t.hyperlinks.source
     );
+    println!(
+        "  bidi = {:?} ({}); rtl_reorder = {} ({}) -- PRD FR-ML-7, experimental (see the RTL bidi section below)",
+        t.bidi.value, t.bidi.source, t.rtl_reorder.value, t.rtl_reorder.source
+    );
     let r = &resolved.reading;
     println!(
         "  reading.margin = {} ({}); text_align = {:?} ({})",
@@ -352,7 +359,7 @@ fn print_contrast_lint(user_themes: &[theme::LoadedUserTheme]) {
     }
 }
 
-fn print_capabilities(configured_color_depth: &str) {
+fn print_capabilities(configured_color_depth: &str, configured_bidi: &str) {
     println!("Terminal capabilities:");
     let colorterm = std::env::var("COLORTERM").unwrap_or_default();
     let truecolor = colorterm == "truecolor" || colorterm == "24bit";
@@ -394,5 +401,34 @@ fn print_capabilities(configured_color_depth: &str) {
     );
     println!(
         "  clipboard (OSC 52 on yank): attempted unconditionally; silently ignored by a terminal that doesn't support it"
+    );
+    print_bidi_capabilities(configured_bidi);
+}
+
+/// PRD FR-ML-7 (experimental RTL): reports this session's resolved bidi
+/// state — config mode, the env heuristic `auto` would use, and whether the
+/// terminal-escape path is actually active — plus the double-reordering
+/// gate `rtl_reorder` is subject to. Documented supported emulators: mlterm
+/// and the VTE family (GNOME Terminal and other VTE-based terminals) per the
+/// PRD; **full bidi is explicitly not promised** — see `bidi.rs`'s own
+/// module doc comment for the research behind the emitted escape sequence
+/// and for exactly what this sandbox could and couldn't verify live.
+fn print_bidi_capabilities(configured_bidi: &str) {
+    println!("RTL bidi (FR-ML-7, EXPERIMENTAL — full bidi is not promised):");
+    println!("  documented supported emulators: mlterm, the VTE family (e.g. GNOME Terminal)");
+    let vte_version = std::env::var("VTE_VERSION").ok();
+    let term = std::env::var("TERM").ok();
+    let env_supported = crate::bidi::auto_env_supported(vte_version.as_deref(), term.as_deref());
+    println!(
+        "  env heuristic: VTE_VERSION={:?}, TERM={:?} -> looks bidi-capable: {env_supported} (unverified — no capability probe exists for this, unlike OSC 11's DA1 guard)",
+        vte_version, term
+    );
+    let mode = crate::bidi::BidiMode::parse(configured_bidi).unwrap_or(crate::bidi::BidiMode::Auto);
+    let terminal_active = crate::bidi::active(mode, env_supported);
+    println!(
+        "  terminal bidi escape emission active this session: {terminal_active} (mode={configured_bidi:?})"
+    );
+    println!(
+        "  app-side rtl_reorder engages only when terminal bidi is INACTIVE (double-reordering hazard gate, bidi::should_app_reorder)"
     );
 }

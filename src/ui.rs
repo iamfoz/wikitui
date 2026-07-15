@@ -10,6 +10,7 @@ use ratatui::widgets::{
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::app::{self, App, Mode};
+use crate::bidi;
 use crate::doc::LinkRef;
 use crate::layout::{
     FLOOR_MIN_HEIGHT, FLOOR_MIN_WIDTH, LaidLine, MatchSpan, SizeTier, SpanKind, size_tier,
@@ -17,7 +18,20 @@ use crate::layout::{
 use crate::registry;
 use crate::search_ops;
 use crate::startpage::{self, StartPageConfig, StartPageModel};
+use crate::strings::{self, Key};
 use crate::theme::Theme;
+
+/// PRD FR-ML-7: whether `tab`'s article should be app-side reordered for
+/// *this* paint — `bidi::should_app_reorder`'s gate (config `rtl_reorder`
+/// AND the terminal is not already doing bidi itself AND the content is
+/// actually RTL), evaluated fresh per tab so a split's two panes (which can
+/// hold different-language articles) decide independently. `None` means
+/// "paint the layout's lines unchanged" — the ordinary, default path for
+/// every LTR article regardless of config.
+fn app_reorder_direction(app: &App, tab: &crate::tab::Tab) -> Option<bidi::Direction> {
+    let dir = bidi::direction(&tab.lang);
+    bidi::should_app_reorder(app.rtl_reorder, app.bidi_terminal_active, dir).then_some(dir)
+}
 
 /// Every title that should render as "visited" in the active tab (PRD
 /// FR-HS-2): this session's own back-stack, forward-stack, and the article
@@ -958,6 +972,13 @@ fn draw_reading(frame: &mut Frame, app: &mut App, area: Rect) {
                     &app.hint_input,
                     app.ambiguous_wide,
                 ))
+            } else if let Some(dir) = app_reorder_direction(app, tab) {
+                // PRD FR-ML-7: an uncached, paint-time-only copy — never
+                // written back into `app.layout`/`layout_cache` (mirrors the
+                // hint-overlay branch just above for exactly the same
+                // reason: this is transient rendering state, not part of the
+                // document's cacheable layout).
+                std::borrow::Cow::Owned(bidi::reorder_laid_lines(&layout.lines, dir))
             } else {
                 std::borrow::Cow::Borrowed(layout.lines.as_slice())
             };
@@ -1200,8 +1221,16 @@ fn paint_pane(
         Some(layout) => {
             let visited = visited_titles_for(app, tab);
             let redlinks = confirmed_redlink_titles_for(app, &tab.wiki, &tab.lang);
+            // PRD FR-ML-7: each pane can hold a different-language article
+            // (that's the whole point of the bilingual split, FR-ML-3), so
+            // the reorder decision — and the resulting transient copy — is
+            // made per pane, exactly like `draw_reading`'s own Cow above.
+            let lines: std::borrow::Cow<[LaidLine]> = match app_reorder_direction(app, tab) {
+                Some(dir) => std::borrow::Cow::Owned(bidi::reorder_laid_lines(&layout.lines, dir)),
+                None => std::borrow::Cow::Borrowed(layout.lines.as_slice()),
+            };
             let text = paint_document(
-                &layout.lines,
+                &lines,
                 tab.focused_link,
                 &tab.links,
                 &visited,
@@ -3220,7 +3249,7 @@ fn draw_info_overlay(frame: &mut Frame, app: &App, area: Rect) {
             .block(
                 UiBlock::default()
                     .borders(Borders::ALL)
-                    .title("Article info"),
+                    .title(strings::t(Key::ArticleInfoTitle)),
             ),
         popup,
     );
@@ -3237,7 +3266,7 @@ fn draw_info_overlay(frame: &mut Frame, app: &App, area: Rect) {
 /// shape an emoji at all.
 fn with_incognito_glyph(text: String, incognito: bool) -> String {
     if incognito {
-        format!("[incognito] {text}")
+        format!("{} {text}", strings::t(Key::IncognitoPrefix))
     } else {
         text
     }
@@ -3360,11 +3389,11 @@ fn status_bar_text(app: &App, width: u16) -> String {
         Mode::Results if app.results.is_empty() && app.search_suggestion.is_some() => {
             "Enter: search the suggestion   Esc: cancel".to_string()
         }
-        Mode::Results => "Enter: open   Esc: cancel   j/k: move".to_string(),
-        Mode::Toc => "Enter: jump to section   Esc: cancel   j/k: move".to_string(),
-        Mode::TabPicker => "Enter: switch tab   d: close   Esc: cancel   j/k: move".to_string(),
-        Mode::HistoryPicker => "Enter: jump   Esc: cancel   j/k: move".to_string(),
-        Mode::WikiPicker => "Enter: switch wiki   Esc: cancel   j/k: move".to_string(),
+        Mode::Results => strings::t(Key::ResultsHint).to_string(),
+        Mode::Toc => strings::t(Key::TocHint).to_string(),
+        Mode::TabPicker => strings::t(Key::TabPickerHint).to_string(),
+        Mode::HistoryPicker => strings::t(Key::HistoryPickerHint).to_string(),
+        Mode::WikiPicker => strings::t(Key::WikiPickerHint).to_string(),
         Mode::Research => "Enter/s: save citation   R: library   Esc: done   j/k: move".to_string(),
         // The library's status line carries transient action feedback
         // (delete/export/style outcomes overwrite it) — see open_library.
@@ -3381,12 +3410,8 @@ fn status_bar_text(app: &App, width: u16) -> String {
         Mode::BookmarkPicker => app.status.clone(),
         Mode::ReadLaterPicker => app.status.clone(),
         Mode::SavedPicker => app.status.clone(),
-        Mode::OfflineCard => {
-            "f: queue for fetch when online   s: search saved pages   Esc: dismiss".to_string()
-        }
-        Mode::RedlinkCard => {
-            "s: search similar titles   y: yank create URL   Esc: dismiss".to_string()
-        }
+        Mode::OfflineCard => strings::t(Key::OfflineCardHint).to_string(),
+        Mode::RedlinkCard => strings::t(Key::RedlinkCardHint).to_string(),
         // PRD FR-NV-4/5: the `K` peek popup carries its own status text
         // (set by `open_peek_at_focus`/`deliver_summary`).
         Mode::Peek => app.status.clone(),
@@ -3414,12 +3439,12 @@ fn status_bar_text(app: &App, width: u16) -> String {
         Mode::Notifications => app.status.clone(),
         Mode::Contribs => app.status.clone(),
         Mode::Prefs => app.status.clone(),
-        Mode::Help => "j/k: scroll   Esc/?/q: close".to_string(),
+        Mode::Help => strings::t(Key::HelpHint).to_string(),
         Mode::Palette => format!(
             "> {}   Enter: run   \u{2191}/\u{2193}: move   Esc: cancel",
             app.palette_input
         ),
-        Mode::Onboarding => "Press any key to start reading".to_string(),
+        Mode::Onboarding => strings::t(Key::OnboardingHint).to_string(),
         Mode::Reading if app.loading => "Loading…".to_string(),
         // PRD FR-DL-1: the start page's own nav hints, ranked right after
         // notice/loading — there is no focused link or find state to show
@@ -3482,6 +3507,17 @@ fn status_bar_text(app: &App, width: u16) -> String {
             } else {
                 String::new()
             };
+            // PRD FR-ML-7 (experimental RTL): a low-priority suffix, same
+            // "always shown when true, never crowds out a notice/find"
+            // treatment as `hint`/`badge`/`cn` above — the one observable
+            // this chunk's pty verification reads to confirm RTL detection
+            // without needing a real bidi-capable terminal (which this
+            // sandbox has none of).
+            let rtl = if bidi::direction(&tab.lang) == bidi::Direction::Rtl {
+                format!("   {}", strings::t(Key::RtlExperimentalBadge))
+            } else {
+                String::new()
+            };
             // PRD FR-DL-6: the wiki-walk HUD, a prefix (not a suffix like
             // the above three) since it's the primary thing a player wants
             // to see at a glance, ahead of whatever the page itself shows.
@@ -3502,7 +3538,7 @@ fn status_bar_text(app: &App, width: u16) -> String {
             let body = match tab.focused_link.and_then(|i| tab.links.get(i)) {
                 Some(link) if link.internal_title.is_some() => {
                     format!(
-                        "{}→ {} ({}/{})   Tab/S-Tab: cycle   Enter: open   H: back   L: forward{hint}{badge}{cn}",
+                        "{}→ {} ({}/{})   Tab/S-Tab: cycle   Enter: open   H: back   L: forward{hint}{badge}{cn}{rtl}",
                         tab.page_source.prefix(),
                         link.text,
                         tab.focused_link.unwrap() + 1,
@@ -3510,7 +3546,7 @@ fn status_bar_text(app: &App, width: u16) -> String {
                     )
                 }
                 Some(link) => format!(
-                    "{}→ {} (external, not yet followable){hint}{badge}{cn}",
+                    "{}→ {} (external, not yet followable){hint}{badge}{cn}{rtl}",
                     tab.page_source.prefix(),
                     link.text
                 ),
@@ -3524,11 +3560,11 @@ fn status_bar_text(app: &App, width: u16) -> String {
                         let prefix = tab.page_source.prefix();
                         let budget = (width as usize).saturating_sub(display_width(&prefix));
                         format!(
-                            "{prefix}{}{hint}{badge}{cn}",
+                            "{prefix}{}{hint}{badge}{cn}{rtl}",
                             build_breadcrumb(&titles, budget)
                         )
                     } else {
-                        format!("{}{hint}{badge}{cn}", app.status)
+                        format!("{}{hint}{badge}{cn}{rtl}", app.status)
                     }
                 }
             };

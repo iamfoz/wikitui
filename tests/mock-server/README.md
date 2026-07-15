@@ -69,6 +69,14 @@ Math and redlink fixtures (PRD FR-RD-7, FR-DL-5):
   Wikipedia output carries), one via the canonical "Citation needed" name
   and one via the "Fact" alias, and one unrelated transclusion (an
   infobox-shaped one) that must *not* be treated as citation-needed.
+- `RTL_Showcase` (PRD FR-ML-7, experimental RTL) — a short article in genuine
+  Arabic, opened with `--lang ar` (this mock has no per-language routing —
+  see `_lang_prefix`'s own comment — so `bidi::direction` reads the `--lang`
+  argument the app tagged the tab with, not anything server-side). One
+  paragraph embeds a bare Latin run ("Turing Award") mid-sentence to exercise
+  the "LTR run embedded in RTL" case; a heading and a real internal link
+  (Arabic anchor text pointing at `Computer_science`) exercise ordinary
+  navigation on an RTL article too.
 
 Sister-project and arbitrary-MediaWiki fixtures (PRD FR-ML-4/5, §6.2 rule 3):
 

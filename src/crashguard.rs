@@ -170,6 +170,15 @@ fn restore_terminal_best_effort() {
         io::stdout(),
         crossterm::style::Print(crate::autotheme::DISABLE_COLOR_SCHEME_NOTIFICATIONS)
     );
+    // PRD FR-ML-7 (experimental RTL): same reasoning again for the VTE bidi
+    // auto-detect toggle — best-effort disabled on every restore, whether or
+    // not this session ever sent the enable sequence (`main::emit_bidi_mode`
+    // sends it at most once, lazily, only after RTL content was actually on
+    // screen).
+    let _ = execute!(
+        io::stdout(),
+        crossterm::style::Print(crate::bidi::VTE_BIDI_AUTODETECT_DISABLE)
+    );
 }
 
 /// Installs a panic hook that restores the terminal, writes a local crash

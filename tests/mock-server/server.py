@@ -367,6 +367,27 @@ PAGES["Citation_Needed_Showcase"] = """<html><head><title>Citation Needed Showca
   An unrelated transclusion<sup typeof="mw:Transclusion" data-mw='{&quot;parts&quot;:[{&quot;template&quot;:{&quot;target&quot;:{&quot;wt&quot;:&quot;Infobox&quot;}}}]}'>(infobox marker)</sup> must not be treated as citation-needed.</p>
 </body></html>"""
 
+# PRD FR-ML-7 pty-verification fixture (experimental RTL): a short article in
+# genuine Arabic (`bidi::direction("ar")` resolves RTL — the mock has no
+# per-language routing, so any lang argument, including `--lang ar`, reaches
+# this same flat PAGES dict; the *language argument itself* is what the app
+# tags the tab with and what FR-ML-7's detection reads). One paragraph
+# embeds a Latin run ("Turing Award") mid-sentence — the "LTR run embedded in
+# RTL" case `bidi::reorder_line_for_display` is asked to handle without
+# mangling it — and one heading, plus a real internal link (Arabic anchor
+# text pointing at the existing `Computer_science` fixture) so link
+# navigation/following on an RTL article is exercised too, not just prose.
+PAGES["RTL_Showcase"] = """<html><head><title>RTL Showcase</title></head><body>
+  <p>تجرِّب هذه المقالة دعم الكتابة من اليمين إلى اليسار (FR-ML-7، تجريبي).
+  ولد آلان تورينج عالم الرياضيات البريطاني، وهو يُعرف بإسهاماته في تأسيس
+  علم الحاسوب النظري، ويُطلق على الجائزة السنوية المرموقة في هذا المجال اسم
+  Turing Award تكريمًا له. تناقش المقالة أيضًا آلة إنجما التي فك تورينج
+  شفرتها أثناء الحرب.</p>
+  <h2>علم الحاسوب</h2>
+  <p>يُعدّ <a href="./Computer_science">علم الحاسوب</a> من أهم المجالات
+  العلمية الحديثة، وقد ساهم فيه تورينج إسهامًا كبيرًا.</p>
+</body></html>"""
+
 # PRD FR-ML-4 pty-verification fixture: a Wiktionary-shaped dictionary entry
 # (etymology, part-of-speech headers, a numbered sense list, a "Related
 # terms" section) — proves sister-project articles render "as-is" through
