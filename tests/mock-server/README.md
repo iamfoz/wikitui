@@ -131,6 +131,40 @@ Language switcher / fallback-chain fixtures (PRD FR-ML-1/2):
   `en`. A request with no `{lang}` segment (every other fixture path, and
   every language not listed in `LANG_MISSING`) is unaffected.
 
+OAuth 2.0 + PKCE fixtures (PRD §5.9 / FR-ACC-1/9):
+
+A minimal authorization-code + PKCE provider standing in for Meta-Wiki's
+`/w/rest.php/oauth2/{authorize,access_token}` (which the test/CI network can't
+reach). Point wikitui's `[auth] authorize_url`/`token_url` at this server.
+
+- `GET /w/rest.php/oauth2/authorize` — **no consent screen**: mints a code
+  bound to the request's `code_challenge` and `302`-redirects to the client's
+  `redirect_uri` with `code`+`state`. That immediate redirect is what makes
+  the loopback flow drivable by a headless "browser" (a `curl -L` that follows
+  the redirect into wikitui's local listener).
+- `POST /w/rest.php/oauth2/access_token` — the token endpoint.
+  `grant_type=authorization_code` **genuinely enforces PKCE**: it checks
+  `base64url(sha256(code_verifier))` against the `S256` challenge captured at
+  `/authorize`, rejecting a wrong/absent verifier with `invalid_grant` — so
+  the test actually exercises the PKCE relationship, not just its plumbing.
+  `grant_type=refresh_token` accepts any non-empty refresh token (so a test
+  can pre-seed an `auth.json` and force a refresh) and mints a fresh access
+  token.
+- `GET /w/api.php?...&meta=userinfo` — the authenticated whoami: a `Bearer`
+  token this provider issued resolves to `MOCK_USERNAME` (`MockWikipedian`);
+  any other token is an anonymous session (`anon: true`), which the client
+  rejects rather than treating as a login.
+- `GET /debug/oauth` — per-grant hit counters (`authorize`/`exchange`/
+  `refresh`/`userinfo`) so a pty test can assert a refresh actually reached
+  the token endpoint.
+- `WIKITUI_MOCK_OAUTH_TTL=<seconds>` (env, default 14400) sets the
+  `expires_in` the token endpoint reports, for exercising near-expiry refresh.
+
+Documented simplifications: one fixed account, no real consent/login UI, and
+refresh accepts any token — this is a flow-shape fixture, not a real IdP. PKCE
+enforcement is the one piece kept faithful, since it's the security-critical
+relationship the client must get right.
+
 Talk-page fixture (PRD FR-ACC-5):
 
 - `Talk:Alan_Turing` — an ordinary `PAGES` entry under the `Talk:` prefix,

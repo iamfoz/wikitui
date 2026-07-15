@@ -1,4 +1,4 @@
-import http.server, urllib.parse, json, time, os, zlib, struct
+import http.server, urllib.parse, json, time, os, zlib, struct, hashlib, base64
 
 # PRD FR-OFF-1/2 fixture revids: stable fake MediaWiki revision ids, one per
 # PAGES key, exposed via the `ETag` header on `/page/{title}/html`
@@ -383,6 +383,61 @@ LANG_MISSING = {
 # prefix when it is none of these.
 _NON_LANG_PATH_ROOTS = {"w", "api", "media", "debug"}
 
+# ---------------------------------------------------------------------------
+# PRD §5.9 / FR-ACC-1: a minimal OAuth 2.0 authorization-code + PKCE provider,
+# standing in for meta.wikimedia.org's `/w/rest.php/oauth2/{authorize,
+# access_token}`. Point wikitui's `[auth] authorize_url`/`token_url` at this
+# server (they default to Meta-Wiki, which the test/CI network can't reach).
+#
+# Documented simplifications (this is a test fixture, not a real IdP):
+#  - There is no consent screen: `/oauth2/authorize` immediately issues a code
+#    and 302-redirects to the client's `redirect_uri` (the loopback listener).
+#    That is what makes the loopback flow drivable by a headless "browser"
+#    (a curl that follows the redirect).
+#  - PKCE *is* genuinely enforced at the token endpoint: the `S256` challenge
+#    captured at `/authorize` is checked against `sha256(code_verifier)` at
+#    `/access_token`, so the test actually exercises the PKCE relationship —
+#    a wrong/absent verifier is rejected with `invalid_grant`.
+#  - Refresh (`grant_type=refresh_token`) accepts any non-empty refresh token
+#    (so a test can pre-seed an `auth.json` with a known refresh token and
+#    force a refresh) and mints a fresh access token with a configurable TTL.
+#  - One fixed account, MOCK_USERNAME. `meta=userinfo` returns it for any
+#    access token this provider issued, and an anonymous session otherwise.
+MOCK_USERNAME = "MockWikipedian"
+# code -> {"challenge": str, "method": str}
+OAUTH_CODES = {}
+# access_token -> username
+OAUTH_ACCESS = {}
+_OAUTH_SEQ = [0]
+# Per-grant hit counters + a note of the last access token minted, so a pty
+# test can assert (via /debug/oauth) that a refresh actually happened.
+OAUTH_STATS = {"authorize": 0, "exchange": 0, "refresh": 0, "userinfo": 0, "last_access": None}
+# `expires_in` (seconds) the token endpoint reports. Overridable per process
+# via WIKITUI_MOCK_OAUTH_TTL so a test can mint a deliberately short-lived
+# access token and observe the client's transparent refresh.
+OAUTH_TTL = int(os.environ.get("WIKITUI_MOCK_OAUTH_TTL", "14400"))
+
+
+def _b64url_nopad(raw):
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+def _pkce_ok(verifier, challenge, method):
+    # Only S256 is issued by wikitui; a `plain` method (not used here) would
+    # compare the verifier directly.
+    if method and method.lower() == "plain":
+        return verifier == challenge
+    expected = _b64url_nopad(hashlib.sha256(verifier.encode()).digest())
+    return expected == challenge
+
+
+def _mint_access():
+    _OAUTH_SEQ[0] += 1
+    token = f"mock-access-{_OAUTH_SEQ[0]}"
+    OAUTH_ACCESS[token] = MOCK_USERNAME
+    OAUTH_STATS["last_access"] = token
+    return token
+
 
 def _lang_prefix(parts):
     if len(parts) > 1 and parts[1] and parts[1] not in _NON_LANG_PATH_ROOTS:
@@ -668,9 +723,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_json({"hits": MEDIA_HITS})
         elif parsed.path == '/debug/requests':
             self._send_json({"requests": REQUEST_LOG})
+        elif parsed.path == '/debug/oauth':
+            # PRD §5.9: per-grant hit counters, so a pty test can assert a
+            # refresh actually reached the token endpoint.
+            self._send_json({"stats": OAUTH_STATS})
         elif parsed.path == '/debug/reset':
             REQUEST_LOG.clear()
             self._send_json({"ok": True})
+        elif parsed.path.endswith('/oauth2/authorize'):
+            self._serve_oauth_authorize(params)
         elif '/page/summary/' in parsed.path:
             self._serve_summary(parts)
         elif '/feed/featured/' in parsed.path:
@@ -736,6 +797,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
         listing = params.get('list', [''])[0]
         generator = params.get('generator', [''])[0]
         prop = params.get('prop', [''])[0]
+        meta = params.get('meta', [''])[0]
+        # PRD FR-ACC-1: the authenticated whoami. A Bearer token this OAuth
+        # provider issued resolves to MOCK_USERNAME; anything else is an
+        # anonymous session (which the client rejects, never mistaking it for
+        # a login).
+        if action == 'query' and meta == 'userinfo':
+            OAUTH_STATS["userinfo"] += 1
+            auth_header = self.headers.get('Authorization', '')
+            token = auth_header[7:].strip() if auth_header.lower().startswith('bearer ') else ''
+            if token and token in OAUTH_ACCESS:
+                self._send_json({
+                    "query": {"userinfo": {"id": 42, "name": OAUTH_ACCESS[token]}}
+                })
+            else:
+                self._send_json({
+                    "query": {"userinfo": {"id": 0, "name": "127.0.0.1", "anon": True}}
+                })
+            return
         # PRD FR-OFF-5 bulk-save-by-category: list=categorymembers, depth 1.
         if action == 'query' and listing == 'categorymembers':
             cmtitle = params.get('cmtitle', [''])[0]
@@ -808,6 +887,87 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         self.send_response(404)
         self.end_headers()
+
+    def _serve_oauth_authorize(self, params):
+        # PRD §5.9: no consent screen — mint a code bound to the PKCE
+        # challenge and 302-redirect to the client's loopback redirect_uri.
+        OAUTH_STATS["authorize"] += 1
+        redirect_uri = params.get('redirect_uri', [''])[0]
+        state = params.get('state', [''])[0]
+        challenge = params.get('code_challenge', [''])[0]
+        method = params.get('code_challenge_method', ['S256'])[0]
+        if not redirect_uri:
+            self.send_response(400)
+            self.end_headers()
+            return
+        _OAUTH_SEQ[0] += 1
+        code = f"mock-code-{_OAUTH_SEQ[0]}"
+        OAUTH_CODES[code] = {"challenge": challenge, "method": method}
+        sep = '&' if '?' in redirect_uri else '?'
+        location = f"{redirect_uri}{sep}code={urllib.parse.quote(code)}"
+        if state:
+            location += f"&state={urllib.parse.quote(state)}"
+        self.send_response(302)
+        self.send_header('Location', location)
+        self.end_headers()
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        length = int(self.headers.get('Content-Length', '0') or '0')
+        body = self.rfile.read(length).decode('utf-8', 'replace') if length else ''
+        form = {k: v[0] for k, v in urllib.parse.parse_qs(body).items()}
+        REQUEST_LOG.append({"path": self.path, "ua": self.headers.get('User-Agent', '')})
+        if parsed.path.endswith('/oauth2/access_token'):
+            self._serve_oauth_token(form)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def _serve_oauth_token(self, form):
+        # PRD §5.9: the token endpoint. `authorization_code` enforces PKCE;
+        # `refresh_token` mints a fresh access token.
+        grant = form.get('grant_type', '')
+        if grant == 'authorization_code':
+            OAUTH_STATS["exchange"] += 1
+            code = form.get('code', '')
+            verifier = form.get('code_verifier', '')
+            entry = OAUTH_CODES.pop(code, None)
+            if entry is None or not verifier or not _pkce_ok(
+                verifier, entry["challenge"], entry.get("method", "S256")
+            ):
+                self._send_oauth_error("invalid_grant", "bad code or PKCE verifier")
+                return
+            access = _mint_access()
+            self._send_json({
+                "access_token": access,
+                "refresh_token": "mock-refresh-token",
+                "expires_in": OAUTH_TTL,
+                "token_type": "Bearer",
+            })
+            return
+        if grant == 'refresh_token':
+            OAUTH_STATS["refresh"] += 1
+            refresh = form.get('refresh_token', '')
+            if not refresh:
+                self._send_oauth_error("invalid_grant", "missing refresh token")
+                return
+            access = _mint_access()
+            self._send_json({
+                "access_token": access,
+                "refresh_token": refresh,
+                "expires_in": OAUTH_TTL,
+                "token_type": "Bearer",
+            })
+            return
+        self._send_oauth_error("unsupported_grant_type", grant)
+
+    def _send_oauth_error(self, error, desc):
+        body = json.dumps({"error": error, "error_description": desc}).encode()
+        self.send_response(400)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _serve_media(self):
         # PRD FR-RD-8: serve the real tiny PNG, counting the hit so tests can

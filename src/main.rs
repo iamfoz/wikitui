@@ -1,6 +1,7 @@
 mod api;
 mod app;
 mod attribution;
+mod auth;
 mod autotheme;
 mod bookmark_export;
 mod bookmarks;
@@ -518,6 +519,8 @@ async fn main() -> Result<()> {
         reload_flag,
         keymap,
         show_onboarding,
+        resolved.auth.clone(),
+        resolved.network_contact.value.clone(),
     )
     .await
 }
@@ -1799,6 +1802,8 @@ async fn run(
     reload_flag: Arc<AtomicBool>,
     keymap: registry::Keymap,
     show_onboarding: bool,
+    auth_cfg: config::ResolvedAuth,
+    contact: String,
 ) -> Result<()> {
     let mut app = App::new(lang, theme, no_color);
     app.keymap = keymap;
@@ -1862,6 +1867,22 @@ async fn run(
     // behind (see that function's doc comment for why incognito must not
     // also erase history it didn't ask to touch).
     app.session_path = session::resolve_session_path();
+
+    // PRD FR-ACC-1 / §5.9: the OAuth client identity + endpoints `:login`
+    // builds a flow from, and — if a token store already holds tokens from a
+    // previous session — the logged-in session restored on startup. Loading
+    // tokens is a fast local read (no network), so it never blocks the
+    // <100 ms cold-start path (§6.8); the username rides the stored tokens so
+    // the indicator shows immediately without a userinfo round trip.
+    app.auth_runtime = app::AuthRuntime {
+        client_id: auth_cfg.client_id.value.clone(),
+        authorize_url: auth_cfg.authorize_url.value.clone(),
+        token_url: auth_cfg.token_url.value.clone(),
+        contact: contact.clone(),
+    };
+    if let Some(state) = load_auth_state(&app.auth_runtime) {
+        app.auth = Some(state);
+    }
 
     // Delivers typeahead responses, background revalidation outcomes, and
     // background-tab fetch results back to the loop (PRD FR-SR-1 / FR-OFF-2 /
@@ -3269,6 +3290,7 @@ async fn handle_key(
                 match command::parse_with_user_themes(&input, &user_theme_names) {
                     Ok(cmd) => {
                         execute_command(
+                            terminal,
                             client,
                             cache,
                             app,
@@ -3288,6 +3310,32 @@ async fn handle_key(
             }
             KeyCode::Char(c) => {
                 app.command_input.push(c);
+            }
+            _ => {}
+        },
+        // PRD §5.9's manual code-paste prompt: type/paste the code (or full
+        // redirect URL), Enter exchanges it, Esc cancels the login.
+        Mode::Login => match code {
+            KeyCode::Esc => {
+                app.mode = Mode::Reading;
+                app.pending_login = None;
+                app.login_input.clear();
+                app.status = String::new();
+                app.notice = Some("Login canceled".to_string());
+            }
+            KeyCode::Enter => {
+                if app.login_input.trim().is_empty() {
+                    app.notice =
+                        Some("Paste the authorization code first (or Esc to cancel)".to_string());
+                } else {
+                    submit_login_paste(client, app).await;
+                }
+            }
+            KeyCode::Backspace => {
+                app.login_input.pop();
+            }
+            KeyCode::Char(c) => {
+                app.login_input.push(c);
             }
             _ => {}
         },
@@ -4810,6 +4858,11 @@ async fn dispatch_action(
         Action::Info => {
             app.open_info();
         }
+        // PRD FR-ACC-1 / §5.9: the palette/keybind entry point mirrors bare
+        // `:login` (the loopback flow).
+        Action::Login => cmd_login_loopback(terminal, client, app).await,
+        // PRD FR-ACC-9.
+        Action::Logout => cmd_logout(app),
         Action::Quit => {
             app.pending_quit_confirm = true;
             app.notice = Some("really quit? (y/n)".to_string());
@@ -4821,11 +4874,322 @@ async fn dispatch_action(
     }
 }
 
+/// PRD SEC-4: the token store — the OS keychain (feature-gated) with the 0600
+/// file fallback. One helper so startup, `:login`, and `:logout` agree on
+/// where tokens live.
+fn build_token_store() -> Option<Box<dyn auth::TokenStore>> {
+    auth::default_store(auth::auth_path())
+}
+
+/// Loads a persisted logged-in session (PRD FR-ACC-1) from the token store,
+/// wrapping it in an `AuthState` ready to refresh on demand. `None` when
+/// logged out, no store resolves, or the stored blob is unreadable (a corrupt
+/// `auth.json` degrades to logged-out, not a crash).
+fn load_auth_state(runtime: &app::AuthRuntime) -> Option<auth::AuthState> {
+    let store = build_token_store()?;
+    let tokens = store.load().ok().flatten()?;
+    let http = auth::token_http_client(&runtime.contact).ok()?;
+    Some(auth::AuthState::new(
+        tokens,
+        runtime.client_id.clone(),
+        runtime.token_url.clone(),
+        http,
+        store,
+    ))
+}
+
+/// PRD §5.9 / FR-ACC-1: the loopback OAuth login. Generates PKCE + a CSRF
+/// `state`, binds a short-lived `127.0.0.1:<port>/callback` listener, opens
+/// the browser to the authorization URL (best-effort), waits for the
+/// redirect, then completes the exchange. Blocking (bounded 180 s) by design:
+/// login is an intentional "wait for the browser" step. The URL is *drawn*
+/// before the wait so a headless reader can copy it (or `:login paste`
+/// instead).
+async fn cmd_login_loopback(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    client: &WikiClient,
+    app: &mut App,
+) {
+    if !app.auth_runtime.is_configured() {
+        app.notice = Some(
+            "Login unavailable: register an OAuth consumer and set [auth] client_id in config.toml"
+                .to_string(),
+        );
+        return;
+    }
+    if let Some(existing) = app.auth.as_ref() {
+        // Already logged in: re-verify the session (the authed action that
+        // transparently refreshes a near-expired token, PRD §5.9).
+        let name = existing.username().to_string();
+        app.notice = Some(format!("Already logged in as {name} — checking session…"));
+        reverify_session(client, app).await;
+        return;
+    }
+
+    let server = match auth::LoopbackServer::bind() {
+        Ok(s) => s,
+        Err(e) => {
+            app.notice = Some(format!("Login failed: {e}"));
+            return;
+        }
+    };
+    let port = server.port();
+    let redirect_uri = server.redirect_uri();
+    let pkce = auth::Pkce::generate();
+    let state = auth::random_state();
+    let url = auth::build_authorize_url(
+        &app.auth_runtime.authorize_url,
+        &app.auth_runtime.client_id,
+        &pkce.challenge,
+        &state,
+        &redirect_uri,
+    );
+    let opened = auth::open_browser(&url);
+    app.status = format!("Waiting for browser authorization on 127.0.0.1:{port} …");
+    app.notice = Some(if opened {
+        format!("Opened your browser to authorize. If nothing opened, visit: {url}")
+    } else {
+        format!("Open this URL to authorize (loopback capture is running): {url}")
+    });
+    // Paint the URL before blocking on the redirect.
+    let _ = terminal.draw(|f| ui::draw(f, app));
+
+    let wait =
+        tokio::task::spawn_blocking(move || server.accept_one(Duration::from_secs(180))).await;
+    let callback = match wait {
+        Ok(Ok(cb)) => cb,
+        Ok(Err(e)) => {
+            app.status = String::new();
+            app.notice = Some(format!("Login canceled: {e}"));
+            return;
+        }
+        Err(e) => {
+            app.notice = Some(format!("Login failed: {e}"));
+            return;
+        }
+    };
+    if let Err(e) = callback.verify_state(&state) {
+        app.status = String::new();
+        app.notice = Some(format!("Login rejected: {e}"));
+        return;
+    }
+    finish_login(client, app, &pkce.verifier, &callback.code, &redirect_uri).await;
+}
+
+/// PRD §5.9's manual code-paste fallback setup: builds the authorization URL
+/// (advertising a loopback redirect the reader copies the code out of — there
+/// is no documented oob for OAuth 2.0, SP-2), opens the browser best-effort,
+/// and enters the paste prompt ([`Mode::Login`]). The exchange runs when the
+/// reader submits the pasted code (`submit_login_paste`).
+fn cmd_login_paste(app: &mut App) {
+    if !app.auth_runtime.is_configured() {
+        app.notice = Some(
+            "Login unavailable: register an OAuth consumer and set [auth] client_id in config.toml"
+                .to_string(),
+        );
+        return;
+    }
+    if let Some(existing) = app.auth.as_ref() {
+        app.notice = Some(format!("Already logged in as {}", existing.username()));
+        return;
+    }
+    let redirect_uri = "http://127.0.0.1/callback".to_string();
+    let pkce = auth::Pkce::generate();
+    let state = auth::random_state();
+    let url = auth::build_authorize_url(
+        &app.auth_runtime.authorize_url,
+        &app.auth_runtime.client_id,
+        &pkce.challenge,
+        &state,
+        &redirect_uri,
+    );
+    let _ = auth::open_browser(&url);
+    app.pending_login = Some(app::PendingLogin {
+        verifier: pkce.verifier,
+        state,
+        redirect_uri,
+        authorize_url: url.clone(),
+    });
+    app.login_input.clear();
+    app.mode = Mode::Login;
+    app.status =
+        format!("Authorize in your browser, then paste the code or full redirect URL: {url}");
+}
+
+/// Completes the manual-paste login: parses the pasted code/URL, runs the
+/// CSRF `state` check when the paste carried one, and exchanges the code.
+async fn submit_login_paste(client: &WikiClient, app: &mut App) {
+    let Some(pending) = app.pending_login.clone() else {
+        app.mode = Mode::Reading;
+        return;
+    };
+    let input = app.login_input.clone();
+    let callback = match auth::parse_manual_input(&input) {
+        Ok(cb) => cb,
+        Err(e) => {
+            app.notice = Some(format!("Paste rejected: {e}"));
+            return;
+        }
+    };
+    // A pasted full redirect URL carries its own `state` — verify it (CSRF);
+    // a bare hand-copied code has none, which is accepted (the reader vouches
+    // for it) per §5.9's manual fallback.
+    if callback.state.is_some()
+        && let Err(e) = callback.verify_state(&pending.state)
+    {
+        app.notice = Some(format!("Paste rejected: {e}"));
+        return;
+    }
+    finish_login(
+        client,
+        app,
+        &pending.verifier,
+        &callback.code,
+        &pending.redirect_uri,
+    )
+    .await;
+}
+
+/// Completes an OAuth login once an authorization `code` is in hand (from the
+/// loopback capture or a manual paste): exchanges the code for tokens (the
+/// PKCE `verifier` proves the client), fetches the username via authenticated
+/// `meta=userinfo`, stores the tokens (SEC-4), and installs the session.
+async fn finish_login(
+    client: &WikiClient,
+    app: &mut App,
+    verifier: &str,
+    code: &str,
+    redirect_uri: &str,
+) {
+    let rt = app.auth_runtime.clone();
+    let http = match auth::token_http_client(&rt.contact) {
+        Ok(h) => h,
+        Err(e) => {
+            app.notice = Some(format!("Login failed: {e}"));
+            return;
+        }
+    };
+    let resp = match auth::exchange_code(
+        &http,
+        &rt.token_url,
+        &rt.client_id,
+        code,
+        verifier,
+        redirect_uri,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            app.notice = Some(format!("Login failed: {e}"));
+            return;
+        }
+    };
+    let username = match client.fetch_userinfo(&app.lang, &resp.access_token).await {
+        Ok(name) => name,
+        Err(e) => {
+            app.notice = Some(format!("Login failed: could not confirm account: {e}"));
+            return;
+        }
+    };
+    let now = chrono::Utc::now().timestamp();
+    let tokens = match auth::Tokens::from_response(&resp, username.clone(), now, None) {
+        Ok(t) => t,
+        Err(e) => {
+            app.notice = Some(format!("Login failed: {e}"));
+            return;
+        }
+    };
+    let Some(store) = build_token_store() else {
+        app.notice =
+            Some("Login failed: no token store available (no keychain, no state dir)".to_string());
+        return;
+    };
+    let file_fallback = store.is_file_fallback();
+    let store_desc = store.describe();
+    if let Err(e) = store.save(&tokens) {
+        app.notice = Some(format!("Login failed: could not store tokens: {e}"));
+        return;
+    }
+    app.auth = Some(auth::AuthState::new(
+        tokens,
+        rt.client_id.clone(),
+        rt.token_url.clone(),
+        http,
+        store,
+    ));
+    app.pending_login = None;
+    app.login_input.clear();
+    app.mode = Mode::Reading;
+    app.status = String::new();
+    // SEC-4: name the storage honestly — a file fallback is less safe than a
+    // keychain and the reader should know.
+    app.notice = Some(if file_fallback {
+        format!("Logged in as {username}  (tokens stored in {store_desc}, not an OS keychain)")
+    } else {
+        format!("Logged in as {username}  (tokens stored in {store_desc})")
+    });
+}
+
+/// PRD §5.9's transparent refresh in action: re-fetches `meta=userinfo`
+/// through `valid_access_token`, which refreshes a near-expired token first
+/// (hitting the token endpoint's refresh grant) and persists the new tokens.
+/// A refresh failure logs the reader out gracefully (§7 "Login: OAuth
+/// failure/expiry").
+async fn reverify_session(client: &WikiClient, app: &mut App) {
+    let now = chrono::Utc::now().timestamp();
+    let Some(auth_state) = app.auth.as_mut() else {
+        return;
+    };
+    let token = match auth_state.valid_access_token(now).await {
+        Ok(t) => t,
+        Err(e) => {
+            // The refresh failed (revoked/expired refresh token): drop the
+            // dead session and delete the local tokens.
+            let _ = auth_state.logout();
+            app.auth = None;
+            app.notice = Some(format!("Session expired — logged out ({e})"));
+            return;
+        }
+    };
+    match client.fetch_userinfo(&app.lang, &token).await {
+        Ok(name) => app.notice = Some(format!("Logged in as {name}")),
+        Err(e) => app.notice = Some(format!("Session check failed: {e}")),
+    }
+}
+
+/// PRD FR-ACC-9 / FR-PR-4: local logout — deletes the stored tokens and drops
+/// the session, then points the reader at `Special:OAuthManageMyGrants` for
+/// server-side revocation (this public client holds no secret to revoke with
+/// itself).
+fn cmd_logout(app: &mut App) {
+    match app.auth.take() {
+        Some(auth_state) => {
+            let who = auth_state.username().to_string();
+            let deleted = auth_state.logout();
+            app.mode = Mode::Reading;
+            let base = match deleted {
+                Ok(()) => format!(
+                    "Logged out {who}. Revoke server-side at {}",
+                    auth::MANAGE_GRANTS_URL
+                ),
+                Err(e) => format!(
+                    "Logged out {who} (local token delete warning: {e}). Revoke server-side at {}",
+                    auth::MANAGE_GRANTS_URL
+                ),
+            };
+            app.notice = Some(base);
+        }
+        None => app.notice = Some("Not logged in".to_string()),
+    }
+}
+
 /// Executes a parsed `:` command. Parsing already validated arguments
 /// (theme/style/lang names), so the arms here mostly delegate to existing
 /// features.
 #[allow(clippy::too_many_arguments)]
 async fn execute_command(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     client: &WikiClient,
     cache: &PageCache,
     app: &mut App,
@@ -4835,7 +5199,7 @@ async fn execute_command(
     related_tx: &UnboundedSender<RelatedOutcome>,
     langlinks_tx: &UnboundedSender<LangLinksOutcome>,
 ) {
-    use command::{Command, RandomSpec, SaveSpec};
+    use command::{Command, LoginMode, RandomSpec, SaveSpec};
     match cmd {
         Command::Open(raw) => {
             // Same grammar as the CLI TITLE argument: URLs and
@@ -5108,6 +5472,11 @@ async fn execute_command(
         Command::Lang(Some(code)) => {
             set_or_switch_lang(client, cache, app, code, revalidate_tx, langlinks_tx).await
         }
+        // PRD FR-ACC-1 / §5.9.
+        Command::Login(LoginMode::Loopback) => cmd_login_loopback(terminal, client, app).await,
+        Command::Login(LoginMode::Paste) => cmd_login_paste(app),
+        // PRD FR-ACC-9.
+        Command::Logout => cmd_logout(app),
         Command::Quit => app.should_quit = true,
     }
 }

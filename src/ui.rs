@@ -472,9 +472,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     match app.mode {
-        Mode::Reading | Mode::Help | Mode::Search | Mode::Find | Mode::Command | Mode::Hint => {
-            draw_reading(frame, app, content_area)
-        }
+        // PRD §5.9's login paste prompt draws over the reading view (like
+        // Command); its prompt lives in the status bar.
+        Mode::Reading
+        | Mode::Help
+        | Mode::Search
+        | Mode::Find
+        | Mode::Command
+        | Mode::Hint
+        | Mode::Login => draw_reading(frame, app, content_area),
         Mode::Results => draw_results(frame, app, content_area),
         Mode::Toc => draw_toc(frame, app, content_area),
         Mode::Research => draw_research(frame, app, content_area),
@@ -2362,6 +2368,18 @@ fn with_incognito_glyph(text: String, incognito: bool) -> String {
     }
 }
 
+/// PRD FR-ACC-1: the logged-in indicator — a `[@username]` prefix on the
+/// status bar whenever a session is active, so the reader can always see who
+/// they're logged in as (and that they are logged in at all). Absent when
+/// logged out. Prefixed like the incognito glyph so it survives whatever
+/// segment (`notice`/focused link/breadcrumb) fills the rest of the bar.
+fn with_login_glyph(text: String, username: Option<&str>) -> String {
+    match username {
+        Some(user) => format!("[@{user}] {text}"),
+        None => text,
+    }
+}
+
 /// Modes whose status bar shows the reader's own live input — the search/
 /// command/find/hint prompts, the `/` filters, and the command palette.
 /// `status_bar_text`'s uniform notice priority skips these: a `notice`
@@ -2429,6 +2447,21 @@ fn status_bar_text(app: &App, width: u16) -> String {
             app.search_input
         ),
         Mode::Command => format!(":{}", app.command_input),
+        // PRD §5.9's manual code-paste prompt — keeps the authorization URL in
+        // view (from the pending login) so the reader can re-open it, then the
+        // live paste input.
+        Mode::Login => match app.pending_login.as_ref() {
+            Some(pending) if app.login_input.is_empty() => {
+                format!(
+                    "authorize at: {}   then paste code   Esc: cancel",
+                    pending.authorize_url
+                )
+            }
+            _ => format!(
+                "paste code: {}   Enter: submit   Esc: cancel",
+                app.login_input
+            ),
+        },
         Mode::Hint => format!("hint: {}   Esc: cancel", app.hint_input),
         Mode::Find if tab.find_matches.is_empty() && !tab.find_input.is_empty() => {
             format!("find: {} (no matches)", tab.find_input)
@@ -2576,12 +2609,14 @@ fn status_bar_text(app: &App, width: u16) -> String {
 
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let text = status_bar_text(app, area.width);
+    let text = with_login_glyph(text, app.logged_in_username());
     let text = with_incognito_glyph(text, app.incognito);
     let style = if matches!(
         app.mode,
         Mode::Search
             | Mode::Find
             | Mode::Command
+            | Mode::Login
             | Mode::Hint
             | Mode::BookmarkFilter
             | Mode::BookmarkTagEdit
@@ -3673,6 +3708,20 @@ mod tests {
         assert_eq!(
             with_incognito_glyph("Alan Turing".to_string(), true),
             "[incognito] Alan Turing"
+        );
+    }
+
+    // ---- Logged-in indicator (PRD FR-ACC-1) -------------------------------
+
+    #[test]
+    fn login_glyph_prefixes_the_status_only_when_logged_in() {
+        assert_eq!(
+            with_login_glyph("Alan Turing".to_string(), None),
+            "Alan Turing"
+        );
+        assert_eq!(
+            with_login_glyph("Alan Turing".to_string(), Some("MockWikipedian")),
+            "[@MockWikipedian] Alan Turing"
         );
     }
 

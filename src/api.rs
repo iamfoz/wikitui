@@ -411,6 +411,30 @@ struct BareResponse {
     latest: BareLatest,
 }
 
+/// `meta=userinfo` (formatversion=2) — the authenticated whoami (PRD FR-ACC-1,
+/// Appendix A userinfo). Only the central account `name` is read here; the
+/// rest of the payload (rights, options) is out of scope for the login label.
+#[derive(Debug, Deserialize)]
+struct UserInfoResponse {
+    query: UserInfoQuery,
+}
+
+#[derive(Debug, Deserialize)]
+struct UserInfoQuery {
+    userinfo: UserInfo,
+}
+
+#[derive(Debug, Deserialize)]
+struct UserInfo {
+    #[serde(default)]
+    name: String,
+    /// An anonymous session reports `anon: true`; a real login never does. Its
+    /// presence is how `fetch_userinfo` distinguishes "the token authenticated
+    /// as someone" from "the token was ignored and this is an anon reply".
+    #[serde(default)]
+    anon: bool,
+}
+
 /// FR-PF-1's `generator=links` + `prop=pageviews` response (formatversion=2).
 /// Each page carries a per-day `pageviews` map (values may be null); the
 /// client sums the non-null days into a single total per title.
@@ -909,6 +933,47 @@ impl WikiClient {
         let parsed: BareResponse =
             serde_json::from_slice(&bytes).context("parsing bare metadata response")?;
         Ok(parsed.latest.id)
+    }
+
+    /// PRD NF-NET-9 / FR-ACC-1: an authenticated GET carrying `Authorization:
+    /// Bearer {token}`. This is the integration seam the watchlist (FR-ACC-2)
+    /// and notifications (FR-ACC-3) consumers — the next Phase C chunk — build
+    /// on; authenticated requests also identify the client for the elevated
+    /// (5,000/h) rate limits (§6.5 NF-NET-9). The URL is built by the caller
+    /// (an Action API query, typically) so this stays a thin bearer-attaching
+    /// wrapper over the shared client.
+    pub async fn authed_get(&self, url: &str, access_token: &str) -> Result<reqwest::Response> {
+        self.http
+            .get(url)
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .with_context(|| format!("requesting {url}"))?
+            .error_for_status()
+            .context("authenticated request failed")
+    }
+
+    /// PRD FR-ACC-1: the logged-in username via authenticated `meta=userinfo`,
+    /// fetched right after token exchange to label the session (and re-checked
+    /// on demand to confirm the token still authenticates). Rejects an
+    /// `anon: true` reply — a token the server ignored comes back anonymous,
+    /// which must not be mistaken for a successful login. The name is
+    /// sanitized (SEC-1) since it becomes displayable status-bar text.
+    pub async fn fetch_userinfo(&self, lang: &str, access_token: &str) -> Result<String> {
+        let url = format!(
+            "{}/w/api.php?action=query&format=json&formatversion=2&meta=userinfo",
+            self.host(lang)
+        );
+        let resp = self.authed_get(&url, access_token).await?;
+        let bytes = read_capped(resp, MAX_SEARCH_RESPONSE_BYTES)
+            .await
+            .context("reading userinfo response body")?;
+        let parsed: UserInfoResponse =
+            serde_json::from_slice(&bytes).context("parsing userinfo response")?;
+        if parsed.query.userinfo.anon || parsed.query.userinfo.name.is_empty() {
+            bail!("the access token did not authenticate (userinfo returned an anonymous session)");
+        }
+        Ok(crate::sanitize::sanitize_single_line(&parsed.query.userinfo.name).into_owned())
     }
 
     /// Full-text search (PRD Appendix A: `GET /w/rest.php/v1/search/page`).

@@ -98,6 +98,11 @@ pub enum Action {
     /// PRD §10 / Appendix B: open the `:info` article-attribution overlay
     /// (title, canonical URL, revid, license, history permalink).
     Info,
+    /// PRD FR-ACC-1 / §5.9: start the OAuth 2.0 PKCE login (loopback flow).
+    Login,
+    /// PRD FR-ACC-9: local logout (delete stored tokens) + link to
+    /// server-side grant revocation.
+    Logout,
     Quit,
     // -- picker-generic (help only; not palette-invokable) --
     MoveDown,
@@ -544,6 +549,22 @@ pub const COMMANDS: &[Meta] = &[
         display: "Article info",
         help: "show this article's attribution: title, URL, revision, license, history",
         contexts: &[KeyContext::Reading],
+        in_palette: true,
+    },
+    Meta {
+        action: Action::Login,
+        name: "login",
+        display: "Log in",
+        help: "log in to Wikipedia via OAuth (watchlist, notifications, reading lists)",
+        contexts: &[KeyContext::Reading, KeyContext::StartPage],
+        in_palette: true,
+    },
+    Meta {
+        action: Action::Logout,
+        name: "logout",
+        display: "Log out",
+        help: "log out and delete stored tokens (revoke server-side via OAuthManageMyGrants)",
+        contexts: &[KeyContext::Reading, KeyContext::StartPage],
         in_palette: true,
     },
     Meta {
@@ -1135,6 +1156,8 @@ pub const READING_HELP_ORDER: &[Action] = &[
     Action::Home,
     Action::Today,
     Action::Info,
+    Action::Login,
+    Action::Logout,
     Action::Help,
     Action::Quit,
 ];

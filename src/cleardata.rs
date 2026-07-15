@@ -21,12 +21,16 @@
 //! *addition* to this module, not a reclassification of what `--all`
 //! already means.
 //!
-//! ## `--stats`/`--auth` (seams)
+//! ## `--stats`/`--auth`
 //!
-//! Reading stats (FR-PC-3) and stored auth tokens (FR-ACC-1/9) don't exist
-//! yet — both flags are accepted (so scripts written against the final
-//! interface work unchanged once they land) and report an honest no-op
-//! rather than erroring on an unrecognized flag.
+//! Reading stats (FR-PC-3) don't exist yet — `--stats` is accepted (so scripts
+//! written against the final interface work unchanged once it lands) and
+//! reports an honest no-op. `--auth` (FR-ACC-1/9) **is** wired: it deletes the
+//! locally stored OAuth token file (`auth.json`, PRD SEC-4), the same tokens
+//! `:logout` removes — and, like `:logout`, tells the reader to revoke
+//! server-side at `Special:OAuthManageMyGrants` (this public client holds no
+//! secret to revoke with itself). When the `keychain` feature is built, the
+//! keychain entry is best-effort removed too.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -76,6 +80,8 @@ impl Scope {
 pub struct Targets {
     pub history: Option<PathBuf>,
     pub cache_dir: Option<PathBuf>,
+    /// PRD FR-ACC-9 / SEC-4: the locally stored OAuth token file (`auth.json`).
+    pub auth: Option<PathBuf>,
 }
 
 /// Resolves `scope` against the real platform directories (`cache_dir_override`
@@ -91,6 +97,7 @@ pub fn resolve_targets(scope: Scope, cache_dir_override: Option<&Path>) -> Targe
             .wants_cache()
             .then(|| crate::cache::resolve_pages_dir(cache_dir_override))
             .flatten(),
+        auth: scope.wants_auth().then(crate::auth::auth_path).flatten(),
     }
 }
 
@@ -105,6 +112,7 @@ pub struct Freed {
 pub struct Report {
     pub history: Option<Freed>,
     pub cache: Option<Freed>,
+    pub auth: Option<Freed>,
 }
 
 /// Recursively sums file sizes under `path` (0 for a missing path or a
@@ -163,6 +171,23 @@ pub fn delete(targets: &Targets, dry_run: bool) -> Report {
                 }
             } else {
                 delete_dir(p)
+            }
+        }),
+        auth: targets.auth.as_deref().map(|p| {
+            if dry_run {
+                Freed {
+                    existed: p.exists(),
+                    bytes: std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
+                }
+            } else {
+                // PRD SEC-4: also drop the keychain entry when that backend is
+                // compiled — the file is the fallback, not the only store.
+                #[cfg(feature = "keychain")]
+                {
+                    use crate::auth::TokenStore as _;
+                    let _ = crate::auth::KeyringTokenStore::new("wikitui", "oauth-tokens").delete();
+                }
+                delete_file(p)
             }
         }),
     }
@@ -230,16 +255,23 @@ pub fn run(resolved: &ResolvedConfig, scope: Scope, assume_yes: bool) -> i32 {
             }
         );
     }
+    if let (Some(path), Some(freed)) = (&targets.auth, preview.auth) {
+        any_real_target = true;
+        println!(
+            "  auth: {} ({}{})",
+            path.display(),
+            human_bytes(freed.bytes),
+            if freed.existed {
+                ""
+            } else {
+                " — not present"
+            }
+        );
+    }
     if scope.wants_stats() {
         println!("  stats: not implemented yet (PRD FR-PC-3) — nothing to delete");
     }
-    if scope.wants_auth() {
-        println!(
-            "  auth: not implemented yet (PRD FR-ACC-1/9) — nothing to delete locally; \
-             once login lands, also revoke server-side at Special:OAuthManageMyGrants"
-        );
-    }
-    if !any_real_target && !scope.wants_stats() && !scope.wants_auth() {
+    if !any_real_target && !scope.wants_stats() {
         println!("  (nothing resolvable — no platform directory could be determined)");
     }
 
@@ -273,6 +305,23 @@ pub fn run(resolved: &ResolvedConfig, scope: Scope, assume_yes: bool) -> i32 {
         } else {
             println!("  cache already absent: {}", path.display());
         }
+    }
+    if let (Some(path), Some(freed)) = (&targets.auth, report.auth) {
+        if freed.existed {
+            println!(
+                "  deleted auth tokens ({}): {}",
+                human_bytes(freed.bytes),
+                path.display()
+            );
+            total_bytes += freed.bytes;
+        } else {
+            println!("  auth tokens already absent: {}", path.display());
+        }
+        // PRD FR-ACC-9: local deletion doesn't revoke the grant server-side.
+        println!(
+            "  note: also revoke server-side at {}",
+            crate::auth::MANAGE_GRANTS_URL
+        );
     }
     println!("Total freed: {}", human_bytes(total_bytes));
     0
@@ -338,6 +387,7 @@ mod tests {
         let Targets {
             history: _h,
             cache_dir: _c,
+            auth: _a,
         } = resolve_targets(
             Scope {
                 all: true,
@@ -345,6 +395,37 @@ mod tests {
             },
             None,
         );
+    }
+
+    // ---- --auth deletes the token file (PRD FR-ACC-9 / SEC-4) ----------
+
+    #[test]
+    fn delete_removes_the_auth_token_file_and_reports_its_size() {
+        let path = temp_dir("auth").with_extension("json");
+        std::fs::write(&path, b"{\"access_token\":\"x\"}").unwrap();
+        let targets = Targets {
+            history: None,
+            cache_dir: None,
+            auth: Some(path.clone()),
+        };
+        let report = delete(&targets, false);
+        assert_eq!(report.auth.map(|f| f.existed), Some(true));
+        assert!(!path.exists(), "auth token file must be gone");
+    }
+
+    #[test]
+    fn dry_run_leaves_the_auth_token_file_in_place() {
+        let path = temp_dir("auth-dry").with_extension("json");
+        std::fs::write(&path, b"{}").unwrap();
+        let targets = Targets {
+            history: None,
+            cache_dir: None,
+            auth: Some(path.clone()),
+        };
+        let report = delete(&targets, true);
+        assert!(report.auth.unwrap().existed);
+        assert!(path.exists(), "a dry run must not delete tokens");
+        let _ = std::fs::remove_file(&path);
     }
 
     // ---- delete/dir_size mechanics (against real tempdirs) --------------
@@ -356,6 +437,7 @@ mod tests {
         let targets = Targets {
             history: Some(path.clone()),
             cache_dir: None,
+            auth: None,
         };
 
         let report = delete(&targets, false);
@@ -379,6 +461,7 @@ mod tests {
         let targets = Targets {
             history: None,
             cache_dir: Some(dir.clone()),
+            auth: None,
         };
 
         let report = delete(&targets, false);
@@ -398,6 +481,7 @@ mod tests {
         let targets = Targets {
             history: Some(dir.join("nope.sqlite")),
             cache_dir: Some(dir.join("nope-cache")),
+            auth: None,
         };
         let report = delete(&targets, false);
         assert_eq!(
@@ -423,6 +507,7 @@ mod tests {
         let targets = Targets {
             history: Some(path.clone()),
             cache_dir: None,
+            auth: None,
         };
 
         let report = delete(&targets, true);

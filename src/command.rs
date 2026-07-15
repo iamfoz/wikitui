@@ -109,8 +109,27 @@ pub enum Command {
     /// overlay for the current article (title, canonical URL, revid,
     /// license, history permalink). Same action as `i`.
     Info,
+    /// `:login` (PRD FR-ACC-1, §5.9) — start the OAuth 2.0 PKCE login. Bare
+    /// `:login` runs the loopback flow (opens the browser, captures the
+    /// redirect on a local listener); `:login paste` runs the manual
+    /// code-paste fallback for when loopback URIs are rejected or no browser
+    /// is reachable.
+    Login(LoginMode),
+    /// `:logout` (PRD FR-ACC-9) — revoke locally (delete stored tokens) and
+    /// link to `Special:OAuthManageMyGrants` for server-side revocation.
+    Logout,
     /// `:q` / `:quit` — exit.
     Quit,
+}
+
+/// `:login`'s two forms (PRD §5.9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginMode {
+    /// Bare `:login`: browser + loopback-listener capture (the primary path).
+    Loopback,
+    /// `:login paste`: the manual code-paste fallback (§5.9; SP-2-unverified
+    /// for OAuth 2.0).
+    Paste,
 }
 
 /// `:random`'s two documented forms (PRD FR-SR-5).
@@ -610,6 +629,17 @@ pub fn parse_with_user_themes(input: &str, user_theme_names: &[String]) -> Resul
         "talk" => Ok(Command::Talk),
         // PRD §10 / Appendix B.
         "info" => Ok(Command::Info),
+        // PRD FR-ACC-1 / §5.9: bare `:login` is the loopback flow, `:login
+        // paste` the manual code-paste fallback.
+        "login" => match arg {
+            "" => Ok(Command::Login(LoginMode::Loopback)),
+            "paste" => Ok(Command::Login(LoginMode::Paste)),
+            other => Err(format!(
+                "unknown :login argument {other:?} — try: login, login paste"
+            )),
+        },
+        // PRD FR-ACC-9.
+        "logout" => Ok(Command::Logout),
         "help" | "h" => Ok(Command::Help),
         "q" | "quit" => Ok(Command::Quit),
         "" => Err(USAGE.to_string()),
@@ -1209,6 +1239,14 @@ mod tests {
     #[test]
     fn related_parses_bare() {
         assert_eq!(parse("related"), Ok(Command::Related));
+    }
+
+    #[test]
+    fn login_parses_loopback_and_paste_and_logout() {
+        assert_eq!(parse("login"), Ok(Command::Login(LoginMode::Loopback)));
+        assert_eq!(parse("login paste"), Ok(Command::Login(LoginMode::Paste)));
+        assert!(parse("login bogus").is_err());
+        assert_eq!(parse("logout"), Ok(Command::Logout));
     }
 
     #[test]

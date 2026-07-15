@@ -264,6 +264,8 @@ pub struct ResolvedConfig {
     pub terminal: ResolvedTerminal,
     /// PRD FR-PC-1's `[reading]` table (spacing/typography options).
     pub reading: ResolvedReading,
+    /// PRD §5.9 / FR-ACC-1's `[auth]` table (OAuth client id + endpoints).
+    pub auth: ResolvedAuth,
     /// Parse errors, unknown keys, and rejected values — never fatal, but
     /// `doctor` reports them and exits 1 if any is `IssueLevel::Error`.
     pub issues: Vec<Issue>,
@@ -368,6 +370,25 @@ pub struct ResolvedReading {
     pub line_spacing: Valued<u8>,
     /// Extra inter-word gap width in cells, default 0.
     pub word_spacing: Valued<u8>,
+}
+
+/// The resolved `[auth]` table (PRD §5.9, FR-ACC-1, §6.2 rule 2): the OAuth
+/// 2.0 client identity and endpoints. All file-only (an OAuth consumer is a
+/// set-once registration detail, not a per-run CLI/env concern). The
+/// endpoints default to Meta-Wiki's central OAuth (Appendix A) and are
+/// overridable so a WMF endpoint move — or pointing at a test server — is a
+/// config change, not a release.
+#[derive(Debug, Clone)]
+pub struct ResolvedAuth {
+    /// `[auth] client_id` — the registered OAuth consumer's public client id.
+    /// Empty by default: login is unavailable (and `:login` says so) until a
+    /// consumer is registered and this is set. There is no secret — wikitui is
+    /// a public PKCE client (§5.9).
+    pub client_id: Valued<String>,
+    /// `[auth] authorize_url` (default [`crate::auth::DEFAULT_AUTHORIZE_URL`]).
+    pub authorize_url: Valued<String>,
+    /// `[auth] token_url` (default [`crate::auth::DEFAULT_TOKEN_URL`]).
+    pub token_url: Valued<String>,
 }
 
 /// A schema migration from `from` to `from + 1`, run over the raw table
@@ -667,6 +688,7 @@ pub fn resolve(
     let network_contact = resolve_network_contact(env, &table, &mut issues);
     let terminal = resolve_terminal(env, &table, &user_theme_names, &mut issues);
     let reading = resolve_reading(&table, &mut issues);
+    let auth = resolve_auth(&table, &mut issues);
 
     ResolvedConfig {
         config_version: Valued {
@@ -701,6 +723,7 @@ pub fn resolve(
         network_contact,
         terminal,
         reading,
+        auth,
         migration_summary: config_version.1,
         issues,
         config_path: config_path.map(Path::to_path_buf),
@@ -1645,6 +1668,61 @@ fn resolve_reading(table: &toml::Table, issues: &mut Vec<Issue>) -> ResolvedRead
     }
 }
 
+/// PRD §5.9 / FR-ACC-1's `[auth]` table: the OAuth client id and endpoints,
+/// all file-only (see `ResolvedAuth`). Unknown keys warn (never crash),
+/// mirroring `resolve_reading`.
+fn resolve_auth(table: &toml::Table, issues: &mut Vec<Issue>) -> ResolvedAuth {
+    let at: Option<&toml::Table> = table.get("auth").and_then(toml::Value::as_table);
+    if table.contains_key("auth") && at.is_none() {
+        issues.push(Issue::warning(
+            "auth must be a table (use [auth] with client_id/authorize_url/token_url); ignoring",
+        ));
+    }
+    if let Some(t) = at {
+        let known: BTreeSet<&str> = ["client_id", "authorize_url", "token_url"]
+            .into_iter()
+            .collect();
+        for key in t.keys() {
+            if !known.contains(key.as_str()) {
+                issues.push(Issue::warning(format!(
+                    "unknown config key 'auth.{key}' — ignored"
+                )));
+            }
+        }
+    }
+    let field = |k: &str| at.and_then(|t| t.get(k));
+    let accept_any = |s: &str| Ok(s.to_string());
+    ResolvedAuth {
+        client_id: resolve_string_field(
+            "auth.client_id",
+            None,
+            None,
+            field("client_id"),
+            "",
+            accept_any,
+            issues,
+        ),
+        authorize_url: resolve_string_field(
+            "auth.authorize_url",
+            None,
+            None,
+            field("authorize_url"),
+            crate::auth::DEFAULT_AUTHORIZE_URL,
+            accept_any,
+            issues,
+        ),
+        token_url: resolve_string_field(
+            "auth.token_url",
+            None,
+            None,
+            field("token_url"),
+            crate::auth::DEFAULT_TOKEN_URL,
+            accept_any,
+            issues,
+        ),
+    }
+}
+
 /// A file-only `u16` field clamped to `[min, max]` with a warning if the
 /// configured value fell outside that range — same "clamp, don't reject"
 /// leniency as `resolve_measure`/`resolve_reading_wpm`, generalized (like
@@ -2504,6 +2582,61 @@ mod tests {
             assert_eq!(r.startpage.source, Source::File);
             cleanup(&path);
         }
+    }
+
+    #[test]
+    fn auth_defaults_to_meta_wiki_endpoints_and_no_client_id() {
+        let d = resolve(&CliOverrides::default(), &EnvOverrides::default(), None);
+        assert_eq!(d.auth.client_id.value, "");
+        assert_eq!(d.auth.client_id.source, Source::Default);
+        assert_eq!(
+            d.auth.authorize_url.value,
+            crate::auth::DEFAULT_AUTHORIZE_URL
+        );
+        assert_eq!(d.auth.token_url.value, crate::auth::DEFAULT_TOKEN_URL);
+    }
+
+    #[test]
+    fn auth_reads_client_id_and_endpoint_overrides_from_the_file() {
+        let path = temp_config(concat!(
+            "[auth]\n",
+            "client_id = \"my-consumer\"\n",
+            "authorize_url = \"http://127.0.0.1:8943/w/rest.php/oauth2/authorize\"\n",
+            "token_url = \"http://127.0.0.1:8943/w/rest.php/oauth2/access_token\"\n",
+        ));
+        let r = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(r.auth.client_id.value, "my-consumer");
+        assert_eq!(r.auth.client_id.source, Source::File);
+        assert_eq!(
+            r.auth.authorize_url.value,
+            "http://127.0.0.1:8943/w/rest.php/oauth2/authorize"
+        );
+        assert_eq!(
+            r.auth.token_url.value,
+            "http://127.0.0.1:8943/w/rest.php/oauth2/access_token"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn auth_unknown_key_warns_but_keeps_the_known_ones() {
+        let path = temp_config("[auth]\nclient_id = \"x\"\nbogus = 1\n");
+        let r = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(r.auth.client_id.value, "x");
+        assert!(
+            r.issues.iter().any(|i| i.message.contains("auth.bogus")),
+            "unknown auth key should warn: {:?}",
+            r.issues
+        );
+        cleanup(&path);
     }
 
     #[test]

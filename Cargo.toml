@@ -22,6 +22,23 @@ categories = ["command-line-utilities", "text-processing"]
 # alongside a new stable release, not preemptively.
 rust-version = "1.92"
 
+[features]
+# PRD SEC-4 / §5.9: the OS-keychain token backend (`keyring` crate). Off by
+# default — the 0600-file store (always compiled) is the portable fallback,
+# and a headless build (no D-Bus Secret Service, no macOS/Windows keychain,
+# as in CI and containers) has nothing for `keyring` to talk to. Packagers
+# targeting a desktop enable this so tokens land in the real OS keychain; the
+# code behind it (`auth::KeyringTokenStore`) compiles against `keyring`'s
+# stable `Entry` API but is unverifiable where no secret service exists. See
+# `auth.rs`'s module doc for the full keychain-vs-file rationale.
+#
+# Build requirements when enabled: the Linux backend (`sync-secret-service`)
+# links `libdbus-1` (`sudo apt install libdbus-1-dev pkg-config`); macOS and
+# Windows use their native keychains and need no extra system packages. A
+# headless container without libdbus (this build environment) cannot compile
+# the feature — hence off by default, with the 0600 file store standing in.
+keychain = ["dep:keyring"]
+
 [dependencies]
 anyhow = "1.0.103"
 base64 = "0.22.1"
@@ -30,7 +47,16 @@ clap = { version = "4.6.1", features = ["derive"] }
 crossterm = "0.29.0"
 directories = "6.0.0"
 ego-tree = "0.11.0"
+# PRD FR-ACC-1 / §5.9: a proper CSPRNG for the PKCE `code_verifier` and the
+# CSRF `state` parameter — never a PRNG or clock-seeded source. `getrandom`
+# (already in the tree transitively) is the lightest option: a thin wrapper
+# over the OS entropy source, no `rand` distribution machinery pulled in.
+getrandom = "0.2"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+# PRD SEC-4: OS keychain token storage, gated behind the off-by-default
+# `keychain` feature above (see it for why). Optional so the default build
+# links no secret-service/D-Bus machinery.
+keyring = { version = "3", optional = true, default-features = false, features = ["sync-secret-service", "apple-native", "windows-native"] }
 ratatui = "0.30.2"
 reqwest = { version = "0.13.4", features = ["json", "gzip"] }
 rusqlite = { version = "0.32.1", features = ["bundled"] }

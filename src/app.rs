@@ -157,6 +157,13 @@ pub enum Mode {
     /// already on the tab. `Esc` closes it; the content lives in `App::info`.
     /// Same overlay idiom as [`Mode::Peek`].
     Info,
+    /// PRD §5.9's manual code-paste login prompt: shown when `:login paste`
+    /// (or `:login` falling back) asks the reader to paste the authorization
+    /// code (or the full redirect URL) after approving in the browser. The
+    /// typed input lives in `App::login_input`; Enter submits it for token
+    /// exchange, Esc cancels. The loopback path does *not* use this mode — it
+    /// completes inside the one blocking `:login` call.
+    Login,
 }
 
 /// The content of the `K` peek popup (PRD FR-NV-4/FR-NV-5). Two visually
@@ -798,6 +805,65 @@ pub struct App {
     /// closes or its fetch fails before landing (removed either way by the
     /// call site, never read again).
     pub pending_session_restore: HashMap<TabId, PendingSessionRestore>,
+
+    // -- OAuth login & tokens (PRD §5.9, FR-ACC-1/9, SEC-4) -----------------
+    /// The live logged-in session, or `None` when logged out (PRD FR-ACC-1).
+    /// Loaded from the token store at startup (`main::run`) so the indicator
+    /// shows immediately without a network round trip; set by `:login`,
+    /// cleared by `:logout`. `App::new` leaves it `None` — every existing
+    /// `App::new` test call site stays logged out, the same in-memory-default
+    /// convention `history`/`session_path` use.
+    pub auth: Option<crate::auth::AuthState>,
+    /// A login flow in progress (PRD §5.9): the PKCE verifier + CSRF state +
+    /// redirect URI generated when `:login` built the authorization URL, held
+    /// until the manual-paste [`Mode::Login`] prompt resolves. `None` outside
+    /// a login. The loopback path never populates this — it completes inside
+    /// the one blocking `:login` call — so this is exactly the manual-paste
+    /// fallback's state.
+    pub pending_login: Option<PendingLogin>,
+    /// The manual-paste prompt's in-progress input ([`Mode::Login`]).
+    pub login_input: String,
+    /// PRD §5.9 / FR-ACC-1: the OAuth client identity + endpoints `:login`
+    /// needs to start a flow (the token host is distinct from the per-`{lang}`
+    /// wiki host, so it can't be derived from `App::lang`). `App::new`
+    /// defaults it to "no consumer registered, Meta-Wiki endpoints"; `main::
+    /// run` overrides it from `[auth]` config, the same convention
+    /// `history`/`session_path` use for their real values.
+    pub auth_runtime: AuthRuntime,
+}
+
+/// PRD §5.9 / FR-ACC-1: the OAuth client identity and endpoints a login flow
+/// is built from — the `App`-resident view of `[auth]` config, plus the
+/// NF-NET-2 contact the token client's User-Agent needs.
+#[derive(Debug, Clone, Default)]
+pub struct AuthRuntime {
+    pub client_id: String,
+    pub authorize_url: String,
+    pub token_url: String,
+    pub contact: String,
+}
+
+impl AuthRuntime {
+    /// Whether login is configured at all: an empty `client_id` means no
+    /// OAuth consumer has been registered, so `:login` reports that instead
+    /// of starting a flow that can only fail (PRD §5.9).
+    pub fn is_configured(&self) -> bool {
+        !self.client_id.trim().is_empty()
+    }
+}
+
+/// PRD §5.9's manual code-paste state: everything needed to finish the
+/// exchange once the reader pastes the code, carried from the moment `:login
+/// paste` built the authorization URL. The `verifier` proves we are the same
+/// client (PKCE); `state` is checked against the pasted redirect's own state
+/// (CSRF) when one is present; `redirect_uri` must match what the
+/// authorization request advertised.
+#[derive(Debug, Clone)]
+pub struct PendingLogin {
+    pub verifier: String,
+    pub state: String,
+    pub redirect_uri: String,
+    pub authorize_url: String,
 }
 
 /// See [`App::pending_session_restore`].
@@ -972,7 +1038,22 @@ impl App {
             suppress_resume_once: false,
             session_path: None,
             pending_session_restore: HashMap::new(),
+            auth: None,
+            pending_login: None,
+            login_input: String::new(),
+            auth_runtime: AuthRuntime {
+                client_id: String::new(),
+                authorize_url: crate::auth::DEFAULT_AUTHORIZE_URL.to_string(),
+                token_url: crate::auth::DEFAULT_TOKEN_URL.to_string(),
+                contact: crate::api::DEFAULT_CONTACT.to_string(),
+            },
         }
+    }
+
+    /// PRD FR-ACC-1: the logged-in username, or `None` when logged out —
+    /// the status-bar indicator's source of truth.
+    pub fn logged_in_username(&self) -> Option<&str> {
+        self.auth.as_ref().map(|a| a.username())
     }
 
     /// PRD FR-CS-1: open the command palette over the current context. The
@@ -6603,6 +6684,35 @@ mod tests {
             app.active_tab().find_matches.is_empty(),
             "wrong-case query with an uppercase letter must not match"
         );
+    }
+
+    // ---- OAuth login state (PRD FR-ACC-1) -------------------------------
+
+    #[test]
+    fn a_fresh_app_is_logged_out() {
+        let app = App::new("en".to_string(), Theme::terminal(), false);
+        assert!(app.auth.is_none());
+        assert_eq!(app.logged_in_username(), None);
+        assert!(app.pending_login.is_none());
+        assert_eq!(app.mode, Mode::Reading);
+    }
+
+    #[test]
+    fn auth_runtime_is_configured_only_with_a_client_id() {
+        let mut rt = AuthRuntime {
+            client_id: String::new(),
+            authorize_url: "a".into(),
+            token_url: "t".into(),
+            contact: "c".into(),
+        };
+        assert!(!rt.is_configured(), "no client_id → login unavailable");
+        rt.client_id = "   ".into();
+        assert!(
+            !rt.is_configured(),
+            "whitespace-only client_id is not configured"
+        );
+        rt.client_id = "real-consumer".into();
+        assert!(rt.is_configured());
     }
 
     // ---- Tab system (PRD FR-TB-1..3) ------------------------------------
