@@ -136,6 +136,15 @@ pub struct Tab {
     /// already uses `Instant` for — not a second, independent clock
     /// convention.
     pub visit_started_at: Option<std::time::Instant>,
+    /// PRD FR-PF-3: whether the dwell interest signal has already been applied
+    /// for the currently-installed document, so repeated dwell flushes (tab
+    /// switching back and forth) don't re-add it — the signal is per-read,
+    /// capped at +2.0, not per-flush. Reset on each document install.
+    pub interest_dwell_signaled: bool,
+    /// PRD FR-PF-3: whether the scroll-≥-70% interest signal has already fired
+    /// for the currently-installed document (it fires once when the reader
+    /// first passes 70% of the article). Reset on each document install.
+    pub interest_scroll_signaled: bool,
 }
 
 impl Tab {
@@ -167,6 +176,8 @@ impl Tab {
             pending_reload: None,
             history_visit_id: None,
             visit_started_at: None,
+            interest_dwell_signaled: false,
+            interest_scroll_signaled: false,
         }
     }
 
@@ -213,6 +224,8 @@ impl Tab {
         // flush in the first place.
         self.history_visit_id = None;
         self.visit_started_at = None;
+        self.interest_dwell_signaled = false;
+        self.interest_scroll_signaled = false;
         self.clear_find();
     }
 
@@ -240,6 +253,8 @@ impl Tab {
         self.pending_reload = None;
         self.history_visit_id = None;
         self.visit_started_at = None;
+        self.interest_dwell_signaled = false;
+        self.interest_scroll_signaled = false;
         self.clear_find();
     }
 

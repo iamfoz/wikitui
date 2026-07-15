@@ -316,6 +316,34 @@ impl History {
         }
     }
 
+    /// Every visit row, oldest first — the raw, *non-deduplicated* log
+    /// (PRD FR-PC-3 reading stats need total time and per-day streaks, which
+    /// `recent`'s one-row-per-article dedup would collapse away). Best-effort
+    /// like the other reads here: a query failure yields an empty list, never
+    /// an error, so `wikitui stats` degrades to "nothing recorded" rather than
+    /// refusing to run.
+    pub fn all_visits(&self) -> Vec<Visit> {
+        let query = self.conn.prepare(
+            "SELECT id, lang, title, opened_at, dwell_secs, referrer_lang, referrer_title
+             FROM visits ORDER BY opened_at ASC, id ASC",
+        );
+        let mut stmt = match query {
+            Ok(stmt) => stmt,
+            Err(e) => {
+                log_write_failure("all_visits", &e);
+                return Vec::new();
+            }
+        };
+        let rows = stmt.query_map([], row_to_visit);
+        match rows {
+            Ok(iter) => iter.filter_map(Result::ok).collect(),
+            Err(e) => {
+                log_write_failure("all_visits", &e);
+                Vec::new()
+            }
+        }
+    }
+
     /// Fuzzy-ranked search over article titles (PRD FR-HS-1's Ctrl-h
     /// picker), recency-weighted. An empty (or whitespace-only) query is
     /// the same list `recent` returns — plain recency, nothing to rank.

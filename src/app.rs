@@ -109,6 +109,15 @@ pub enum Mode {
     /// recent prefetch actions with their reason strings, status, and bytes,
     /// plus the live budget state. Read-only; any key / Esc closes it.
     PrefetchLog,
+    /// `:interests` (PRD FR-PF-3 / FR-PF-4): the interest-model inspector —
+    /// the top topic affinities with their scores, the decay half-life, the
+    /// on/off/incognito state, and the current morelike seeds. Read-only,
+    /// "the whole model is human-readable"; any key / Esc closes it.
+    Interests,
+    /// `:stats` (PRD FR-PC-3): the local reading-stats view — articles read,
+    /// total time, streaks, and topic distribution. Read-only; any key / Esc
+    /// closes it. The same numbers `wikitui stats` prints, shown in the TUI.
+    Stats,
     /// `:today` (PRD FR-DL-2): the on-this-day panel — events/births/deaths/
     /// holidays/selected tabs, each a selectable list of entries; Enter opens
     /// the focused entry's linked article, Esc closes. Distinct from the
@@ -664,6 +673,26 @@ pub struct App {
     /// The mode `open_prefetch_log` was entered from, restored on close.
     pub prefetch_prior_mode: Mode,
 
+    // -- Interest model + reading stats (PRD FR-PF-3, FR-PC-3, FR-PR-2) -----
+    /// The local, private interest-affinity model (`interest::InterestModel`).
+    /// `App::new` defaults to an empty in-memory model (like `history`) so
+    /// tests never touch the real state dir; `main::run` loads the on-disk
+    /// `interest.json` and sets `interest_path` to enable persistence.
+    pub interest: crate::interest::InterestModel,
+    /// PRD FR-PF-3 config `interest_learning` (default on). Whether reading
+    /// signals update the model at all — see `interest_active` for how it
+    /// combines with incognito (which disables learning regardless).
+    pub interest_learning: bool,
+    /// Where the interest model persists (`$XDG_STATE/wikitui/interest.json`).
+    /// `None` in tests (no persistence); `Some` in `main::run`. `persist_
+    /// interest` writes only when this is set, mirroring how `session_path`
+    /// gates session writes.
+    pub interest_path: Option<std::path::PathBuf>,
+    /// The mode `open_interests` was entered from, restored on close.
+    pub interest_prior_mode: Mode,
+    /// The mode `open_stats` was entered from, restored on close.
+    pub stats_prior_mode: Mode,
+
     // -- Start page, on-this-day panel, TIL widget (PRD FR-DL-1,2,7) -------
     /// The daily Wikifeeds cache, shared with the background substrate's
     /// executor (`main::BgExecutor`) via the same `Arc<Mutex<_>>` — the "one
@@ -1163,6 +1192,11 @@ impl App {
             pending_saved_export_overwrite: None,
             prefetch: None,
             prefetch_prior_mode: Mode::Reading,
+            interest: crate::interest::InterestModel::default(),
+            interest_learning: true,
+            interest_path: None,
+            interest_prior_mode: Mode::Reading,
+            stats_prior_mode: Mode::Reading,
             feed_cache: None,
             startpage_config: StartPageConfig::default(),
             start_selected: 0,
@@ -1358,6 +1392,151 @@ impl App {
                 .prefetch
                 .as_ref()
                 .is_some_and(crate::netqueue::SubstrateHandle::is_enabled)
+    }
+
+    // -- Interest model (PRD FR-PF-3, FR-PR-2) ------------------------------
+
+    /// Whether the interest model may learn from reading signals right now:
+    /// the `interest_learning` config is on AND `privacy::decide` allows a
+    /// `Write::Interest` (incognito denies it — PRD FR-PR-3 "no interest
+    /// updates", so the model is off in incognito regardless of config). The
+    /// single gate every signal-application path consults, routed through the
+    /// same privacy chokepoint as history/prefetch so the audit is uniform.
+    pub fn interest_active(&self) -> bool {
+        self.interest_learning
+            && crate::privacy::decide(self.incognito, crate::privacy::Write::Interest)
+                == crate::privacy::Verdict::Allow
+    }
+
+    /// The interest-model clock: unix seconds, this module's single wall-clock
+    /// read for interest signals (mirrors `history::now_unix`), so a signal is
+    /// never timestamped against a second, independently-read "now". The model
+    /// methods themselves take `now` as a parameter (deterministic in tests);
+    /// this is only where the *live* app reads it.
+    fn interest_now() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+
+    /// PRD FR-PF-3 "open" signal: record that `title` was read with these raw
+    /// (API-form) categories and apply +1.0 to its topics. A no-op when
+    /// `interest_active` is false (learning off / incognito). On a revisit
+    /// whose categories are already cached this session, `raw_categories` may
+    /// be empty — the model applies the open signal from the cached categories.
+    /// Persists the model afterward (best-effort).
+    pub fn note_article_read(&mut self, title: &str, raw_categories: &[String]) {
+        if !self.interest_active() {
+            return;
+        }
+        let now = Self::interest_now();
+        if self.interest.knows_categories(title) {
+            self.interest
+                .apply_signal_for_title(title, crate::interest::SIGNAL_OPEN, now);
+        } else {
+            self.interest.note_open(title, raw_categories, now);
+        }
+        self.persist_interest();
+    }
+
+    /// Apply a signal `amount` (bookmark/save) to the *active article*'s
+    /// categories — the discrete signals the reader triggers on the page
+    /// they're reading. Returns whether the model was affected (false when
+    /// learning is off, no article is open, or its categories aren't known
+    /// yet). Persists on a real change.
+    pub fn apply_active_article_signal(&mut self, amount: f64) -> bool {
+        if !self.interest_active() {
+            return false;
+        }
+        let Some(title) = self.active_tab().doc.as_ref().map(|d| d.title.clone()) else {
+            return false;
+        };
+        let changed = self
+            .interest
+            .apply_signal_for_title(&title, amount, Self::interest_now());
+        if changed {
+            self.persist_interest();
+        }
+        changed
+    }
+
+    /// PRD FR-PF-3's explicit "not interested" (`:not-interested` / key): tank
+    /// the active article's categories by the strong negative signal and set a
+    /// notice. Reports honestly when there's nothing to act on (no article, or
+    /// its categories aren't known yet).
+    pub fn mark_not_interested(&mut self) {
+        if !self.interest_active() {
+            self.notice = Some(if self.incognito {
+                "Interest learning is off in incognito".to_string()
+            } else {
+                "Interest learning is off".to_string()
+            });
+            return;
+        }
+        let Some(title) = self.active_tab().doc.as_ref().map(|d| d.title.clone()) else {
+            self.notice = Some("No article open".to_string());
+            return;
+        };
+        if self.interest.not_interested(&title, Self::interest_now()) {
+            self.persist_interest();
+            self.notice = Some(format!(
+                "Marked \"{title}\" not interesting — its topics dropped"
+            ));
+        } else {
+            self.notice = Some("No topics known for this article yet — open it first".to_string());
+        }
+    }
+
+    /// Persist the interest model to `interest_path`, if one is set (only in a
+    /// real run, never in tests). Best-effort: a write failure is logged to
+    /// stderr, never surfaced to the reader — the model is non-critical, same
+    /// posture as `history`.
+    fn persist_interest(&self) {
+        if let Some(path) = &self.interest_path
+            && let Err(e) = self.interest.save(path)
+        {
+            eprintln!("wikitui: interest: save failed: {e}");
+        }
+    }
+
+    /// PRD FR-PF-3 / FR-PF-4: open the `:interests` model inspector.
+    pub fn open_interests(&mut self) {
+        self.interest_prior_mode = self.mode;
+        self.mode = Mode::Interests;
+        self.status = "Interest model — Esc to close".to_string();
+    }
+
+    /// Close the interests panel, restoring the prior mode.
+    pub fn close_interests(&mut self) {
+        self.mode = self.interest_prior_mode;
+        self.restore_reading_status();
+    }
+
+    /// PRD FR-PC-3: open the `:stats` reading-stats view.
+    pub fn open_stats(&mut self) {
+        self.stats_prior_mode = self.mode;
+        self.mode = Mode::Stats;
+        self.status = "Reading stats — Esc to close".to_string();
+    }
+
+    /// Close the stats view, restoring the prior mode.
+    pub fn close_stats(&mut self) {
+        self.mode = self.stats_prior_mode;
+        self.restore_reading_status();
+    }
+
+    /// The current reading stats (PRD FR-PC-3) for the `:stats` view — computed
+    /// live from history + the interest model's top topics, the same
+    /// `stats::compute` the `wikitui stats` CLI uses.
+    pub fn reading_stats(&self) -> crate::stats::ReadingStats {
+        crate::stats::compute(&self.history.all_visits(), self.interest.top_categories(8))
+    }
+
+    /// Reset the status line to the article title (or the default hint) —
+    /// shared by the read-only panels' close paths.
+    fn restore_reading_status(&mut self) {
+        self.status = match &self.active_tab().doc {
+            Some(doc) => doc.title.clone(),
+            None => "Press / to search, ? for help, q to quit".to_string(),
+        };
     }
 
     // -- Start page (PRD FR-DL-1) -------------------------------------------
@@ -2802,7 +2981,47 @@ impl App {
         let id = tab.history_visit_id.take();
         let started = tab.visit_started_at.take();
         if let (Some(id), Some(started)) = (id, started) {
-            self.history.update_dwell(id, started.elapsed().as_secs());
+            let dwell = started.elapsed().as_secs();
+            self.history.update_dwell(id, dwell);
+            // PRD FR-PF-3: the normalized dwell interest signal, applied once
+            // per read (the flag guards repeated flushes from re-adding it).
+            self.apply_dwell_signal(index, dwell);
+        }
+    }
+
+    /// PRD FR-PF-3's dwell signal: `normalized_dwell(dwell, expected_read_time)`
+    /// (≤ +2.0) added to the article's topics, once per read. `expected_read_
+    /// time` is the FR-RD-11 estimate (word count ÷ WPM), so a fully-read
+    /// article contributes the whole +2.0 and a glance proportionally less.
+    /// A no-op when learning is off, already applied, or the dwell is zero.
+    fn apply_dwell_signal(&mut self, index: usize, dwell_secs: u64) {
+        if !self.interest_active() {
+            return;
+        }
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        if tab.interest_dwell_signaled {
+            return;
+        }
+        let Some(doc) = tab.doc.as_ref() else {
+            return;
+        };
+        let title = doc.title.clone();
+        let words = crate::doc::word_count(doc);
+        let expected = (words as f64 / self.reading_wpm.max(1) as f64) * 60.0;
+        let amount = crate::interest::normalized_dwell(dwell_secs as i64, expected);
+        if amount <= 0.0 {
+            return;
+        }
+        let changed = self
+            .interest
+            .apply_signal_for_title(&title, amount, Self::interest_now());
+        if let Some(tab) = self.tabs.get_mut(index) {
+            tab.interest_dwell_signaled = true;
+        }
+        if changed {
+            self.persist_interest();
         }
     }
 
@@ -3876,6 +4095,7 @@ impl App {
         let tab = self.active_tab_mut();
         let new = (tab.scroll as i32 + delta).clamp(0, tab.max_scroll as i32);
         tab.scroll = new as u16;
+        self.maybe_signal_scroll();
     }
 
     pub fn scroll_to_top(&mut self) {
@@ -3885,6 +4105,36 @@ impl App {
     pub fn scroll_to_bottom(&mut self) {
         let max = self.active_tab().max_scroll;
         self.active_tab_mut().scroll = max;
+        self.maybe_signal_scroll();
+    }
+
+    /// PRD FR-PF-3's scroll signal: +1.0 to the article's topics once the
+    /// reader has scrolled past 70% of it — fired at most once per read (the
+    /// per-tab flag). A no-op when learning is off, the article fits without
+    /// scrolling (`max_scroll == 0`), or the threshold isn't reached yet.
+    fn maybe_signal_scroll(&mut self) {
+        if !self.interest_active() {
+            return;
+        }
+        let tab = self.active_tab();
+        if tab.interest_scroll_signaled || tab.max_scroll == 0 {
+            return;
+        }
+        if (tab.scroll as f64 / tab.max_scroll as f64) < 0.70 {
+            return;
+        }
+        let Some(title) = tab.doc.as_ref().map(|d| d.title.clone()) else {
+            return;
+        };
+        let changed = self.interest.apply_signal_for_title(
+            &title,
+            crate::interest::SIGNAL_SCROLL,
+            Self::interest_now(),
+        );
+        self.active_tab_mut().interest_scroll_signaled = true;
+        if changed {
+            self.persist_interest();
+        }
     }
 
     /// Build the active tab's breadcrumb trail (PRD FR-NV-7): the last few
@@ -3959,6 +4209,12 @@ impl App {
 
         match self.bookmarks.toggle(&lang, &title, revid) {
             ToggleOutcome::Added => {
+                // PRD FR-PF-3: a bookmark is a strong interest signal (+3.0)
+                // on the article's topics — applied only when the add half
+                // fires, and only if interest learning is active (off in
+                // incognito, so an incognito bookmark still persists but never
+                // teaches the model).
+                self.apply_active_article_signal(crate::interest::SIGNAL_BOOKMARK);
                 self.notice = Some(crate::privacy::append_warning_if_needed(
                     self.incognito,
                     crate::privacy::Write::Bookmark,
@@ -7989,6 +8245,114 @@ mod tests {
             app.history.recent(10).len(),
             1,
             "recording resumes once incognito is turned off"
+        );
+    }
+
+    // ---- PRD FR-PF-3 interest-model wiring --------------------------------
+
+    fn cats(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn score_of(app: &App, cat: &str) -> f64 {
+        app.interest
+            .top_categories(50)
+            .into_iter()
+            .find(|(c, _)| c == cat)
+            .map(|(_, s)| s)
+            .unwrap_or(0.0)
+    }
+
+    #[test]
+    fn note_article_read_learns_the_articles_topics() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.open_document(doc("Enigma machine"));
+        app.note_article_read(
+            "Enigma machine",
+            &cats(&[
+                "Category:Cryptography",
+                "Category:Articles with dead external links",
+            ]),
+        );
+        assert_eq!(
+            score_of(&app, "Cryptography"),
+            crate::interest::SIGNAL_OPEN,
+            "the open signal lands on the real topic"
+        );
+        assert_eq!(
+            score_of(&app, "Articles with dead external links"),
+            0.0,
+            "maintenance categories are filtered out of the model"
+        );
+    }
+
+    #[test]
+    fn incognito_reading_does_not_update_the_interest_model() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.incognito = true;
+        app.open_document(doc("Enigma machine"));
+        app.note_article_read("Enigma machine", &cats(&["Category:Cryptography"]));
+        assert!(
+            app.interest.is_empty(),
+            "incognito must leave the interest model untouched (privacy gate)"
+        );
+        assert!(!app.interest_active());
+    }
+
+    #[test]
+    fn disabling_interest_learning_stops_updates() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.interest_learning = false;
+        app.open_document(doc("Enigma machine"));
+        app.note_article_read("Enigma machine", &cats(&["Category:Cryptography"]));
+        assert!(app.interest.is_empty(), "learning off → no model updates");
+    }
+
+    #[test]
+    fn bookmarking_applies_the_bookmark_signal_to_the_articles_topics() {
+        // `app_with_bookmarks` gives an in-memory bookmark store — without it,
+        // `toggle_bookmark` shares the real on-disk store across parallel
+        // tests and can hit the Removed branch (no signal) nondeterministically.
+        let mut app = app_with_bookmarks();
+        app.open_document(doc("Enigma machine"));
+        app.note_article_read("Enigma machine", &cats(&["Category:Cryptography"]));
+        app.toggle_bookmark();
+        // Approximate, not exact: the two signals go through the app's real
+        // wall clock (`interest_now`), so a second boundary crossing between
+        // them applies a negligible (< 1e-6) decay to the first — the sum is
+        // 4.0 to any meaningful precision, never a brittle exact-f64 compare.
+        let expected = crate::interest::SIGNAL_OPEN + crate::interest::SIGNAL_BOOKMARK;
+        assert!(
+            (score_of(&app, "Cryptography") - expected).abs() < 1e-3,
+            "open (+1) plus the bookmark boost (+3) are both visible (got {})",
+            score_of(&app, "Cryptography")
+        );
+    }
+
+    #[test]
+    fn not_interested_drives_the_current_articles_topics_negative() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.open_document(doc("Enigma machine"));
+        app.note_article_read("Enigma machine", &cats(&["Category:Cryptography"]));
+        app.mark_not_interested();
+        assert!(
+            score_of(&app, "Cryptography") < 0.0,
+            "a veto outweighs the read"
+        );
+    }
+
+    #[test]
+    fn not_interested_reports_when_no_topics_are_known_yet() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.open_document(doc("Enigma machine"));
+        // No categories fetched yet.
+        app.mark_not_interested();
+        assert!(app.interest.is_empty());
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|n| n.contains("No topics")),
+            "the reader is told there's nothing to act on yet"
         );
     }
 

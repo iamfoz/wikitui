@@ -530,6 +530,34 @@ CATEGORIES = {
     "computing": ["Computer science", "Alan Turing"],
 }
 
+# PRD FR-PF-3 interest-model fixture: per-article categories as
+# `prop=categories` returns them (Category:-prefixed display titles), keyed by
+# the article's display title. Deliberately mixes real topic categories with
+# maintenance/tracking ones (dead-link, CS1 citation maintenance, webarchive)
+# so the client's `interest::is_maintenance_category` filter is exercised end
+# to end: the mock returns them ALL (most maintenance categories are not
+# flagged `hidden`, so the request's `clshow=!hidden` would not drop them — the
+# client's name-pattern filter is what must). The shared "Cryptography" topic
+# on both Alan Turing and Enigma machine lets a pty run watch affinity
+# accumulate across a short reading session, and drives the `morelike:` seed.
+ARTICLE_CATEGORIES = {
+    "Alan Turing": [
+        "Category:Cryptography",
+        "Category:British computer scientists",
+        "Category:Articles with dead external links",
+        "Category:CS1 maint: multiple names: authors list",
+    ],
+    "Enigma machine": [
+        "Category:Cryptography",
+        "Category:Encryption devices",
+        "Category:Webarchive template wayback links",
+    ],
+    "Computer science": [
+        "Category:Computer science",
+        "Category:Cryptography",
+    ],
+}
+
 # PRD FR-PF-1 link-ranking fixture (§6.2 rule 7): the outgoing links of a
 # source article joined with pageviews, served as the ONE batched
 # generator=links + prop=pageviews response. Keyed by the source's display
@@ -1135,6 +1163,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 cls = ASSESSMENTS.get(t)
                 assessments = {"WikiProject Mock": {"class": cls}} if cls else {}
                 pages.append({"title": t, "pageassessments": assessments})
+            self._send_json({"query": {"pages": pages}})
+            return
+        # PRD FR-PF-3: `prop=categories` (with `clshow=!hidden`), batched over
+        # `titles=A|B`. Returns each page's categories in `Category:Foo` form —
+        # including maintenance categories, on purpose, so the client's own
+        # maintenance filter (`interest::is_maintenance_category`) is what
+        # drops them (see ARTICLE_CATEGORIES's comment).
+        if action == 'query' and prop == 'categories':
+            raw = urllib.parse.unquote(params.get('titles', [''])[0])
+            titles = raw.split('|')
+            pages = []
+            for t in titles:
+                disp = t.replace('_', ' ')
+                cats = ARTICLE_CATEGORIES.get(disp, [])
+                pages.append({"title": disp, "categories": [{"title": c} for c in cats]})
             self._send_json({"query": {"pages": pages}})
             return
         # PRD FR-ML-1/2 (Appendix A "Langlinks"): `prop=langlinks&

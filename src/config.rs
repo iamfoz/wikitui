@@ -229,6 +229,15 @@ pub struct ResolvedConfig {
     /// PRD FR-HS-4's retention window: `history::History::retention_prune`
     /// runs with this at startup. `0` (the default) means "keep forever."
     pub history_retention_days: Valued<u64>,
+    /// PRD FR-PF-3 / FR-PR-2: whether the local interest-learning model
+    /// updates from reading signals. Default `true` — it is a differentiator,
+    /// fully local + inspectable (`:interests`) + incognito-exempt (incognito
+    /// disables it regardless). File only, like `include_nonfree`/`history.*`.
+    pub interest_learning: Valued<bool>,
+    /// PRD FR-PF-3's exponential-decay half-life in days
+    /// (`interest_half_life_days`, default 30): a topic's affinity halves per
+    /// this many days untouched. File only.
+    pub interest_half_life_days: Valued<f64>,
     /// PRD FR-TH-7's `images` key: overrides the active theme's `images`
     /// default when set (`Some(true)`/`Some(false)`); `None` (the default)
     /// means "follow the theme." Wired into `App::images_override`.
@@ -685,6 +694,8 @@ pub fn resolve(
     let (active_wiki, base_url_template) = resolve_wiki(env, &table, &mut issues);
     let readlater_auto_dequeue = resolve_readlater_auto_dequeue(env, &table, &mut issues);
     let history_retention_days = resolve_history(&table, &mut issues);
+    let interest_learning = resolve_interest_learning(&table, &mut issues);
+    let interest_half_life_days = resolve_interest_half_life(&table, &mut issues);
     let images = resolve_images(env, &table, &mut issues);
     let include_nonfree = resolve_include_nonfree(&table, &mut issues);
     let startpage = resolve_startpage(&table, &mut issues);
@@ -721,6 +732,8 @@ pub fn resolve(
         base_url_template,
         readlater_auto_dequeue,
         history_retention_days,
+        interest_learning,
+        interest_half_life_days,
         images,
         include_nonfree,
         startpage,
@@ -1405,10 +1418,18 @@ fn resolve_prefetch(
             1.0,
             issues,
         ),
+        // PRD FR-PF-3 fills this once-zero seam: the interest model now
+        // supplies a real w3 affinity term (`interest::InterestModel::
+        // affinity_of_title`), so the default weight is live (1.0). It only
+        // ever affects a link whose target the reader already read this
+        // session — an unseen target's affinity is 0, so this default never
+        // reshuffles ranking for a reader with no interest data (and is 0
+        // whenever interest learning is off or incognito, since the affinity
+        // map is then empty).
         weight_affinity: resolve_weight(
             field("weight_affinity"),
             "prefetch.weight_affinity",
-            0.0,
+            1.0,
             issues,
         ),
     }
@@ -2028,6 +2049,63 @@ fn resolve_history(table: &toml::Table, issues: &mut Vec<Issue>) -> Valued<u64> 
                 default
             }
         },
+    }
+}
+
+/// PRD FR-PF-3 / FR-PR-2: top-level `interest_learning` boolean, default
+/// `true`. A single key (not a `[interest]` table) — like `include_nonfree`
+/// it's one preference, not a family. Incognito overrides it to off at runtime
+/// regardless of this value (see `App::interest_active`).
+fn resolve_interest_learning(table: &toml::Table, issues: &mut Vec<Issue>) -> Valued<bool> {
+    const DEFAULT: bool = true;
+    let default = Valued {
+        value: DEFAULT,
+        source: Source::Default,
+    };
+    match table.get("interest_learning") {
+        None => default,
+        Some(v) => match v.as_bool() {
+            Some(b) => Valued {
+                value: b,
+                source: Source::File,
+            },
+            None => {
+                issues.push(Issue::warning(
+                    "interest_learning must be a boolean; using default true",
+                ));
+                default
+            }
+        },
+    }
+}
+
+/// PRD FR-PF-3's `interest_half_life_days` (default 30). Must be positive — a
+/// zero or negative half-life would disable decay entirely (or worse), so a
+/// bad value falls back to the default rather than degrading the model.
+fn resolve_interest_half_life(table: &toml::Table, issues: &mut Vec<Issue>) -> Valued<f64> {
+    const DEFAULT: f64 = crate::interest::DEFAULT_HALF_LIFE_DAYS;
+    let default = Valued {
+        value: DEFAULT,
+        source: Source::Default,
+    };
+    match table.get("interest_half_life_days") {
+        None => default,
+        Some(v) => {
+            // Accept either an integer (30) or a float (30.0) spelling.
+            let parsed = v.as_float().or_else(|| v.as_integer().map(|n| n as f64));
+            match parsed {
+                Some(d) if d > 0.0 => Valued {
+                    value: d,
+                    source: Source::File,
+                },
+                _ => {
+                    issues.push(Issue::warning(format!(
+                        "interest_half_life_days must be a positive number; using default {DEFAULT}"
+                    )));
+                    default
+                }
+            }
+        }
     }
 }
 
@@ -2813,8 +2891,61 @@ mod tests {
         assert_eq!(d.prefetch.top_n.value, 5, "FR-PF-1 default top-5");
         assert_eq!(d.prefetch.weight_lead.value, 1.0);
         assert_eq!(d.prefetch.weight_pageviews.value, 1.0);
-        assert_eq!(d.prefetch.weight_affinity.value, 0.0);
+        assert_eq!(
+            d.prefetch.weight_affinity.value, 1.0,
+            "FR-PF-3 wired the w3 affinity term: default weight is now live"
+        );
         assert_eq!(d.network_contact.value, crate::api::DEFAULT_CONTACT);
+    }
+
+    #[test]
+    fn interest_learning_defaults_on_and_half_life_defaults_to_thirty_days() {
+        let d = resolve(&CliOverrides::default(), &EnvOverrides::default(), None);
+        assert!(
+            d.interest_learning.value,
+            "FR-PF-3: default on (differentiator)"
+        );
+        assert_eq!(d.interest_learning.source, Source::Default);
+        assert_eq!(
+            d.interest_half_life_days.value, 30.0,
+            "FR-PF-3 default half-life"
+        );
+        assert_eq!(d.interest_half_life_days.source, Source::Default);
+    }
+
+    #[test]
+    fn interest_options_honor_the_file_and_reject_bad_values() {
+        let path = temp_config("interest_learning = false\ninterest_half_life_days = 14\n");
+        let r = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert!(!r.interest_learning.value);
+        assert_eq!(r.interest_learning.source, Source::File);
+        assert_eq!(
+            r.interest_half_life_days.value, 14.0,
+            "integer spelling accepted"
+        );
+        assert_eq!(r.interest_half_life_days.source, Source::File);
+        cleanup(&path);
+
+        let bad = temp_config("interest_half_life_days = 0\n");
+        let r = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&bad),
+        );
+        assert_eq!(
+            r.interest_half_life_days.value, 30.0,
+            "non-positive falls back"
+        );
+        assert!(
+            r.issues
+                .iter()
+                .any(|i| i.message.contains("interest_half_life_days"))
+        );
+        cleanup(&bad);
     }
 
     #[test]

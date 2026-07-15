@@ -498,6 +498,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         }
         Mode::SavedPicker => draw_saved_picker(frame, app, content_area),
         Mode::PrefetchLog => draw_prefetch_log(frame, app, content_area),
+        Mode::Interests => draw_interests(frame, app, content_area),
+        Mode::Stats => draw_stats(frame, app, content_area),
         // The offline card overlays the reading view (drawn after the status
         // bar below, like the help overlay).
         Mode::OfflineCard => draw_reading(frame, app, content_area),
@@ -1982,6 +1984,168 @@ fn draw_prefetch_log(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(para, area);
 }
 
+/// PRD FR-PF-3 / FR-PF-4's `:interests` panel — the interest-model inspector.
+/// "The whole model is human-readable": it shows the learning on/off/incognito
+/// state, the decay half-life, then every tracked topic with its affinity
+/// score (a small bar plus the number), and the current morelike seeds. A
+/// paint function — reads the model, mutates nothing.
+fn draw_interests(frame: &mut Frame, app: &App, area: Rect) {
+    let model = &app.interest;
+    let top = model.top_categories(40);
+
+    let state = if app.incognito {
+        "OFF (incognito — not learning this session)".to_string()
+    } else if app.interest_learning {
+        "ON".to_string()
+    } else {
+        "OFF (interest_learning = false)".to_string()
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![
+        RSpan::styled("learning: ", colored(app.no_color, app.theme.dim)),
+        RSpan::styled(state, Style::default().add_modifier(Modifier::BOLD)),
+    ]));
+    lines.push(Line::from(RSpan::styled(
+        format!(
+            "{} topics · half-life {:.0}d · local only, never leaves this machine",
+            model.len(),
+            model.half_life_days(),
+        ),
+        colored(app.no_color, app.theme.dim),
+    )));
+    lines.push(Line::from(""));
+
+    if model.is_empty() {
+        lines.push(Line::from(RSpan::styled(
+            "No topics yet — read a few articles (and bookmark or save the ones you like).",
+            colored(app.no_color, app.theme.dim),
+        )));
+    } else {
+        // Scale the bars to the largest-magnitude score so the display is
+        // readable regardless of absolute values.
+        let peak = top
+            .iter()
+            .map(|(_, s)| s.abs())
+            .fold(0.0_f64, f64::max)
+            .max(1.0);
+        for (cat, score) in &top {
+            let filled = ((score.abs() / peak) * 16.0).round() as usize;
+            let bar: String = "█".repeat(filled.min(16));
+            let bar_style = if *score < 0.0 {
+                colored(app.no_color, app.theme.warning)
+            } else {
+                colored(app.no_color, app.theme.link)
+            };
+            lines.push(Line::from(vec![
+                RSpan::styled(format!("{score:>7.2}  "), Style::default()),
+                RSpan::styled(format!("{bar:<16} "), bar_style),
+                RSpan::styled(cat.clone(), Style::default().add_modifier(Modifier::BOLD)),
+            ]));
+        }
+    }
+
+    // The morelike seeds the model would prefetch from — the reason strings
+    // made visible without waiting for the prefetch log.
+    let recent: Vec<String> = app
+        .history
+        .recent(30)
+        .into_iter()
+        .filter(|v| v.lang == app.lang)
+        .map(|v| v.title)
+        .collect();
+    let seeds = model.morelike_seeds(&recent, 3);
+    if !seeds.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(RSpan::styled(
+            "Prefetch seeds:",
+            colored(app.no_color, app.theme.dim),
+        )));
+        for s in &seeds {
+            lines.push(Line::from(RSpan::styled(
+                format!(
+                    "  {}",
+                    crate::prefetch::morelike_reason(&s.category, s.affinity)
+                ),
+                colored(app.no_color, app.theme.dim),
+            )));
+        }
+    }
+
+    let title = format!("Interests ({} topics) — Esc: close", model.len());
+    let para = Paragraph::new(lines)
+        .style(base_style(&app.theme, app.no_color))
+        .block(UiBlock::default().borders(Borders::ALL).title(title));
+    frame.render_widget(para, area);
+}
+
+/// PRD FR-PC-3's `:stats` view — local reading stats: articles read, total
+/// time, streaks, and the interest model's topic distribution. Suppressed by
+/// incognito upstream (incognito never writes history/interest), so it simply
+/// shows whatever non-incognito reading produced. A paint function.
+fn draw_stats(frame: &mut Frame, app: &App, area: Rect) {
+    let stats = app.reading_stats();
+    let mut lines: Vec<Line> = Vec::new();
+
+    let row = |label: &str, value: String| {
+        Line::from(vec![
+            RSpan::styled(format!("{label:<16}"), colored(app.no_color, app.theme.dim)),
+            RSpan::styled(value, Style::default().add_modifier(Modifier::BOLD)),
+        ])
+    };
+    lines.push(row("articles read", stats.distinct_articles.to_string()));
+    lines.push(row("page loads", stats.total_visits.to_string()));
+    lines.push(row(
+        "reading time",
+        crate::stats::human_duration(stats.total_time_secs),
+    ));
+    lines.push(row(
+        "current streak",
+        format!("{} day(s)", stats.current_streak_days),
+    ));
+    lines.push(row(
+        "longest streak",
+        format!("{} day(s)", stats.longest_streak_days),
+    ));
+    lines.push(Line::from(""));
+    lines.push(Line::from(RSpan::styled(
+        "Top topics (from the interest model):",
+        colored(app.no_color, app.theme.dim),
+    )));
+    if stats.top_topics.is_empty() {
+        lines.push(Line::from(RSpan::styled(
+            "  (none yet)",
+            colored(app.no_color, app.theme.dim),
+        )));
+    } else {
+        for (cat, score) in &stats.top_topics {
+            lines.push(Line::from(vec![
+                RSpan::styled(
+                    format!("  {score:>6.2}  "),
+                    colored(app.no_color, app.theme.link),
+                ),
+                RSpan::styled(cat.clone(), Style::default()),
+            ]));
+        }
+    }
+    if app.incognito {
+        lines.push(Line::from(""));
+        lines.push(Line::from(RSpan::styled(
+            "Incognito: this session's reading is not counted.",
+            colored(app.no_color, app.theme.dim),
+        )));
+    }
+
+    let para = Paragraph::new(lines)
+        .style(base_style(&app.theme, app.no_color))
+        .block(
+            UiBlock::default()
+                .borders(Borders::ALL)
+                .title("Reading stats — Esc: close"),
+        );
+    frame.render_widget(para, area);
+}
+
 /// PRD FR-DL-2's `:today` panel: a one-row strip of type tabs (events/
 /// births/deaths/holidays/selected) above a selectable list of that type's
 /// entries — Tab/Shift-Tab (or h/l) switch types, j/k move, Enter opens.
@@ -2785,7 +2949,7 @@ fn status_bar_text(app: &App, width: u16) -> String {
         Mode::ReadingHistoryFilter => {
             format!("filter: {}   Esc: apply", app.history_pick_filter)
         }
-        Mode::PrefetchLog => app.status.clone(),
+        Mode::PrefetchLog | Mode::Interests | Mode::Stats => app.status.clone(),
         Mode::OnThisDay => app.status.clone(),
         Mode::Related => app.status.clone(),
         Mode::LangPicker => app.status.clone(),

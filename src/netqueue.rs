@@ -149,9 +149,13 @@ impl Default for SubstrateConfig {
     }
 }
 
-/// FR-PF-1 ranking weights, config-overridable. `affinity` is retained but 0
-/// by default — the interest model (FR-PF-3) is a v1.x chunk; this is its
-/// seam.
+/// FR-PF-1 ranking weights, config-overridable. `affinity` is the FR-PF-3 w3
+/// term, now live: production resolves it from config (default 1.0, see
+/// `config::resolve_prefetch`) and `prefetch::rank_links` multiplies it by a
+/// link target's interest affinity (`interest::InterestModel::affinity_of_
+/// title`, 0 for unseen targets). This struct's own `Default` keeps `affinity`
+/// at 0 — the neutral value the substrate's non-config-driven paths (and this
+/// module's tests) use, where no interest data is threaded through.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RankWeights {
     pub lead: f64,
@@ -452,6 +456,20 @@ pub struct LinkCandidate {
     pub is_cursor: bool,
 }
 
+/// FR-PF-3 interest-driven candidate seed: a recently-read article to run
+/// `morelike:` against, plus the dominant topic and affinity behind it — the
+/// pieces the FR-PF-4 reason string ("morelike your Cryptography reading,
+/// affinity 0.82") needs. Kept as a plain data struct here (the substrate
+/// "knows nothing about Wikipedia") so `main` can build it from
+/// `interest::MorelikeSeed` without this module depending on the interest
+/// model.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MorelikeSeed {
+    pub title: String,
+    pub category: String,
+    pub affinity: f64,
+}
+
 /// A unit of background work. Priority is derived from the variant:
 /// `Revalidate` is revalidation priority (outranks all prefetch), everything
 /// else is prefetch priority. `RankLinks`/`Featured` are *seed* jobs — one
@@ -476,16 +494,29 @@ pub enum Job {
         log_id: u64,
     },
     /// FR-PF-1 seed: batch-fetch pageviews for a page's links, rank, and
-    /// enqueue the top-N bodies.
+    /// enqueue the top-N bodies. `affinity` is the FR-PF-3 w3 term per
+    /// candidate title (interest of a *previously read* target; 0 for unseen
+    /// targets — see `interest`'s w3 resolution), computed in `main` where the
+    /// interest model lives and snapshotted here so the executor stays
+    /// stateless.
     RankLinks {
         lang: String,
         article_title: String,
         candidates: Vec<LinkCandidate>,
+        affinity: std::collections::HashMap<String, f64>,
     },
     /// FR-PF-2 seed: fetch the day's featured feed and enqueue TFA + top-10
     /// most-read bodies. `date` is the `yyyy-mm-dd` bucket (injected in main
     /// from `chrono`) that also drives the once-per-day cache.
     Featured { lang: String, date: String },
+    /// FR-PF-3 seed: run `morelike:` on the reader's top-affinity recent reads
+    /// and enqueue the results (intersected with trending where possible) as
+    /// interest candidates. The seeds are computed in `main` from the interest
+    /// model; the executor only does the searches and the intersection.
+    InterestMorelike {
+        lang: String,
+        seeds: Vec<MorelikeSeed>,
+    },
 }
 
 impl Job {
@@ -503,6 +534,13 @@ impl Job {
                 ..
             } => format!("rl:{lang}:{article_title}"),
             Job::Featured { lang, date } => format!("ft:{lang}:{date}"),
+            // Dedups on the seed titles so re-scheduling the same top-affinity
+            // reads (every navigation) coalesces rather than re-searching.
+            Job::InterestMorelike { lang, seeds } => {
+                let mut titles: Vec<&str> = seeds.iter().map(|s| s.title.as_str()).collect();
+                titles.sort_unstable();
+                format!("im:{lang}:{}", titles.join("|"))
+            }
         }
     }
 }

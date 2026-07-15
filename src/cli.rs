@@ -94,8 +94,10 @@ pub enum Commands {
         /// Deletes the page cache (PRD §5.7's L2 store).
         #[arg(long)]
         cache: bool,
-        /// Deletes local reading stats (PRD FR-PC-3) — a seam today: no
-        /// stats file exists yet, so this reports a no-op.
+        /// Deletes the local interest model (`interest.json`, PRD FR-PC-3 /
+        /// FR-PF-3) — the learned-topic state the reading-stats topic
+        /// distribution reads. The stats numbers themselves derive from
+        /// history (cleared by `--history`).
         #[arg(long)]
         stats: bool,
         /// Deletes locally stored auth tokens (PRD FR-ACC-9) — a seam
@@ -110,6 +112,18 @@ pub enum Commands {
         /// Skip the confirmation prompt.
         #[arg(long)]
         yes: bool,
+    },
+    /// PRD FR-PC-3: print local-only reading stats (articles read, total
+    /// time, streaks, topic distribution) to stdout and exit — a standalone,
+    /// TUI-free subcommand like `config doctor`/`clear-data`. Reads the local
+    /// reading history and interest model; nothing leaves the machine
+    /// (FR-PR-2). `--explain` additionally shows the interest model's top
+    /// topics with scores and how they're learned.
+    Stats {
+        /// Show the interest model's top topics with scores and a short
+        /// explanation of how they are learned.
+        #[arg(long)]
+        explain: bool,
     },
     /// PRD FR-TH-8 (backs goal G3): best-effort migration from wiki-tui
     /// (github.com/Builditluc/wiki-tui) — reads its `config.toml`'s

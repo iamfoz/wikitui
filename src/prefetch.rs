@@ -31,8 +31,14 @@ pub struct RankedLink {
 const LEAD_CUTOFF: usize = 5;
 
 /// FR-PF-1 ranking: `w1·lead_position + w2·log(pageviews) + w3·interest`.
-/// `interest` (affinity) is 0 until the FR-PF-3 interest model lands (v1.x);
-/// the term and its weight are kept so turning it on is a one-line change.
+/// The `affinity` map supplies the FR-PF-3 w3 term per candidate title — the
+/// summed topic affinity of a link *target* the reader already read this
+/// session (0, i.e. absent from the map, for an unseen target: the interest
+/// model never fabricates affinity for a target it has no evidence about, see
+/// [`crate::interest`]'s w3 resolution). So this term only ever *raises* a
+/// link to a demonstrably-preferred topic; it never reshuffles ranking for a
+/// reader with no interest data (the map is empty), nor when interest learning
+/// is off/incognito (the caller passes an empty map).
 ///
 /// Returns up to `top_n` links, highest score first, **plus** the cursor link
 /// if the reader has one focused and it didn't already make the cut — "the
@@ -41,6 +47,7 @@ pub fn rank_links(
     article_title: &str,
     candidates: &[LinkCandidate],
     pageviews: &HashMap<String, u64>,
+    affinity: &HashMap<String, f64>,
     weights: RankWeights,
     top_n: usize,
 ) -> Vec<RankedLink> {
@@ -50,8 +57,8 @@ pub fn rank_links(
             let views = pageviews.get(&c.title).copied().unwrap_or(0);
             let lead_term = weights.lead * lead_score(c.lead_position);
             let views_term = weights.pageviews * ((views as f64) + 1.0).ln();
-            // Affinity term is the FR-PF-3 seam (0 for now).
-            let affinity_term = weights.affinity * 0.0;
+            // FR-PF-3 w3 term: the target's topic affinity (0 if unseen).
+            let affinity_term = weights.affinity * affinity.get(&c.title).copied().unwrap_or(0.0);
             (lead_term + views_term + affinity_term, c, views)
         })
         .collect();
@@ -119,6 +126,14 @@ pub fn trending_reason(rank: Option<usize>, views: u64) -> String {
         Some(r) if views > 0 => format!("trending #{r} ({} views/day)", format_views(views)),
         Some(r) => format!("trending #{r}"),
     }
+}
+
+/// FR-PF-4 reason for an interest-driven `morelike:` candidate (FR-PF-3), e.g.
+/// `morelike your Cryptography reading, affinity 0.82` — the exact phrasing the
+/// PRD gives. `affinity` is the seed article's summed topic affinity; `category`
+/// is the dominant topic that made it a seed.
+pub fn morelike_reason(category: &str, affinity: f64) -> String {
+    format!("morelike your {category} reading, affinity {affinity:.2}")
 }
 
 /// Compact view counts for reason strings: `12345 -> "12k"`, `1234567 -> "1.2M"`.
@@ -473,6 +488,12 @@ mod tests {
         }
     }
 
+    /// The FR-PF-3 w3 affinity map, empty — the common case (no interest data,
+    /// or interest off/incognito), where ranking is lead+pageviews only.
+    fn no_affinity() -> HashMap<String, f64> {
+        HashMap::new()
+    }
+
     #[test]
     fn lead_position_breaks_ties_when_views_are_equal() {
         let cands = vec![cand("Late", 10), cand("Early", 0), cand("Mid", 3)];
@@ -480,7 +501,14 @@ mod tests {
             .iter()
             .map(|t| (t.to_string(), 100))
             .collect();
-        let ranked = rank_links("Src", &cands, &views, RankWeights::default(), 5);
+        let ranked = rank_links(
+            "Src",
+            &cands,
+            &views,
+            &no_affinity(),
+            RankWeights::default(),
+            5,
+        );
         let order: Vec<&str> = ranked.iter().map(|r| r.title.as_str()).collect();
         assert_eq!(
             order,
@@ -496,7 +524,14 @@ mod tests {
         views.insert("Obscure".to_string(), 5);
         views.insert("Popular".to_string(), 50_000);
         views.insert("Medium".to_string(), 500);
-        let ranked = rank_links("Src", &cands, &views, RankWeights::default(), 5);
+        let ranked = rank_links(
+            "Src",
+            &cands,
+            &views,
+            &no_affinity(),
+            RankWeights::default(),
+            5,
+        );
         let order: Vec<&str> = ranked.iter().map(|r| r.title.as_str()).collect();
         assert_eq!(order, vec!["Popular", "Medium", "Obscure"]);
     }
@@ -512,7 +547,14 @@ mod tests {
         ];
         cands[4].is_cursor = true;
         let views: HashMap<String, u64> = cands.iter().map(|c| (c.title.clone(), 100)).collect();
-        let ranked = rank_links("Src", &cands, &views, RankWeights::default(), 3);
+        let ranked = rank_links(
+            "Src",
+            &cands,
+            &views,
+            &no_affinity(),
+            RankWeights::default(),
+            3,
+        );
         let titles: Vec<&str> = ranked.iter().map(|r| r.title.as_str()).collect();
         assert_eq!(titles.len(), 4, "top-3 plus the cursor link");
         assert!(
@@ -527,7 +569,14 @@ mod tests {
         let mut cands = vec![cand("A", 0), cand("B", 1)];
         cands[0].is_cursor = true;
         let views: HashMap<String, u64> = cands.iter().map(|c| (c.title.clone(), 100)).collect();
-        let ranked = rank_links("Src", &cands, &views, RankWeights::default(), 5);
+        let ranked = rank_links(
+            "Src",
+            &cands,
+            &views,
+            &no_affinity(),
+            RankWeights::default(),
+            5,
+        );
         let count = ranked.iter().filter(|r| r.title == "A").count();
         assert_eq!(count, 1, "cursor link that made the cut is not added twice");
     }
@@ -559,6 +608,65 @@ mod tests {
             "trending #3 (98k views/day)"
         );
         assert_eq!(trending_reason(Some(7), 0), "trending #7");
+    }
+
+    #[test]
+    fn morelike_reason_matches_the_prd_phrasing() {
+        assert_eq!(
+            morelike_reason("Cryptography", 0.82),
+            "morelike your Cryptography reading, affinity 0.82"
+        );
+        assert_eq!(
+            morelike_reason("Computer science", 4.0),
+            "morelike your Computer science reading, affinity 4.00"
+        );
+    }
+
+    /// FR-PF-3 w3 wiring: with equal lead position and equal pageviews, the
+    /// link whose target carries higher topic affinity ranks above the one
+    /// that carries none — the documented "affinity of a previously-read
+    /// target" resolution (see `interest`).
+    #[test]
+    fn a_high_affinity_target_outranks_a_low_one_at_equal_lead_and_views() {
+        let cands = vec![cand("LowAffinity", 0), cand("HighAffinity", 0)];
+        let views: HashMap<String, u64> = cands.iter().map(|c| (c.title.clone(), 100)).collect();
+        let mut affinity = HashMap::new();
+        affinity.insert("HighAffinity".to_string(), 5.0);
+        // LowAffinity intentionally absent from the map → 0.
+        let weights = RankWeights {
+            lead: 1.0,
+            pageviews: 1.0,
+            affinity: 1.0,
+        };
+        let ranked = rank_links("Src", &cands, &views, &affinity, weights, 5);
+        assert_eq!(
+            ranked[0].title, "HighAffinity",
+            "the demonstrably-preferred topic's link is prefetched first"
+        );
+        assert!(ranked[0].score > ranked[1].score);
+    }
+
+    #[test]
+    fn a_zero_affinity_weight_ignores_the_map_entirely() {
+        // Even with affinity data present, weight 0 (interest off) means the
+        // w3 term contributes nothing — ranking is lead+pageviews only.
+        let cands = vec![cand("A", 0), cand("B", 0)];
+        let views: HashMap<String, u64> = [("A", 10u64), ("B", 5000)]
+            .iter()
+            .map(|(t, v)| (t.to_string(), *v))
+            .collect();
+        let mut affinity = HashMap::new();
+        affinity.insert("A".to_string(), 1000.0); // would dominate if weighted
+        let weights = RankWeights {
+            lead: 1.0,
+            pageviews: 1.0,
+            affinity: 0.0,
+        };
+        let ranked = rank_links("Src", &cands, &views, &affinity, weights, 5);
+        assert_eq!(
+            ranked[0].title, "B",
+            "pageviews win; affinity is unweighted"
+        );
     }
 
     #[test]

@@ -348,6 +348,34 @@ struct MissingLinksPage {
     missing: bool,
 }
 
+/// PRD FR-PF-3's `prop=categories` response (formatversion=2). Each page
+/// carries a `categories` array of `{title}` (in `Category:Foo` form); a page
+/// with no non-hidden categories has an empty/absent array.
+#[derive(Debug, Deserialize, Default)]
+struct CategoriesResponse {
+    #[serde(default)]
+    query: Option<CategoriesQuery>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CategoriesQuery {
+    #[serde(default)]
+    pages: Vec<CategoriesPage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CategoriesPage {
+    title: String,
+    #[serde(default)]
+    categories: Vec<CategoryEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CategoryEntry {
+    #[serde(default)]
+    title: String,
+}
+
 /// PRD FR-DL-3's quality classes as `prop=pageassessments` reports them
 /// (Appendix A "Quality"), ordered low→high so `Ord`/`>=` express "at least
 /// as good as" directly — FR-SR-5's "random good article" filter is exactly
@@ -866,6 +894,52 @@ impl WikiClient {
             }
         }
         Ok(best)
+    }
+
+    /// PRD FR-PF-3's per-article categories: `prop=categories` for up to 50
+    /// titles in **one** batched call (§6.2 rule 10 — never a per-article
+    /// fanout), used to build the interest-affinity model. `clshow=!hidden`
+    /// asks the API to drop its own hidden/tracking categories server-side;
+    /// the remaining maintenance categories the API doesn't flag hidden are
+    /// dropped client-side by `interest::is_maintenance_category`. Returns
+    /// `title -> category names` (in `Category:Foo` API form — the interest
+    /// model normalizes them). Category titles are sanitized (SEC-1) as they
+    /// become model keys and, via `:interests`, displayed text.
+    pub async fn fetch_categories(
+        &self,
+        lang: &str,
+        titles: &[String],
+    ) -> Result<HashMap<String, Vec<String>>> {
+        let joined = titles.join("|");
+        let url = format!(
+            "{}/w/api.php?action=query&format=json&formatversion=2&prop=categories&clshow=!hidden&cllimit=500&titles={}",
+            self.host(lang),
+            urlencoding::encode(&joined)
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .context("requesting page categories")?
+            .error_for_status()
+            .context("page categories request failed")?;
+        let bytes = read_capped(resp, MAX_SEARCH_RESPONSE_BYTES)
+            .await
+            .context("reading page categories response body")?;
+        let parsed: CategoriesResponse =
+            serde_json::from_slice(&bytes).context("parsing page categories response")?;
+        let mut out: HashMap<String, Vec<String>> = HashMap::new();
+        for page in parsed.query.map(|q| q.pages).unwrap_or_default() {
+            let title = crate::sanitize::sanitize_single_line(&page.title).into_owned();
+            let cats = page
+                .categories
+                .into_iter()
+                .map(|c| crate::sanitize::sanitize_single_line(&c.title).into_owned())
+                .collect();
+            out.insert(title, cats);
+        }
+        Ok(out)
     }
 
     /// PRD FR-DL-5's batched redlink check: `source_title`'s own outgoing

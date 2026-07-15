@@ -90,6 +90,15 @@ pub enum Command {
     /// `:prefetch-log` (PRD FR-PF-4): open the transparency/debug panel of
     /// recent prefetch actions, their reasons, status, and budget state.
     PrefetchLog,
+    /// `:interests` (PRD FR-PF-3 / FR-PF-4): open the interest-model inspector
+    /// — top topic affinities, decay half-life, on/off state, morelike seeds.
+    Interests,
+    /// `:not-interested` (PRD FR-PF-3): strongly down-weight the current
+    /// article's topics in the interest model. Same action as the keybinding.
+    NotInterested,
+    /// `:stats` (PRD FR-PC-3): open the local reading-stats view (articles
+    /// read, time, streaks, topic distribution).
+    Stats,
     /// `:start` (PRD FR-DL-1) — return the active tab to the start page
     /// (same action as the `gh` "home" keybinding).
     Start,
@@ -363,7 +372,7 @@ fn validate_set_value(
     }
 }
 
-pub const USAGE: &str = "commands: open <title>, lang [<code>], theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, prefetch-log, start, today, random [good], related, talk, info, set theme=<name>|images=on|off|prefetch=on|off|measure=N|ambiguous_width=1|2|reading_wpm=N|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N, set-tab measure=N|images=on|off|ambiguous_width=1|2|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N (or set-tab key= to reset), config reload, watchlist, notifications, contribs [username], prefs, sync, mirror-watchlist, help, quit";
+pub const USAGE: &str = "commands: open <title>, lang [<code>], theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, prefetch-log, interests, not-interested, stats, start, today, random [good], related, talk, info, set theme=<name>|images=on|off|prefetch=on|off|measure=N|ambiguous_width=1|2|reading_wpm=N|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N, set-tab measure=N|images=on|off|ambiguous_width=1|2|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N (or set-tab key= to reset), config reload, watchlist, notifications, contribs [username], prefs, sync, mirror-watchlist, help, quit";
 
 /// Parses one `:` command line. `user_theme_names` are accepted alongside
 /// the six built-ins for `:theme <name>` and `:set theme=<name>` (PRD
@@ -633,6 +642,11 @@ pub fn parse_with_user_themes(input: &str, user_theme_names: &[String]) -> Resul
             }
         }
         "prefetch-log" | "prefetchlog" => Ok(Command::PrefetchLog),
+        // PRD FR-PF-3: the interest model inspector + its explicit signals.
+        "interests" | "interest" => Ok(Command::Interests),
+        "not-interested" | "notinterested" => Ok(Command::NotInterested),
+        // PRD FR-PC-3: the reading-stats view.
+        "stats" => Ok(Command::Stats),
         // PRD FR-DL-1/2.
         "start" => Ok(Command::Start),
         "today" => Ok(Command::Today),
@@ -1176,6 +1190,15 @@ mod tests {
     fn prefetch_log_parses() {
         assert_eq!(parse("prefetch-log"), Ok(Command::PrefetchLog));
         assert_eq!(parse("prefetchlog"), Ok(Command::PrefetchLog));
+    }
+
+    #[test]
+    fn interest_and_stats_commands_parse() {
+        assert_eq!(parse("interests"), Ok(Command::Interests));
+        assert_eq!(parse("interest"), Ok(Command::Interests));
+        assert_eq!(parse("not-interested"), Ok(Command::NotInterested));
+        assert_eq!(parse("notinterested"), Ok(Command::NotInterested));
+        assert_eq!(parse("stats"), Ok(Command::Stats));
     }
 
     #[test]

@@ -22,6 +22,7 @@ mod hints;
 mod history;
 mod hyperlink;
 mod image;
+mod interest;
 mod jsonl;
 mod layout;
 mod migrate;
@@ -37,6 +38,7 @@ mod saved_export;
 mod search_ops;
 mod session;
 mod startpage;
+mod stats;
 mod tab;
 mod talk;
 mod target;
@@ -251,6 +253,18 @@ async fn main() -> Result<()> {
             all: *all,
         };
         std::process::exit(cleardata::run(&resolved, scope, *yes));
+    }
+
+    // PRD FR-PC-3: `wikitui stats [--explain]` is another standalone,
+    // TUI-free subcommand (plain stdout, no terminal/network) — it reads the
+    // local history + interest model and prints. Nothing leaves the machine.
+    if let Some(Commands::Stats { explain }) = &cli.command {
+        let cli_overrides = cli_overrides_from(&cli);
+        let env_overrides = config::EnvOverrides::from_process_env();
+        let config_path =
+            config::resolve_config_path(cli.config.clone(), std::env::var("WIKITUI_CONFIG").ok());
+        let resolved = config::resolve(&cli_overrides, &env_overrides, config_path.as_deref());
+        std::process::exit(stats::run(&resolved, *explain));
     }
 
     // PRD FR-TH-8 / goal G3: `wikitui import-wiki-tui <path>` is the third
@@ -510,6 +524,8 @@ async fn main() -> Result<()> {
         cite_style,
         resolved.readlater_auto_dequeue.value,
         resolved.history_retention_days.value,
+        resolved.interest_learning.value,
+        resolved.interest_half_life_days.value,
         resolved.images.value,
         resolved.include_nonfree.value,
         resolved.startpage.value,
@@ -904,12 +920,24 @@ impl netqueue::Executor for BgExecutor {
                     lang,
                     article_title,
                     candidates,
+                    affinity,
                 } => {
-                    execute_rank_links(&client, &lang, &article_title, &candidates, weights, top_n)
-                        .await
+                    execute_rank_links(
+                        &client,
+                        &lang,
+                        &article_title,
+                        &candidates,
+                        &affinity,
+                        weights,
+                        top_n,
+                    )
+                    .await
                 }
                 netqueue::Job::Featured { lang, date } => {
                     execute_featured(&client, &feed_cache, &lang, &date).await
+                }
+                netqueue::Job::InterestMorelike { lang, seeds } => {
+                    execute_interest_morelike(&client, &feed_cache, &lang, &seeds, top_n).await
                 }
             }
         }
@@ -968,13 +996,20 @@ async fn execute_rank_links(
     lang: &str,
     article_title: &str,
     candidates: &[netqueue::LinkCandidate],
+    affinity: &std::collections::HashMap<String, f64>,
     weights: netqueue::RankWeights,
     top_n: usize,
 ) -> netqueue::ExecResult {
     match client.fetch_link_pageviews(lang, article_title).await {
         Ok((pageviews, bytes)) => {
-            let ranked =
-                prefetch::rank_links(article_title, candidates, &pageviews, weights, top_n);
+            let ranked = prefetch::rank_links(
+                article_title,
+                candidates,
+                &pageviews,
+                affinity,
+                weights,
+                top_n,
+            );
             let follow_ups = ranked
                 .into_iter()
                 .map(|r| netqueue::Job::PrefetchArticle {
@@ -1051,6 +1086,103 @@ async fn execute_featured(
         },
     }
 }
+
+/// FR-PF-3 seed: run `morelike:` on the reader's top-affinity recent reads and
+/// enqueue the results as interest candidates, intersected with the day's
+/// trending most-read where that feed is available (the PRD's "morelike on
+/// top-affinity reads ∩ trending"). Falls back to the raw morelike results when
+/// no trending feed is cached yet, or when the intersection is empty — the
+/// "at minimum, morelike on the highest-affinity recently-read articles" floor.
+/// Each candidate carries the FR-PF-4 reason
+/// "morelike your {topic} reading, affinity {a}".
+async fn execute_interest_morelike(
+    client: &WikiClient,
+    feed_cache: &Arc<std::sync::Mutex<prefetch::FeedCache>>,
+    lang: &str,
+    seeds: &[netqueue::MorelikeSeed],
+    top_n: usize,
+) -> netqueue::ExecResult {
+    if seeds.is_empty() {
+        return netqueue::ExecResult {
+            outcome: netqueue::Outcome::Skipped {
+                note: "no interest seeds".to_string(),
+            },
+            follow_ups: Vec::new(),
+        };
+    }
+    // The seed titles themselves are already-read; never re-prefetch them.
+    let seed_titles: std::collections::HashSet<String> =
+        seeds.iter().map(|s| s.title.clone()).collect();
+
+    // (title -> reason), first seed to surface a title wins its attribution.
+    let mut candidates: Vec<(String, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut any_ok = false;
+    for seed in seeds {
+        let query = format!("morelike:{}", seed.title);
+        // Best-effort: a failed morelike search just yields no candidates from
+        // that seed. It never trips the breaker (search isn't a budgeted
+        // background primitive the way pageviews/feeds are).
+        if let Ok(outcome) = client.search(lang, &query, MORELIKE_CANDIDATE_LIMIT).await {
+            any_ok = true;
+            let reason = prefetch::morelike_reason(&seed.category, seed.affinity);
+            for result in outcome.results {
+                let title = result.title;
+                if seed_titles.contains(&title) || !seen.insert(title.clone()) {
+                    continue;
+                }
+                candidates.push((title, reason.clone()));
+            }
+        }
+    }
+
+    // FR-PF-3 "∩ trending": if the daily feed is cached, prefer candidates that
+    // are also in today's most-read; fall back to the full set if that leaves
+    // nothing (or the feed isn't available yet).
+    let trending: std::collections::HashSet<String> = feed_cache
+        .lock()
+        .unwrap()
+        .get()
+        .map(|f| f.mostread.iter().map(|m| m.title.clone()).collect())
+        .unwrap_or_default();
+    if !trending.is_empty() {
+        let intersected: Vec<(String, String)> = candidates
+            .iter()
+            .filter(|(t, _)| trending.contains(t))
+            .cloned()
+            .collect();
+        if !intersected.is_empty() {
+            candidates = intersected;
+        }
+    }
+
+    if !any_ok {
+        return netqueue::ExecResult {
+            outcome: netqueue::Outcome::Failed,
+            follow_ups: Vec::new(),
+        };
+    }
+
+    let follow_ups: Vec<netqueue::Job> = candidates
+        .into_iter()
+        .take(top_n)
+        .map(|(title, reason)| netqueue::Job::PrefetchArticle {
+            lang: lang.to_string(),
+            title,
+            reason,
+            log_id: 0,
+        })
+        .collect();
+    netqueue::ExecResult {
+        // The seed job itself fetched only search metadata (no article body);
+        // the follow-up bodies count their own bytes.
+        outcome: netqueue::Outcome::Done { bytes: 0 },
+        follow_ups,
+    }
+}
+
+/// How many `morelike:` results to consider per interest seed.
+const MORELIKE_CANDIDATE_LIMIT: u32 = 10;
 
 /// FR-OFF-2 on the substrate: the cheap bare check with `maxlag`, then a full
 /// re-fetch only if the revid changed. Always sends exactly one
@@ -1176,10 +1308,25 @@ fn schedule_link_prefetch(app: &App) {
     if candidates.is_empty() {
         return;
     }
+    // FR-PF-3 w3 term: snapshot each candidate's affinity from the interest
+    // model here, where it lives, so the executor stays stateless. Only
+    // previously-read targets have a nonzero entry; the map is empty when
+    // interest learning is off/incognito (`interest_active` false), so the
+    // affinity term then contributes nothing.
+    let mut affinity = std::collections::HashMap::new();
+    if app.interest_active() {
+        for c in &candidates {
+            let a = app.interest.affinity_of_title(&c.title);
+            if a != 0.0 {
+                affinity.insert(c.title.clone(), a);
+            }
+        }
+    }
     handle.enqueue_prefetch(netqueue::Job::RankLinks {
         lang: tab.lang.clone(),
         article_title,
         candidates,
+        affinity,
     });
 }
 
@@ -1198,6 +1345,52 @@ fn schedule_trending_prefetch(app: &App) {
         date,
     });
 }
+
+/// PRD FR-PF-3: enqueue the interest-driven `morelike:` candidate seed — the
+/// reader's top-affinity recent reads, run through `morelike:` and intersected
+/// with trending in the executor. A no-op unless prefetch is active (kill
+/// switch, not incognito) *and* interest learning is on (`interest_active`);
+/// the kill switch (`:set prefetch=off`) suppresses interest-driven prefetch
+/// exactly like the other two sources. Seeds are capped small so the seed job
+/// makes only a handful of `morelike:` searches.
+fn schedule_interest_prefetch(app: &App) {
+    if !app.prefetch_active() || !app.interest_active() {
+        return;
+    }
+    let Some(handle) = &app.prefetch else {
+        return;
+    };
+    // Recent reads in the active language, most-recent first — the pool the
+    // model ranks by affinity for seeding.
+    let recent: Vec<String> = app
+        .history
+        .recent(INTEREST_SEED_POOL)
+        .into_iter()
+        .filter(|v| v.lang == app.lang)
+        .map(|v| v.title)
+        .collect();
+    let seeds = app.interest.morelike_seeds(&recent, INTEREST_MAX_SEEDS);
+    if seeds.is_empty() {
+        return;
+    }
+    let seeds: Vec<netqueue::MorelikeSeed> = seeds
+        .into_iter()
+        .map(|s| netqueue::MorelikeSeed {
+            title: s.title,
+            category: s.category,
+            affinity: s.affinity,
+        })
+        .collect();
+    handle.enqueue_prefetch(netqueue::Job::InterestMorelike {
+        lang: app.lang.clone(),
+        seeds,
+    });
+}
+
+/// How many recent reads to consider when picking interest seeds.
+const INTEREST_SEED_POOL: usize = 30;
+/// How many seeds to run `morelike:` on (each is a background search).
+const INTEREST_MAX_SEEDS: usize = 3;
 
 /// Applies a completed revalidation (PRD FR-OFF-2, FR-TB-3): writes any
 /// changed content into L2 (or silently touches `fetched_at` for an unchanged
@@ -1524,6 +1717,11 @@ fn start_current_save(
     };
     let title = doc.title.clone();
     let lang = app.active_tab().lang.clone();
+    // PRD FR-PF-3: saving an article is the strongest positive signal (+5.0)
+    // on its topics — the reader deliberately kept this page. Gated on
+    // `interest_active` (off in incognito), so an incognito save still pins
+    // the page but never teaches the model.
+    app.apply_active_article_signal(crate::interest::SIGNAL_SAVE);
     fire_save_job(
         client,
         cache,
@@ -1794,6 +1992,8 @@ async fn run(
     cite_style: CiteStyle,
     readlater_auto_dequeue: bool,
     history_retention_days: u64,
+    interest_learning: bool,
+    interest_half_life_days: f64,
     images_config: Option<bool>,
     include_nonfree: bool,
     startpage_config: String,
@@ -1863,6 +2063,22 @@ async fn run(
     // FR-HS-4.
     app.history = history::History::open();
     app.history.retention_prune(history_retention_days);
+    // PRD FR-PF-3 / FR-PR-2: the local, private interest model — loaded from
+    // `$XDG_STATE/wikitui/interest.json` (a fast local read, no network) with
+    // the config half-life. Like history, `App::new` defaults to an empty
+    // in-memory model so tests never touch the real state dir; this line is
+    // the one place production loads and persists it. `interest_path` being
+    // `Some` is what enables persistence (`App::persist_interest`).
+    app.interest_learning = interest_learning;
+    match interest::interest_path() {
+        Some(path) => {
+            app.interest = interest::InterestModel::load(&path, interest_half_life_days);
+            app.interest_path = Some(path);
+        }
+        None => {
+            app.interest = interest::InterestModel::new(interest_half_life_days);
+        }
+    }
     // PRD FR-TB-5 (§6.4: sessions live in state): resolved unconditionally,
     // even under `--incognito` — `App::persist_session` is the one gate
     // that stops incognito writing anything new, so a later non-incognito
@@ -2796,6 +3012,27 @@ async fn enrich_article(client: &WikiClient, app: &mut App, lang: &str, title: &
                 .extend(missing.into_iter().map(|t| (lang.to_string(), t)));
         }
     }
+
+    // PRD FR-PF-3: learn from this read. On a first read this session we fetch
+    // the article's categories (one batched `prop=categories` call) and apply
+    // the "open" signal; on a revisit the categories are already cached, so
+    // we apply the open signal without re-fetching. Then schedule interest-
+    // driven `morelike:` prefetch. All gated on `interest_active` (learning on
+    // and not incognito), so incognito reads leave the model untouched.
+    if app.interest_active() {
+        let raw = if app.interest.knows_categories(title) {
+            Vec::new()
+        } else {
+            client
+                .fetch_categories(lang, &[title.to_string()])
+                .await
+                .ok()
+                .and_then(|mut m| m.remove(title))
+                .unwrap_or_default()
+        };
+        app.note_article_read(title, &raw);
+        schedule_interest_prefetch(app);
+    }
 }
 
 async fn open_title(
@@ -3230,6 +3467,10 @@ async fn handle_key(
         }
         // PRD FR-PF-4: the prefetch-log panel is read-only — any key closes it.
         Mode::PrefetchLog => app.close_prefetch_log(),
+        // PRD FR-PF-3 / FR-PC-3: the interest and stats panels are read-only
+        // inspectors — any key closes them, same as the prefetch log.
+        Mode::Interests => app.close_interests(),
+        Mode::Stats => app.close_stats(),
         // PRD Appendix B's search keybindings: Enter opens the highlighted
         // typeahead suggestion directly (FR-SR-1); Tab runs a full-text
         // search of the typed query instead (FR-SR-2's mode toggle) — the
@@ -6140,6 +6381,9 @@ async fn execute_command(
         // scoped to the active tab only (`App::set_tab_override`).
         Command::SetTab { key, value } => app.set_tab_override(&key, value.as_deref()),
         Command::PrefetchLog => app.open_prefetch_log(),
+        Command::Interests => app.open_interests(),
+        Command::NotInterested => app.mark_not_interested(),
+        Command::Stats => app.open_stats(),
         Command::Style(name) => {
             if let Some(style) = cite::CiteStyle::by_name(&name) {
                 app.cite_style = style;
