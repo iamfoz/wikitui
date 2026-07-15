@@ -1799,6 +1799,73 @@ impl WikiClient {
         self.authed_post_form(&url, access_token, &form).await
     }
 
+    /// PRD FR-ACC-8: fetches an article's current **wikitext** plus the
+    /// revision identity an edit needs for conflict detection —
+    /// `action=query&prop=revisions&rvprop=content|ids|timestamp&rvslots=main`.
+    /// This is deliberately the *source* wikitext (what the editor fixes),
+    /// **not** the Parsoid HTML `fetch_article_html` renders. Authenticated
+    /// (the whole edit flow requires a login) so it identifies the client for
+    /// the elevated rate limits (NF-NET-9). Parsed by
+    /// `editing::parse_wikitext_response`.
+    pub async fn fetch_wikitext(
+        &self,
+        lang: &str,
+        title: &str,
+        access_token: &str,
+    ) -> Result<crate::editing::FetchedWikitext> {
+        let url = format!(
+            "{}/w/api.php?action=query&format=json&formatversion=2&prop=revisions&rvprop=content%7Cids%7Ctimestamp&rvslots=main&titles={}",
+            self.host(lang),
+            urlencoding::encode(&title.replace(' ', "_"))
+        );
+        let resp = self.authed_get(&url, access_token).await?;
+        let bytes = read_capped(resp, crate::doc::MAX_ARTICLE_HTML_BYTES)
+            .await
+            .context("reading wikitext response body")?;
+        crate::editing::parse_wikitext_response(&bytes).ok_or_else(|| {
+            anyhow!("no wikitext for {title:?} on {lang} (missing page or empty revision)")
+        })
+    }
+
+    /// PRD FR-ACC-8: the ONLY article-write in the product — `action=edit`
+    /// with the changed wikitext, an auto summary + optional user note, the
+    /// **minor** flag (always set — a typo fix is a minor edit), and
+    /// `baserevid`/`basetimestamp` for **conflict detection** (a stale base
+    /// makes the API return an `editconflict` error, surfaced not forced —
+    /// see `editing::parse_edit_response`). `nocreate=1` is an extra
+    /// structural guard: this can only ever *edit an existing* main-namespace
+    /// article, never create a page. Returns the raw body — a success, an
+    /// edit conflict, and a badtoken all parse from it. There is deliberately
+    /// **no** `action=move`/`upload`/`rollback` counterpart anywhere in this
+    /// module (FR-ACC-8's hard prohibitions, enforced by absence).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn edit_raw(
+        &self,
+        lang: &str,
+        access_token: &str,
+        title: &str,
+        text: &str,
+        summary: &str,
+        baserevid: u64,
+        basetimestamp: &str,
+        token: &str,
+    ) -> Result<Vec<u8>> {
+        let url = format!("{}/w/api.php?format=json&formatversion=2", self.host(lang));
+        let baserevid_str = baserevid.to_string();
+        let form = [
+            ("action", "edit"),
+            ("title", title),
+            ("text", text),
+            ("summary", summary),
+            ("minor", "1"),
+            ("nocreate", "1"),
+            ("baserevid", baserevid_str.as_str()),
+            ("basetimestamp", basetimestamp),
+            ("token", token),
+        ];
+        self.authed_post_form(&url, access_token, &form).await
+    }
+
     /// PRD FR-ACC-7: `meta=userinfo&uiprop=options` — the read-only prefs
     /// surface. Never paired with a write; this build has no `action=
     /// options` call anywhere.
@@ -3546,6 +3613,99 @@ mod tests {
         assert!(req.body.contains("action=thank"), "{}", req.body);
         assert!(req.body.contains("rev=5103"), "{}", req.body);
         assert!(req.body.contains("token=CSRFTOK"), "{}", req.body);
+    }
+
+    #[tokio::test]
+    async fn fetch_wikitext_requests_source_content_and_carries_the_bearer() {
+        // PRD FR-ACC-8: the edit flow fetches SOURCE wikitext (revisions),
+        // never the Parsoid HTML, authenticated.
+        let (base, rx) = spawn_one_shot_server(
+            r#"{"query":{"pages":[{"title":"Alan Turing","revisions":[{"revid":1001,"timestamp":"2026-07-15T08:00:00Z","slots":{"main":{"content":"Alan Turing was a mathematician."}}}]}]}}"#,
+        );
+        let client = WikiClient::new(base).unwrap();
+        let got = client
+            .fetch_wikitext("en", "Alan Turing", "access-tok")
+            .await
+            .unwrap();
+        assert_eq!(got.text, "Alan Turing was a mathematician.");
+        assert_eq!(got.revid, 1001);
+        let req = rx.recv().unwrap();
+        assert!(
+            req.request_line.contains("prop=revisions"),
+            "{}",
+            req.request_line
+        );
+        assert!(
+            req.request_line.contains("rvprop=content"),
+            "{}",
+            req.request_line
+        );
+        assert_eq!(req.authorization, "Bearer access-tok");
+    }
+
+    #[tokio::test]
+    async fn edit_raw_request_carries_summary_minor_baserevid_and_token() {
+        // PRD FR-ACC-8: the save request shape — summary, minor flag,
+        // baserevid/basetimestamp (conflict detection), nocreate guard, CSRF
+        // token, all under the Bearer header.
+        let (base, rx) = spawn_one_shot_server(
+            r#"{"edit":{"result":"Success","newrevid":1002,"oldrevid":1001}}"#,
+        );
+        let client = WikiClient::new(base).unwrap();
+        let body = client
+            .edit_raw(
+                "en",
+                "access-tok",
+                "Alan Turing",
+                "Alan Turing was a brilliant mathematician.",
+                "Typo fix via wikitui",
+                1001,
+                "2026-07-15T08:00:00Z",
+                "CSRFTOK",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::editing::parse_edit_response(&body),
+            crate::editing::EditOutcome::Success { newrevid: 1002 }
+        );
+        let req = rx.recv().unwrap();
+        assert!(req.request_line.starts_with("POST"), "{}", req.request_line);
+        assert!(req.body.contains("action=edit"), "{}", req.body);
+        assert!(req.body.contains("summary=Typo%20fix"), "{}", req.body);
+        assert!(req.body.contains("minor=1"), "{}", req.body);
+        assert!(req.body.contains("nocreate=1"), "{}", req.body);
+        assert!(req.body.contains("baserevid=1001"), "{}", req.body);
+        assert!(req.body.contains("basetimestamp="), "{}", req.body);
+        assert!(req.body.contains("token=CSRFTOK"), "{}", req.body);
+        assert_eq!(req.authorization, "Bearer access-tok");
+    }
+
+    #[tokio::test]
+    async fn edit_raw_surfaces_an_edit_conflict_body() {
+        // PRD FR-ACC-8: a stale base revid comes back as an editconflict the
+        // caller reads off the response (never forced).
+        let (base, _rx) = spawn_one_shot_server(
+            r#"{"error":{"code":"editconflict","info":"Edit conflict detected"}}"#,
+        );
+        let client = WikiClient::new(base).unwrap();
+        let body = client
+            .edit_raw(
+                "en",
+                "access-tok",
+                "Alan Turing",
+                "t",
+                "s",
+                999,
+                "ts",
+                "TOK",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::editing::parse_edit_response(&body),
+            crate::editing::EditOutcome::Conflict
+        );
     }
 
     #[tokio::test]

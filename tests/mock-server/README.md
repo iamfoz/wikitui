@@ -293,6 +293,39 @@ every assumption it makes:
   (`READINGLISTS_SETUP_DONE`/`READING_LIST_ENTRIES`/
   `READINGLISTS_NEXT_ENTRY_ID`).
 
+Typo-fix editing fixtures (PRD FR-ACC-8 — the product's only article-write
+path, hard-gated). The SOURCE wikitext (`WIKITEXT`) is served separately from
+the rendered `PAGES` HTML, because an edit fixes the source, not the render:
+
+- `GET .../api.php?action=query&prop=revisions&rvprop=content|ids|timestamp&
+  rvslots=main&titles=<t>` — the current wikitext + base revid + timestamp
+  (`slots.main.content`). A page with no `WIKITEXT` fixture returns `missing`.
+  `Alan_Turing`'s lead sentence mirrors its HTML lead (with a
+  `[[Computer science|computer science]]` link where the HTML has the anchor),
+  so the client's rendered-sentence → wikitext-span fuzzy locate resolves end
+  to end.
+- `POST .../api.php` `action=edit` — the ONLY write. Requires the OAuth Bearer
+  token AND a valid `csrf` token (`badtoken` otherwise, exercising the retry).
+  Enforces `nocreate` (a title with no fixture is `missingtitle` — edits
+  never create pages) and **conflict detection**: a `baserevid` that doesn't
+  match the page's current revid returns an `editconflict` error (never a
+  force-overwrite). On success it stores the received text verbatim, bumps the
+  revid, and reports the new revision. There is deliberately **no**
+  `action=move`/`upload`/`rollback` handler anywhere (FR-ACC-8's hard
+  prohibitions, enforced by absence).
+- `GET /debug/edits` — every recorded edit (title, echoed text, summary, minor
+  flag, nocreate, baserevid, basetimestamp, token), so a test can confirm the
+  save request shape and byte-compare the received wikitext against the
+  expected splice.
+- `GET /debug/wikitext?title=<t>` — a page's current source wikitext + revid
+  (post-edit).
+- `GET /debug/bump-revid?title=<t>` — bumps a page's current revid out of band
+  (simulating another editor saving between the client's fetch and its save),
+  so the client's next `action=edit` with a now-stale `baserevid` gets a real
+  `editconflict`.
+- `GET /debug/reset` additionally clears `RECORDED_EDITS` and restores
+  `WIKITEXT`/`WIKITEXT_REVID` to their seed.
+
 ## Running it
 
 ```sh

@@ -73,16 +73,32 @@ pub const GRANTS: &[&str] = &[
     "editmyprivateinfo",
 ];
 
+/// PRD FR-ACC-8: the article-editing grant. **Deliberately not in [`GRANTS`]**
+/// — the ordinary login stays read-only, and editing is a *separate, explicit*
+/// opt-in (`:enable-editing`) that re-runs the OAuth flow requesting this
+/// extra scope. A session that never requested it can never edit (the double
+/// opt-in gate's grant half — see `editing::edit_gate`).
+pub const EDIT_GRANT: &str = "editpage";
+
 /// Refresh this long *before* the access token's stated expiry rather than at
 /// it — a request fired at the instant of expiry can still land a beat late
 /// and 401. Five minutes comfortably covers clock skew and in-flight latency
 /// against a 4 h token.
 pub const REFRESH_SKEW: Duration = Duration::from_secs(300);
 
-/// The `scope` value sent in the authorization request (space-joined per
-/// RFC 6749 §3.3).
+/// The `scope` value sent in the ordinary (read-only) authorization request
+/// (space-joined per RFC 6749 §3.3).
 pub fn scope_param() -> String {
     GRANTS.join(" ")
+}
+
+/// PRD FR-ACC-8: the `scope` value for the *editing* re-auth — the read-only
+/// [`GRANTS`] plus [`EDIT_GRANT`]. Requested only by `:enable-editing`, never
+/// by a plain `:login`.
+pub fn scope_param_editing() -> String {
+    let mut scopes: Vec<&str> = GRANTS.to_vec();
+    scopes.push(EDIT_GRANT);
+    scopes.join(" ")
 }
 
 // ---------------------------------------------------------------------------
@@ -157,12 +173,35 @@ pub fn build_authorize_url(
     state: &str,
     redirect_uri: &str,
 ) -> String {
+    build_authorize_url_scoped(
+        authorize_url,
+        client_id,
+        challenge,
+        state,
+        redirect_uri,
+        &scope_param(),
+    )
+}
+
+/// [`build_authorize_url`] with an explicit `scope` — the seam the FR-ACC-8
+/// editing re-auth uses to request [`scope_param_editing`] (read-only grants
+/// plus `editpage`) without a second copy of the URL-building logic. The
+/// plain [`build_authorize_url`] is exactly this with the read-only
+/// [`scope_param`].
+pub fn build_authorize_url_scoped(
+    authorize_url: &str,
+    client_id: &str,
+    challenge: &str,
+    state: &str,
+    redirect_uri: &str,
+    scope: &str,
+) -> String {
     let q = |s: &str| urlencoding::encode(s).into_owned();
     format!(
         "{authorize_url}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
         q(client_id),
         q(redirect_uri),
-        q(&scope_param()),
+        q(scope),
         q(state),
         q(challenge),
     )
@@ -424,6 +463,16 @@ pub struct Tokens {
     /// Absolute expiry, unix seconds.
     pub expires_at: i64,
     pub username: String,
+    /// PRD FR-ACC-8: whether this session was obtained with the `editpage`
+    /// grant requested — the local record of the deliberate editing opt-in
+    /// (`:enable-editing`). An ordinary read-only login leaves it `false`, so
+    /// editing stays gated off. `#[serde(default)]` keeps every pre-existing
+    /// `auth.json` (which never had this field) reading back as `false`
+    /// (read-only), never crashing on load. On the real API the grant is
+    /// ultimately enforced server-side; this flag records the client's own
+    /// opt-in so `:edit` refuses locally without a doomed round trip.
+    #[serde(default)]
+    pub editpage: bool,
 }
 
 impl Tokens {
@@ -450,6 +499,10 @@ impl Tokens {
             refresh_token,
             expires_at: now + ttl,
             username,
+            // Defaults to read-only; the FR-ACC-8 editing login sets it true
+            // on the returned value (`main::finish_login`), and a refresh
+            // carries it forward (`AuthState::valid_access_token`).
+            editpage: false,
         })
     }
 
@@ -786,6 +839,27 @@ impl AuthState {
         &self.tokens.username
     }
 
+    /// PRD FR-ACC-8: whether this session holds the `editpage` grant (the
+    /// grant half of the editing double opt-in gate — see
+    /// `editing::edit_gate`). `false` for an ordinary read-only login.
+    pub fn has_editpage(&self) -> bool {
+        self.tokens.editpage
+    }
+
+    /// PRD FR-ACC-8: marks this live session as editing-enabled and persists
+    /// it. The symmetric counterpart of [`has_editpage`](Self::has_editpage),
+    /// kept as the seam an *upgrade-in-place* editing re-auth would use;
+    /// today's `:enable-editing` re-runs the whole OAuth flow and installs a
+    /// fresh `AuthState` whose tokens already carry the grant
+    /// (`main::finish_login`), so this is exercised by its own unit test
+    /// rather than the login path — same "documented, tested, kept" posture as
+    /// `WikiCapabilities::full`.
+    #[allow(dead_code)]
+    pub fn set_editpage(&mut self, editpage: bool) -> Result<()> {
+        self.tokens.editpage = editpage;
+        self.store.save(&self.tokens)
+    }
+
     /// A valid bearer token, refreshing first if it is at/near expiry (PRD
     /// §5.9 transparent refresh). On a successful refresh the new tokens are
     /// persisted to the store. `now` is passed in (never read from the clock
@@ -801,12 +875,16 @@ impl AuthState {
             )
             .await
             .context("refreshing access token")?;
-            let refreshed = Tokens::from_response(
+            let mut refreshed = Tokens::from_response(
                 &resp,
                 self.tokens.username.clone(),
                 now,
                 Some(&self.tokens.refresh_token),
             )?;
+            // PRD FR-ACC-8: a refresh preserves the editing opt-in — a
+            // near-expiry token refresh must not silently downgrade an
+            // editing session back to read-only.
+            refreshed.editpage = self.tokens.editpage;
             // Persist before returning so a crash right after refresh doesn't
             // lose the new refresh token (the old one may now be invalid).
             self.store
@@ -951,6 +1029,47 @@ mod tests {
         assert!(!scope.contains("editmyoptions"));
     }
 
+    #[test]
+    fn read_only_scope_never_includes_editpage() {
+        // PRD FR-ACC-8: the ordinary login must stay read-only — the edit
+        // grant is opt-in only, never requested by a plain `:login`.
+        assert!(!scope_param().contains(EDIT_GRANT));
+    }
+
+    #[test]
+    fn editing_scope_adds_editpage_to_the_read_only_grants() {
+        let scope = scope_param_editing();
+        for g in GRANTS {
+            assert!(scope.contains(g), "{scope} missing {g}");
+        }
+        assert!(scope.contains(EDIT_GRANT), "{scope}");
+        assert!(!scope.contains("editmyoptions"));
+        // The editing scope is a strict superset of the read-only one.
+        assert!(scope.len() > scope_param().len());
+    }
+
+    #[test]
+    fn editing_authorize_url_requests_the_editpage_scope() {
+        let url = build_authorize_url_scoped(
+            DEFAULT_AUTHORIZE_URL,
+            "my-client",
+            "CHALLENGE",
+            "STATE",
+            "http://127.0.0.1:5555/callback",
+            &scope_param_editing(),
+        );
+        assert!(url.contains("editpage"), "{url}");
+        // A plain read-only authorize URL never does.
+        let plain = build_authorize_url(
+            DEFAULT_AUTHORIZE_URL,
+            "my-client",
+            "CHALLENGE",
+            "STATE",
+            "http://127.0.0.1:5555/callback",
+        );
+        assert!(!plain.contains("editpage"), "{plain}");
+    }
+
     // ---- state / CSRF -------------------------------------------------
 
     #[test]
@@ -1031,6 +1150,7 @@ mod tests {
             refresh_token: "r".into(),
             expires_at: 1_000_000,
             username: "u".into(),
+            editpage: false,
         };
         // Well before expiry: fresh.
         assert!(!t.needs_refresh(1_000_000 - 3600));
@@ -1083,6 +1203,7 @@ mod tests {
             refresh_token: "refresh-abc".into(),
             expires_at: 2_000_000_000,
             username: "Wikipedian".into(),
+            editpage: false,
         }
     }
 
@@ -1394,6 +1515,7 @@ mod tests {
             refresh_token: "OLD_RT".into(),
             expires_at: now + 10, // inside the refresh skew
             username: "Alice".into(),
+            editpage: false,
         };
         store.save(&expired).unwrap();
         let mut auth = AuthState::new(expired, "id".into(), url, http, store);
@@ -1416,6 +1538,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_preserves_the_editpage_opt_in() {
+        // PRD FR-ACC-8: a near-expiry refresh must not downgrade an editing
+        // session back to read-only.
+        let (url, _rx) = spawn_token_mock(
+            1,
+            r#"{"access_token":"REFRESHED","refresh_token":"NEW_RT","expires_in":14400}"#,
+            "HTTP/1.1 200 OK",
+        );
+        let http = token_http_client("c").unwrap();
+        let dir = temp_path("editrefresh");
+        let path = dir.join("auth.json");
+        let store = Box::new(FileTokenStore::new(path.clone())) as Box<dyn TokenStore>;
+        let now = 1_000_000i64;
+        let editing = Tokens {
+            access_token: "OLD".into(),
+            refresh_token: "OLD_RT".into(),
+            expires_at: now + 10,
+            username: "Editor".into(),
+            editpage: true,
+        };
+        store.save(&editing).unwrap();
+        let mut auth = AuthState::new(editing, "id".into(), url, http, store);
+        assert!(auth.has_editpage());
+        auth.valid_access_token(now).await.unwrap();
+        assert!(auth.has_editpage(), "editpage must survive a refresh");
+        let reloaded = FileTokenStore::new(path.clone()).load().unwrap().unwrap();
+        assert!(reloaded.editpage, "persisted tokens keep the opt-in");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn set_editpage_upgrades_and_persists_the_session() {
+        // PRD FR-ACC-8: the editing re-auth marks the live session and its
+        // stored tokens editing-enabled.
+        let http = token_http_client("c").unwrap();
+        let dir = temp_path("setedit");
+        let path = dir.join("auth.json");
+        let store = Box::new(FileTokenStore::new(path.clone())) as Box<dyn TokenStore>;
+        let now = 1_000_000i64;
+        let read_only = Tokens {
+            access_token: "AT".into(),
+            refresh_token: "RT".into(),
+            expires_at: now + 4 * 3600,
+            username: "Reader".into(),
+            editpage: false,
+        };
+        store.save(&read_only).unwrap();
+        let mut auth = AuthState::new(
+            read_only,
+            "id".into(),
+            "http://127.0.0.1:1".into(),
+            http,
+            store,
+        );
+        assert!(!auth.has_editpage());
+        auth.set_editpage(true).unwrap();
+        assert!(auth.has_editpage());
+        let reloaded = FileTokenStore::new(path.clone()).load().unwrap().unwrap();
+        assert!(reloaded.editpage);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn valid_access_token_returns_a_fresh_token_without_refreshing() {
         // No mock needed: a fresh token must not touch the network at all.
         let http = token_http_client("c").unwrap();
@@ -1427,6 +1612,7 @@ mod tests {
             refresh_token: "RT".into(),
             expires_at: now + 4 * 3600,
             username: "Bob".into(),
+            editpage: false,
         };
         let mut auth = AuthState::new(fresh, "id".into(), "http://127.0.0.1:1".into(), http, store);
         assert_eq!(auth.valid_access_token(now).await.unwrap(), "STILL_GOOD");
@@ -1448,6 +1634,7 @@ mod tests {
             refresh_token: "OLD_RT".into(),
             expires_at: now - 1,
             username: "u".into(),
+            editpage: false,
         };
         let mut auth = AuthState::new(expired, "id".into(), url, http, store);
         // Refresh failure surfaces as an error — the caller logs the reader

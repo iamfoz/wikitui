@@ -623,6 +623,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_prefs_overlay(frame, app, area);
     }
 
+    // PRD FR-ACC-8's diff-preview + confirmation, keyed on the pending edit
+    // rather than a mode (like the quit/bulk-save confirmations): a prepared,
+    // UNSAVED edit is on screen awaiting the reader's explicit y/n.
+    if app.pending_edit.is_some() {
+        draw_edit_confirm_overlay(frame, app, area);
+    }
+
     // PRD FR-CS-1's command palette and FR-CS-8's onboarding: modal overlays,
     // drawn last so they layer over everything (same ordering as help above).
     if app.mode == Mode::Palette {
@@ -2984,6 +2991,68 @@ fn draw_prefs_overlay(frame: &mut Frame, app: &App, area: Rect) {
                 UiBlock::default()
                     .borders(Borders::ALL)
                     .title("Preferences (read-only)"),
+            ),
+        popup,
+    );
+}
+
+/// PRD FR-ACC-8's typo-fix diff preview: the before/after of the located
+/// sentence's wikitext, the edit summary, and the y/n confirm prompt. A
+/// floating card in the same idiom as the prefs/info overlays — the reader
+/// must see exactly what will be written and explicitly confirm before any
+/// save. `-`/`+` gutter lines (styled with the theme's error/accent colors)
+/// stand in for a diff without a word-level algorithm to get wrong.
+fn draw_edit_confirm_overlay(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(edit) = app.pending_edit.as_ref() else {
+        return;
+    };
+    let width = 90.min(area.width.saturating_sub(4)).max(30);
+    let height = 18.min(area.height.saturating_sub(2)).max(8);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    let dim = colored(app.no_color, app.theme.dim);
+    let removed = colored(app.no_color, app.theme.error);
+    let added = colored(app.no_color, app.theme.link);
+    let body = Text::from(vec![
+        Line::from(vec![
+            RSpan::styled("Page: ", dim.add_modifier(Modifier::BOLD)),
+            RSpan::raw(edit.title.clone()),
+        ]),
+        Line::from(vec![
+            RSpan::styled("Summary: ", dim.add_modifier(Modifier::BOLD)),
+            RSpan::raw(edit.summary.clone()),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            RSpan::styled("- ", removed.add_modifier(Modifier::BOLD)),
+            RSpan::styled(edit.before.clone(), removed),
+        ]),
+        Line::from(vec![
+            RSpan::styled("+ ", added.add_modifier(Modifier::BOLD)),
+            RSpan::styled(edit.after.clone(), added),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            RSpan::styled("minor edit · ", dim),
+            RSpan::styled(
+                "Save this change? (y/n)",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ]),
+    ]);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(body)
+            .style(base_style(&app.theme, app.no_color))
+            .wrap(Wrap { trim: false })
+            .block(
+                UiBlock::default()
+                    .borders(Borders::ALL)
+                    .title("Confirm typo fix"),
             ),
         popup,
     );

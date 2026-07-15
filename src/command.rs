@@ -128,6 +128,19 @@ pub enum Command {
     /// `:logout` (PRD FR-ACC-9) — revoke locally (delete stored tokens) and
     /// link to `Special:OAuthManageMyGrants` for server-side revocation.
     Logout,
+    /// `:enable-editing` (PRD FR-ACC-8) — opt into typo-fix editing: flips the
+    /// `editing_enabled` config gate on for the session AND re-runs the OAuth
+    /// flow requesting the extra `editpage` grant (the *separate* opt-in the
+    /// ordinary read-only login never asks for). Both halves are required
+    /// before any `:edit` is permitted.
+    EnableEditing,
+    /// `:edit [summary]` (PRD FR-ACC-8) — fix a typo in the focused sentence
+    /// of the current MAIN-namespace article: fetch its wikitext, locate the
+    /// sentence, open `$EDITOR`, preview the diff, and save (minor, with a
+    /// conflict-detecting base revid) on confirmation. Gated by the editing
+    /// double opt-in; refused on non-main-namespace pages. The optional
+    /// argument is appended to the automatic "Typo fix via wikitui" summary.
+    Edit(Option<String>),
     /// `:watchlist` (PRD FR-ACC-2, logged in only) — the watched-pages list
     /// plus the "what changed" activity feed. Same view as `gW`.
     Watchlist,
@@ -492,7 +505,7 @@ fn validate_set_value(
     }
 }
 
-pub const USAGE: &str = "commands: open <title>, lang [<code>], theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, prefetch-log, interests, not-interested, stats, start, today, random [good], related, talk, info, set theme=<name>|images=on|off|prefetch=on|off|show-cn=on|off|measure=N|ambiguous_width=1|2|reading_wpm=N|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N|justify=on|off|hyphenate=on|off, set-tab measure=N|images=on|off|ambiguous_width=1|2|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N|justify=on|off|hyphenate=on|off (or set-tab key= to reset), config reload, vsplit, only, bilingual, wiki [<name>], set scrollbind, set show-cn, watchlist, notifications, contribs [username], prefs, sync, mirror-watchlist, search-offline, trail [all|days N|export md|dot|mermaid [path]], mksession <name>, session <name>, sessions, tts [stop], speak [stop], run <macro>, game [daily|share|<start> <goal>], xyzzy, help, quit";
+pub const USAGE: &str = "commands: open <title>, lang [<code>], theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, prefetch-log, interests, not-interested, stats, start, today, random [good], related, talk, info, set theme=<name>|images=on|off|prefetch=on|off|show-cn=on|off|measure=N|ambiguous_width=1|2|reading_wpm=N|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N|justify=on|off|hyphenate=on|off, set-tab measure=N|images=on|off|ambiguous_width=1|2|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N|justify=on|off|hyphenate=on|off (or set-tab key= to reset), config reload, vsplit, only, bilingual, wiki [<name>], set scrollbind, set show-cn, watchlist, notifications, contribs [username], prefs, enable-editing, edit [summary], sync, mirror-watchlist, search-offline, trail [all|days N|export md|dot|mermaid [path]], mksession <name>, session <name>, sessions, tts [stop], speak [stop], run <macro>, game [daily|share|<start> <goal>], xyzzy, help, quit";
 
 /// Parses one `:` command line. `user_theme_names` are accepted alongside
 /// the six built-ins for `:theme <name>` and `:set theme=<name>` (PRD
@@ -889,6 +902,11 @@ pub fn parse_with_user_themes(input: &str, user_theme_names: &[String]) -> Resul
         },
         // PRD FR-ACC-9.
         "logout" => Ok(Command::Logout),
+        // PRD FR-ACC-8: opt into editing (config gate + editpage re-auth).
+        "enable-editing" | "enableediting" => Ok(Command::EnableEditing),
+        // PRD FR-ACC-8: the gated typo-fix flow; the optional argument is a
+        // free-text summary note appended to the automatic prefix.
+        "edit" => Ok(Command::Edit((!arg.is_empty()).then(|| arg.to_string()))),
         // PRD FR-ACC-2.
         "watchlist" => Ok(Command::Watchlist),
         // PRD FR-ACC-3.
@@ -1722,6 +1740,18 @@ mod tests {
         assert_eq!(parse("login paste"), Ok(Command::Login(LoginMode::Paste)));
         assert!(parse("login bogus").is_err());
         assert_eq!(parse("logout"), Ok(Command::Logout));
+    }
+
+    #[test]
+    fn editing_commands_parse() {
+        // PRD FR-ACC-8.
+        assert_eq!(parse("enable-editing"), Ok(Command::EnableEditing));
+        assert_eq!(parse("enableediting"), Ok(Command::EnableEditing));
+        assert_eq!(parse("edit"), Ok(Command::Edit(None)));
+        assert_eq!(
+            parse("edit fixed teh->the"),
+            Ok(Command::Edit(Some("fixed teh->the".to_string())))
+        );
     }
 
     #[test]

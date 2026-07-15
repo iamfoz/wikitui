@@ -81,6 +81,53 @@ def current_revid(title):
     return revid + 1 if title == UPDATED_TITLE else revid
 
 
+# PRD FR-ACC-8 (typo-fix editing): the SOURCE wikitext of a page, served by
+# `action=query&prop=revisions&rvprop=content|ids|timestamp` — deliberately
+# distinct from the rendered PAGES HTML (an edit fixes the source, not the
+# render). The lead sentence of Alan_Turing mirrors its PAGES HTML lead (with a
+# `[[Computer science|computer science]]` link where the HTML has the anchor),
+# so the client's rendered-sentence → wikitext-span fuzzy locate resolves end
+# to end. A Talk: fixture exists so the client's main-namespace-only block is
+# exercised against a real non-main page (the block is client-side, before any
+# fetch — this is here for completeness).
+WIKITEXT = {
+    "Alan_Turing": (
+        "Alan Mathison Turing was an English mathematician, computer scientist, logician, "
+        "cryptanalyst, philosopher and theoretical biologist. He was highly influential in the "
+        "development of theoretical [[Computer science|computer science]], providing a "
+        "formalisation of the concepts of algorithm and computation with the Turing machine, "
+        "which can be considered a model of a general-purpose computer. Turing is widely "
+        "considered to be the father of theoretical computer science and artificial "
+        "intelligence.\n\n"
+        "== Early life ==\n"
+        "Alan Turing was born in London while his father was on leave from his position with "
+        "the Indian Civil Service."
+    ),
+    "Talk:Alan_Turing": (
+        "== Merge proposal ==\n"
+        "Should the history section here be merged into [[Computer science]] instead? ~~~~"
+    ),
+}
+
+# Pristine copy of the wikitext fixtures, so /debug/reset can restore them
+# after an edit-flow phase mutated WIKITEXT in place.
+WIKITEXT_SEED = {k: v for k, v in WIKITEXT.items()}
+
+# PRD FR-ACC-8 conflict detection: the CURRENT editable revid of each wikitext
+# page (mutable — a successful edit bumps it, and `/debug/bump-revid` bumps it
+# out of band to simulate another editor changing the page between the client's
+# fetch and its save, so a stale `baserevid` produces a real `editconflict`).
+WIKITEXT_REVID = {title: REVIDS.get(title, 9000 + i) for i, title in enumerate(WIKITEXT)}
+WIKITEXT_TIMESTAMP = "2026-07-15T08:00:00Z"
+
+# PRD FR-ACC-8: every `action=edit` this mock accepts, recorded for pty
+# verification (/debug/edits) — the exact title, spliced text, summary, minor
+# flag, baserevid, basetimestamp, and token the client sent, so a test can
+# confirm the save request shape AND that the wikitext splice byte-preserved
+# everything outside the edited sentence (the mock echoes the received text).
+RECORDED_EDITS = []
+
+
 def current_html(title, html):
     if title == UPDATED_TITLE:
         return html.replace(
@@ -1007,7 +1054,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
             READINGLISTS_SETUP_DONE[0] = False
             READINGLISTS_NEXT_ENTRY_ID[0] = 1
             READING_LIST_ENTRIES.clear()
+            # PRD FR-ACC-8: restore the editing fixtures' mutable state (the
+            # recorded edits, the per-page wikitext + revids) so an edit-flow
+            # phase starts clean, same as the account fixtures above.
+            RECORDED_EDITS.clear()
+            for k, v in WIKITEXT_SEED.items():
+                WIKITEXT[k] = v
+                WIKITEXT_REVID[k] = REVIDS.get(k, WIKITEXT_REVID[k])
             self._send_json({"ok": True})
+        elif parsed.path == '/debug/edits':
+            # PRD FR-ACC-8: every recorded typo-fix edit, so a pty test can
+            # confirm the save request shape (summary/minor/baserevid/token)
+            # AND byte-compare the received wikitext against the expected
+            # splice (the mock echoes the text verbatim).
+            self._send_json({"edits": list(RECORDED_EDITS)})
+        elif parsed.path == '/debug/wikitext':
+            # The current source wikitext + revid of a page (post-edit), so a
+            # test can confirm a save landed and what it wrote.
+            key = urllib.parse.unquote(params.get('title', [''])[0]).replace(' ', '_')
+            self._send_json({
+                "title": key.replace('_', ' '),
+                "revid": WIKITEXT_REVID.get(key),
+                "text": WIKITEXT.get(key),
+            })
+        elif parsed.path == '/debug/bump-revid':
+            # PRD FR-ACC-8 conflict simulation: bump a page's current revid out
+            # of band (as if another editor saved between the client's fetch
+            # and its save), so the client's next `action=edit` with the now-
+            # stale `baserevid` gets a real `editconflict`.
+            key = urllib.parse.unquote(params.get('title', [''])[0]).replace(' ', '_')
+            if key in WIKITEXT_REVID:
+                WIKITEXT_REVID[key] += 1
+            self._send_json({"title": key.replace('_', ' '), "revid": WIKITEXT_REVID.get(key)})
         elif parsed.path == '/debug/expire-tokens':
             # PRD §6.2 rule 8: bump the token epoch, instantly invalidating
             # every csrf/watch token minted before this call — the fixture a
@@ -1304,6 +1382,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 pages.append({"title": disp, "categories": [{"title": c} for c in cats]})
             self._send_json({"query": {"pages": pages}})
             return
+        # PRD FR-ACC-8: the SOURCE wikitext + base revision the typo-fix edit
+        # flow fetches (`prop=revisions&rvprop=content|ids|timestamp&
+        # rvslots=main`) — the current wikitext, not the rendered HTML. A page
+        # with no WIKITEXT fixture comes back `missing`, which the client
+        # treats as "couldn't fetch the source", never as an empty article to
+        # overwrite.
+        if action == 'query' and prop == 'revisions':
+            raw = urllib.parse.unquote(params.get('titles', [''])[0])
+            key = raw.replace(' ', '_')
+            text = WIKITEXT.get(key)
+            if text is None:
+                self._send_json({"query": {"pages": [{"title": raw.replace('_', ' '), "missing": True}]}})
+                return
+            self._send_json({
+                "query": {
+                    "pages": [{
+                        "title": raw.replace('_', ' '),
+                        "revisions": [{
+                            "revid": WIKITEXT_REVID[key],
+                            "timestamp": WIKITEXT_TIMESTAMP,
+                            "slots": {"main": {"contentmodel": "wikitext", "content": text}},
+                        }],
+                    }]
+                }
+            })
+            return
         # PRD FR-ML-1/2 (Appendix A "Langlinks"): `prop=langlinks&
         # llprop=autonym|langname|url`, one queried title, its LANGLINKS
         # entry (or an empty list for a title this fixture has none for —
@@ -1395,7 +1499,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # wire shapes on the real APIs too).
         action = form.get('action', '')
         username = _bearer_username(self.headers)
-        if action not in ('watch', 'thank', 'echomarkread', 'readinglists'):
+        if action not in ('watch', 'thank', 'echomarkread', 'readinglists', 'edit'):
             self.send_response(404)
             self.end_headers()
             return
@@ -1405,6 +1509,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         token_kind = 'watch' if action == 'watch' else 'csrf'
         if not _token_valid(token_kind, form.get('token', '')):
             self._send_json({"error": {"code": "badtoken", "info": "Invalid CSRF token"}})
+            return
+        if action == 'edit':
+            self._serve_edit_write(form)
             return
         if action == 'watch':
             # PRD FR-BM-6: `titles=A|B` (the watch-mirror's own batching) is
@@ -1480,6 +1587,62 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         self._send_json({
             "error": {"code": "readinglists-bad-command", "info": f"unknown command {command!r}"}
+        })
+
+    def _serve_edit_write(self, form):
+        # PRD FR-ACC-8: the ONLY article-write this mock accepts — a typo-fix
+        # `action=edit`. Login + a valid csrf token were already checked by
+        # `_serve_action_api_write`. Enforces:
+        #   - `nocreate`: a title with no WIKITEXT fixture is a `missingtitle`
+        #     error (this can only EDIT existing articles, never create one);
+        #   - conflict detection: a `baserevid` that doesn't match the page's
+        #     current revid is an `editconflict` (the page changed underneath
+        #     the client — never force-overwritten);
+        # On success it stores the received text verbatim (echoed via
+        # /debug/edits so a test can byte-compare the splice), bumps the revid,
+        # and reports the new revision.
+        raw_title = form.get('title', '')
+        key = raw_title.replace(' ', '_')
+        if key not in WIKITEXT:
+            self._send_json({
+                "error": {"code": "missingtitle", "info": "The page you tried to edit doesn't exist."}
+            })
+            return
+        try:
+            baserevid = int(form.get('baserevid', '0') or '0')
+        except ValueError:
+            baserevid = 0
+        current = WIKITEXT_REVID[key]
+        if baserevid != current:
+            self._send_json({
+                "error": {"code": "editconflict", "info": "Edit conflict detected."}
+            })
+            return
+        text = form.get('text', '')
+        summary = form.get('summary', '')
+        minor = form.get('minor', '') in ('1', 'true')
+        newrevid = current + 1
+        WIKITEXT[key] = text
+        WIKITEXT_REVID[key] = newrevid
+        RECORDED_EDITS.append({
+            "title": raw_title.replace('_', ' '),
+            "text": text,
+            "summary": summary,
+            "minor": minor,
+            "nocreate": form.get('nocreate', '') in ('1', 'true'),
+            "baserevid": baserevid,
+            "basetimestamp": form.get('basetimestamp', ''),
+            "token": form.get('token', ''),
+        })
+        self._send_json({
+            "edit": {
+                "result": "Success",
+                "pageid": 1,
+                "title": raw_title.replace('_', ' '),
+                "oldrevid": current,
+                "newrevid": newrevid,
+                "newtimestamp": WIKITEXT_TIMESTAMP,
+            }
         })
 
     def _serve_oauth_token(self, form):

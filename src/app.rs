@@ -1097,6 +1097,20 @@ pub struct App {
     /// on `:logout` (`cmd_logout`), since a new session needs its own.
     pub tokens: crate::account::TokenCache,
 
+    // -- Typo-fix editing (PRD FR-ACC-8, gated) -----------------------------
+    /// The config half of the editing double opt-in gate (`editing_enabled`,
+    /// default false). `:enable-editing` flips it on for the session; the
+    /// config key persists it. Even `true` never enables writing on its own —
+    /// the `editpage` OAuth grant (`AuthState::has_editpage`) is the required
+    /// second half (see `editing::edit_gate`).
+    pub editing_enabled: bool,
+    /// A prepared, unsaved edit awaiting the reader's explicit confirmation
+    /// (PRD FR-ACC-8's "REQUIRE explicit confirmation before saving"). `Some`
+    /// only between `:edit`'s $EDITOR step and the `y`/`n` diff-preview
+    /// decision; the save request is fired ONLY from the `y` branch, so there
+    /// is structurally no path that saves without a confirm.
+    pub pending_edit: Option<PendingEdit>,
+
     // -- Preferences (PRD FR-ACC-7, read-only) ------------------------------
     /// The curated prefs card's content, `None` until `:prefs` has fetched
     /// once.
@@ -1287,6 +1301,29 @@ pub struct BulkSaveRequest {
     pub label: String,
     pub tier: Tier,
     pub targets: Vec<(String, String)>,
+}
+
+/// PRD FR-ACC-8: a prepared, unsaved typo-fix edit awaiting the reader's
+/// explicit confirmation. Everything needed to fire the save is captured here
+/// at `:edit` time (after the $EDITOR step) so the confirm handler splices and
+/// posts with no re-fetch and no further decisions — the diff the reader sees
+/// (`before`/`after`) is exactly the change that will be saved. `baserevid`/
+/// `basetimestamp` were captured at fetch time and travel to the API for
+/// conflict detection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingEdit {
+    pub lang: String,
+    pub title: String,
+    /// The full article wikitext with the sentence already spliced — what a
+    /// confirmed save posts verbatim (byte-preserving outside the sentence).
+    pub new_wikitext: String,
+    /// The located sentence's original wikitext span (diff "before").
+    pub before: String,
+    /// The reader's edited wikitext span (diff "after").
+    pub after: String,
+    pub summary: String,
+    pub baserevid: u64,
+    pub basetimestamp: String,
 }
 
 impl App {
@@ -1492,6 +1529,8 @@ impl App {
             contribs_selected: 0,
             contribs_prior_mode: Mode::Reading,
             tokens: crate::account::TokenCache::new(),
+            editing_enabled: false,
+            pending_edit: None,
             prefs: None,
             prefs_prior_mode: Mode::Reading,
             watchlist_mirror_tag: "watched".to_string(),
@@ -2457,6 +2496,34 @@ impl App {
 
     pub fn active_tab_mut(&mut self) -> &mut Tab {
         &mut self.tabs[self.active]
+    }
+
+    // -- Typo-fix editing (PRD FR-ACC-8) ------------------------------------
+
+    /// The FR-ACC-8 editing gate for the current session: the config opt-in
+    /// (`editing_enabled`) AND a logged-in session carrying the `editpage`
+    /// grant. The single predicate every edit command routes through — see
+    /// `editing::edit_gate`.
+    pub fn edit_gate(&self) -> crate::editing::EditGate {
+        let logged_in = self.auth.is_some();
+        let has_grant = self.auth.as_ref().is_some_and(|a| a.has_editpage());
+        crate::editing::edit_gate(self.editing_enabled, logged_in, has_grant)
+    }
+
+    /// PRD FR-ACC-8: the rendered sentence the reader has selected to edit —
+    /// the sentence containing the currently focused link's anchor text, drawn
+    /// from that link's own paragraph. `None` when nothing is focused, no
+    /// document is open, or the anchor couldn't be resolved to a sentence.
+    /// This is the *rendered* text; `editing::locate_sentence` maps it to the
+    /// wikitext source span.
+    pub fn focused_sentence(&self) -> Option<String> {
+        let tab = self.active_tab();
+        let doc = tab.doc.as_ref()?;
+        let link_index = tab.focused_link?;
+        let anchor = tab.links.get(link_index)?.text.clone();
+        let block_text = crate::editing::block_text_containing_link(doc, link_index)?;
+        let sentences = crate::editing::split_sentences(&block_text);
+        crate::editing::sentence_containing(&sentences, &anchor).cloned()
     }
 
     /// The cache/session-state scope key (`api::wiki_scope`) for the wiki new

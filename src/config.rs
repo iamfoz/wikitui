@@ -263,6 +263,13 @@ pub struct ResolvedConfig {
     /// `include_nonfree`/`startpage`), a preference set once, not a CLI/env
     /// concern.
     pub pro: Valued<bool>,
+    /// PRD FR-ACC-8's `editing_enabled` (file-only, default `false`): the
+    /// config half of the typo-fix editing double opt-in gate. Even when
+    /// `true`, editing still requires the separate `editpage` OAuth grant
+    /// (`:enable-editing` re-auth) — this bool alone never enables writing.
+    /// File only (a deliberate, set-once safety opt-in, like `include_nonfree`
+    /// /`pro`); `:enable-editing` also flips it on for the running session.
+    pub editing_enabled: Valued<bool>,
     /// PRD FR-DL-1's `startpage = feed|blank|resume`, default `feed`. File
     /// only (like `include_nonfree`/`history.*`) — a preference set once,
     /// not worth a CLI flag or env var for a single run. Parsed into
@@ -750,6 +757,7 @@ pub fn resolve(
         "images",
         "include_nonfree",
         "pro",
+        "editing_enabled",
         "startpage",
         "restore_session",
         "reading_wpm",
@@ -851,6 +859,13 @@ pub fn resolve(
     let images = resolve_images(env, &table, &mut issues);
     let include_nonfree = resolve_include_nonfree(&table, &mut issues);
     let pro = resolve_pro(&table, &mut issues);
+    let editing_enabled = resolve_bool_field(
+        "editing_enabled",
+        None,
+        table.get("editing_enabled"),
+        false,
+        &mut issues,
+    );
     let startpage = resolve_startpage(&table, &mut issues);
     let restore_session = resolve_restore_session(&table, &mut issues);
     let reading_wpm = resolve_reading_wpm(&table, &mut issues);
@@ -894,6 +909,7 @@ pub fn resolve(
         images,
         include_nonfree,
         pro,
+        editing_enabled,
         startpage,
         restore_session,
         reading_wpm,
@@ -3916,6 +3932,25 @@ mod tests {
         );
         assert!(from_file.pro.value);
         assert_eq!(from_file.pro.source, Source::File);
+        cleanup(&path);
+    }
+
+    /// PRD FR-ACC-8: `editing_enabled` (file-only, default false) is the
+    /// config half of the editing double opt-in — same shape as `pro`.
+    #[test]
+    fn editing_enabled_defaults_false_and_honors_file() {
+        let default = resolve(&CliOverrides::default(), &EnvOverrides::default(), None);
+        assert!(!default.editing_enabled.value);
+        assert_eq!(default.editing_enabled.source, Source::Default);
+
+        let path = temp_config("editing_enabled = true\n");
+        let from_file = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert!(from_file.editing_enabled.value);
+        assert_eq!(from_file.editing_enabled.source, Source::File);
         cleanup(&path);
     }
 

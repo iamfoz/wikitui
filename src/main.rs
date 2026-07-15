@@ -17,6 +17,7 @@ mod config;
 mod crashguard;
 mod doc;
 mod doctor;
+mod editing;
 mod fetch_queue;
 mod fuzzy;
 mod game;
@@ -605,6 +606,7 @@ async fn main() -> Result<()> {
         resolved.images.value,
         resolved.include_nonfree.value,
         resolved.pro.value,
+        resolved.editing_enabled.value,
         resolved.startpage.value,
         resolved.restore_session.value,
         prefetch_config_from(&resolved.prefetch),
@@ -2269,6 +2271,7 @@ async fn run(
     images_config: Option<bool>,
     include_nonfree: bool,
     pro: bool,
+    editing_enabled: bool,
     startpage_config: String,
     restore_session_config: bool,
     prefetch_config: netqueue::SubstrateConfig,
@@ -2371,6 +2374,8 @@ async fn run(
     app.images_override = images_config;
     app.include_nonfree = include_nonfree;
     app.pro = pro;
+    // PRD FR-ACC-8: the config half of the editing double opt-in gate.
+    app.editing_enabled = editing_enabled;
     // Already validated during resolution (an invalid value fell back to
     // "feed" with a warning above) — same belt-and-braces default as
     // `theme`/`cite_style` just above this function.
@@ -3276,6 +3281,13 @@ fn apply_config_reload(app: &mut App) {
     }
     app.include_nonfree = resolved.include_nonfree.value;
     app.pro = resolved.pro.value;
+    // PRD FR-ACC-8: a config reload can flip the editing config gate — but a
+    // `:enable-editing` opt-in made this session must not be silently undone
+    // by a reload of a config file that never set the key, so only take the
+    // file's value when it actually set one.
+    if resolved.editing_enabled.source != config::Source::Default {
+        app.editing_enabled = resolved.editing_enabled.value;
+    }
     // Measure/ambiguous_wide feed layout, not just paint — drop the cached
     // layout so the next `ensure_layout` recomputes instead of reusing a
     // stale one keyed on the old options.
@@ -4241,6 +4253,22 @@ async fn handle_key(
                 );
             }
             _ => app.notice = Some("Bulk save cancelled".to_string()),
+        }
+        return;
+    }
+
+    // PRD FR-ACC-8's diff-preview confirmation, intercepted the same way as
+    // the quit/bulk-save confirmations above: a prepared, UNSAVED edit is on
+    // screen and the reader must explicitly confirm. `y` fires the save (the
+    // ONLY path that reaches `action=edit`); anything else cancels it,
+    // discarding the pending edit. Nothing was written until this point.
+    if app.pending_edit.is_some() {
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => confirm_edit_save(client, app).await,
+            _ => {
+                app.pending_edit = None;
+                app.notice = Some("Edit cancelled — nothing saved".to_string());
+            }
         }
         return;
     }
@@ -6387,7 +6415,7 @@ async fn dispatch_action(
         }
         // PRD FR-ACC-1 / §5.9: the palette/keybind entry point mirrors bare
         // `:login` (the loopback flow).
-        Action::Login => cmd_login_loopback(terminal, client, app).await,
+        Action::Login => cmd_login_loopback(terminal, client, app, false).await,
         // PRD FR-ACC-9.
         Action::Logout => cmd_logout(app),
         // PRD FR-ACC-2.
@@ -6448,6 +6476,7 @@ async fn cmd_login_loopback(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     client: &WikiClient,
     app: &mut App,
+    editpage: bool,
 ) {
     if !app.auth_runtime.is_configured() {
         app.notice = Some(
@@ -6457,12 +6486,16 @@ async fn cmd_login_loopback(
         return;
     }
     if let Some(existing) = app.auth.as_ref() {
-        // Already logged in: re-verify the session (the authed action that
-        // transparently refreshes a near-expired token, PRD §5.9).
-        let name = existing.username().to_string();
-        app.notice = Some(format!("Already logged in as {name} — checking session…"));
-        reverify_session(client, app).await;
-        return;
+        // PRD FR-ACC-8: an editing re-auth must re-run the flow to obtain the
+        // extra `editpage` grant when the current session lacks it — only a
+        // plain `:login` (or an already-editing session) short-circuits to a
+        // reverify.
+        if !editpage || existing.has_editpage() {
+            let name = existing.username().to_string();
+            app.notice = Some(format!("Already logged in as {name} — checking session…"));
+            reverify_session(client, app).await;
+            return;
+        }
     }
 
     let server = match auth::LoopbackServer::bind() {
@@ -6476,12 +6509,18 @@ async fn cmd_login_loopback(
     let redirect_uri = server.redirect_uri();
     let pkce = auth::Pkce::generate();
     let state = auth::random_state();
-    let url = auth::build_authorize_url(
+    let scope = if editpage {
+        auth::scope_param_editing()
+    } else {
+        auth::scope_param()
+    };
+    let url = auth::build_authorize_url_scoped(
         &app.auth_runtime.authorize_url,
         &app.auth_runtime.client_id,
         &pkce.challenge,
         &state,
         &redirect_uri,
+        &scope,
     );
     let opened = auth::open_browser(&url);
     app.status = format!("Waiting for browser authorization on 127.0.0.1:{port} …");
@@ -6512,7 +6551,15 @@ async fn cmd_login_loopback(
         app.notice = Some(format!("Login rejected: {e}"));
         return;
     }
-    finish_login(client, app, &pkce.verifier, &callback.code, &redirect_uri).await;
+    finish_login(
+        client,
+        app,
+        &pkce.verifier,
+        &callback.code,
+        &redirect_uri,
+        editpage,
+    )
+    .await;
 }
 
 /// PRD §5.9's manual code-paste fallback setup: builds the authorization URL
@@ -6579,12 +6626,15 @@ async fn submit_login_paste(client: &WikiClient, app: &mut App) {
         app.notice = Some(format!("Paste rejected: {e}"));
         return;
     }
+    // The paste fallback is the read-only login path only; editing opt-in goes
+    // through `:enable-editing`'s loopback re-auth (PRD FR-ACC-8).
     finish_login(
         client,
         app,
         &pending.verifier,
         &callback.code,
         &pending.redirect_uri,
+        false,
     )
     .await;
 }
@@ -6599,6 +6649,7 @@ async fn finish_login(
     verifier: &str,
     code: &str,
     redirect_uri: &str,
+    editpage: bool,
 ) {
     let rt = app.auth_runtime.clone();
     let http = match auth::token_http_client(&rt.contact) {
@@ -6632,13 +6683,17 @@ async fn finish_login(
         }
     };
     let now = chrono::Utc::now().timestamp();
-    let tokens = match auth::Tokens::from_response(&resp, username.clone(), now, None) {
+    let mut tokens = match auth::Tokens::from_response(&resp, username.clone(), now, None) {
         Ok(t) => t,
         Err(e) => {
             app.notice = Some(format!("Login failed: {e}"));
             return;
         }
     };
+    // PRD FR-ACC-8: record the editing opt-in on the session obtained via the
+    // `:enable-editing` re-auth (which requested the `editpage` scope) — an
+    // ordinary `:login` leaves this false, so editing stays gated off.
+    tokens.editpage = editpage;
     let Some(store) = build_token_store() else {
         app.notice =
             Some("Login failed: no token store available (no keychain, no state dir)".to_string());
@@ -6663,10 +6718,16 @@ async fn finish_login(
     app.status = String::new();
     // SEC-4: name the storage honestly — a file fallback is less safe than a
     // keychain and the reader should know.
-    app.notice = Some(if file_fallback {
-        format!("Logged in as {username}  (tokens stored in {store_desc}, not an OS keychain)")
+    let storage = if file_fallback {
+        format!("tokens stored in {store_desc}, not an OS keychain")
     } else {
-        format!("Logged in as {username}  (tokens stored in {store_desc})")
+        format!("tokens stored in {store_desc}")
+    };
+    app.notice = Some(if editpage {
+        // PRD FR-ACC-8: the editing double opt-in is now fully satisfied.
+        format!("Logged in as {username} with editing enabled — :edit fixes a typo  ({storage})")
+    } else {
+        format!("Logged in as {username}  ({storage})")
     });
     // PRD FR-ACC-3's login/startup poll (see `account.rs`'s poll-cadence
     // doc): the unread badge shows up right away, without waiting for the
@@ -6729,6 +6790,272 @@ fn cmd_logout(app: &mut App) {
         }
         None => app.notice = Some("Not logged in".to_string()),
     }
+}
+
+// ---------------------------------------------------------------------------
+// PRD FR-ACC-8: gated typo-fix editing — the product's ONLY article-write path
+// ---------------------------------------------------------------------------
+
+/// PRD FR-ACC-8's `:enable-editing`: the deliberate opt-in into typo-fix
+/// editing. Flips the config gate (`editing_enabled`) on for the session AND
+/// re-runs the OAuth flow requesting the extra `editpage` grant — the
+/// *separate* opt-in the ordinary read-only login never asks for. Both halves
+/// must succeed before `:edit` is permitted (`editing::edit_gate`); enabling
+/// the config half but declining the grant leaves editing still gated off.
+async fn cmd_enable_editing(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    client: &WikiClient,
+    app: &mut App,
+) {
+    // The config half of the double gate. Persisting it across restarts is the
+    // `editing_enabled` config key's job (documented on `ResolvedConfig`);
+    // this flips it on for the running session.
+    app.editing_enabled = true;
+    if app.auth.as_ref().is_some_and(|a| a.has_editpage()) {
+        app.notice = Some("Editing already enabled — :edit fixes a typo".to_string());
+        return;
+    }
+    // The grant half: a re-auth requesting `editpage`. `cmd_login_loopback`
+    // proceeds with the full flow (not a mere reverify) precisely because the
+    // current session lacks the grant.
+    cmd_login_loopback(terminal, client, app, true).await;
+}
+
+/// PRD FR-ACC-8: the gated typo-fix flow, up to (but NOT including) the save.
+/// Every guardrail is checked here in order — the double opt-in gate,
+/// main-namespace-only, a resolvable focused sentence, a confidently located
+/// wikitext span — before `$EDITOR` even opens; the actual write is deferred
+/// to `confirm_edit_save`, reached only from the diff-preview `y` branch, so
+/// there is structurally no path that saves without an explicit confirm.
+async fn cmd_edit(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    client: &WikiClient,
+    app: &mut App,
+    user_summary: Option<&str>,
+) {
+    // Gate 1: the double opt-in (config + editpage grant).
+    let gate = app.edit_gate();
+    if !gate.is_ready() {
+        app.notice = Some(gate.message().to_string());
+        return;
+    }
+    // Gate 2: main-namespace only. A talk/template/user/… page is refused
+    // before any request is made (FR-ACC-8's hard prohibition).
+    let Some(doc) = app.active_tab().doc.as_ref() else {
+        app.notice = Some("Open an article first".to_string());
+        return;
+    };
+    let title = doc.title.clone();
+    if !editing::is_main_namespace(&title) {
+        app.notice = Some(format!(
+            "editing is main-namespace only — \"{title}\" is not an article"
+        ));
+        return;
+    }
+    let lang = app.active_tab().lang.clone();
+
+    // Gate 3: a resolvable focused sentence (the reader's cursor).
+    let Some(sentence) = app.focused_sentence() else {
+        app.notice =
+            Some("focus a link in the sentence you want to fix (Tab), then :edit".to_string());
+        return;
+    };
+
+    // The $EDITOR spec (SEC-5: a user-configured command; the sentence's
+    // wikitext travels via the temp file, never on argv).
+    let Ok(editor_spec) = std::env::var("EDITOR") else {
+        app.notice = Some("set $EDITOR to edit".to_string());
+        return;
+    };
+    let Some((program, args)) = bookmarks::parse_editor_command(&editor_spec) else {
+        app.notice = Some("set $EDITOR to edit".to_string());
+        return;
+    };
+
+    // Fetch the SOURCE wikitext + base revision (needs the OAuth token).
+    let Some(access_token) = require_login(app, "edit an article").await else {
+        return;
+    };
+    let fetched = match client.fetch_wikitext(&lang, &title, &access_token).await {
+        Ok(f) => f,
+        Err(e) => {
+            app.notice = Some(format!("Couldn't fetch the source wikitext: {e}"));
+            return;
+        }
+    };
+
+    // Gate 4: locate the sentence in the wikitext, aborting on any doubt
+    // rather than risk editing the wrong span (FR-ACC-8's safety abort).
+    let (span_start, span_end) = match editing::locate_sentence(&fetched.text, &sentence) {
+        editing::Located::Found { start, end } => (start, end),
+        editing::Located::NotFound | editing::Located::Ambiguous => {
+            app.notice = Some("couldn't locate this text in the source — edit skipped".to_string());
+            return;
+        }
+    };
+    let original_span = fetched.text[span_start..span_end].to_string();
+
+    // Seed a temp file with the located sentence's WIKITEXT and open $EDITOR
+    // (SEC-5: the temp file PATH is argv; the content only ever rides the file).
+    let tmp = std::env::temp_dir().join(format!(
+        "wikitui-edit-{}-{}.wiki",
+        std::process::id(),
+        EDIT_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    if std::fs::write(&tmp, &original_span).is_err() {
+        app.notice = Some("Could not create a temp file to edit".to_string());
+        return;
+    }
+    let status = {
+        let _suspended = SuspendedTerminal::suspend(terminal);
+        std::process::Command::new(&program)
+            .args(&args)
+            .arg(&tmp)
+            .status()
+    };
+    let edited = match status {
+        Ok(exit) if exit.success() => std::fs::read_to_string(&tmp).ok(),
+        Ok(_) | Err(_) => None,
+    };
+    let _ = std::fs::remove_file(&tmp);
+    let Some(edited_span) = edited else {
+        app.notice = Some("Editor exited without saving — edit cancelled".to_string());
+        return;
+    };
+    // Editors add a trailing newline on save; drop it so a no-op edit is
+    // recognized as such and the splice stays byte-clean.
+    let edited_span = edited_span.trim_end_matches(['\n', '\r']).to_string();
+
+    let diff = editing::SentenceDiff::new(&original_span, &edited_span);
+    if !diff.is_change() {
+        app.notice = Some("No change — edit skipped".to_string());
+        return;
+    }
+
+    // Splice the edited span back into the full wikitext (byte-preserving
+    // everything outside the located sentence) and stash the prepared, UNSAVED
+    // edit for the diff-preview confirmation. Nothing is written yet.
+    let new_wikitext = editing::splice(&fetched.text, span_start, span_end, &edited_span);
+    app.pending_edit = Some(app::PendingEdit {
+        lang,
+        title: title.clone(),
+        new_wikitext,
+        before: original_span,
+        after: edited_span,
+        summary: editing::build_summary(user_summary),
+        baserevid: fetched.revid,
+        basetimestamp: fetched.timestamp,
+    });
+    app.status = String::new();
+    app.notice = Some(format!("Review the change to \"{title}\" — save? (y/n)"));
+}
+
+/// Per-call-unique temp filenames for [`cmd_edit`] within one process
+/// (mirroring `ANNOTATE_TMP_COUNTER`).
+static EDIT_TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// PRD FR-ACC-8: fires the confirmed save — the ONLY place `action=edit` is
+/// ever reached. Re-checks the gate defensively, then posts the spliced
+/// wikitext with the auto summary, the minor flag, and the base revid/
+/// timestamp for conflict detection (`edit_with_retry`). An edit conflict is
+/// surfaced, never forced; a badtoken triggers exactly one refetch-and-retry
+/// (§6.2 rule 8, via `edit_with_retry`).
+async fn confirm_edit_save(client: &WikiClient, app: &mut App) {
+    let Some(pending) = app.pending_edit.take() else {
+        return;
+    };
+    // Defensive re-check: the gate can only have tightened (a logout) between
+    // preparing and confirming, never loosened.
+    if !app.edit_gate().is_ready() {
+        app.notice = Some(app.edit_gate().message().to_string());
+        return;
+    }
+    let Some(access_token) = require_login(app, "edit an article").await else {
+        return;
+    };
+    let body = match edit_with_retry(app, client, &access_token, &pending).await {
+        Ok(b) => b,
+        Err(e) => {
+            app.notice = Some(format!("Edit failed: {e}"));
+            return;
+        }
+    };
+    match editing::parse_edit_response(&body) {
+        editing::EditOutcome::Success { newrevid } => {
+            // Keep the open tab's base revid current so an immediate second
+            // edit doesn't false-conflict against the now-stale one.
+            if newrevid != 0
+                && app.active_tab().doc.as_ref().map(|d| &d.title) == Some(&pending.title)
+            {
+                app.active_tab_mut().current_revid = newrevid;
+            }
+            app.notice = Some(format!(
+                "Saved typo fix to \"{}\" (revision {newrevid})",
+                pending.title
+            ));
+        }
+        editing::EditOutcome::Conflict => {
+            app.notice = Some(
+                "the page changed since you fetched it — re-fetch and retry (edit not saved)"
+                    .to_string(),
+            );
+        }
+        editing::EditOutcome::Failure(msg) => {
+            app.notice = Some(format!("Edit not saved: {msg}"));
+        }
+    }
+}
+
+/// PRD §6.2 rule 8's badtoken retry, for `action=edit` (the csrf-token
+/// counterpart of `watch_with_retry`/`thank`): fetches (or reuses) the cached
+/// CSRF token, attempts the save, and — only on a `badtoken` response —
+/// invalidates the cache, fetches one fresh token, and retries exactly once.
+async fn edit_with_retry(
+    app: &mut App,
+    client: &WikiClient,
+    access_token: &str,
+    pending: &app::PendingEdit,
+) -> Result<Vec<u8>> {
+    let post = |token: String, client: &WikiClient| {
+        let (lang, title, text, summary, baserevid, basetimestamp) = (
+            pending.lang.clone(),
+            pending.title.clone(),
+            pending.new_wikitext.clone(),
+            pending.summary.clone(),
+            pending.baserevid,
+            pending.basetimestamp.clone(),
+        );
+        let access = access_token.to_string();
+        let client = client.clone();
+        async move {
+            client
+                .edit_raw(
+                    &lang,
+                    &access,
+                    &title,
+                    &text,
+                    &summary,
+                    baserevid,
+                    &basetimestamp,
+                    &token,
+                )
+                .await
+        }
+    };
+    let write_token = app
+        .tokens
+        .csrf_token(client, &pending.lang, access_token)
+        .await?;
+    let body = post(write_token, client).await?;
+    if !account::is_badtoken_response(&body) {
+        return Ok(body);
+    }
+    app.tokens.invalidate_csrf();
+    let fresh = app
+        .tokens
+        .csrf_token(client, &pending.lang, access_token)
+        .await?;
+    post(fresh, client).await
 }
 
 // ---------------------------------------------------------------------------
@@ -7776,10 +8103,15 @@ async fn execute_command(
             });
         }
         // PRD FR-ACC-1 / §5.9.
-        Command::Login(LoginMode::Loopback) => cmd_login_loopback(terminal, client, app).await,
+        Command::Login(LoginMode::Loopback) => {
+            cmd_login_loopback(terminal, client, app, false).await
+        }
         Command::Login(LoginMode::Paste) => cmd_login_paste(app),
         // PRD FR-ACC-9.
         Command::Logout => cmd_logout(app),
+        // PRD FR-ACC-8: the editing double opt-in and the gated typo-fix flow.
+        Command::EnableEditing => cmd_enable_editing(terminal, client, app).await,
+        Command::Edit(summary) => cmd_edit(terminal, client, app, summary.as_deref()).await,
         // PRD FR-ACC-2. Same action as `gW`.
         Command::Watchlist => open_watchlist(client, app).await,
         // PRD FR-ACC-3.
