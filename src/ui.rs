@@ -132,6 +132,7 @@ fn kind_style(
     redlinks: &HashSet<&str>,
     theme: &Theme,
     no_color: bool,
+    show_cn: bool,
 ) -> Style {
     match kind {
         SpanKind::Plain => Style::default(),
@@ -204,6 +205,20 @@ fn kind_style(
         // appears where the two could be confused) without needing a new
         // theme color (`§FR-RD-7` allows "a math color *or* dim").
         SpanKind::Math => colored(no_color, theme.dim).add_modifier(Modifier::ITALIC),
+        // PRD FR-DL-4: "highlighting", not "always-on styling" — the marker
+        // text (`doc::CITATION_NEEDED_MARKER`) renders as ordinary prose
+        // until `:set show-cn` is on, at which point it dims to stand apart
+        // from the surrounding claim (and becomes `]c`/`[c`-navigable and
+        // status-bar-counted — both decided by `App::show_cn` elsewhere, not
+        // here). Reading is therefore unaffected by this feature at all
+        // while the toggle is off, its documented default.
+        SpanKind::CitationNeeded => {
+            if show_cn {
+                colored(no_color, theme.dim)
+            } else {
+                Style::default()
+            }
+        }
     }
 }
 
@@ -230,6 +245,7 @@ fn paint_line(
     redlinks: &HashSet<&str>,
     theme: &Theme,
     no_color: bool,
+    show_cn: bool,
     matches: &[MatchSpan],
     is_current: &dyn Fn(MatchSpan) -> bool,
     image_store: &crate::image::ImageStore,
@@ -271,6 +287,7 @@ fn paint_line(
             redlinks,
             theme,
             no_color,
+            show_cn,
         );
         let graphemes: Vec<&str> = s.text.graphemes(true).collect();
         let mut cursor = 0usize;
@@ -335,6 +352,7 @@ fn paint_document(
     redlinks: &HashSet<&str>,
     theme: &Theme,
     no_color: bool,
+    show_cn: bool,
     find_occurrences: &[crate::layout::Occurrence],
     find_index: usize,
     image_store: &crate::image::ImageStore,
@@ -366,6 +384,7 @@ fn paint_document(
                     redlinks,
                     theme,
                     no_color,
+                    show_cn,
                     &per_line[i],
                     &is_current,
                     image_store,
@@ -950,6 +969,7 @@ fn draw_reading(frame: &mut Frame, app: &mut App, area: Rect) {
                 &redlinks,
                 &app.theme,
                 app.no_color,
+                app.show_cn,
                 &tab.find_occurrences,
                 tab.find_index,
                 &app.image_store,
@@ -1188,6 +1208,7 @@ fn paint_pane(
                 &redlinks,
                 &app.theme,
                 app.no_color,
+                app.show_cn,
                 &tab.find_occurrences,
                 tab.find_index,
                 &app.image_store,
@@ -3447,10 +3468,41 @@ fn status_bar_text(app: &App, width: u16) -> String {
                 .current_quality_badge()
                 .map(|b| format!("   {b}"))
                 .unwrap_or_default();
-            match tab.focused_link.and_then(|i| tab.links.get(i)) {
+            // PRD FR-DL-4: "N uncited claims", the same low-priority-suffix
+            // treatment as `hint`/`badge` — shown only while the toggle is
+            // on (default off) and only when the page actually has any, so
+            // reading with the feature untouched sees no change at all.
+            let cn = if app.show_cn {
+                tab.doc
+                    .as_ref()
+                    .map(crate::doc::count_citation_needed)
+                    .filter(|&n| n > 0)
+                    .map(|n| format!("   {n} uncited claim{}", if n == 1 { "" } else { "s" }))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            // PRD FR-DL-6: the wiki-walk HUD, a prefix (not a suffix like
+            // the above three) since it's the primary thing a player wants
+            // to see at a glance, ahead of whatever the page itself shows.
+            let game_hud = app
+                .game
+                .as_ref()
+                .map(|g| {
+                    let elapsed =
+                        crate::game::format_elapsed(crate::history::now_unix() - g.started_at);
+                    format!(
+                        "[wiki-walk {} clicks {elapsed}] {} \u{2192} {}   ",
+                        g.clicks(),
+                        g.current(),
+                        g.goal
+                    )
+                })
+                .unwrap_or_default();
+            let body = match tab.focused_link.and_then(|i| tab.links.get(i)) {
                 Some(link) if link.internal_title.is_some() => {
                     format!(
-                        "{}→ {} ({}/{})   Tab/S-Tab: cycle   Enter: open   H: back   L: forward{hint}{badge}",
+                        "{}→ {} ({}/{})   Tab/S-Tab: cycle   Enter: open   H: back   L: forward{hint}{badge}{cn}",
                         tab.page_source.prefix(),
                         link.text,
                         tab.focused_link.unwrap() + 1,
@@ -3458,7 +3510,7 @@ fn status_bar_text(app: &App, width: u16) -> String {
                     )
                 }
                 Some(link) => format!(
-                    "{}→ {} (external, not yet followable){hint}{badge}",
+                    "{}→ {} (external, not yet followable){hint}{badge}{cn}",
                     tab.page_source.prefix(),
                     link.text
                 ),
@@ -3471,12 +3523,16 @@ fn status_bar_text(app: &App, width: u16) -> String {
                     if titles.len() > 1 {
                         let prefix = tab.page_source.prefix();
                         let budget = (width as usize).saturating_sub(display_width(&prefix));
-                        format!("{prefix}{}{hint}{badge}", build_breadcrumb(&titles, budget))
+                        format!(
+                            "{prefix}{}{hint}{badge}{cn}",
+                            build_breadcrumb(&titles, budget)
+                        )
                     } else {
-                        format!("{}{hint}{badge}", app.status)
+                        format!("{}{hint}{badge}{cn}", app.status)
                     }
                 }
-            }
+            };
+            format!("{game_hud}{body}")
         }
     }
 }
@@ -3884,6 +3940,7 @@ mod tests {
             &HashSet::new(),
             &theme,
             false,
+            false, // show_cn
             &[],
             0,
             &crate::image::ImageStore::new(),
@@ -3957,6 +4014,7 @@ mod tests {
             &HashSet::new(),
             &theme,
             false,
+            false, // show_cn
             &[],
             0,
             &crate::image::ImageStore::new(),
@@ -4013,6 +4071,7 @@ mod tests {
             &HashSet::new(),
             &theme,
             false,
+            false, // show_cn
             &[],
             0,
             &crate::image::ImageStore::new(),
@@ -4072,6 +4131,7 @@ mod tests {
             &redlinks,
             &theme,
             false,
+            false, // show_cn
             &[],
             0,
             &crate::image::ImageStore::new(),
@@ -4084,6 +4144,72 @@ mod tests {
             .unwrap();
         assert_eq!(span.style.fg, Some(theme.dim));
         assert!(span.style.add_modifier.contains(Modifier::CROSSED_OUT));
+    }
+
+    /// PRD FR-DL-4: the citation-needed marker renders as ordinary
+    /// (undimmed) text while `show_cn` is off — the documented default, and
+    /// the exact claim `main::execute_command`'s guard/`App::show_cn` doc
+    /// comments make about "reading unaffected while the toggle is off" —
+    /// and dim once it's on, with no other styling change.
+    #[test]
+    fn citation_needed_marker_dims_only_when_show_cn_is_on() {
+        let html = "<html><body><p>A claim<sup typeof=\"mw:Transclusion\" \
+             data-mw='{&quot;parts&quot;:[{&quot;template&quot;:{&quot;target&quot;:\
+             {&quot;wt&quot;:&quot;Citation needed&quot;}}}]}'>x</sup>.</p></body></html>";
+        let doc = parse_article_html("Test", html);
+        let theme = Theme::full();
+        let layout = layout_document(&doc, 80, LayoutOptions::default());
+
+        let off = paint_document(
+            &layout.lines,
+            None,
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            &theme,
+            false,
+            false, // show_cn off
+            &[],
+            0,
+            &crate::image::ImageStore::new(),
+        );
+        let off_span = off
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.contains("citation needed"))
+            .expect("marker span present");
+        assert_ne!(
+            off_span.style.fg,
+            Some(theme.dim),
+            "show_cn off must render the marker as ordinary text: {:?}",
+            off_span.style
+        );
+
+        let on = paint_document(
+            &layout.lines,
+            None,
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            &theme,
+            false,
+            true, // show_cn on
+            &[],
+            0,
+            &crate::image::ImageStore::new(),
+        );
+        let on_span = on
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.contains("citation needed"))
+            .expect("marker span present");
+        assert_eq!(
+            on_span.style.fg,
+            Some(theme.dim),
+            "show_cn on must dim the marker"
+        );
     }
 
     #[test]
@@ -4179,6 +4305,7 @@ mod tests {
             &HashSet::new(),
             &theme,
             false,
+            false, // show_cn
             &occurrences,
             0, // the first occurrence is "current"
             &crate::image::ImageStore::new(),
@@ -4248,6 +4375,7 @@ mod tests {
             &HashSet::new(),
             &theme,
             false,
+            false, // show_cn
             &[occurrence],
             0,
             &crate::image::ImageStore::new(),

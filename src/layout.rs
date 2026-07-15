@@ -85,6 +85,12 @@ pub enum SpanKind {
     /// also never becomes a `SpanKind` variant of its own (see this enum's
     /// doc comment).
     Hint,
+    /// PRD FR-DL-4: a `{{citation needed}}`-family marker
+    /// (`doc::SpanStyle::CitationNeeded`). Its own kind (not folded into
+    /// `Dim`) because whether it *paints* dim depends on the `:set show-cn`
+    /// runtime toggle (`ui::kind_style`), and `layout::citation_needed_lines`
+    /// needs to find it regardless of that toggle's state.
+    CitationNeeded,
 }
 
 /// One styled run of text within a laid-out line.
@@ -547,6 +553,12 @@ fn span_kind(style: &SpanStyle, plain_kind: &SpanKind, link_counter: &mut usize)
         // by `flatten_spans` below, not here (this function only maps style
         // to *kind*, never rewrites `text`).
         SpanStyle::Math(_) => SpanKind::Math,
+        // PRD FR-DL-4: dimmed only when `:set show-cn` is on (`ui::kind_style`
+        // consults `App::show_cn` — a runtime toggle, so this stays a
+        // distinct `SpanKind` rather than folding into `Dim` the way
+        // `Superscript` does above); always its own kind so
+        // `citation_needed_lines` can find it regardless of the toggle.
+        SpanStyle::CitationNeeded => SpanKind::CitationNeeded,
     }
 }
 
@@ -2100,6 +2112,37 @@ fn occurrence_from_origins(origins: &[Option<(usize, usize)>]) -> Option<Occurre
     (!pieces.is_empty()).then_some(Occurrence { pieces })
 }
 
+/// PRD FR-DL-4's `]c`/`[c` jump targets: the line index of every rendered
+/// `{{citation needed}}` marker (`SpanKind::CitationNeeded`), one entry per
+/// occurrence — mirroring `find_matches`' "one entry per hit, never
+/// double-counted across a soft wrap" contract. A marker that wraps across a
+/// `continuation`-linked line break is still one stop, keyed to the line the
+/// run started on.
+///
+/// Documented simplification, honest rather than silently wrong: two
+/// *separate* markers that happen to land on the exact same rendered line
+/// (both fit on one wide-terminal row with no wrap between them) collapse to
+/// one stop here — a jump-granularity trade-off, not a miscount. The
+/// status-bar count (`doc::count_citation_needed`) is the authoritative
+/// template count and is never derived from this list.
+pub fn citation_needed_lines(lines: &[LaidLine], continuation: &[bool]) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut in_run = false;
+    for (i, line) in lines.iter().enumerate() {
+        let has_marker = line
+            .spans
+            .iter()
+            .any(|s| s.kind == SpanKind::CitationNeeded);
+        let continues_prev_run =
+            in_run && i > 0 && continuation.get(i - 1).copied().unwrap_or(false);
+        if has_marker && !continues_prev_run {
+            out.push(i);
+        }
+        in_run = has_marker;
+    }
+    out
+}
+
 /// Bump whenever `Layout`/`LaidLine`'s shape, or `layout_document`'s
 /// wrapping/breaking semantics, change in a way that would make an old
 /// cached `Layout` wrong to keep serving. Participates in
@@ -3406,6 +3449,95 @@ mod tests {
         let lines = vec![plain_line("some text")];
         assert!(find_matches(&lines, &[], "").is_empty());
         assert!(find_matches(&[], &[], "text").is_empty());
+    }
+
+    // ---- FR-DL-4: citation_needed_lines -------------------------------------
+
+    fn cn_span(text: &str) -> LaidSpan {
+        LaidSpan {
+            text: text.to_string(),
+            kind: SpanKind::CitationNeeded,
+        }
+    }
+
+    #[test]
+    fn citation_needed_lines_is_empty_with_no_markers() {
+        let lines = vec![plain_line("nothing to see here")];
+        assert!(citation_needed_lines(&lines, &[]).is_empty());
+    }
+
+    #[test]
+    fn citation_needed_lines_finds_one_marker_per_line() {
+        let lines = vec![
+            plain_line("a claim"),
+            LaidLine {
+                spans: vec![cn_span("[citation needed]")],
+            },
+            plain_line("another claim"),
+            LaidLine {
+                spans: vec![cn_span("[citation needed]")],
+            },
+        ];
+        assert_eq!(
+            citation_needed_lines(&lines, &[false, false, false]),
+            vec![1, 3]
+        );
+    }
+
+    /// A marker that wraps across a soft line break (`continuation`) is one
+    /// stop, keyed to the run's first line — mirrors `find_matches`' own
+    /// "never double-count a wrap" contract.
+    #[test]
+    fn a_marker_split_across_a_continuation_run_is_one_stop_not_two() {
+        let lines = vec![
+            LaidLine {
+                spans: vec![cn_span("[citation")],
+            },
+            LaidLine {
+                spans: vec![cn_span("needed]")],
+            },
+        ];
+        // `continuation[0] == true`: line 1 is a soft-wrap continuation of
+        // line 0 (the same convention `Layout::continuation` uses).
+        assert_eq!(citation_needed_lines(&lines, &[true]), vec![0]);
+    }
+
+    /// Two markers immediately adjacent (no continuation between them) are
+    /// two distinct stops, even though both carry the same `SpanKind`.
+    #[test]
+    fn two_consecutive_non_continuation_marker_lines_are_two_stops() {
+        let lines = vec![
+            LaidLine {
+                spans: vec![cn_span("[citation needed]")],
+            },
+            LaidLine {
+                spans: vec![cn_span("[citation needed]")],
+            },
+        ];
+        assert_eq!(citation_needed_lines(&lines, &[false]), vec![0, 1]);
+    }
+
+    /// Wired to real `layout_document` output: the citation-needed detector
+    /// in `doc.rs` plus this function together find the marker's rendered
+    /// line.
+    #[test]
+    fn citation_needed_lines_wired_to_a_real_layout() {
+        let html = "<html><body><p>A claim<sup typeof=\"mw:Transclusion\" \
+             data-mw='{&quot;parts&quot;:[{&quot;template&quot;:{&quot;target&quot;:\
+             {&quot;wt&quot;:&quot;Citation needed&quot;}}}]}'>x</sup>.</p></body></html>";
+        let doc = parse_article_html("Test", html);
+        let layout = layout_document(&doc, 80, LayoutOptions::default());
+        let hits = citation_needed_lines(&layout.lines, &layout.continuation);
+        assert_eq!(hits.len(), 1, "exactly one marker in this fixture");
+        let line_text: String = layout.lines[hits[0]]
+            .spans
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
+        assert!(
+            line_text.contains("[citation needed]"),
+            "the hit line must contain the marker text: {line_text:?}"
+        );
     }
 
     /// Wires `find_matches` to real `layout_document` output: a paragraph

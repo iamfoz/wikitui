@@ -78,6 +78,18 @@ pub enum SpanStyle {
     /// code can apply `normalize_trivial_math` without re-deriving "is this
     /// a math span" from content.
     Math(String),
+    /// PRD FR-DL-4: a `{{citation needed}}`-family template transclusion
+    /// (`typeof="mw:Transclusion"` + `data-mw` naming one of
+    /// [`CITATION_NEEDED_TEMPLATES`] — see `is_citation_needed_transclusion`).
+    /// Carries no payload: the visible text is always the canonical
+    /// `[citation needed]` marker (`collect_inline` discards whatever the
+    /// template's own rendered children were, the same "don't trust the
+    /// content, trust the template name" posture `RedLink`'s href takes
+    /// toward its link target), so every occurrence reads identically
+    /// regardless of which alias or `|date=` parameter produced it.
+    /// Deliberately not a `Link` — it is a marker to highlight/navigate/
+    /// count, not a followable citation.
+    CitationNeeded,
 }
 
 #[derive(Debug, Clone)]
@@ -387,6 +399,33 @@ pub fn section_outline(doc: &Document) -> Vec<SectionRef> {
         .collect()
 }
 
+/// PRD FR-DL-4's status-bar count ("12 uncited claims") — the authoritative
+/// number of `{{citation needed}}`-family occurrences in the document,
+/// independent of terminal width/wrapping (unlike the layout-level jump
+/// list, `layout::citation_needed_lines`, which counts *rendered lines*, not
+/// templates — two markers that happen to land on the same wrapped row
+/// collapse to one jump stop there, but both still count here). Scoped to
+/// the same blocks `collect_links` scans (paragraphs, list items,
+/// blockquotes) — a heading is flattened to plain text with no per-span
+/// styling, so a template inside one couldn't carry the marker anyway.
+pub fn count_citation_needed(doc: &Document) -> usize {
+    let mut count = 0;
+    let mut visit = |spans: &[Span]| {
+        count += spans
+            .iter()
+            .filter(|s| s.style == SpanStyle::CitationNeeded)
+            .count();
+    };
+    for block in &doc.blocks {
+        match block {
+            Block::Paragraph(spans) | Block::Blockquote(spans) => visit(spans),
+            Block::ListItem { spans, .. } => visit(spans),
+            _ => {}
+        }
+    }
+    count
+}
+
 /// Tags whose content is handled by a dedicated `Block`, and which
 /// `inline_spans` must therefore never descend into (otherwise their text
 /// would be captured twice: once as a block, once as part of an ancestor's
@@ -445,6 +484,55 @@ fn has_typeof(el: &scraper::node::Element, needle: &str) -> bool {
 fn is_math_node(el: &scraper::node::Element) -> bool {
     el.name() == "math" || (el.name() == "span" && has_typeof(el, "mw:Extension/math"))
 }
+
+/// PRD FR-DL-4's documented template-name set: the `{{citation needed}}`
+/// family, matched case-insensitively with underscores folded to spaces (so
+/// a `data-mw` target of `Citation_needed` and `Citation needed` are the
+/// same check). Deliberately small — real Wikipedia has many more redirects
+/// to this template (`Better source needed`, `Verify source`, …) but the PRD
+/// names exactly these three; an unlisted alias falls through to ordinary
+/// transclusion handling (its Parsoid-rendered content passes through
+/// untouched) rather than this list silently growing on a hunch.
+const CITATION_NEEDED_TEMPLATES: &[&str] = &["citation needed", "fact", "cn"];
+
+fn is_citation_needed_template_name(name: &str) -> bool {
+    let normalized = name.trim().replace('_', " ").to_lowercase();
+    CITATION_NEEDED_TEMPLATES.contains(&normalized.as_str())
+}
+
+/// Whether `el` (already known to carry `typeof="mw:Transclusion"` — PRD
+/// §6.2 rule 3) is a citation-needed-family template call, read from its
+/// `data-mw` attribute. Parses just enough of Parsoid's `data-mw` shape
+/// (`{"parts":[{"template":{"target":{"wt":"Citation needed", ...}}}, ...]}`)
+/// to read each part's template name — a multi-part transclusion (rare for
+/// this template in practice) counts if *any* part names one of
+/// [`CITATION_NEEDED_TEMPLATES`]. A missing/malformed/unexpected-shaped
+/// `data-mw` is `false`, never a parse error: a hostile or future-format
+/// payload degrades to "not citation-needed" (PRD SEC-3 posture), same as
+/// `extract_math`'s "missing-tex graceful" `None`.
+fn is_citation_needed_transclusion(el: &scraper::node::Element) -> bool {
+    let Some(raw) = el.attr("data-mw") else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return false;
+    };
+    let Some(parts) = value.get("parts").and_then(|p| p.as_array()) else {
+        return false;
+    };
+    parts.iter().any(|part| {
+        part.get("template")
+            .and_then(|t| t.get("target"))
+            .and_then(|t| t.get("wt"))
+            .and_then(|wt| wt.as_str())
+            .is_some_and(is_citation_needed_template_name)
+    })
+}
+
+/// The canonical marker text every citation-needed occurrence renders as
+/// (PRD FR-DL-4), regardless of which alias or `|date=` parameter produced
+/// it — see `SpanStyle::CitationNeeded`'s doc comment.
+const CITATION_NEEDED_MARKER: &str = "[citation needed]";
 
 /// One math node's extracted content (PRD FR-RD-7): the TeX source and
 /// whether it is a display (own-line) equation vs. inline with surrounding
@@ -972,6 +1060,22 @@ fn collect_inline(node: NodeRef<Node>, style: &SpanStyle, spans: &mut Vec<Span>,
             }
             Node::Element(el) => {
                 let tag = el.name();
+                // PRD FR-DL-4: checked *before* the `is_noise` skip below —
+                // real Parsoid output for this template carries a `noprint`
+                // class (Wikipedia hides it from print stylesheets), which
+                // `is_noise` would otherwise drop entirely before this
+                // reader ever saw it. One canonical span replaces whatever
+                // the template's own children rendered; they are never
+                // descended into (`continue` below skips the rest of this
+                // arm), so a hostile/unusual template body can't smuggle
+                // extra spans in under this style.
+                if has_typeof(el, "mw:Transclusion") && is_citation_needed_transclusion(el) {
+                    spans.push(Span {
+                        text: CITATION_NEEDED_MARKER.to_string(),
+                        style: SpanStyle::CitationNeeded,
+                    });
+                    continue;
+                }
                 if is_skipped_tag(tag) || is_noise(el) || is_block_tag(tag) {
                     continue;
                 }
@@ -1877,7 +1981,14 @@ fn sanitize_spans(spans: &mut [Span]) {
             SpanStyle::Math(tex) => {
                 *tex = sanitize::sanitize_and_cap_multiline(tex, sanitize::MAX_SPAN_CHARS);
             }
-            SpanStyle::Plain | SpanStyle::Bold | SpanStyle::Italic | SpanStyle::Superscript => {}
+            // PRD FR-DL-4: no extra payload to sanitize — the marker text
+            // is always the fixed `CITATION_NEEDED_MARKER` constant, never
+            // derived from anything in the source HTML.
+            SpanStyle::Plain
+            | SpanStyle::Bold
+            | SpanStyle::Italic
+            | SpanStyle::Superscript
+            | SpanStyle::CitationNeeded => {}
         }
     }
 }
@@ -3293,6 +3404,95 @@ mod tests {
         );
     }
 
+    // ---- FR-DL-4: citation-needed detection (parse-time signal) -----------
+
+    /// Builds one `<sup typeof="mw:Transclusion">` the shape real Parsoid
+    /// output uses for this template family: a `data-mw` naming `target`
+    /// (the template call, before alias-normalization) and a `noprint`
+    /// class — the class that would make `is_noise` drop the node entirely
+    /// if the citation-needed check didn't run ahead of it.
+    fn citation_needed_html(target: &str) -> String {
+        format!(
+            "<html><body><p>A claim<sup class=\"noprint\" typeof=\"mw:Transclusion\" \
+             data-mw='{{&quot;parts&quot;:[{{&quot;template&quot;:{{&quot;target&quot;:\
+             {{&quot;wt&quot;:&quot;{target}&quot;}},&quot;params&quot;:{{}}}}}}]}}'>\
+             [<i><a href=\"./Wikipedia:Citation_needed\">citation needed</a></i>]</sup>.</p></body></html>"
+        )
+    }
+
+    #[test]
+    fn citation_needed_template_becomes_one_canonical_marker_span() {
+        let html = citation_needed_html("Citation needed");
+        let doc = parse_article_html("Test", &html);
+        let Block::Paragraph(spans) = &doc.blocks[0] else {
+            panic!("paragraph expected")
+        };
+        let marker = spans
+            .iter()
+            .find(|s| s.style == SpanStyle::CitationNeeded)
+            .expect("a CitationNeeded span");
+        assert_eq!(marker.text, "[citation needed]");
+        // The template's own rendered children (the "citation needed" link
+        // text) must not additionally survive as a separate span — the
+        // canonical marker replaces them, it doesn't sit alongside them.
+        assert!(
+            !spans.iter().any(
+                |s| s.text.contains("citation needed]") && s.style != SpanStyle::CitationNeeded
+            ),
+            "the template's own rendered link text must not leak through as a second span"
+        );
+        assert_eq!(count_citation_needed(&doc), 1);
+    }
+
+    /// The documented alias set (PRD FR-DL-4: "Citation needed" / "Fact" /
+    /// "Cn") all match, case-insensitively and underscore-folded; an
+    /// unlisted template name does not.
+    #[test]
+    fn citation_needed_alias_set_matches_case_and_underscore_insensitively() {
+        for alias in ["Citation needed", "FACT", "cn", "Citation_Needed"] {
+            let doc = parse_article_html("Test", &citation_needed_html(alias));
+            assert_eq!(
+                count_citation_needed(&doc),
+                1,
+                "{alias:?} must match the citation-needed alias set"
+            );
+        }
+        let doc = parse_article_html("Test", &citation_needed_html("Infobox"));
+        assert_eq!(
+            count_citation_needed(&doc),
+            0,
+            "an unrelated template name must not match"
+        );
+    }
+
+    /// A transclusion with no `data-mw` at all (or one that fails to parse
+    /// as JSON) degrades to "not citation-needed" rather than panicking —
+    /// PRD SEC-3's posture for a malformed/hostile payload.
+    #[test]
+    fn a_transclusion_with_missing_or_malformed_data_mw_is_never_citation_needed() {
+        let html = "<html><body><p><sup typeof=\"mw:Transclusion\">no data-mw here</sup></p></body></html>";
+        let doc = parse_article_html("Test", html);
+        assert_eq!(count_citation_needed(&doc), 0);
+
+        let html = "<html><body><p><sup typeof=\"mw:Transclusion\" data-mw=\"not json\">x</sup></p></body></html>";
+        let doc = parse_article_html("Test", html);
+        assert_eq!(count_citation_needed(&doc), 0);
+    }
+
+    /// Two occurrences in one article both count, even across two separate
+    /// paragraphs (not coalesced into one).
+    #[test]
+    fn multiple_citation_needed_occurrences_all_count() {
+        let html = "<html><body><p>First claim<sup class=\"noprint\" typeof=\"mw:Transclusion\" \
+             data-mw='{&quot;parts&quot;:[{&quot;template&quot;:{&quot;target&quot;:\
+             {&quot;wt&quot;:&quot;Citation needed&quot;}}}]}'>[citation needed]</sup>.</p>\
+             <p>Second claim<sup class=\"noprint\" typeof=\"mw:Transclusion\" \
+             data-mw='{&quot;parts&quot;:[{&quot;template&quot;:{&quot;target&quot;:\
+             {&quot;wt&quot;:&quot;Fact&quot;}}}]}'>[citation needed]</sup>.</p></body></html>";
+        let doc = parse_article_html("Test", html);
+        assert_eq!(count_citation_needed(&doc), 2);
+    }
+
     /// PRD §9's assertion, checked against every string a `Document`
     /// exposes: no C0 control other than `\n`/`\t`, no DEL, no C1, no bidi
     /// override/isolate character.
@@ -3334,7 +3534,8 @@ mod tests {
                             SpanStyle::Plain
                             | SpanStyle::Bold
                             | SpanStyle::Italic
-                            | SpanStyle::Superscript => {}
+                            | SpanStyle::Superscript
+                            | SpanStyle::CitationNeeded => {}
                         }
                     }
                 }

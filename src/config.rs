@@ -258,6 +258,11 @@ pub struct ResolvedConfig {
     /// Default false. Today a policy flag with a documented seam (saved-page
     /// image persistence, which must exclude non-free, isn't built yet).
     pub include_nonfree: Valued<bool>,
+    /// PRD FR-DL-8's `pro = true`: disables every easter egg (`:xyzzy`) and
+    /// achievement toast outright. Default `false` — file only (like
+    /// `include_nonfree`/`startpage`), a preference set once, not a CLI/env
+    /// concern.
+    pub pro: Valued<bool>,
     /// PRD FR-DL-1's `startpage = feed|blank|resume`, default `feed`. File
     /// only (like `include_nonfree`/`history.*`) — a preference set once,
     /// not worth a CLI flag or env var for a single run. Parsed into
@@ -698,6 +703,7 @@ pub fn resolve(
         "history",
         "images",
         "include_nonfree",
+        "pro",
         "startpage",
         "restore_session",
         "reading_wpm",
@@ -796,6 +802,7 @@ pub fn resolve(
     let interest_half_life_days = resolve_interest_half_life(&table, &mut issues);
     let images = resolve_images(env, &table, &mut issues);
     let include_nonfree = resolve_include_nonfree(&table, &mut issues);
+    let pro = resolve_pro(&table, &mut issues);
     let startpage = resolve_startpage(&table, &mut issues);
     let restore_session = resolve_restore_session(&table, &mut issues);
     let reading_wpm = resolve_reading_wpm(&table, &mut issues);
@@ -838,6 +845,7 @@ pub fn resolve(
         interest_half_life_days,
         images,
         include_nonfree,
+        pro,
         startpage,
         restore_session,
         reading_wpm,
@@ -1327,6 +1335,32 @@ fn resolve_include_nonfree(table: &toml::Table, issues: &mut Vec<Issue>) -> Valu
             None => {
                 issues.push(Issue::warning(format!(
                     "include_nonfree must be a boolean; using default {DEFAULT}"
+                )));
+                default
+            }
+        },
+        None => default,
+    }
+}
+
+/// PRD FR-DL-8's `pro = true` (file-only, default false): disables every
+/// easter egg and achievement toast. Mirrors `resolve_include_nonfree`'s
+/// shape exactly (a plain policy bool with no CLI/env surface).
+fn resolve_pro(table: &toml::Table, issues: &mut Vec<Issue>) -> Valued<bool> {
+    const DEFAULT: bool = false;
+    let default = Valued {
+        value: DEFAULT,
+        source: Source::Default,
+    };
+    match table.get("pro") {
+        Some(v) => match v.as_bool() {
+            Some(value) => Valued {
+                value,
+                source: Source::File,
+            },
+            None => {
+                issues.push(Issue::warning(format!(
+                    "pro must be a boolean; using default {DEFAULT}"
                 )));
                 default
             }
@@ -3796,6 +3830,46 @@ mod tests {
         );
         assert!(from_file.include_nonfree.value);
         assert_eq!(from_file.include_nonfree.source, Source::File);
+        cleanup(&path);
+    }
+
+    /// PRD FR-DL-8: `pro = true` (file-only, default false) disables every
+    /// easter egg and achievement toast — same shape as `include_nonfree`.
+    #[test]
+    fn pro_defaults_false_and_honors_file() {
+        let default = resolve(&CliOverrides::default(), &EnvOverrides::default(), None);
+        assert!(!default.pro.value);
+        assert_eq!(default.pro.source, Source::Default);
+
+        let path = temp_config("pro = true\n");
+        let from_file = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert!(from_file.pro.value);
+        assert_eq!(from_file.pro.source, Source::File);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn pro_rejects_a_non_boolean_with_a_warning() {
+        let path = temp_config("pro = \"sometimes\"\n");
+        let resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert!(!resolved.pro.value, "a bad value falls back to the default");
+        assert_eq!(resolved.pro.source, Source::Default);
+        assert!(
+            resolved
+                .issues
+                .iter()
+                .any(|i| i.message.contains("pro must be a boolean")),
+            "{:?}",
+            resolved.issues
+        );
         cleanup(&path);
     }
 

@@ -1081,6 +1081,55 @@ pub struct App {
     /// diff`'s doc comment for why this can't just be re-derived from the
     /// live watchlist.
     pub watch_mirror_state_path: Option<PathBuf>,
+
+    // -- Delight & discovery (PRD §5.16: FR-DL-4/6/8) -----------------------
+    /// PRD FR-DL-4's `:set show-cn` toggle: whether citation-needed markers
+    /// paint dim and become `]c`/`[c`-navigable and status-bar-counted.
+    /// Default off (opt-in) — a `SpanStyle::CitationNeeded` span always
+    /// parses and always renders its canonical text either way (see
+    /// `ui::kind_style`'s doc comment); this only controls the highlighting.
+    pub show_cn: bool,
+    /// The `]`/`[`-prefix chord's pending-key latch for FR-DL-4's `]c`/`[c`
+    /// jump — armed only while `show_cn` is on (see `main::handle_key`'s `]`/
+    /// `[` arms), so the bare keys' existing table-scroll meaning
+    /// (`App::scroll_tables`) is completely untouched while the feature is
+    /// off, its default. Mirrors `pending_r`'s "the prefix key has its own
+    /// standalone meaning" shape (`app::RPrefixAction`) rather than `pending_g`'s
+    /// "dead prefix" shape, since `]`/`[` alone are never dead.
+    pub pending_cn_bracket: Option<CnBracket>,
+    /// PRD FR-DL-6's in-progress (or just-finished) wiki-walk. `None` means
+    /// ordinary, unrestricted reading. While `Some` and not yet won,
+    /// navigation is restricted to link-follows (`main::execute_command`'s
+    /// game guard, and the `/`/`gr`/`gR` key guards) — see `game`'s module
+    /// doc for the full rules.
+    pub game: Option<crate::game::GameState>,
+    /// PRD FR-DL-8's "fires once, not every nav" rule: the id of every
+    /// achievement (`achievements::ACHIEVEMENTS`) already toasted this
+    /// session. Never cleared — an achievement is a one-time session event,
+    /// not a repeating notification.
+    pub achievements_shown: std::collections::HashSet<&'static str>,
+    /// PRD FR-DL-8's `pro = true` config: disables every easter egg
+    /// (`:xyzzy`) and achievement toast outright. Default `false` (the
+    /// egg/toast behavior is the default experience); `main::run`/
+    /// `apply_config_reload` set this from `[pro]`... — see
+    /// `config::ResolvedConfig::pro`'s own doc comment for the exact key.
+    pub pro: bool,
+}
+
+/// Which bracket armed FR-DL-4's citation-needed jump chord (`]c`/`[c`) —
+/// `]` jumps forward, `[` jumps backward; a second key other than `c`
+/// resolves to that bracket's own ordinary meaning (`App::scroll_tables`),
+/// mirroring `RPrefixAction`'s "the prefix key has a standalone meaning, so
+/// an unrecognized second key still performs it" shape rather than `g`/`b`/
+/// `z`'s "dead prefix" shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CnBracket {
+    /// `]` was pressed: `]c` jumps to the next marker, anything else scrolls
+    /// tables right (`App::scroll_tables(1)`).
+    Next,
+    /// `[` was pressed: `[c` jumps to the previous marker, anything else
+    /// scrolls tables left (`App::scroll_tables(-1)`).
+    Prev,
 }
 
 /// The watchlist pane's two tabs (PRD FR-ACC-2).
@@ -1406,6 +1455,11 @@ impl App {
             watchlist_mirror_tag: "watched".to_string(),
             readinglist_sync_state_path: None,
             watch_mirror_state_path: None,
+            show_cn: false,
+            pending_cn_bracket: None,
+            game: None,
+            achievements_shown: std::collections::HashSet::new(),
+            pro: false,
         }
     }
 
@@ -3475,6 +3529,103 @@ impl App {
         let tab = &mut self.tabs[index];
         tab.history_visit_id = id;
         tab.visit_started_at = Some(std::time::Instant::now());
+        // PRD FR-DL-8: every recorded visit can newly cross an achievement
+        // threshold — checked here, the one place both the active-tab and
+        // background-tab-load install paths funnel through, same posture as
+        // `check_resume_position` above it in `set_document`.
+        self.check_achievements();
+    }
+
+    /// PRD FR-DL-8: after a visit is recorded, checks whether this session's
+    /// trail (`trail::stats`, the seam `trail.rs` left for this) just
+    /// crossed a new achievement threshold and, unless `pro` disabled
+    /// easter eggs, toasts the first newly-crossed one (`self.notice`) —
+    /// "fires once, not every nav": `achievements_shown` remembers which ids
+    /// already toasted this session, so a stat that stays above its
+    /// threshold on every later visit never toasts again. Rebuilds the
+    /// session trail from scratch each call (bounded by `session_started_at`,
+    /// not full history) rather than maintaining incremental counters —
+    /// simple and correct; a long enough session for this to matter is not
+    /// this feature's concern.
+    fn check_achievements(&mut self) {
+        if self.pro {
+            return;
+        }
+        let visits = self.trail_scoped_visits(crate::command::TrailScope::Session);
+        let trail = crate::trail::build(&visits);
+        let stats = crate::trail::stats(&trail);
+        let newly = crate::achievements::newly_crossed(&stats, &self.achievements_shown);
+        if let Some(achievement) = newly.first() {
+            self.achievements_shown.insert(achievement.id);
+            self.notice = Some(format!("Achievement unlocked: {}", achievement.message));
+        }
+    }
+
+    /// PRD FR-DL-6: advances the active wiki-walk (if any) after a link
+    /// follow installed a new document in the active tab — the shared tail
+    /// `main::follow_internal_link` calls for every `counts_toward_game`
+    /// caller. Reads the *active tab's* now-installed document title (the
+    /// real, possibly-redirected title, matching what `record_history_visit`
+    /// itself just recorded) rather than the raw string the reader clicked,
+    /// so a redirect still resolves goal-matching correctly. A no-op with no
+    /// game active or no document installed.
+    pub fn record_game_move(&mut self) {
+        let Some(title) = self.active_tab().doc.as_ref().map(|d| d.title.clone()) else {
+            return;
+        };
+        let Some(game) = &mut self.game else {
+            return;
+        };
+        let was_won = game.won;
+        game.follow(title);
+        if game.won && !was_won {
+            self.notice = Some(format!("You won! {}", crate::game::share_card(game)));
+        }
+    }
+
+    /// PRD FR-DL-4's `]c`/`[c` jump (armed only while `show_cn` is on — see
+    /// `App::pending_cn_bracket`'s doc comment): moves the active tab's
+    /// scroll to the next/previous citation-needed marker relative to the
+    /// current scroll offset, wrapping around either end, and centers it
+    /// (`center_scroll`, the same treatment `find_next`/`find_prev` give a
+    /// find match). A `notice` when the page has no markers at all.
+    pub fn jump_citation_needed(&mut self, forward: bool) {
+        self.ensure_layout();
+        let Some(layout) = &self.layout else {
+            return;
+        };
+        let lines = crate::layout::citation_needed_lines(&layout.lines, &layout.continuation);
+        if lines.is_empty() {
+            self.notice = Some("No citation-needed markers on this page".to_string());
+            return;
+        }
+        let current = self.active_tab().scroll;
+        let target = if forward {
+            lines
+                .iter()
+                .copied()
+                .find(|&l| l as u16 > current)
+                .unwrap_or(lines[0])
+        } else {
+            lines
+                .iter()
+                .copied()
+                .rev()
+                .find(|&l| (l as u16) < current)
+                .unwrap_or(*lines.last().expect("checked non-empty above"))
+        };
+        let scroll = self.center_scroll(target as u16);
+        self.active_tab_mut().scroll = scroll;
+    }
+
+    /// `:set show-cn`/`:set noshow-cn` (PRD FR-DL-4): toggles citation-needed
+    /// highlighting. No relayout needed — `SpanKind::CitationNeeded` is
+    /// theme/toggle-independent (PRD §6.3's "theme applied at paint time");
+    /// only `ui::kind_style`'s dim-or-plain decision and the status-bar count
+    /// depend on this flag, both read fresh every draw.
+    pub fn set_show_cn(&mut self, on: bool) {
+        self.show_cn = on;
+        self.notice = Some(format!("show-cn={}", if on { "on" } else { "off" }));
     }
 
     /// Flushes accumulated dwell time for `tabs[index]`'s current visit
@@ -10218,5 +10369,174 @@ mod tests {
                 "a laid-out line ({w} cells) overflowed the pane width {pane_width}"
             );
         }
+    }
+
+    // ---- FR-DL-4: `:set show-cn` toggle + `]c`/`[c` jump -------------------
+
+    fn citation_needed_doc() -> Document {
+        let html = "<html><body><p>First claim<sup typeof=\"mw:Transclusion\" \
+             data-mw='{&quot;parts&quot;:[{&quot;template&quot;:{&quot;target&quot;:\
+             {&quot;wt&quot;:&quot;Citation needed&quot;}}}]}'>x</sup>.</p>\
+             <p>Second claim<sup typeof=\"mw:Transclusion\" \
+             data-mw='{&quot;parts&quot;:[{&quot;template&quot;:{&quot;target&quot;:\
+             {&quot;wt&quot;:&quot;Fact&quot;}}}]}'>x</sup>.</p></body></html>";
+        crate::doc::parse_article_html("Cited", html)
+    }
+
+    #[test]
+    fn set_show_cn_flips_the_flag_and_leaves_a_notice() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        assert!(!app.show_cn, "default is off");
+        app.set_show_cn(true);
+        assert!(app.show_cn);
+        assert_eq!(app.notice.as_deref(), Some("show-cn=on"));
+        app.set_show_cn(false);
+        assert!(!app.show_cn);
+        assert_eq!(app.notice.as_deref(), Some("show-cn=off"));
+    }
+
+    #[test]
+    fn jump_citation_needed_with_no_markers_notices_instead_of_moving_scroll() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(doc("Plain"));
+        app.layout_width = 80;
+        app.viewport_height = 24;
+        app.jump_citation_needed(true);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("No citation-needed markers on this page")
+        );
+    }
+
+    #[test]
+    fn jump_citation_needed_moves_scroll_to_the_next_and_previous_marker() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(citation_needed_doc());
+        app.layout_width = 80;
+        app.viewport_height = 24;
+        app.active_tab_mut().scroll = 0;
+        app.jump_citation_needed(true);
+        let first_hit = app.active_tab().scroll;
+        // A second forward jump from further down must land on a later (or
+        // equal, if both markers are within one centered viewport) line,
+        // never go backwards — the whole point of `]c`.
+        app.jump_citation_needed(true);
+        let second_hit = app.active_tab().scroll;
+        assert!(
+            second_hit >= first_hit,
+            "forward jumps must not move backwards: {first_hit} then {second_hit}"
+        );
+        // Wrapping: pushing scroll past the last marker and jumping forward
+        // again wraps to the first one again rather than doing nothing.
+        app.active_tab_mut().scroll = app.active_tab().max_scroll;
+        app.jump_citation_needed(true);
+        assert_eq!(
+            app.active_tab().scroll,
+            first_hit,
+            "forward from the very end must wrap to the first marker"
+        );
+    }
+
+    // ---- FR-DL-6: the wiki-walk game's App-level plumbing -------------------
+
+    #[test]
+    fn record_game_move_advances_the_active_game_and_detects_a_win() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.open_document(doc("Alan Turing"));
+        app.game = Some(crate::game::GameState::new(
+            "Alan Turing",
+            "Computer science",
+            0,
+        ));
+        app.open_document(doc("Enigma machine"));
+        app.record_game_move();
+        {
+            let game = app.game.as_ref().unwrap();
+            assert_eq!(game.clicks(), 1);
+            assert!(!game.won);
+        }
+        app.open_document(doc("Computer science"));
+        app.record_game_move();
+        let game = app.game.as_ref().unwrap();
+        assert_eq!(game.clicks(), 2);
+        assert!(game.won);
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("You won!"),
+            "a win must post a result notice: {:?}",
+            app.notice
+        );
+    }
+
+    #[test]
+    fn record_game_move_with_no_active_game_is_a_no_op() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.open_document(doc("Alan Turing"));
+        app.record_game_move(); // must not panic with `app.game == None`
+        assert!(app.game.is_none());
+    }
+
+    // ---- FR-DL-8: achievement toasts from trail stats ----------------------
+
+    #[test]
+    fn crossing_five_articles_toasts_curious_exactly_once() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        for title in ["A", "B", "C", "D", "E"] {
+            app.open_document(doc(title));
+        }
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Curious: 5 articles in one session"),
+            "the 5th distinct article must toast the threshold: {:?}",
+            app.notice
+        );
+        app.notice = None;
+        // A 6th article does not re-cross the same threshold — no new toast.
+        app.open_document(doc("F"));
+        assert_eq!(
+            app.notice, None,
+            "an already-shown achievement must not toast again"
+        );
+    }
+
+    #[test]
+    fn crossing_fifteen_articles_toasts_rabbit_hole() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        for i in 0..15 {
+            app.open_document(doc(&format!("Article {i}")));
+        }
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Rabbit Hole: 15 articles in one session"),
+            "the 15th distinct article must toast rabbit-hole-15: {:?}",
+            app.notice
+        );
+    }
+
+    #[test]
+    fn pro_true_suppresses_achievement_toasts_entirely() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.pro = true;
+        for title in ["A", "B", "C", "D", "E"] {
+            app.open_document(doc(title));
+        }
+        assert!(
+            app.achievements_shown.is_empty(),
+            "pro=true must skip achievement bookkeeping entirely"
+        );
+        assert!(
+            !app.notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Achievement"),
+            "pro=true must never toast: {:?}",
+            app.notice
+        );
     }
 }

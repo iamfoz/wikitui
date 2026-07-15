@@ -1,4 +1,5 @@
 mod account;
+mod achievements;
 mod api;
 mod app;
 mod attribution;
@@ -17,6 +18,7 @@ mod doc;
 mod doctor;
 mod fetch_queue;
 mod fuzzy;
+mod game;
 mod graphics;
 mod hints;
 mod history;
@@ -600,6 +602,7 @@ async fn main() -> Result<()> {
         resolved.interest_half_life_days.value,
         resolved.images.value,
         resolved.include_nonfree.value,
+        resolved.pro.value,
         resolved.startpage.value,
         resolved.restore_session.value,
         prefetch_config_from(&resolved.prefetch),
@@ -2263,6 +2266,7 @@ async fn run(
     interest_half_life_days: f64,
     images_config: Option<bool>,
     include_nonfree: bool,
+    pro: bool,
     startpage_config: String,
     restore_session_config: bool,
     prefetch_config: netqueue::SubstrateConfig,
@@ -2347,6 +2351,7 @@ async fn run(
     app.graphics_env = graphics::GraphicsEnv::from_process_env(std::io::stdout().is_terminal());
     app.images_override = images_config;
     app.include_nonfree = include_nonfree;
+    app.pro = pro;
     // Already validated during resolution (an invalid value fell back to
     // "feed" with a warning above) — same belt-and-braces default as
     // `theme`/`cite_style` just above this function.
@@ -3243,6 +3248,7 @@ fn apply_config_reload(app: &mut App) {
         app.note_image_state_change();
     }
     app.include_nonfree = resolved.include_nonfree.value;
+    app.pro = resolved.pro.value;
     // Measure/ambiguous_wide feed layout, not just paint — drop the cached
     // layout so the next `ensure_layout` recomputes instead of reusing a
     // stale one keyed on the old options.
@@ -3289,6 +3295,16 @@ fn apply_config_reload(app: &mut App) {
 /// foreground card would fight the "doesn't move focus" contract FR-TB-3
 /// gives that action — a documented, narrower scope than the foreground
 /// follow paths this covers.
+///
+/// `counts_toward_game` (PRD FR-DL-6): `true` for every caller that is a
+/// genuine reader-initiated link follow (plain Enter, the registry's
+/// `Action::FollowLink`, a resolved link hint) — `App::record_game_move`
+/// runs afterward, advancing the active wiki-walk's click count/path and
+/// checking for a win. `false` for `toggle_talk_page`'s reuse of this same
+/// path: flipping to an article's talk page is a view toggle on the *same*
+/// subject, not "the reader followed a link elsewhere," so it must not
+/// count as a click or accidentally "win" a game whose goal happens to be
+/// a `Talk:` page.
 async fn follow_internal_link(
     client: &WikiClient,
     cache: &PageCache,
@@ -3296,12 +3312,16 @@ async fn follow_internal_link(
     title: &str,
     revalidate_tx: &UnboundedSender<RevalidationOutcome>,
     langlinks_tx: &UnboundedSender<LangLinksOutcome>,
+    counts_toward_game: bool,
 ) {
     if app.is_redlink(title) {
         app.show_redlink_card(app.lang.clone(), title.to_string());
         return;
     }
     open_title(client, cache, app, title, revalidate_tx, langlinks_tx).await;
+    if counts_toward_game {
+        app.record_game_move();
+    }
 }
 
 /// PRD FR-ACC-5: `T` (Reading context) or `:talk` flips the active tab
@@ -3326,7 +3346,16 @@ async fn toggle_talk_page(
     };
     let entering_talk = talk::from_talk(&current_title).is_none();
     let target = talk::toggle_target(&current_title);
-    follow_internal_link(client, cache, app, &target, revalidate_tx, langlinks_tx).await;
+    follow_internal_link(
+        client,
+        cache,
+        app,
+        &target,
+        revalidate_tx,
+        langlinks_tx,
+        false,
+    )
+    .await;
     // A status/notice cue that this is the talk page, not the article
     // (PRD FR-ACC-5) — on top of the ordinary status line, which already
     // shows the real (now `Talk:`-prefixed) title. Only on the way in:
@@ -4530,6 +4559,7 @@ async fn handle_key(
                                 &title,
                                 revalidate_tx,
                                 langlinks_tx,
+                                true,
                             )
                             .await;
                         }
@@ -5026,8 +5056,16 @@ async fn handle_key(
                 if let Some((lang, title)) = app.peek_open_target() {
                     app.close_peek();
                     app.lang = lang;
-                    follow_internal_link(client, cache, app, &title, revalidate_tx, langlinks_tx)
-                        .await;
+                    follow_internal_link(
+                        client,
+                        cache,
+                        app,
+                        &title,
+                        revalidate_tx,
+                        langlinks_tx,
+                        true,
+                    )
+                    .await;
                 }
             }
             _ => {}
@@ -5208,12 +5246,31 @@ async fn handle_key(
                             return;
                         }
                         app::GPrefixAction::Random => {
-                            open_random_article(client, cache, app, revalidate_tx, langlinks_tx)
+                            // PRD FR-DL-6: same restriction as `:random`
+                            // (`game::blocks_command`) — `gr` resolves
+                            // straight to this action without ever becoming
+                            // a parsed `Command`, so it's guarded here.
+                            if app.game.as_ref().is_some_and(|g| !g.won) {
+                                app.notice = Some(game::BLOCKED_NOTICE.to_string());
+                            } else {
+                                open_random_article(
+                                    client,
+                                    cache,
+                                    app,
+                                    revalidate_tx,
+                                    langlinks_tx,
+                                )
                                 .await;
+                            }
                             return;
                         }
                         app::GPrefixAction::Related => {
-                            open_related(app, client, related_tx);
+                            // PRD FR-DL-6: same restriction as `:related`.
+                            if app.game.as_ref().is_some_and(|g| !g.won) {
+                                app.notice = Some(game::BLOCKED_NOTICE.to_string());
+                            } else {
+                                open_related(app, client, related_tx);
+                            }
                             return;
                         }
                         // PRD FR-NV-4: `gK` jumps to the References section.
@@ -5334,6 +5391,25 @@ async fn handle_key(
             if !matches!(code, KeyCode::Char('r')) {
                 app.pending_resume = None;
             }
+            // PRD FR-DL-4's `]c`/`[c` jump chord, resolved on the key right
+            // after `]`/`[` armed it (see those arms' own doc comment):
+            // `c` jumps, anything else performs the deferred ordinary
+            // table-scroll the bracket key would have done immediately had
+            // `show_cn` been off — the second key is still consumed either
+            // way (matching `RPrefixAction`'s shape, not `GPrefixAction`'s
+            // "dead prefix" one), so it never *also* runs its own binding.
+            if let Some(bracket) = app.pending_cn_bracket.take() {
+                if matches!(code, KeyCode::Char('c')) {
+                    app.jump_citation_needed(bracket == app::CnBracket::Next);
+                } else {
+                    app.scroll_tables(if bracket == app::CnBracket::Next {
+                        1
+                    } else {
+                        -1
+                    });
+                }
+                return;
+            }
             match code {
                 // PRD Appendix B: `q` closes the current tab (quitting if it
                 // was the last); `Q` quits outright behind a one-keypress
@@ -5352,6 +5428,14 @@ async fn handle_key(
                 KeyCode::Char('Q') => {
                     app.pending_quit_confirm = true;
                     app.notice = Some("really quit? (y/n)".to_string());
+                }
+                // PRD FR-DL-6: search is one of the "direct open, bypassing
+                // links" moves a wiki-walk restricts — see
+                // `game::blocks_command`'s doc comment for why this key
+                // (never a parsed `Command`) is guarded here rather than
+                // there.
+                KeyCode::Char('/') if app.game.as_ref().is_some_and(|g| !g.won) => {
+                    app.notice = Some(game::BLOCKED_NOTICE.to_string());
                 }
                 KeyCode::Char('/') => {
                     app.mode = Mode::Search;
@@ -5388,6 +5472,19 @@ async fn handle_key(
                     app.scroll_by(-10)
                 }
                 KeyCode::Char(' ') => app.scroll_by(15),
+                // PRD FR-DL-4: `]c`/`[c` jump to the next/previous
+                // citation-needed marker — armed only while `show_cn` is on
+                // (see `App::pending_cn_bracket`'s doc comment for why the
+                // bare keys' table-scroll meaning is completely untouched
+                // while the feature is off, its default). Resolved on the
+                // *next* keypress, mirroring `pending_r`'s "the prefix key
+                // has a standalone meaning" latch shape just below.
+                KeyCode::Char(']') if app.show_cn => {
+                    app.pending_cn_bracket = Some(app::CnBracket::Next);
+                }
+                KeyCode::Char('[') if app.show_cn => {
+                    app.pending_cn_bracket = Some(app::CnBracket::Prev);
+                }
                 // PRD FR-RD-4's horizontal table scroll: `[`/`]` shift the
                 // shared column window of every wide table in the article
                 // left/right (documented "simplest coherent model" — one
@@ -5473,6 +5570,7 @@ async fn handle_key(
                                     &title,
                                     revalidate_tx,
                                     langlinks_tx,
+                                    true,
                                 )
                                 .await
                             }
@@ -6054,6 +6152,7 @@ async fn dispatch_action(
                             &title,
                             revalidate_tx,
                             langlinks_tx,
+                            true,
                         )
                         .await
                     }
@@ -7251,6 +7350,15 @@ async fn poll_notifications_count(client: &WikiClient, app: &mut App) {
     }
 }
 
+/// PRD FR-DL-6: whether `cmd` is one of the "direct open, bypassing links"
+/// moves a wiki-walk restricts (`game::blocks_command`), evaluated only
+/// while a game is active and not yet won — a pure, synchronous predicate
+/// (no network, no `&mut App`) so `execute_command`'s guard is testable
+/// without a live client/terminal.
+fn game_navigation_blocked(app: &App, cmd: &command::Command) -> bool {
+    app.game.as_ref().is_some_and(|g| !g.won) && game::blocks_command(cmd)
+}
+
 /// Executes a parsed `:` command. Parsing already validated arguments
 /// (theme/style/lang names), so the arms here mostly delegate to existing
 /// features.
@@ -7268,6 +7376,17 @@ async fn execute_command(
     langlinks_tx: &UnboundedSender<LangLinksOutcome>,
 ) {
     use command::{Command, LoginMode, RandomSpec, SaveSpec, TtsSpec};
+    // PRD FR-DL-6: while a wiki-walk is active and unwon, `:open`/`:random`/
+    // `:related` are the "direct open, bypassing links" moves the game
+    // restricts — see `game_navigation_blocked`'s doc comment for exactly
+    // which commands and why (the `/` search key and `gr`/`gR` chords are
+    // guarded at their own key-resolution sites in `handle_key`, since
+    // neither becomes a parsed `Command` at all). `:game` itself is never
+    // blocked (a fresh `:game` may always restart/abandon the current one).
+    if game_navigation_blocked(app, &cmd) {
+        app.notice = Some(game::BLOCKED_NOTICE.to_string());
+        return;
+    }
     match cmd {
         Command::Open(raw) => {
             // Same grammar as the CLI TITLE argument: URLs, lang-prefixed
@@ -7306,6 +7425,8 @@ async fn execute_command(
             "prefetch" => app.set_prefetch(value == "on"),
             // PRD FR-TB-4: sync-scroll a split's two panes in lockstep.
             "scrollbind" => app.set_scrollbind(value == "on"),
+            // PRD FR-DL-4: citation-needed highlighting, default off.
+            "show-cn" => app.set_show_cn(value == "on"),
             // PRD FR-TH-2: live theme switch (value already validated by the
             // parser, so `by_name` cannot fail here).
             "theme" => {
@@ -7401,7 +7522,7 @@ async fn execute_command(
             }
             other => {
                 app.notice = Some(format!(
-                    "unknown :set key {other:?} (try: theme, images, prefetch, scrollbind, measure, ambiguous_width, reading_wpm, mouse, animations, hyperlinks, text_align, margin, paragraph_spacing, line_spacing, word_spacing)"
+                    "unknown :set key {other:?} (try: theme, images, prefetch, scrollbind, show-cn, measure, ambiguous_width, reading_wpm, mouse, animations, hyperlinks, text_align, margin, paragraph_spacing, line_spacing, word_spacing)"
                 ));
             }
         },
@@ -7632,8 +7753,89 @@ async fn execute_command(
             )
             .await
         }
+        // PRD FR-DL-6: the wiki-walk game.
+        Command::Game(spec) => {
+            start_or_share_game(client, cache, app, spec, revalidate_tx, langlinks_tx).await
+        }
+        // PRD FR-DL-8: the classic. `pro = true` disables every easter egg —
+        // rather than a parse-time difference (which would make `:xyzzy`
+        // itself vanish from `USAGE`/completion depending on config, an odd
+        // asymmetry to explain), the check lives here at execution time: in
+        // `pro` mode this reports exactly the same "unknown command"
+        // message an actually-unrecognized command would, so the two are
+        // indistinguishable to the reader.
+        Command::Xyzzy => {
+            app.notice = Some(xyzzy_response(app.pro));
+        }
         Command::Quit => app.should_quit = true,
     }
+}
+
+/// PRD FR-DL-8's `:xyzzy` — the classic. Extracted as a pure function (no
+/// `&App`) so both branches are directly testable without exercising
+/// `execute_command`'s full async signature.
+fn xyzzy_response(pro: bool) -> String {
+    if pro {
+        format!("unknown command \"xyzzy\" — {}", command::USAGE)
+    } else {
+        "Nothing happens.".to_string()
+    }
+}
+
+/// PRD FR-DL-6: `:game daily`/`:game <start> <goal>` opens the start article
+/// (bypassing the game's own navigation guard — see `execute_command`'s doc
+/// comment, checked *before* this function is ever reached, only for
+/// `Open`/`Random`/`Related`, never `Game` itself) and installs a fresh
+/// [`game::GameState`]; `:game share` instead (re)shows and clipboard-yanks
+/// the current game's [`game::share_card`], never opening anything.
+async fn start_or_share_game(
+    client: &WikiClient,
+    cache: &PageCache,
+    app: &mut App,
+    spec: command::GameSpec,
+    revalidate_tx: &UnboundedSender<RevalidationOutcome>,
+    langlinks_tx: &UnboundedSender<LangLinksOutcome>,
+) {
+    let (start, goal) = match spec {
+        command::GameSpec::Daily => {
+            let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+            let (start, goal) = game::daily_puzzle(&date);
+            (start.to_string(), goal.to_string())
+        }
+        command::GameSpec::Pair(start, goal) => (start, goal),
+        command::GameSpec::Share => {
+            match &app.game {
+                Some(g) => {
+                    let card = game::share_card(g);
+                    app.notice = Some(match yank_to_clipboard(&card) {
+                        Ok(()) => format!("{card}   (copied)"),
+                        Err(_) => card,
+                    });
+                }
+                None => {
+                    app.notice =
+                        Some("No wiki-walk in progress — :game <start> <goal>".to_string());
+                }
+            }
+            return;
+        }
+    };
+    open_title(client, cache, app, &start, revalidate_tx, langlinks_tx).await;
+    let Some(actual_title) = app.active_tab().doc.as_ref().map(|d| d.title.clone()) else {
+        app.notice = Some(format!("Could not open {start:?} to start the wiki-walk"));
+        return;
+    };
+    let now = history::now_unix();
+    let state = game::GameState::new(actual_title, goal.clone(), now);
+    app.notice = Some(if state.won {
+        format!(
+            "wiki-walk: {} already is {goal:?} — instant win!",
+            state.start()
+        )
+    } else {
+        format!("wiki-walk: reach {goal:?} by following links only — 0 clicks so far")
+    });
+    app.game = Some(state);
 }
 
 /// PRD FR-ML-3 `:bilingual`: open the current article in a split alongside the
@@ -8007,6 +8209,69 @@ mod tests {
             .decode(payload)
             .unwrap();
         assert_eq!(decoded, b"Alan Turing");
+    }
+
+    // ---- PRD FR-DL-6: wiki-walk navigation guard (`game_navigation_blocked`) --
+
+    #[test]
+    fn no_game_active_never_blocks_anything() {
+        let app = App::new("en".to_string(), Theme::terminal(), false);
+        assert!(!game_navigation_blocked(
+            &app,
+            &command::Command::Open("Anywhere".to_string())
+        ));
+    }
+
+    #[test]
+    fn an_active_unwon_game_blocks_open_random_and_related() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.game = Some(game::GameState::new("Alan Turing", "Computer science", 0));
+        assert!(game_navigation_blocked(
+            &app,
+            &command::Command::Open("Anywhere".to_string())
+        ));
+        assert!(game_navigation_blocked(
+            &app,
+            &command::Command::Random(command::RandomSpec::Any)
+        ));
+        assert!(game_navigation_blocked(&app, &command::Command::Related));
+        // `:game` itself is never blocked — a fresh one may always restart.
+        assert!(!game_navigation_blocked(
+            &app,
+            &command::Command::Game(command::GameSpec::Daily)
+        ));
+        // An unrelated command (help) is untouched.
+        assert!(!game_navigation_blocked(&app, &command::Command::Help));
+    }
+
+    // ---- PRD FR-DL-8: `:xyzzy` -----------------------------------------------
+
+    #[test]
+    fn xyzzy_says_nothing_happens_by_default() {
+        assert_eq!(xyzzy_response(false), "Nothing happens.");
+    }
+
+    #[test]
+    fn xyzzy_is_indistinguishable_from_an_unknown_command_when_pro_is_true() {
+        let pro_response = xyzzy_response(true);
+        assert_ne!(
+            pro_response, "Nothing happens.",
+            "pro=true must disable the easter egg"
+        );
+        assert!(pro_response.contains("unknown command"), "{pro_response:?}");
+    }
+
+    #[test]
+    fn a_won_game_no_longer_blocks_navigation() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        let mut game = game::GameState::new("Alan Turing", "Computer science", 0);
+        game.follow("Computer science");
+        assert!(game.won);
+        app.game = Some(game);
+        assert!(!game_navigation_blocked(
+            &app,
+            &command::Command::Open("Anywhere".to_string())
+        ));
     }
 
     // ---- Background completion routing by tab id (PRD FR-TB-3, FR-OFF-2) --

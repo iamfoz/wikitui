@@ -385,13 +385,13 @@ pub fn dwell_bar(dwell_secs: i64, peak_secs: i64, width: usize) -> String {
     "\u{2588}".repeat(filled.min(width))
 }
 
-/// PRD FR-DL-8 seam: pure stats over a trail, for the (later-chunk)
-/// achievement-toast easter egg ("Rabbit Hole: 15 articles in one session")
-/// to read. This chunk exposes only the numbers — the toast itself, its
-/// wording/threshold, and the `pro = true` opt-out are FR-DL-8's own scope;
-/// nothing here renders or decides when to show anything.
+/// PRD FR-DL-8 seam: pure stats over a trail, consumed by
+/// `achievements::newly_crossed` (via `App::check_achievements`) for the
+/// achievement-toast easter egg ("Rabbit Hole: 15 articles in one session").
+/// This module exposes only the numbers — the toast wording/thresholds and
+/// the `pro = true` opt-out live in `achievements.rs`/`app.rs`; nothing here
+/// renders or decides when to show anything.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct TrailStats {
     /// Distinct articles in the trail's scope.
     pub article_count: usize,
@@ -403,12 +403,9 @@ pub struct TrailStats {
     pub longest_chain: usize,
 }
 
-/// Computes [`TrailStats`] from an already-built trail. Not wired into
-/// anything yet (see the module doc's FR-DL-8 seam) — kept as the documented
-/// call site a future achievement-toast chunk reaches for, the same "not
-/// consumed by anything in this phase" posture `history::is_visited` and
-/// `cache.rs`'s `etag` field already take.
-#[allow(dead_code)]
+/// Computes [`TrailStats`] from an already-built trail — see the module
+/// doc's FR-DL-8 seam; `App::check_achievements` calls this after every
+/// recorded visit.
 pub fn stats(trail: &Trail) -> TrailStats {
     let article_count = trail.graph.nodes.len();
     let lines = flatten(&trail.tree);

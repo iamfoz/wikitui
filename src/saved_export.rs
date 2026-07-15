@@ -130,6 +130,10 @@ fn spans_to_md(spans: &[Span], lang: &str) -> String {
             // TeX's own backslash commands), backticks so it renders
             // literally rather than being reinterpreted as Markdown itself.
             SpanStyle::Math(tex) => out.push_str(&format!("`{tex}`")),
+            // PRD FR-DL-4: the canonical marker text as plain content — an
+            // export has no show-cn toggle to dim it for, and it's already
+            // exactly what a reader would see rendered on Wikipedia itself.
+            SpanStyle::CitationNeeded => out.push_str(&text),
         }
     }
     out
@@ -252,6 +256,8 @@ fn spans_to_html(spans: &[Span], lang: &str) -> String {
             // already is, above) but otherwise untouched, in `<code>` so it
             // renders literally.
             SpanStyle::Math(_) => out.push_str(&format!("<code>{text}</code>")),
+            // PRD FR-DL-4: plain text — see `spans_to_md`'s matching arm.
+            SpanStyle::CitationNeeded => out.push_str(&text),
         }
     }
     out

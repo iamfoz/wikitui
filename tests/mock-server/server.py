@@ -20,6 +20,9 @@ REVIDS = {
     # PRD FR-ACC-5 talk-page fixture: an ordinary page like any other, just
     # under the "Talk:" namespace prefix `src/talk.rs::to_talk` derives.
     "Talk:Alan_Turing": 1012,
+    # PRD FR-DL-4 pty-verification fixture: two `{{citation needed}}`-family
+    # markers.
+    "Citation_Needed_Showcase": 1013,
 }
 
 # PRD FR-RD-8 media fixture: build a real, tiny PNG at import time (stdlib
@@ -333,6 +336,23 @@ PAGES["Redlink_Showcase"] = """<html><head><title>Redlink Showcase</title></head
   but doesn't exist either — the batched link/info check is what catches
   that one. It also links to a real article, <a href="./Computer_science">computer science</a>,
   which must render and follow as an ordinary link.</p>
+</body></html>"""
+
+# PRD FR-DL-4 pty-verification fixture: two `{{citation needed}}`-family
+# transclusions in real Parsoid shape — `typeof="mw:Transclusion"` plus a
+# `data-mw` naming the template call (`doc::is_citation_needed_transclusion`
+# reads `data-mw.parts[].template.target.wt`), and the `noprint` class real
+# Wikipedia output carries (the class `doc.rs`'s `is_noise` would otherwise
+# drop the node for, if the citation-needed check didn't run ahead of it).
+# One uses the canonical "Citation needed" name, the other the "Fact" alias
+# — both are in `doc::CITATION_NEEDED_TEMPLATES`. A third, unrelated
+# transclusion (an infobox-shaped one) proves an unlisted template name
+# is left alone rather than also being treated as a citation-needed marker.
+PAGES["Citation_Needed_Showcase"] = """<html><head><title>Citation Needed Showcase</title></head><body>
+  <p>This article exercises citation-needed highlighting (FR-DL-4). The
+  first claim needs a source<sup class="noprint Inline-Template" typeof="mw:Transclusion" data-mw='{&quot;parts&quot;:[{&quot;template&quot;:{&quot;target&quot;:{&quot;wt&quot;:&quot;Citation needed&quot;,&quot;href&quot;:&quot;./Template:Citation_needed&quot;},&quot;params&quot;:{&quot;date&quot;:{&quot;wt&quot;:&quot;July 2026&quot;}}}}]}'>[<i><a href="./Wikipedia:Citation_needed">citation needed</a></i>]</sup>.
+  A second, separate claim also needs one<sup class="noprint Inline-Template" typeof="mw:Transclusion" data-mw='{&quot;parts&quot;:[{&quot;template&quot;:{&quot;target&quot;:{&quot;wt&quot;:&quot;Fact&quot;}}}]}'>[<i><a href="./Wikipedia:Citation_needed">citation needed</a></i>]</sup>.
+  An unrelated transclusion<sup typeof="mw:Transclusion" data-mw='{&quot;parts&quot;:[{&quot;template&quot;:{&quot;target&quot;:{&quot;wt&quot;:&quot;Infobox&quot;}}}]}'>(infobox marker)</sup> must not be treated as citation-needed.</p>
 </body></html>"""
 
 # PRD FR-ML-4 pty-verification fixture: a Wiktionary-shaped dictionary entry

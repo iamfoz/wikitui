@@ -63,6 +63,12 @@ Math and redlink fixtures (PRD FR-RD-7, FR-DL-5):
   one: any linked title that isn't a real `PAGES` key comes back
   `"missing": true`, the same technique a real wiki's `generator=links&
   prop=info` responds with.
+- `Citation_Needed_Showcase` (PRD FR-DL-4) — two `{{citation needed}}`-family
+  transclusions in real Parsoid shape (`typeof="mw:Transclusion"` + a
+  `data-mw` naming the template call, plus the `noprint` class real
+  Wikipedia output carries), one via the canonical "Citation needed" name
+  and one via the "Fact" alias, and one unrelated transclusion (an
+  infobox-shaped one) that must *not* be treated as citation-needed.
 
 Sister-project and arbitrary-MediaWiki fixtures (PRD FR-ML-4/5, §6.2 rule 3):
 

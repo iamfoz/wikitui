@@ -210,8 +210,32 @@ pub enum Command {
     /// see that call site's doc comment for why macro names can't be
     /// validated inside this parser itself).
     RunMacro(String),
+    /// `:game ...` (PRD FR-DL-6) — the wiki-walk game; see [`GameSpec`].
+    Game(GameSpec),
+    /// `:xyzzy` (PRD FR-DL-8) — the classic. "Nothing happens." unless
+    /// `pro = true`, in which case it's treated exactly like any other
+    /// unrecognized command (`main::execute_command`'s doc comment explains
+    /// why that check lives at execution time, not here).
+    Xyzzy,
     /// `:q` / `:quit` — exit.
     Quit,
+}
+
+/// `:game`'s three forms (PRD FR-DL-6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GameSpec {
+    /// Bare `:game` or `:game daily`: today's deterministic daily puzzle
+    /// (`game::daily_puzzle`) — see that function's doc comment for why bare
+    /// `:game` doesn't instead draw a fresh client-side-random pair.
+    Daily,
+    /// `:game <start> <goal>`: two whitespace-separated tokens (underscores
+    /// stand in for spaces in a multi-word title, the same URL-ish
+    /// convention the mock fixtures and `internal_title_from_href` already
+    /// use) — already underscore-normalized to real titles here.
+    Pair(String, String),
+    /// `:game share`: (re)shows and clipboard-yanks the current/just-
+    /// finished game's shareable result card (`game::share_card`).
+    Share,
 }
 
 /// `:tts`/`:speak`'s two forms (PRD FR-PC-2).
@@ -337,6 +361,8 @@ fn validate_set_value(
         "prefetch" => on_off(value),
         // PRD FR-TB-4: sync-scroll the two panes of a split.
         "scrollbind" => on_off(value),
+        // PRD FR-DL-4: citation-needed highlighting, default off.
+        "show-cn" => on_off(value),
         // PRD FR-TH-2: live theme switch, same validation as `:theme <name>`
         // and the config loader.
         "theme" => {
@@ -455,12 +481,12 @@ fn validate_set_value(
             Err(_) => Err(format!("word_spacing must be an integer (got {value:?})")),
         },
         other => Err(format!(
-            "unknown :set key {other:?} — try: theme, images=on|off, prefetch=on|off, scrollbind=on|off, measure=N, ambiguous_width=1|2, reading_wpm=N, mouse=on|off, animations=full|none, hyperlinks=auto|on|off, text_align=center|left, margin=N, paragraph_spacing=N, line_spacing=N, word_spacing=N"
+            "unknown :set key {other:?} — try: theme, images=on|off, prefetch=on|off, scrollbind=on|off, show-cn=on|off, measure=N, ambiguous_width=1|2, reading_wpm=N, mouse=on|off, animations=full|none, hyperlinks=auto|on|off, text_align=center|left, margin=N, paragraph_spacing=N, line_spacing=N, word_spacing=N"
         )),
     }
 }
 
-pub const USAGE: &str = "commands: open <title>, lang [<code>], theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, prefetch-log, interests, not-interested, stats, start, today, random [good], related, talk, info, set theme=<name>|images=on|off|prefetch=on|off|measure=N|ambiguous_width=1|2|reading_wpm=N|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N, set-tab measure=N|images=on|off|ambiguous_width=1|2|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N (or set-tab key= to reset), config reload, vsplit, only, bilingual, wiki [<name>], set scrollbind, watchlist, notifications, contribs [username], prefs, sync, mirror-watchlist, search-offline, trail [all|days N|export md|dot|mermaid [path]], mksession <name>, session <name>, sessions, tts [stop], speak [stop], run <macro>, help, quit";
+pub const USAGE: &str = "commands: open <title>, lang [<code>], theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, prefetch-log, interests, not-interested, stats, start, today, random [good], related, talk, info, set theme=<name>|images=on|off|prefetch=on|off|show-cn=on|off|measure=N|ambiguous_width=1|2|reading_wpm=N|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N, set-tab measure=N|images=on|off|ambiguous_width=1|2|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N (or set-tab key= to reset), config reload, vsplit, only, bilingual, wiki [<name>], set scrollbind, set show-cn, watchlist, notifications, contribs [username], prefs, sync, mirror-watchlist, search-offline, trail [all|days N|export md|dot|mermaid [path]], mksession <name>, session <name>, sessions, tts [stop], speak [stop], run <macro>, game [daily|share|<start> <goal>], xyzzy, help, quit";
 
 /// Parses one `:` command line. `user_theme_names` are accepted alongside
 /// the six built-ins for `:theme <name>` and `:set theme=<name>` (PRD
@@ -754,9 +780,10 @@ pub fn parse_with_user_themes(input: &str, user_theme_names: &[String]) -> Resul
         "bilingual" | "bi" => Ok(Command::Bilingual),
         "set" => {
             let assignment = require_arg("key=value")?;
-            // PRD FR-TB-4: vim-style boolean toggles without `=` —
-            // `:set scrollbind` / `:set noscrollbind` (the spelling the PRD
-            // uses), normalized to the ordinary `key=value` shape.
+            // PRD FR-TB-4 / FR-DL-4: vim-style boolean toggles without `=` —
+            // `:set scrollbind` / `:set noscrollbind` and `:set show-cn` /
+            // `:set noshow-cn` (the spelling the PRD uses), normalized to
+            // the ordinary `key=value` shape.
             if !assignment.contains('=') {
                 return match assignment.trim() {
                     "scrollbind" => Ok(Command::Set {
@@ -767,8 +794,16 @@ pub fn parse_with_user_themes(input: &str, user_theme_names: &[String]) -> Resul
                         key: "scrollbind".to_string(),
                         value: "off".to_string(),
                     }),
+                    "show-cn" => Ok(Command::Set {
+                        key: "show-cn".to_string(),
+                        value: "on".to_string(),
+                    }),
+                    "noshow-cn" => Ok(Command::Set {
+                        key: "show-cn".to_string(),
+                        value: "off".to_string(),
+                    }),
                     other => Err(format!(
-                        "usage: :set key=value (e.g. images=on) — or :set scrollbind (got {other:?})"
+                        "usage: :set key=value (e.g. images=on) — or :set scrollbind/show-cn (got {other:?})"
                     )),
                 };
             }
@@ -900,6 +935,30 @@ pub fn parse_with_user_themes(input: &str, user_theme_names: &[String]) -> Resul
         },
         // PRD FR-CS-5: `:run <macro-name>`.
         "run" => Ok(Command::RunMacro(require_arg("macro name")?)),
+        // PRD FR-DL-6: `:game`/`:game daily` (today's puzzle), `:game
+        // <start> <goal>` (exactly two whitespace-separated titles,
+        // underscores standing in for spaces), or `:game share`.
+        "game" => {
+            let arg = arg.trim();
+            if arg.is_empty() || arg.eq_ignore_ascii_case("daily") {
+                Ok(Command::Game(GameSpec::Daily))
+            } else if arg.eq_ignore_ascii_case("share") {
+                Ok(Command::Game(GameSpec::Share))
+            } else {
+                let mut parts = arg.split_whitespace();
+                match (parts.next(), parts.next(), parts.next()) {
+                    (Some(start), Some(goal), None) => Ok(Command::Game(GameSpec::Pair(
+                        start.replace('_', " "),
+                        goal.replace('_', " "),
+                    ))),
+                    _ => Err(format!(
+                        "usage: game <start> <goal> (underscores for multi-word titles), or game daily, or game share (got {arg:?})"
+                    )),
+                }
+            }
+        }
+        // PRD FR-DL-8: the classic easter egg.
+        "xyzzy" => Ok(Command::Xyzzy),
         "help" | "h" => Ok(Command::Help),
         "q" | "quit" => Ok(Command::Quit),
         "" => Err(USAGE.to_string()),
@@ -957,6 +1016,81 @@ mod tests {
             parse("set scrollbind=maybe").is_err(),
             "scrollbind is on|off only"
         );
+    }
+
+    // ---- FR-DL-4: `:set show-cn` -------------------------------------------
+
+    #[test]
+    fn set_show_cn_toggle_parses_with_and_without_equals() {
+        assert_eq!(
+            parse("set show-cn"),
+            Ok(Command::Set {
+                key: "show-cn".to_string(),
+                value: "on".to_string()
+            })
+        );
+        assert_eq!(
+            parse("set noshow-cn"),
+            Ok(Command::Set {
+                key: "show-cn".to_string(),
+                value: "off".to_string()
+            })
+        );
+        assert_eq!(
+            parse("set show-cn=off"),
+            Ok(Command::Set {
+                key: "show-cn".to_string(),
+                value: "off".to_string()
+            })
+        );
+        assert!(
+            parse("set show-cn=maybe").is_err(),
+            "show-cn is on|off only"
+        );
+    }
+
+    // ---- FR-DL-6: `:game` ---------------------------------------------------
+
+    #[test]
+    fn bare_game_and_game_daily_both_parse_as_daily() {
+        assert_eq!(parse("game"), Ok(Command::Game(GameSpec::Daily)));
+        assert_eq!(parse("game daily"), Ok(Command::Game(GameSpec::Daily)));
+        assert_eq!(parse("game DAILY"), Ok(Command::Game(GameSpec::Daily)));
+    }
+
+    #[test]
+    fn game_share_parses_as_share() {
+        assert_eq!(parse("game share"), Ok(Command::Game(GameSpec::Share)));
+    }
+
+    #[test]
+    fn game_with_two_titles_underscore_normalizes_both() {
+        assert_eq!(
+            parse("game Alan_Turing Computer_science"),
+            Ok(Command::Game(GameSpec::Pair(
+                "Alan Turing".to_string(),
+                "Computer science".to_string()
+            )))
+        );
+    }
+
+    #[test]
+    fn game_with_the_wrong_number_of_titles_is_an_error() {
+        assert!(
+            parse("game Alan_Turing").is_err(),
+            "one title alone (not \"daily\"/\"share\") is not a valid pair"
+        );
+        assert!(
+            parse("game Alan_Turing Computer_science Extra").is_err(),
+            "three tokens is not a start/goal pair"
+        );
+    }
+
+    // ---- FR-DL-8: `:xyzzy` ---------------------------------------------------
+
+    #[test]
+    fn xyzzy_parses() {
+        assert_eq!(parse("xyzzy"), Ok(Command::Xyzzy));
     }
 
     #[test]
