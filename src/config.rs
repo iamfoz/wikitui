@@ -42,6 +42,18 @@ pub const MEASURE_MAX: u16 = 200;
 /// same split as `MEASURE_MIN`/`MEASURE_MAX`.
 pub const READING_WPM_MIN: u32 = 50;
 pub const READING_WPM_MAX: u32 = 2000;
+/// The sane bounds for the FR-PC-1 spacing/typography knobs, shared with
+/// `:set`/`:set-tab` (`command::validate_set_value`) so the runtime override
+/// and the config loader agree — same split as `MEASURE_MIN`/`MEASURE_MAX`.
+/// `margin` tops out well below `measure` itself (a margin that ate the
+/// whole column would leave nothing to read); `paragraph_spacing`/
+/// `line_spacing` top out at "airy, not empty page"; `word_spacing` is
+/// binary (PRD FR-PC-1: "inter_word_spacing +1") since a cell grid has no
+/// finer inter-word gradient worth exposing.
+pub const MARGIN_MAX: u16 = 40;
+pub const PARAGRAPH_SPACING_MAX: u8 = 4;
+pub const LINE_SPACING_MAX: u8 = 2;
+pub const WORD_SPACING_MAX: u8 = 1;
 const DEFAULT_WIKI_NAME: &str = "wikipedia";
 
 /// Where a resolved value came from, in the precedence order the PRD
@@ -250,6 +262,8 @@ pub struct ResolvedConfig {
     /// FR-RD-2 (OSC 8 hyperlinks) — the terminal-integration settings this
     /// chunk adds, grouped the way `[prefetch]` groups its own table.
     pub terminal: ResolvedTerminal,
+    /// PRD FR-PC-1's `[reading]` table (spacing/typography options).
+    pub reading: ResolvedReading,
     /// Parse errors, unknown keys, and rejected values — never fatal, but
     /// `doctor` reports them and exits 1 if any is `IssueLevel::Error`.
     pub issues: Vec<Issue>,
@@ -334,6 +348,28 @@ pub struct ResolvedTerminal {
     pub color_depth: Valued<String>,
 }
 
+/// PRD FR-PC-1's `[reading]` table: the "honestly marketed spacing options"
+/// — measure/margin/text-align, paragraph and interline spacing, and the
+/// one letter-spacing-adjacent knob a cell grid actually allows (extra
+/// inter-word gap width). Each also has a runtime `:set`/`:set-tab`
+/// override (`command::validate_set_value`), same config-default-plus-
+/// runtime-override split as `measure`/`reading_wpm`.
+#[derive(Debug, Clone)]
+pub struct ResolvedReading {
+    /// Extra left margin in cells, default 0. See `layout::LayoutOptions::
+    /// margin`'s doc comment for how it interacts with centering.
+    pub margin: Valued<u16>,
+    /// `center` (default, FR-RD-9's original centered column) or `left`.
+    pub text_align: Valued<String>,
+    /// Blank rows between blocks, default 1 (today's pre-FR-PC-1 behavior).
+    pub paragraph_spacing: Valued<u8>,
+    /// Blank rows after every wrapped line, default 0. No literal "1.5" —
+    /// see `layout::LayoutOptions::line_spacing`'s doc comment.
+    pub line_spacing: Valued<u8>,
+    /// Extra inter-word gap width in cells, default 0.
+    pub word_spacing: Valued<u8>,
+}
+
 /// A schema migration from `from` to `from + 1`, run over the raw table
 /// before typed fields are extracted. Empty today (`CONFIG_VERSION` is 1,
 /// the first shipped schema) — the table exists so bumping the version
@@ -396,6 +432,23 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = "\
 # East-Asian-Ambiguous characters are (1 = narrow, 2 = wide).
 # measure = 88
 # ambiguous_width = 1
+
+# Reading comfort / spacing options (FR-PC-1) — honestly \"spacing\", not
+# letter-spacing (a cell grid can't do that). All also settable per-`:set`
+# session-wide, or per-tab via `:set-tab` (measure/images/ambiguous_width
+# too). text_align: center (default, floats the measure column in the
+# middle of a wide terminal) | left (hugs the left margin instead).
+# paragraph_spacing: blank rows between blocks, 0 (tight) .. 4 (airy),
+# default 1. line_spacing: blank rows after every wrapped line, 0..=2,
+# default 0 — there is no literal \"1.5\"; a true half-row isn't renderable,
+# so `line_spacing = 1` is offered as the closest honest approximation.
+# word_spacing: extra cells in every inter-word gap, 0 or 1, default 0.
+# [reading]
+# margin = 0
+# text_align = \"center\"
+# paragraph_spacing = 1
+# line_spacing = 0
+# word_spacing = 0
 
 # Citation style for Research mode: apa | harvard | mla | chicago.
 # cite_style = \"apa\"
@@ -527,6 +580,7 @@ pub fn resolve(
         "theme_dark",
         "hyperlinks",
         "color_depth",
+        "reading",
     ]
     .into_iter()
     .collect();
@@ -612,6 +666,7 @@ pub fn resolve(
     let prefetch = resolve_prefetch(env, &table, &mut issues);
     let network_contact = resolve_network_contact(env, &table, &mut issues);
     let terminal = resolve_terminal(env, &table, &user_theme_names, &mut issues);
+    let reading = resolve_reading(&table, &mut issues);
 
     ResolvedConfig {
         config_version: Valued {
@@ -645,6 +700,7 @@ pub fn resolve(
         prefetch,
         network_contact,
         terminal,
+        reading,
         migration_summary: config_version.1,
         issues,
         config_path: config_path.map(Path::to_path_buf),
@@ -1517,6 +1573,156 @@ fn resolve_terminal(
             &["auto", "truecolor", "256", "16", "mono"],
             issues,
         ),
+    }
+}
+
+/// PRD FR-PC-1's `[reading]` table: the spacing/typography options. File
+/// only (like `startpage`/`include_nonfree`) — a preference set once; the
+/// runtime `:set`/`:set-tab` override layers on top at read time
+/// (`App::layout_options`), same config-default-plus-runtime-override split
+/// as `measure`/`reading_wpm`.
+fn resolve_reading(table: &toml::Table, issues: &mut Vec<Issue>) -> ResolvedReading {
+    let rt: Option<&toml::Table> = table.get("reading").and_then(toml::Value::as_table);
+    if table.contains_key("reading") && rt.is_none() {
+        issues.push(Issue::warning(
+            "reading must be a table (use [reading] with margin/text_align/paragraph_spacing/line_spacing/word_spacing); ignoring",
+        ));
+    }
+    if let Some(t) = rt {
+        let known: BTreeSet<&str> = [
+            "margin",
+            "text_align",
+            "paragraph_spacing",
+            "line_spacing",
+            "word_spacing",
+        ]
+        .into_iter()
+        .collect();
+        for key in t.keys() {
+            if !known.contains(key.as_str()) {
+                issues.push(Issue::warning(format!(
+                    "unknown config key 'reading.{key}' — ignored"
+                )));
+            }
+        }
+    }
+    let field = |k: &str| rt.and_then(|t| t.get(k));
+
+    ResolvedReading {
+        margin: resolve_bounded_u16("reading.margin", field("margin"), 0, 0, MARGIN_MAX, issues),
+        text_align: resolve_closed_string_field(
+            "reading.text_align",
+            None,
+            field("text_align"),
+            "center",
+            &["center", "left"],
+            issues,
+        ),
+        paragraph_spacing: resolve_bounded_u8(
+            "reading.paragraph_spacing",
+            field("paragraph_spacing"),
+            1,
+            0,
+            PARAGRAPH_SPACING_MAX,
+            issues,
+        ),
+        line_spacing: resolve_bounded_u8(
+            "reading.line_spacing",
+            field("line_spacing"),
+            0,
+            0,
+            LINE_SPACING_MAX,
+            issues,
+        ),
+        word_spacing: resolve_bounded_u8(
+            "reading.word_spacing",
+            field("word_spacing"),
+            0,
+            0,
+            WORD_SPACING_MAX,
+            issues,
+        ),
+    }
+}
+
+/// A file-only `u16` field clamped to `[min, max]` with a warning if the
+/// configured value fell outside that range — same "clamp, don't reject"
+/// leniency as `resolve_measure`/`resolve_reading_wpm`, generalized (like
+/// `resolve_weight` already is for the three `[prefetch]` weights) so
+/// `reading.margin` doesn't need its own near-duplicate.
+fn resolve_bounded_u16(
+    field_name: &str,
+    raw: Option<&toml::Value>,
+    default: u16,
+    min: u16,
+    max: u16,
+    issues: &mut Vec<Issue>,
+) -> Valued<u16> {
+    let fallback = Valued {
+        value: default,
+        source: Source::Default,
+    };
+    match raw {
+        None => fallback,
+        Some(v) => match v.as_integer() {
+            Some(n) => {
+                let clamped = n.clamp(min as i64, max as i64);
+                if clamped != n {
+                    issues.push(Issue::warning(format!(
+                        "{field_name} {n} is outside the sane {min}..={max} range; clamped to {clamped}"
+                    )));
+                }
+                Valued {
+                    value: clamped as u16,
+                    source: Source::File,
+                }
+            }
+            None => {
+                issues.push(Issue::warning(format!(
+                    "{field_name} must be an integer; using default {default}"
+                )));
+                fallback
+            }
+        },
+    }
+}
+
+/// The `u8` twin of [`resolve_bounded_u16`], for the three FR-PC-1 spacing
+/// fields small enough to fit a byte.
+fn resolve_bounded_u8(
+    field_name: &str,
+    raw: Option<&toml::Value>,
+    default: u8,
+    min: u8,
+    max: u8,
+    issues: &mut Vec<Issue>,
+) -> Valued<u8> {
+    let fallback = Valued {
+        value: default,
+        source: Source::Default,
+    };
+    match raw {
+        None => fallback,
+        Some(v) => match v.as_integer() {
+            Some(n) => {
+                let clamped = n.clamp(min as i64, max as i64);
+                if clamped != n {
+                    issues.push(Issue::warning(format!(
+                        "{field_name} {n} is outside the sane {min}..={max} range; clamped to {clamped}"
+                    )));
+                }
+                Valued {
+                    value: clamped as u8,
+                    source: Source::File,
+                }
+            }
+            None => {
+                issues.push(Issue::warning(format!(
+                    "{field_name} must be an integer; using default {default}"
+                )));
+                fallback
+            }
+        },
     }
 }
 
@@ -2436,6 +2642,118 @@ mod tests {
                 .any(|i| i.message.contains("prefetch.weight_lead"))
         );
         cleanup(&path);
+    }
+
+    /// PRD FR-PC-1: the `[reading]` table defaults, honoring the file, and
+    /// clamping out-of-range values with a warning — same three-way check
+    /// `prefetch_table_is_honored_and_validated`/`prefetch_rejects_bad_
+    /// values_with_warnings_and_falls_back` run for `[prefetch]`.
+    #[test]
+    fn reading_table_defaults_are_the_pre_fr_pc_1_behavior() {
+        let r = resolve(&CliOverrides::default(), &EnvOverrides::default(), None);
+        assert_eq!(r.reading.margin.value, 0);
+        assert_eq!(r.reading.text_align.value, "center");
+        assert_eq!(r.reading.paragraph_spacing.value, 1);
+        assert_eq!(r.reading.line_spacing.value, 0);
+        assert_eq!(r.reading.word_spacing.value, 0);
+        for v in [
+            &r.reading.margin.source,
+            &r.reading.paragraph_spacing.source,
+            &r.reading.line_spacing.source,
+            &r.reading.word_spacing.source,
+        ] {
+            assert_eq!(*v, Source::Default);
+        }
+    }
+
+    #[test]
+    fn reading_table_is_honored_from_the_file() {
+        let path = temp_config(
+            "[reading]\nmargin = 4\ntext_align = \"left\"\nparagraph_spacing = 2\nline_spacing = 1\nword_spacing = 1\n",
+        );
+        let r = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(r.reading.margin.value, 4);
+        assert_eq!(r.reading.margin.source, Source::File);
+        assert_eq!(r.reading.text_align.value, "left");
+        assert_eq!(r.reading.paragraph_spacing.value, 2);
+        assert_eq!(r.reading.line_spacing.value, 1);
+        assert_eq!(r.reading.word_spacing.value, 1);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn reading_table_clamps_out_of_range_values_with_a_warning() {
+        let path = temp_config(
+            "[reading]\nmargin = 9999\nparagraph_spacing = 9\nline_spacing = 9\nword_spacing = 9\ntext_align = \"justify\"\n",
+        );
+        let r = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(r.reading.margin.value, MARGIN_MAX);
+        assert_eq!(r.reading.paragraph_spacing.value, PARAGRAPH_SPACING_MAX);
+        assert_eq!(r.reading.line_spacing.value, LINE_SPACING_MAX);
+        assert_eq!(r.reading.word_spacing.value, WORD_SPACING_MAX);
+        assert_eq!(
+            r.reading.text_align.value, "center",
+            "an unknown text_align falls back to the default rather than clamping"
+        );
+        assert!(
+            r.issues
+                .iter()
+                .any(|i| i.message.contains("reading.margin"))
+        );
+        assert!(
+            r.issues
+                .iter()
+                .any(|i| i.message.contains("reading.paragraph_spacing"))
+        );
+        assert!(
+            r.issues
+                .iter()
+                .any(|i| i.message.contains("reading.line_spacing"))
+        );
+        assert!(
+            r.issues
+                .iter()
+                .any(|i| i.message.contains("reading.word_spacing"))
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn reading_table_rejects_a_non_table_value_and_unknown_subkeys() {
+        let path = temp_config("reading = \"nope\"\n");
+        let r = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(r.reading.margin.value, 0, "falls back to defaults");
+        assert!(
+            r.issues
+                .iter()
+                .any(|i| i.message.contains("reading must be a table"))
+        );
+        cleanup(&path);
+
+        let path2 = temp_config("[reading]\nbogus_key = 1\n");
+        let r2 = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path2),
+        );
+        assert!(
+            r2.issues
+                .iter()
+                .any(|i| i.message.contains("reading.bogus_key"))
+        );
+        cleanup(&path2);
     }
 
     #[test]

@@ -501,6 +501,7 @@ async fn main() -> Result<()> {
         user_themes,
         accessible,
         resolved.terminal.clone(),
+        resolved.reading.clone(),
         resolved.measure.value,
         resolved.ambiguous_wide.value,
         resolved.reading_wpm.value,
@@ -1781,6 +1782,7 @@ async fn run(
     user_themes: Vec<theme::LoadedUserTheme>,
     accessible: bool,
     terminal_cfg: config::ResolvedTerminal,
+    reading_cfg: config::ResolvedReading,
     measure: u16,
     ambiguous_wide: bool,
     reading_wpm: u32,
@@ -1822,6 +1824,16 @@ async fn run(
     app.measure = measure;
     app.ambiguous_wide = ambiguous_wide;
     app.reading_wpm = reading_wpm;
+    // PRD FR-PC-1: the `[reading]` spacing/typography options — session-
+    // global starting points, same as `measure`/`ambiguous_wide` above;
+    // already validated/clamped by `config::resolve`, so no fallback logic
+    // is needed here (mirrors `app.measure = measure` just above).
+    app.margin = reading_cfg.margin.value;
+    app.text_align = layout::TextAlign::parse(&reading_cfg.text_align.value)
+        .unwrap_or(layout::TextAlign::Center);
+    app.paragraph_spacing = reading_cfg.paragraph_spacing.value;
+    app.line_spacing = reading_cfg.line_spacing.value;
+    app.word_spacing = reading_cfg.word_spacing.value;
     app.cite_style = cite_style;
     app.readlater_auto_dequeue = readlater_auto_dequeue;
     // PRD FR-RD-8/§6.3: terminal graphics capability snapshot, taken once.
@@ -2585,6 +2597,17 @@ fn apply_config_reload(app: &mut App) {
     app.measure = resolved.measure.value;
     app.ambiguous_wide = resolved.ambiguous_wide.value;
     app.reading_wpm = resolved.reading_wpm.value;
+    // PRD FR-PC-1: reload the `[reading]` spacing/typography defaults too —
+    // same live-apply seam as measure/ambiguous_wide just above. A `:set`
+    // made this session is not specially preserved here (unlike `images`
+    // below): these are cosmetic reading preferences, not a persisted
+    // network/privacy posture, so a reload simply re-adopts the file.
+    app.margin = resolved.reading.margin.value;
+    app.text_align = layout::TextAlign::parse(&resolved.reading.text_align.value)
+        .unwrap_or(layout::TextAlign::Center);
+    app.paragraph_spacing = resolved.reading.paragraph_spacing.value;
+    app.line_spacing = resolved.reading.line_spacing.value;
+    app.word_spacing = resolved.reading.word_spacing.value;
     app.readlater_auto_dequeue = resolved.readlater_auto_dequeue.value;
     // PRD FR-ML-2: the fallback chain and picker-pinning both read this
     // live, like measure/ambiguous_wide above — no restart needed to pick
@@ -4878,12 +4901,53 @@ async fn execute_command(
                     app.set_hyperlinks_mode(mode);
                 }
             }
+            // PRD FR-PC-1: the honest "spacing options", session-global.
+            // Every one of these feeds `layout_options`, so each needs the
+            // same relayout seam `measure`/`ambiguous_width` use above.
+            "text_align" => {
+                if let Some(align) = layout::TextAlign::parse(&value) {
+                    app.text_align = align;
+                    app.layout = None;
+                    app.notice = Some(format!("text_align={value}"));
+                }
+            }
+            "margin" => {
+                if let Ok(n) = value.parse::<u16>() {
+                    app.margin = n;
+                    app.layout = None;
+                    app.notice = Some(format!("margin={n}"));
+                }
+            }
+            "paragraph_spacing" => {
+                if let Ok(n) = value.parse::<u8>() {
+                    app.paragraph_spacing = n;
+                    app.layout = None;
+                    app.notice = Some(format!("paragraph_spacing={n}"));
+                }
+            }
+            "line_spacing" => {
+                if let Ok(n) = value.parse::<u8>() {
+                    app.line_spacing = n;
+                    app.layout = None;
+                    app.notice = Some(format!("line_spacing={n}"));
+                }
+            }
+            "word_spacing" => {
+                if let Ok(n) = value.parse::<u8>() {
+                    app.word_spacing = n;
+                    app.layout = None;
+                    app.notice = Some(format!("word_spacing={n}"));
+                }
+            }
             other => {
                 app.notice = Some(format!(
-                    "unknown :set key {other:?} (try: theme, images, prefetch, measure, ambiguous_width, reading_wpm, mouse, animations, hyperlinks)"
+                    "unknown :set key {other:?} (try: theme, images, prefetch, measure, ambiguous_width, reading_wpm, mouse, animations, hyperlinks, text_align, margin, paragraph_spacing, line_spacing, word_spacing)"
                 ));
             }
         },
+        // PRD FR-PC-4: `:set-tab` — same keys `TAB_SCOPED_KEYS` allows,
+        // scoped to the active tab only (`App::set_tab_override`).
+        Command::SetTab { key, value } => app.set_tab_override(&key, value.as_deref()),
         Command::PrefetchLog => app.open_prefetch_log(),
         Command::Style(name) => {
             if let Some(style) = cite::CiteStyle::by_name(&name) {

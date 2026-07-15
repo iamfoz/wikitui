@@ -113,6 +113,35 @@ impl LaidLine {
     }
 }
 
+/// PRD FR-PC-1's honest "spacing options": a cell grid can't letter-space,
+/// so the one alignment choice on offer is where the leftover width (beyond
+/// `measure`) goes. `Center` is FR-RD-9's original behavior — pad both
+/// sides so the column floats in the middle of a wide terminal; `Left`
+/// drops that pad so the column instead hugs the left margin, for readers
+/// who find a floating center column disorienting. Either way the column
+/// itself is never wider than `measure` — this only redistributes the
+/// leftover space, never the content width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TextAlign {
+    #[default]
+    Center,
+    Left,
+}
+
+impl TextAlign {
+    /// Parses the `:set`/`:set-tab text_align=` and config `text_align =`
+    /// spelling. Mirrors `HyperlinkMode::parse`'s shape: a small closed set,
+    /// `None` for anything else, so the caller can produce its own error
+    /// message naming the valid choices.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "center" => Some(Self::Center),
+            "left" => Some(Self::Left),
+            _ => None,
+        }
+    }
+}
+
 /// Layout knobs a config file will eventually wire (FR-RD-9/FR-RD-10);
 /// exposed now as `App` fields with the documented defaults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +180,66 @@ pub struct LayoutOptions {
     /// changes the laid-out header line, so a stale cached layout must not
     /// be reused across a change.
     pub reading_wpm: u32,
+    /// The *resolved* images-enabled bool for the tab this layout is built
+    /// for (PRD FR-TH-7, FR-RD-8) — never consulted inside
+    /// `layout_document_with_images` itself (the actual box-vs-placeholder
+    /// decision is entirely a property of the `ImageResolver`/box map the
+    /// caller passes in, exactly like `image_epoch`), only carried here so
+    /// it participates in the L1 cache key. That's load-bearing once FR-PC-4
+    /// lets two *tabs* disagree about images on the same article/width/
+    /// options: `image_epoch` alone is a nonce, not the answer, so it can't
+    /// tell one tab's "on" apart from another tab's "off" at the same nonce
+    /// value — this field can.
+    pub images_on: bool,
+    /// PRD FR-PC-1: `center` (default, FR-RD-9's original behavior) or
+    /// `left` — see [`TextAlign`].
+    pub text_align: TextAlign,
+    /// PRD FR-PC-1: extra left margin in cells, carved out of the *same*
+    /// available-width budget `measure`/centering already share (never added
+    /// on top of it) — see `layout_document_with_images`'s pad-width math.
+    /// Default 0 (no margin beyond whatever centering already applies).
+    pub margin: u16,
+    /// PRD FR-PC-1: blank rows between one block-level element and the next
+    /// (a paragraph, heading, list, quote, table, image, …) — every
+    /// `Emitter::blank` call site shares this one knob, so raising or
+    /// lowering it is a single configuration change rather than a per-block-
+    /// kind rule. Default 1 reproduces the pre-FR-PC-1 layout byte for byte;
+    /// 0 is "tight", 2 (and up) is "airy".
+    pub paragraph_spacing: u8,
+    /// PRD FR-PC-1's honest "interline spacing": a terminal cell grid has no
+    /// fractional line height, so this is literally how many blank rows
+    /// follow *every* visual (wrapped) line of prose — paragraphs, headings,
+    /// list items, blockquotes, captions, image placeholders, and math (see
+    /// `Emitter::emit_wrapped`, the one choke point that applies it).
+    /// Structured/grid content — table grids and collapse-lists, infobox
+    /// cards, image half-block boxes, code blocks, horizontal rules, and
+    /// gallery strips — is deliberately exempt: a blank row spliced into a
+    /// box-drawing grid or an image's pixel rows would break it, not space
+    /// it out. `0` is today's single-spacing default. There is no literal
+    /// "1.5" setting — a true half-row isn't renderable on a cell grid, and
+    /// this option does not pretend otherwise; `1` (one blank row after
+    /// every line) is offered as the closest *honest* approximation of
+    /// "1.5-line spacing" a reader coming from a word processor would
+    /// recognize, `2` approximates a still-airier double-plus. Also: at
+    /// `line_spacing > 0`, in-page find's wrap-straddling glue (`Layout::
+    /// continuation`, "a query split across a wrap point is still found")
+    /// stops gluing across that particular wrap — the inserted blank row
+    /// means the two visual lines are no longer adjacent in `lines`, so a
+    /// query is still found within either line alone, just not one that
+    /// happens to straddle the old wrap point. A narrow, documented
+    /// trade-off, not a bug: exactly the kind of edge case `find_matches`'s
+    /// own doc comment already calls "a narrow, documented miss."
+    pub line_spacing: u8,
+    /// PRD FR-PC-1's honest "inter-word spacing": a cell grid can't
+    /// letter-space, but it can widen the single collapsed space between
+    /// words by this many extra cells (`0` default, `1` typical) — applied
+    /// in `fill`'s greedy line-filler so the extra width always counts
+    /// toward line-fill math (a wider gap still wraps correctly, never
+    /// overflows). Scoped to prose wrapping (`wrap_content`/`emit_wrapped`'s
+    /// call sites); table/infobox cell text (`wrap_cell_text`) is exempt —
+    /// widening the gaps inside a fixed-width grid column would misalign it
+    /// against its own border, not make it more readable.
+    pub word_spacing: u8,
 }
 
 impl Default for LayoutOptions {
@@ -162,6 +251,12 @@ impl Default for LayoutOptions {
             table_col_offset: 0,
             image_epoch: 0,
             reading_wpm: 230,
+            images_on: false,
+            text_align: TextAlign::Center,
+            margin: 0,
+            paragraph_spacing: 1,
+            line_spacing: 0,
+            word_spacing: 0,
         }
     }
 }
@@ -379,6 +474,26 @@ fn is_no_end(c: char) -> bool {
     )
 }
 
+/// A single collapsed inter-word gap `width` cells wide (PRD FR-PC-1's
+/// `word_spacing`: `1` normally, `1 + word_spacing` when widened). Built
+/// directly rather than through `make_cluster`, whose `is_space` branch
+/// hardcodes width 1 regardless of the text's actual length — here the
+/// extra cell(s) must count toward line-fill width math so a widened gap
+/// still wraps correctly and the no-overflow invariant holds.
+fn space_cluster(kind: SpanKind, width: usize) -> Cluster {
+    let width = width.max(1);
+    Cluster {
+        text: " ".repeat(width),
+        width,
+        kind,
+        is_space: true,
+        is_newline: false,
+        cjk: false,
+        first_char: ' ',
+        last_char: ' ',
+    }
+}
+
 fn make_cluster(text: &str, kind: SpanKind, ambiguous_wide: bool) -> Cluster {
     let is_newline = text == "\n";
     let is_space = !is_newline && !text.is_empty() && text.chars().all(char::is_whitespace);
@@ -562,8 +677,13 @@ fn build_pieces(clusters: &[Cluster]) -> Vec<Piece> {
 
 /// Greedily pack pieces into lines no wider than `avail`. A piece wider than
 /// `avail` is hard-split at cluster boundaries so nothing ever overflows.
-fn fill(pieces: Vec<Piece>, avail: usize) -> Vec<Vec<Cluster>> {
+/// `word_spacing` (PRD FR-PC-1) widens every collapsed inter-word gap from 1
+/// cell to `1 + word_spacing`; the extra width is folded into the same
+/// wrap-or-not check a plain 1-cell gap already used, so a widened gap still
+/// wraps at the right point instead of silently overflowing.
+fn fill(pieces: Vec<Piece>, avail: usize, word_spacing: usize) -> Vec<Vec<Cluster>> {
     let avail = avail.max(1);
+    let space_w = 1 + word_spacing;
     let mut lines: Vec<Vec<Cluster>> = Vec::new();
     let mut cur: Vec<Cluster> = Vec::new();
     let mut cur_w = 0usize;
@@ -571,7 +691,11 @@ fn fill(pieces: Vec<Piece>, avail: usize) -> Vec<Vec<Cluster>> {
 
     for piece in pieces {
         let pw = piece.width();
-        let sep_w = usize::from(pending_space.is_some() && !cur.is_empty());
+        let sep_w = if pending_space.is_some() && !cur.is_empty() {
+            space_w
+        } else {
+            0
+        };
         if !cur.is_empty() && cur_w + sep_w + pw > avail {
             lines.push(std::mem::take(&mut cur));
             cur_w = 0;
@@ -580,8 +704,8 @@ fn fill(pieces: Vec<Piece>, avail: usize) -> Vec<Vec<Cluster>> {
         if let Some(kind) = pending_space.take()
             && !cur.is_empty()
         {
-            cur.push(make_cluster(" ", kind, false));
-            cur_w += 1;
+            cur.push(space_cluster(kind, space_w));
+            cur_w += space_w;
         }
 
         if cur_w + pw <= avail {
@@ -609,18 +733,20 @@ fn fill(pieces: Vec<Piece>, avail: usize) -> Vec<Vec<Cluster>> {
 }
 
 /// Wrap a run of clusters (with hard `\n` breaks honored) into visual lines.
-fn wrap_content(clusters: Vec<Cluster>, avail: usize) -> Vec<Vec<Cluster>> {
+/// `word_spacing` is threaded straight through to `fill` — see its own doc
+/// comment.
+fn wrap_content(clusters: Vec<Cluster>, avail: usize, word_spacing: usize) -> Vec<Vec<Cluster>> {
     let mut out = Vec::new();
     let mut sub: Vec<Cluster> = Vec::new();
     for c in clusters {
         if c.is_newline {
-            out.extend(fill(build_pieces(&sub), avail));
+            out.extend(fill(build_pieces(&sub), avail, word_spacing));
             sub = Vec::new();
         } else {
             sub.push(c);
         }
     }
-    out.extend(fill(build_pieces(&sub), avail));
+    out.extend(fill(build_pieces(&sub), avail, word_spacing));
     out
 }
 
@@ -699,6 +825,19 @@ struct Emitter<'a> {
     /// Reserves inline-image boxes (PRD FR-RD-8); `&NoImages` when images are
     /// off, so every image emits its alt-text placeholder instead.
     images: &'a dyn ImageResolver,
+    /// PRD FR-PC-1 `paragraph_spacing`: how many blank rows `blank()` inserts
+    /// at every block-separator call site (default 1, today's behavior).
+    paragraph_spacing: usize,
+    /// PRD FR-PC-1 `line_spacing`: how many blank rows `emit_wrapped` inserts
+    /// after every visual (wrapped) line of prose — see its own field doc
+    /// comment on `LayoutOptions` for the full honest framing and the
+    /// find-glue trade-off.
+    line_spacing: usize,
+    /// PRD FR-PC-1 `word_spacing`: extra cells added to every collapsed
+    /// inter-word gap in prose wrapping (`emit_wrapped`/`wrap_content`'s
+    /// Emitter call sites) — see `fill`'s doc comment for the width-safety
+    /// argument.
+    word_spacing: usize,
 }
 
 impl Emitter<'_> {
@@ -714,8 +853,25 @@ impl Emitter<'_> {
         self.lines.push(line);
     }
 
+    /// The standard inter-block blank-line gap (PRD FR-PC-1
+    /// `paragraph_spacing`): every block-separator call site in this emitter
+    /// shares this one knob, so raising or lowering the gap is a single
+    /// configuration change, never a per-block-kind rule. `paragraph_spacing
+    /// = 0` means no gap at all — a still-valid, "tight" layout.
     fn blank(&mut self) {
-        self.push_line(finalize(self.pad_width, &[], &[]), false);
+        for _ in 0..self.paragraph_spacing {
+            self.push_line(finalize(self.pad_width, &[], &[]), false);
+        }
+    }
+
+    /// `line_spacing` blank filler rows, inserted immediately after one
+    /// visual line of prose (PRD FR-PC-1) — factored out of `emit_wrapped`
+    /// since it is pushed after *every* wrapped line, including the
+    /// zero-content-line early return.
+    fn line_spacing_filler(&mut self) {
+        for _ in 0..self.line_spacing {
+            self.push_line(finalize(self.pad_width, &[], &[]), false);
+        }
     }
 
     /// Emit a block whose content wraps under an optional hanging prefix
@@ -739,14 +895,16 @@ impl Emitter<'_> {
             (first_prefix, cont_prefix, prefix_width)
         };
         let avail = self.content_width - prefix_width;
-        let wrapped = wrap_content(content, avail);
+        let wrapped = wrap_content(content, avail, self.word_spacing);
         if wrapped.is_empty() {
             self.push_line(finalize(self.pad_width, &first_prefix, &[]), false);
+            self.line_spacing_filler();
             return;
         }
         for (i, line) in wrapped.iter().enumerate() {
             let prefix = if i == 0 { &first_prefix } else { &cont_prefix };
             self.push_line(finalize(self.pad_width, prefix, line), i > 0);
+            self.line_spacing_filler();
         }
     }
 
@@ -1045,7 +1203,7 @@ impl Emitter<'_> {
                 .collect::<Vec<_>>()
                 .join("   ");
             let clusters = clusters_from_str(&joined, SpanKind::Caption, aw);
-            for (i, wl) in wrap_content(clusters, self.content_width.max(1))
+            for (i, wl) in wrap_content(clusters, self.content_width.max(1), self.word_spacing)
                 .into_iter()
                 .enumerate()
             {
@@ -1078,7 +1236,7 @@ impl Emitter<'_> {
                         continue;
                     }
                     let clusters = clusters_from_str(&line, SpanKind::Table, aw);
-                    for wl in wrap_content(clusters, self.content_width.max(1)) {
+                    for wl in wrap_content(clusters, self.content_width.max(1), self.word_spacing) {
                         self.push_line(finalize(self.pad_width, &[], &wl), false);
                     }
                 }
@@ -1141,6 +1299,9 @@ impl Emitter<'_> {
                 content_width: left_w,
                 ambiguous_wide: aw,
                 images: self.images,
+                paragraph_spacing: self.paragraph_spacing,
+                line_spacing: self.line_spacing,
+                word_spacing: self.word_spacing,
             };
             for b in lead_blocks {
                 tem.emit_block(
@@ -1375,9 +1536,15 @@ fn pad_to_width(s: &str, w: usize, aw: bool) -> String {
 /// Wrap `text` to `w` cells using the same word/CJK line-breaker the body
 /// text uses (so a cell that overflows its column wraps and grows the row's
 /// height, never overflows). Returns one string per visual line.
+///
+/// Deliberately never widened by `word_spacing` (PRD FR-PC-1): this feeds
+/// fixed-width table/infobox grid cells, where a widened inter-word gap
+/// would misalign the cell's own padding against its column border rather
+/// than make it more readable — `word_spacing` is scoped to prose wrapping
+/// (`Emitter::emit_wrapped` and its own direct `wrap_content` call sites).
 fn wrap_cell_text(text: &str, w: usize, aw: bool) -> Vec<String> {
     let clusters = clusters_from_str(text, SpanKind::Table, aw);
-    let wrapped = wrap_content(clusters, w.max(1));
+    let wrapped = wrap_content(clusters, w.max(1), 0);
     let mut out: Vec<String> = wrapped
         .into_iter()
         .map(|line| line.iter().map(|c| c.text.as_str()).collect())
@@ -1544,8 +1711,20 @@ pub fn layout_document_with_images(
     folds: &[usize],
 ) -> Layout {
     let available = (width.max(1)) as usize;
-    let content_width = available.min((options.measure.max(1)) as usize);
-    let pad_width = available.saturating_sub(content_width) / 2;
+    // PRD FR-PC-1's `margin`: carved out of the *same* available-width
+    // budget `measure`/centering already share, never added on top of it —
+    // clamped so at least 1 cell of content column always remains, which is
+    // what keeps `pad_width + content_width <= available` an unconditional
+    // invariant (the no-overflow property tests rely on it) regardless of
+    // how large a margin is configured on a narrow terminal.
+    let margin = (options.margin as usize).min(available.saturating_sub(1));
+    let avail_after_margin = (available - margin).max(1);
+    let content_width = avail_after_margin.min((options.measure.max(1)) as usize);
+    let center_pad = match options.text_align {
+        TextAlign::Center => avail_after_margin.saturating_sub(content_width) / 2,
+        TextAlign::Left => 0,
+    };
+    let pad_width = margin + center_pad;
     let aw = options.ambiguous_wide;
 
     let mut lines: Vec<LaidLine> = Vec::new();
@@ -1584,6 +1763,9 @@ pub fn layout_document_with_images(
             content_width,
             ambiguous_wide: aw,
             images,
+            paragraph_spacing: options.paragraph_spacing as usize,
+            line_spacing: options.line_spacing as usize,
+            word_spacing: options.word_spacing as usize,
         };
         // Title, then a blank line — mirrors the previous renderer's header.
         em.emit_plain_wrapped(clusters_from_str(&doc.title, SpanKind::Title, aw));
@@ -1924,7 +2106,10 @@ fn occurrence_from_origins(origins: &[Option<(usize, usize)>]) -> Option<Occurre
 /// [`LayoutCacheKey`] (PRD FR-OFF-1's L1 layer) so a stale schema can never
 /// be silently replayed across an upgrade — a version bump makes every
 /// existing L1 entry a guaranteed miss instead.
-pub const LAYOUT_SCHEMA_VERSION: u32 = 4;
+/// v5 (PRD FR-PC-1): line emission gained `paragraph_spacing`/`line_spacing`/
+/// `word_spacing`, which insert or widen rows a v4-shaped `LayoutOptions`
+/// never accounted for.
+pub const LAYOUT_SCHEMA_VERSION: u32 = 5;
 
 /// PRD §6.8's L1 hit target (< 50 ms) only holds if the cache stays small
 /// enough that a linear scan over it is free — 8 entries covers "the
@@ -2331,6 +2516,355 @@ mod tests {
         // Some line should actually use most of the width (proves we wrap to
         // 50, not to 88).
         assert!(layout.lines.iter().any(|l| l.width(false) > 40));
+    }
+
+    // ---- FR-PC-1: spacing/typography options -------------------------
+
+    /// A tiny, hand-verifiable fixture for the spacing tests below: two short
+    /// paragraphs, nothing else, so the exact line sequence a given set of
+    /// spacing options produces can be reasoned about directly instead of
+    /// through a big fixture's incidental structure.
+    const TWO_PARAGRAPHS: &str = r#"<html><head><title>Spacing Test</title></head><body>
+      <p>First paragraph here.</p>
+      <p>Second paragraph here.</p>
+    </body></html>"#;
+
+    /// PRD FR-PC-1: `LayoutOptions::default()` must reproduce the exact
+    /// pre-FR-PC-1 layout — a golden-ish regression guard so a future change
+    /// to a default value (rather than to an explicit `:set`) doesn't slip
+    /// by unnoticed. Pinned against the same `FIXTURE` several other tests
+    /// already exercise, at a width wide enough to also exercise the default
+    /// centered `text_align`.
+    #[test]
+    fn default_options_reproduce_the_pre_fr_pc_1_layout() {
+        let doc = parse_article_html("Test Article", FIXTURE);
+        let layout = layout_document(&doc, 90, LayoutOptions::default());
+        // measure=88 inside a 90-wide terminal centers with a 1-cell pad —
+        // the default `text_align = Center`, `margin = 0`.
+        assert_eq!(
+            layout.lines[0].spans[0].text, " ",
+            "default centering pads (90-88)/2 = 1 cell"
+        );
+        // No `line_spacing` filler anywhere under the default (0): the "N min
+        // read" line (FR-RD-11) immediately follows the title with no blank
+        // row of its own, then exactly one unconditional block-separator
+        // blank (paragraph_spacing=1), then the first real block — never two.
+        let min_read = layout
+            .lines
+            .iter()
+            .position(|l| line_text(l).contains("min read"))
+            .expect("a nonempty article always reports a nonzero reading time");
+        assert_eq!(
+            min_read, 1,
+            "immediately follows the title, no filler row between"
+        );
+        assert_eq!(line_text(&layout.lines[min_read + 1]).trim(), "");
+        assert_ne!(
+            line_text(&layout.lines[min_read + 2]).trim(),
+            "",
+            "default paragraph_spacing=1 means exactly one blank row, not two"
+        );
+        // Words stay separated by exactly one space (default `word_spacing =
+        // 0`): a known two-word run from the fixture renders with a single
+        // collapsed space, never a widened gap.
+        let joined: String = layout
+            .lines
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("bold and"),
+            "default word_spacing=0 keeps a single collapsed space: {joined:?}"
+        );
+    }
+
+    /// `paragraph_spacing = 2` doubles every block-separator gap — a second
+    /// paragraph's lead line now sits two blank rows below the first's, not
+    /// one.
+    #[test]
+    fn paragraph_spacing_two_adds_a_second_blank_line_between_paragraphs() {
+        let doc = parse_article_html("Spacing Test", TWO_PARAGRAPHS);
+        let opts = LayoutOptions {
+            paragraph_spacing: 2,
+            ..LayoutOptions::default()
+        };
+        let layout = layout_document(&doc, 40, opts);
+        let first = layout
+            .lines
+            .iter()
+            .position(|l| line_text(l).contains("First paragraph"))
+            .expect("first paragraph line");
+        let second = layout
+            .lines
+            .iter()
+            .position(|l| line_text(l).contains("Second paragraph"))
+            .expect("second paragraph line");
+        let gap = second - first - 1;
+        assert_eq!(gap, 2, "two blank rows between the paragraphs' own lines");
+        for i in first + 1..second {
+            assert_eq!(
+                line_text(&layout.lines[i]).trim(),
+                "",
+                "gap row {i} must be blank"
+            );
+        }
+
+        // The default (paragraph_spacing=1) is exactly one blank row, so this
+        // really is "a second blank line," not just "the fixture changed."
+        let default_layout = layout_document(&doc, 40, LayoutOptions::default());
+        let d_first = default_layout
+            .lines
+            .iter()
+            .position(|l| line_text(l).contains("First paragraph"))
+            .unwrap();
+        let d_second = default_layout
+            .lines
+            .iter()
+            .position(|l| line_text(l).contains("Second paragraph"))
+            .unwrap();
+        assert_eq!(d_second - d_first - 1, 1);
+    }
+
+    /// `line_spacing = 1` inserts one blank row after *every* wrapped line of
+    /// prose — including a single-line paragraph, so the gap between two
+    /// consecutive one-line paragraphs grows by exactly 1 on top of whatever
+    /// `paragraph_spacing` already contributes.
+    #[test]
+    fn line_spacing_one_inserts_a_blank_after_each_visual_line() {
+        let doc = parse_article_html("Spacing Test", TWO_PARAGRAPHS);
+        let opts = LayoutOptions {
+            line_spacing: 1,
+            ..LayoutOptions::default()
+        };
+        let layout = layout_document(&doc, 40, opts);
+        let first = layout
+            .lines
+            .iter()
+            .position(|l| line_text(l).contains("First paragraph"))
+            .expect("first paragraph line");
+        let second = layout
+            .lines
+            .iter()
+            .position(|l| line_text(l).contains("Second paragraph"))
+            .expect("second paragraph line");
+        // line_spacing's own filler (1) plus the default paragraph_spacing's
+        // separator (1) = 2 blank rows between the two paragraph lines.
+        assert_eq!(
+            second - first - 1,
+            2,
+            "line_spacing=1 adds its own filler row on top of paragraph_spacing's"
+        );
+
+        // A multi-line paragraph gets a filler after *each* of its own
+        // wrapped lines, not just at the end of the block.
+        let long = "word ".repeat(30);
+        let html = format!("<html><body><p>{long}</p></body></html>");
+        let doc2 = parse_article_html("Long", &html);
+        let opts2 = LayoutOptions {
+            line_spacing: 1,
+            ..LayoutOptions::default()
+        };
+        let laid = layout_document(&doc2, 20, opts2);
+        // Only the paragraph's own wrapped lines (never the title line above
+        // it, which sits behind an extra unconditional block-separator blank
+        // that would otherwise throw off the "every gap is 2" pattern below).
+        let content_lines: Vec<usize> = laid
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| line_text(l).contains("word"))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            content_lines.len() >= 3,
+            "the long paragraph wraps to several lines"
+        );
+        for w in content_lines.windows(2) {
+            assert_eq!(
+                w[1] - w[0],
+                2,
+                "each content line is followed by exactly one filler blank"
+            );
+        }
+    }
+
+    /// `word_spacing = 1` widens every collapsed inter-word gap by one cell
+    /// and the extra width still counts toward wrapping — a line built from
+    /// widened gaps never overflows, and packs (very slightly) fewer words
+    /// per line than the default.
+    #[test]
+    fn word_spacing_one_widens_gaps_and_still_wraps_within_width() {
+        let doc = parse_article_html("T", "<html><body><p>Alpha Beta Gamma</p></body></html>");
+        let widened = layout_document(
+            &doc,
+            40,
+            LayoutOptions {
+                word_spacing: 1,
+                ..LayoutOptions::default()
+            },
+        );
+        let plain = layout_document(&doc, 40, LayoutOptions::default());
+        let plain_line = plain
+            .lines
+            .iter()
+            .find(|l| line_text(l).contains("Alpha"))
+            .expect("the paragraph's own line");
+        assert_eq!(line_text(plain_line).trim(), "Alpha Beta Gamma");
+        let widened_line = widened
+            .lines
+            .iter()
+            .find(|l| line_text(l).contains("Alpha"))
+            .expect("the paragraph's own line");
+        assert_eq!(
+            line_text(widened_line).trim(),
+            "Alpha  Beta  Gamma",
+            "word_spacing=1 doubles every inter-word gap to 2 cells"
+        );
+
+        // No-overflow across the CJK and long-ASCII-token fixtures, exactly
+        // like the existing width-invariant sweep, but with word_spacing on.
+        let docs = [
+            parse_article_html("Test Article", FIXTURE),
+            parse_article_html("アラン・チューリング", JA_FIXTURE),
+            hard_cases_doc(),
+        ];
+        for doc in &docs {
+            for width in [20u16, 40, 60, 80, 100, 200] {
+                assert_no_overflow(
+                    doc,
+                    width,
+                    LayoutOptions {
+                        word_spacing: 1,
+                        ..LayoutOptions::default()
+                    },
+                );
+            }
+        }
+    }
+
+    /// `text_align = left` drops the centering pad entirely — the column
+    /// still never exceeds `measure`, but it now hugs the left edge instead
+    /// of floating in the middle of a wide terminal. Uses `TWO_PARAGRAPHS`
+    /// (no infobox/table) rather than `FIXTURE`: a floated infobox's own
+    /// lead/card merge legitimately emits its *own* all-space filler spans
+    /// (padding a lead row with no text out to the card's column) that have
+    /// nothing to do with `text_align` and would make a blanket "no line
+    /// starts with an all-space span" assertion a false positive.
+    #[test]
+    fn text_align_left_removes_the_centering_pad() {
+        let doc = parse_article_html("Spacing Test", TWO_PARAGRAPHS);
+        let centered = layout_document(&doc, 200, LayoutOptions::default());
+        let left = layout_document(
+            &doc,
+            200,
+            LayoutOptions {
+                text_align: TextAlign::Left,
+                ..LayoutOptions::default()
+            },
+        );
+        // Centered: measure=88 inside 200 cells pads (200-88)/2 = 56 cells.
+        assert_eq!(display_width(&centered.lines[0].spans[0].text, false), 56);
+        assert_eq!(centered.lines[0].spans[0].kind, SpanKind::Plain);
+        // Left: the title's own first span is the title content directly —
+        // no pad span at all, since `finalize` only ever emits one when
+        // `pad_width > 0`.
+        assert_eq!(left.lines[0].spans[0].kind, SpanKind::Title);
+        for line in &left.lines {
+            assert!(line.width(false) <= 88, "content still capped at measure");
+        }
+    }
+
+    /// `margin` shifts the whole column right by that many cells (carved out
+    /// of the same width budget as `measure`, never added on top of it), and
+    /// combines with `text_align = left` as "hug the margin, not the center."
+    #[test]
+    fn margin_adds_a_left_offset_without_overflowing() {
+        let doc = parse_article_html("Test Article", FIXTURE);
+        let opts = LayoutOptions {
+            margin: 5,
+            text_align: TextAlign::Left,
+            ..LayoutOptions::default()
+        };
+        let layout = layout_document(&doc, 60, opts);
+        assert_eq!(
+            layout.lines[0].spans[0].text, "     ",
+            "left-aligned with a 5-cell margin and no centering pad"
+        );
+        for line in &layout.lines {
+            assert!(
+                line.width(false) <= 60,
+                "margin must never push a line past the terminal width"
+            );
+        }
+    }
+
+    /// PRD FR-PC-1 + FR-NV-3/6/8: with `paragraph_spacing = 2` and
+    /// `line_spacing = 1` both active, section-jump anchors
+    /// (`block_lines`), link occurrence mapping (`link_lines`/`link_cols`),
+    /// and in-page find (`find_matches`) must all still land on the correct
+    /// laid-out line — the extra blank rows must never desynchronize these
+    /// mappings from the content they describe.
+    #[test]
+    fn block_and_link_and_find_mappings_stay_correct_under_spacing() {
+        let doc = parse_article_html("Test Article", FIXTURE);
+        let opts = LayoutOptions {
+            paragraph_spacing: 2,
+            line_spacing: 1,
+            ..LayoutOptions::default()
+        };
+        let layout = layout_document(&doc, 80, opts);
+
+        // Section jump: block_lines must still point at the heading's own
+        // rendered text (same property `section_block_lines_land_on_the_
+        // rendered_heading` checks under defaults).
+        let sections = section_outline(&doc);
+        assert_eq!(sections.len(), 1);
+        for section in &sections {
+            let line = layout.block_lines[section.block];
+            assert_eq!(
+                line_text(&layout.lines[line]).trim(),
+                section.title,
+                "block_lines must still land on the heading under spacing"
+            );
+        }
+
+        // Link occurrence mapping: every link's own text is exactly what
+        // `link_cols` slices out of its `link_lines` line.
+        let links = collect_links(&doc);
+        assert_eq!(layout.link_cols.len(), links.len());
+        for (occ, link) in links.iter().enumerate() {
+            if !layout.link_visible[occ] {
+                continue;
+            }
+            let line = &layout.lines[layout.link_lines[occ]];
+            let text = line_text(line);
+            let graphemes: Vec<&str> = text.graphemes(true).collect();
+            let span = layout.link_cols[occ];
+            let sliced: String = graphemes[span.start..span.end].concat();
+            assert_eq!(
+                sliced, link.text,
+                "link_cols[{occ}] must still bound the link's own text under spacing"
+            );
+        }
+
+        // In-page find: a word unique to the fixture's body is found, and it
+        // lands on a line that actually contains it (the extra blank rows
+        // are never mistaken for a match, and the mapping is self-consistent
+        // even though absolute line numbers shifted from the unspaced case).
+        let occurrences = find_matches(&layout.lines, &layout.continuation, "history");
+        assert!(
+            !occurrences.is_empty(),
+            "find must still find matches under spacing"
+        );
+        for occ in &occurrences {
+            for (line_idx, span) in &occ.pieces {
+                let text = line_text(&layout.lines[*line_idx]);
+                let graphemes: Vec<&str> = text.graphemes(true).collect();
+                let matched: String = graphemes[span.start..span.end].concat();
+                assert_eq!(matched.to_lowercase(), "history");
+            }
+        }
     }
 
     #[test]

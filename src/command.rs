@@ -75,11 +75,18 @@ pub enum Command {
     /// `:fetch-queue` — drain the offline "queue for fetch when online" list
     /// (PRD FR-OFF-6): fetch every queued title into the cache now.
     FetchQueue,
-    /// `:set <key>=<value>` — runtime render override. Handles `images=on|off`
-    /// (PRD FR-TH-7) and `prefetch=on|off` (FR-PF-6 kill switch); this is the
-    /// seed for FR-PC-4's broader per-tab `:set` (width/justify/images), which
-    /// will extend the accepted keys here.
+    /// `:set <key>=<value>` — session-global runtime render override. Handles
+    /// `images=on|off` (PRD FR-TH-7), `prefetch=on|off` (FR-PF-6 kill
+    /// switch), and the FR-PC-1 typography/spacing knobs (`text_align`,
+    /// `margin`, `paragraph_spacing`, `line_spacing`, `word_spacing`)
+    /// alongside `measure`/`ambiguous_width`/`reading_wpm`.
     Set { key: String, value: String },
+    /// `:set-tab <key>=<value>` / `:set-tab <key>=` (PRD FR-PC-4): a
+    /// tab-local override for one of `TAB_SCOPED_KEYS`, applying only to the
+    /// active tab. `value: None` is the `key=` (empty right-hand side)
+    /// spelling that clears the override, falling back to whatever `:set`
+    /// (or config) says session-globally.
+    SetTab { key: String, value: Option<String> },
     /// `:prefetch-log` (PRD FR-PF-4): open the transparency/debug panel of
     /// recent prefetch actions, their reasons, status, and budget state.
     PrefetchLog,
@@ -152,7 +159,170 @@ pub enum SaveSpec {
 /// parse-time constant so `command` doesn't depend on the render module.
 const SAVE_EXPORT_FORMATS: [&str; 3] = ["md", "txt", "html"];
 
-pub const USAGE: &str = "commands: open <title>, lang [<code>], theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, prefetch-log, start, today, random [good], related, talk, info, set theme=<name>|images=on|off|prefetch=on|off|measure=N|ambiguous_width=1|2|reading_wpm=N, config reload, help, quit";
+/// PRD FR-PC-4: the `:set` keys `:set-tab` also accepts — every render/
+/// typography option that feeds `layout::LayoutOptions` (plus `images`,
+/// which feeds the image box map alongside it). Deliberately excludes the
+/// session-only keys (`theme`, `prefetch`, `mouse`, `animations`,
+/// `hyperlinks`, `reading_wpm`) — none of those describe "how this one
+/// article reads," so a per-tab override for them would have no coherent
+/// meaning. Shared by the parser (this list gates which keys `:set-tab`
+/// accepts) and quoted verbatim in its own error message.
+pub const TAB_SCOPED_KEYS: [&str; 8] = [
+    "measure",
+    "images",
+    "ambiguous_width",
+    "text_align",
+    "margin",
+    "paragraph_spacing",
+    "line_spacing",
+    "word_spacing",
+];
+
+/// Validates and normalizes one `:set`/`:set-tab` `key=value` pair's value,
+/// shared by both commands so the bounds/spelling checks live in exactly one
+/// place. `theme_name_is_known` is threaded through rather than closed over
+/// so this stays a plain function callable from either parse arm.
+fn validate_set_value(
+    key: &str,
+    value: &str,
+    theme_name_is_known: &impl Fn(&str) -> bool,
+) -> Result<String, String> {
+    let on_off = |value: &str| -> Result<String, String> {
+        if value == "on" || value == "off" {
+            Ok(value.to_string())
+        } else {
+            Err(format!("{key} must be on or off (got {value:?})"))
+        }
+    };
+    match key {
+        // PRD FR-TH-7.
+        "images" => on_off(value),
+        // PRD FR-PF-6 kill switch.
+        "prefetch" => on_off(value),
+        // PRD FR-TH-2: live theme switch, same validation as `:theme <name>`
+        // and the config loader.
+        "theme" => {
+            if theme_name_is_known(value) {
+                Ok(value.to_string())
+            } else {
+                Err(format!(
+                    "unknown theme {value:?} — one of: {} (or a themes/*.toml name)",
+                    Theme::NAMES.join(", ")
+                ))
+            }
+        }
+        // PRD FR-RD-9 / FR-PC-4: line measure, same 40..=200 bounds the
+        // config loader enforces.
+        "measure" => match value.parse::<u16>() {
+            Ok(n) if (crate::config::MEASURE_MIN..=crate::config::MEASURE_MAX).contains(&n) => {
+                Ok(n.to_string())
+            }
+            Ok(n) => Err(format!(
+                "measure must be {}..={} (got {n})",
+                crate::config::MEASURE_MIN,
+                crate::config::MEASURE_MAX
+            )),
+            Err(_) => Err(format!("measure must be an integer (got {value:?})")),
+        },
+        // PRD FR-RD-10: East-Asian-Ambiguous width, 1 (narrow) or 2 (wide).
+        "ambiguous_width" => {
+            if value == "1" || value == "2" {
+                Ok(value.to_string())
+            } else {
+                Err(format!("ambiguous_width must be 1 or 2 (got {value:?})"))
+            }
+        }
+        // PRD FR-RD-11: reading-time WPM divisor, same
+        // config-default-plus-runtime-override split as `measure`.
+        "reading_wpm" => match value.parse::<u32>() {
+            Ok(n)
+                if (crate::config::READING_WPM_MIN..=crate::config::READING_WPM_MAX)
+                    .contains(&n) =>
+            {
+                Ok(n.to_string())
+            }
+            Ok(n) => Err(format!(
+                "reading_wpm must be {}..={} (got {n})",
+                crate::config::READING_WPM_MIN,
+                crate::config::READING_WPM_MAX
+            )),
+            Err(_) => Err(format!("reading_wpm must be an integer (got {value:?})")),
+        },
+        // PRD FR-NV-9: opt-in mouse capture.
+        "mouse" => on_off(value),
+        // PRD FR-ACS-4: no-motion mode.
+        "animations" => {
+            if value == "full" || value == "none" {
+                Ok(value.to_string())
+            } else {
+                Err(format!("animations must be full or none (got {value:?})"))
+            }
+        }
+        // PRD FR-RD-2 / SEC-2: OSC 8 hyperlink emission.
+        "hyperlinks" => {
+            if crate::hyperlink::HyperlinkMode::parse(value).is_some() {
+                Ok(value.to_string())
+            } else {
+                Err(format!(
+                    "hyperlinks must be auto, on, or off (got {value:?})"
+                ))
+            }
+        }
+        // PRD FR-PC-1: `center` (default) or `left` — see `layout::TextAlign`.
+        "text_align" => {
+            if crate::layout::TextAlign::parse(value).is_some() {
+                Ok(value.to_string())
+            } else {
+                Err(format!("text_align must be center or left (got {value:?})"))
+            }
+        }
+        // PRD FR-PC-1: extra left margin in cells.
+        "margin" => match value.parse::<u16>() {
+            Ok(n) if n <= crate::config::MARGIN_MAX => Ok(n.to_string()),
+            Ok(n) => Err(format!(
+                "margin must be 0..={} (got {n})",
+                crate::config::MARGIN_MAX
+            )),
+            Err(_) => Err(format!("margin must be an integer (got {value:?})")),
+        },
+        // PRD FR-PC-1: blank rows between blocks (0 tight, 1 default, 2+ airy).
+        "paragraph_spacing" => match value.parse::<u8>() {
+            Ok(n) if n <= crate::config::PARAGRAPH_SPACING_MAX => Ok(n.to_string()),
+            Ok(n) => Err(format!(
+                "paragraph_spacing must be 0..={} (got {n})",
+                crate::config::PARAGRAPH_SPACING_MAX
+            )),
+            Err(_) => Err(format!(
+                "paragraph_spacing must be an integer (got {value:?})"
+            )),
+        },
+        // PRD FR-PC-1: blank rows after every wrapped line — no literal
+        // "1.5"; see `layout::LayoutOptions::line_spacing`'s doc comment.
+        "line_spacing" => match value.parse::<u8>() {
+            Ok(n) if n <= crate::config::LINE_SPACING_MAX => Ok(n.to_string()),
+            Ok(n) => Err(format!(
+                "line_spacing must be 0..={} (got {n})",
+                crate::config::LINE_SPACING_MAX
+            )),
+            Err(_) => Err(format!("line_spacing must be an integer (got {value:?})")),
+        },
+        // PRD FR-PC-1: extra inter-word gap width, the only "spacing" a cell
+        // grid honestly allows.
+        "word_spacing" => match value.parse::<u8>() {
+            Ok(n) if n <= crate::config::WORD_SPACING_MAX => Ok(n.to_string()),
+            Ok(n) => Err(format!(
+                "word_spacing must be 0..={} (got {n})",
+                crate::config::WORD_SPACING_MAX
+            )),
+            Err(_) => Err(format!("word_spacing must be an integer (got {value:?})")),
+        },
+        other => Err(format!(
+            "unknown :set key {other:?} — try: theme, images=on|off, prefetch=on|off, measure=N, ambiguous_width=1|2, reading_wpm=N, mouse=on|off, animations=full|none, hyperlinks=auto|on|off, text_align=center|left, margin=N, paragraph_spacing=N, line_spacing=N, word_spacing=N"
+        )),
+    }
+}
+
+pub const USAGE: &str = "commands: open <title>, lang [<code>], theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, prefetch-log, start, today, random [good], related, talk, info, set theme=<name>|images=on|off|prefetch=on|off|measure=N|ambiguous_width=1|2|reading_wpm=N|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N, set-tab measure=N|images=on|off|ambiguous_width=1|2|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N (or set-tab key= to reset), config reload, help, quit";
 
 /// Parses one `:` command line. `user_theme_names` are accepted alongside
 /// the six built-ins for `:theme <name>` and `:set theme=<name>` (PRD
@@ -376,129 +546,49 @@ pub fn parse_with_user_themes(input: &str, user_theme_names: &[String]) -> Resul
             }
         }
         // `:set <key>=<value>` — session-global render/behavior overrides
-        // (PRD FR-PC-4 seed; FR-TH-7, FR-PF-6). Values are validated here so
-        // execution (`main::execute_command`) is a pure apply; per-article /
-        // per-tab scoping is FR-PC-4's remaining scope (a documented seam).
+        // (PRD FR-TH-7, FR-PF-6, FR-PC-1). Values are validated here so
+        // execution (`main::execute_command`) is a pure apply.
         "set" => {
             let assignment = require_arg("key=value")?;
             let (key, value) = assignment
                 .split_once('=')
                 .ok_or_else(|| "usage: :set images=on|off".to_string())?;
             let (key, value) = (key.trim(), value.trim());
-            let on_off = |value: &str| -> Result<String, String> {
-                if value == "on" || value == "off" {
-                    Ok(value.to_string())
-                } else {
-                    Err(format!("{key} must be on or off (got {value:?})"))
-                }
-            };
-            match key {
-                // PRD FR-TH-7.
-                "images" => Ok(Command::Set {
-                    key: "images".to_string(),
-                    value: on_off(value)?,
-                }),
-                // PRD FR-PF-6 kill switch.
-                "prefetch" => Ok(Command::Set {
-                    key: "prefetch".to_string(),
-                    value: on_off(value)?,
-                }),
-                // PRD FR-TH-2: live theme switch, same validation as
-                // `:theme <name>` and the config loader.
-                "theme" => {
-                    if theme_name_is_known(value) {
-                        Ok(Command::Set {
-                            key: "theme".to_string(),
-                            value: value.to_string(),
-                        })
-                    } else {
-                        Err(format!(
-                            "unknown theme {value:?} — one of: {} (or a themes/*.toml name)",
-                            Theme::NAMES.join(", ")
-                        ))
-                    }
-                }
-                // PRD FR-RD-9 / FR-PC-4: line measure, same 40..=200 bounds
-                // the config loader enforces.
-                "measure" => match value.parse::<u16>() {
-                    Ok(n)
-                        if (crate::config::MEASURE_MIN..=crate::config::MEASURE_MAX)
-                            .contains(&n) =>
-                    {
-                        Ok(Command::Set {
-                            key: "measure".to_string(),
-                            value: n.to_string(),
-                        })
-                    }
-                    Ok(n) => Err(format!(
-                        "measure must be {}..={} (got {n})",
-                        crate::config::MEASURE_MIN,
-                        crate::config::MEASURE_MAX
-                    )),
-                    Err(_) => Err(format!("measure must be an integer (got {value:?})")),
-                },
-                // PRD FR-RD-10: East-Asian-Ambiguous width, 1 (narrow) or 2 (wide).
-                "ambiguous_width" => {
-                    if value == "1" || value == "2" {
-                        Ok(Command::Set {
-                            key: "ambiguous_width".to_string(),
-                            value: value.to_string(),
-                        })
-                    } else {
-                        Err(format!("ambiguous_width must be 1 or 2 (got {value:?})"))
-                    }
-                }
-                // PRD FR-RD-11: reading-time WPM divisor, same
-                // config-default-plus-runtime-override split as `measure`.
-                "reading_wpm" => match value.parse::<u32>() {
-                    Ok(n)
-                        if (crate::config::READING_WPM_MIN..=crate::config::READING_WPM_MAX)
-                            .contains(&n) =>
-                    {
-                        Ok(Command::Set {
-                            key: "reading_wpm".to_string(),
-                            value: n.to_string(),
-                        })
-                    }
-                    Ok(n) => Err(format!(
-                        "reading_wpm must be {}..={} (got {n})",
-                        crate::config::READING_WPM_MIN,
-                        crate::config::READING_WPM_MAX
-                    )),
-                    Err(_) => Err(format!("reading_wpm must be an integer (got {value:?})")),
-                },
-                // PRD FR-NV-9: opt-in mouse capture.
-                "mouse" => Ok(Command::Set {
-                    key: "mouse".to_string(),
-                    value: on_off(value)?,
-                }),
-                // PRD FR-ACS-4: no-motion mode.
-                "animations" => {
-                    if value == "full" || value == "none" {
-                        Ok(Command::Set {
-                            key: "animations".to_string(),
-                            value: value.to_string(),
-                        })
-                    } else {
-                        Err(format!("animations must be full or none (got {value:?})"))
-                    }
-                }
-                // PRD FR-RD-2 / SEC-2: OSC 8 hyperlink emission.
-                "hyperlinks" => {
-                    if crate::hyperlink::HyperlinkMode::parse(value).is_some() {
-                        Ok(Command::Set {
-                            key: "hyperlinks".to_string(),
-                            value: value.to_string(),
-                        })
-                    } else {
-                        Err(format!(
-                            "hyperlinks must be auto, on, or off (got {value:?})"
-                        ))
-                    }
-                }
-                other => Err(format!(
-                    "unknown :set key {other:?} — try: theme, images=on|off, prefetch=on|off, measure=N, ambiguous_width=1|2, reading_wpm=N, mouse=on|off, animations=full|none, hyperlinks=auto|on|off"
-                )),
+            Ok(Command::Set {
+                key: key.to_string(),
+                value: validate_set_value(key, value, &theme_name_is_known)?,
+            })
+        }
+        // `:set-tab <key>=<value>` / `:set-tab <key>=` (PRD FR-PC-4): the
+        // same value grammar/bounds as `:set`, but restricted to
+        // `TAB_SCOPED_KEYS` — the render/typography options that actually
+        // feed a per-article layout, never the session-only ones (`theme`,
+        // `prefetch`, `mouse`, `animations`, `hyperlinks`, `reading_wpm`).
+        // An empty right-hand side (`key=`) clears the override instead of
+        // setting one — `require_arg` still demands the `=` itself, so bare
+        // `:set-tab measure` (no `=` at all) stays an error, matching `:set`.
+        "set-tab" | "settab" => {
+            let assignment = require_arg("key=value (or key= to reset)")?;
+            let (key, value) = assignment
+                .split_once('=')
+                .ok_or_else(|| "usage: :set-tab measure=60 (or measure= to reset)".to_string())?;
+            let (key, value) = (key.trim(), value.trim());
+            if !TAB_SCOPED_KEYS.contains(&key) {
+                return Err(format!(
+                    "{key} is not a per-tab setting — try: {}",
+                    TAB_SCOPED_KEYS.join(", ")
+                ));
+            }
+            if value.is_empty() {
+                Ok(Command::SetTab {
+                    key: key.to_string(),
+                    value: None,
+                })
+            } else {
+                Ok(Command::SetTab {
+                    key: key.to_string(),
+                    value: Some(validate_set_value(key, value, &theme_name_is_known)?),
+                })
             }
         }
         "prefetch-log" | "prefetchlog" => Ok(Command::PrefetchLog),
@@ -872,6 +962,147 @@ mod tests {
             );
         }
         assert!(parse("set hyperlinks=sometimes").is_err());
+    }
+
+    /// PRD FR-PC-1: `:set`'s new typography/spacing keys, same
+    /// bounds-shared-with-the-config-loader pattern as `measure`.
+    #[test]
+    fn set_spacing_keys_parse_and_validate_bounds() {
+        assert_eq!(
+            parse("set text_align=left"),
+            Ok(Command::Set {
+                key: "text_align".to_string(),
+                value: "left".to_string()
+            })
+        );
+        assert_eq!(
+            parse("set text_align=center"),
+            Ok(Command::Set {
+                key: "text_align".to_string(),
+                value: "center".to_string()
+            })
+        );
+        assert!(parse("set text_align=justify").is_err());
+
+        assert_eq!(
+            parse("set margin=10"),
+            Ok(Command::Set {
+                key: "margin".to_string(),
+                value: "10".to_string()
+            })
+        );
+        assert!(
+            parse(&format!(
+                "set margin={}",
+                crate::config::MARGIN_MAX as u32 + 1
+            ))
+            .is_err()
+        );
+        assert!(parse("set margin=wide").is_err());
+
+        assert_eq!(
+            parse("set paragraph_spacing=2"),
+            Ok(Command::Set {
+                key: "paragraph_spacing".to_string(),
+                value: "2".to_string()
+            })
+        );
+        assert!(
+            parse(&format!(
+                "set paragraph_spacing={}",
+                crate::config::PARAGRAPH_SPACING_MAX as u32 + 1
+            ))
+            .is_err()
+        );
+
+        assert_eq!(
+            parse("set line_spacing=1"),
+            Ok(Command::Set {
+                key: "line_spacing".to_string(),
+                value: "1".to_string()
+            })
+        );
+        assert!(
+            parse(&format!(
+                "set line_spacing={}",
+                crate::config::LINE_SPACING_MAX as u32 + 1
+            ))
+            .is_err()
+        );
+
+        assert_eq!(
+            parse("set word_spacing=1"),
+            Ok(Command::Set {
+                key: "word_spacing".to_string(),
+                value: "1".to_string()
+            })
+        );
+        assert!(
+            parse(&format!(
+                "set word_spacing={}",
+                crate::config::WORD_SPACING_MAX as u32 + 1
+            ))
+            .is_err()
+        );
+    }
+
+    /// PRD FR-PC-4: `:set-tab` accepts exactly `TAB_SCOPED_KEYS`, rejects the
+    /// session-only keys with a clear message, and treats an empty
+    /// right-hand side as a reset (`value: None`) rather than an error.
+    #[test]
+    fn set_tab_scopes_to_render_options_and_supports_reset() {
+        assert_eq!(
+            parse("set-tab measure=60"),
+            Ok(Command::SetTab {
+                key: "measure".to_string(),
+                value: Some("60".to_string())
+            })
+        );
+        assert_eq!(
+            parse("set-tab measure="),
+            Ok(Command::SetTab {
+                key: "measure".to_string(),
+                value: None
+            }),
+            "an empty right-hand side resets the override"
+        );
+        assert_eq!(
+            parse("settab images=on"),
+            Ok(Command::SetTab {
+                key: "images".to_string(),
+                value: Some("on".to_string())
+            }),
+            "settab is accepted as an alias"
+        );
+        // Every key in TAB_SCOPED_KEYS round-trips through validation.
+        for key in TAB_SCOPED_KEYS {
+            let value = match key {
+                "images" => "on",
+                "ambiguous_width" => "2",
+                "text_align" => "left",
+                "measure" => "60",
+                _ => "1",
+            };
+            assert!(
+                parse(&format!("set-tab {key}={value}")).is_ok(),
+                "{key} should be a valid :set-tab key"
+            );
+        }
+        // Session-only keys are rejected with a clear message, not silently
+        // accepted or confused with a per-tab override.
+        for key in [
+            "theme",
+            "prefetch",
+            "mouse",
+            "animations",
+            "hyperlinks",
+            "reading_wpm",
+        ] {
+            let err = parse(&format!("set-tab {key}=on")).unwrap_err();
+            assert!(err.contains("not a per-tab setting"), "{key}: {err}");
+        }
+        assert!(parse("set-tab measure").is_err(), "needs key=value");
+        assert!(parse("set-tab").is_err());
     }
 
     #[test]

@@ -1951,6 +1951,19 @@ pub fn resolve_link_url(href: &str, lang: &str) -> String {
 /// target]` — the only way a link is "followable" from a plain stdout dump,
 /// which has no clickable escape and no interactive focus/Enter to follow
 /// one).
+///
+/// PRD FR-PC-1's spacing options (`measure`/`margin`/`text_align`/
+/// `paragraph_spacing`/`line_spacing`/`word_spacing`) never distort this
+/// output: this function takes `doc: &Document` directly and never consults
+/// `layout::LayoutOptions` at all (unlike the interactive reading view,
+/// which always goes through `layout::layout_document_with_images`) — a
+/// deliberate scope decision, not an oversight. `--dump` feeds pipes,
+/// scripts, and screen readers (PRD §4's accessibility-first persona); those
+/// consumers want the fixed, predictable "one blank line between
+/// paragraphs" contract this function already had, not a moving target that
+/// changes shape with a reading-comfort preference meant for the interactive
+/// view. A paragraph is still exactly one blank line here regardless of what
+/// `paragraph_spacing` is currently set to.
 pub fn render_plain(doc: &Document, lang: &str) -> String {
     let mut out = String::new();
     out.push_str(&doc.title);

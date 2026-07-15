@@ -439,6 +439,26 @@ pub struct App {
     /// changing it invalidates the cached layout the same way `measure`
     /// does.
     pub reading_wpm: u32,
+    /// PRD FR-PC-1's session-global text alignment (`:set text_align=`,
+    /// `[reading] text_align` in config, default `center`). A tab's own
+    /// `TabOverrides::text_align` wins over this when set — see
+    /// `App::layout_options`.
+    pub text_align: layout::TextAlign,
+    /// PRD FR-PC-1's session-global left margin in cells (`:set margin=`,
+    /// `[reading] margin`, default 0).
+    pub margin: u16,
+    /// PRD FR-PC-1's session-global blank-rows-between-blocks (`:set
+    /// paragraph_spacing=`, `[reading] paragraph_spacing`, default 1 —
+    /// today's pre-FR-PC-1 behavior).
+    pub paragraph_spacing: u8,
+    /// PRD FR-PC-1's session-global blank-rows-after-every-wrapped-line
+    /// (`:set line_spacing=`, `[reading] line_spacing`, default 0). See
+    /// `layout::LayoutOptions::line_spacing`'s doc comment for the honest
+    /// "no literal 1.5" framing.
+    pub line_spacing: u8,
+    /// PRD FR-PC-1's session-global extra inter-word gap width in cells
+    /// (`:set word_spacing=`, `[reading] word_spacing`, default 0).
+    pub word_spacing: u8,
     /// The active tab's currently-labeled link hints (PRD FR-NV-1), valid
     /// only while `mode == Mode::Hint`. Recomputed from scratch by
     /// `refresh_hint_targets` on entry and on every draw — never patched
@@ -871,6 +891,11 @@ impl App {
             measure: 88,
             ambiguous_wide: false,
             reading_wpm: 230,
+            text_align: layout::TextAlign::Center,
+            margin: 0,
+            paragraph_spacing: 1,
+            line_spacing: 0,
+            word_spacing: 0,
             hint_targets: Vec::new(),
             hint_input: String::new(),
             hint_background: false,
@@ -1803,15 +1828,31 @@ impl App {
         self.tabs.iter().any(|t| t.loading)
     }
 
-    /// The layout options derived from the current reading preferences.
+    /// The layout options derived from the current reading preferences —
+    /// PRD FR-PC-4's merge point: **config < session (`:set`, the plain
+    /// `self.*` fields, themselves seeded from config at startup) < this
+    /// tab's `TabOverrides`**. Every overridable field reads the tab's own
+    /// override first and only falls back to the session-global field when
+    /// the tab has never set one (`Option::unwrap_or`), so a tab with no
+    /// overrides at all renders exactly like the session default, and a tab
+    /// with one override still inherits every other setting from the
+    /// session — never a partial/stale mix of old and new values.
     pub fn layout_options(&self) -> LayoutOptions {
+        let tab = self.active_tab();
+        let ov = &tab.overrides;
         LayoutOptions {
-            measure: self.measure,
-            ambiguous_wide: self.ambiguous_wide,
+            measure: ov.measure.unwrap_or(self.measure),
+            ambiguous_wide: ov.ambiguous_wide.unwrap_or(self.ambiguous_wide),
             accessible: self.accessible,
-            table_col_offset: self.active_tab().table_col_offset,
+            table_col_offset: tab.table_col_offset,
             image_epoch: self.image_epoch,
             reading_wpm: self.reading_wpm,
+            images_on: self.images_enabled(),
+            text_align: ov.text_align.unwrap_or(self.text_align),
+            margin: ov.margin.unwrap_or(self.margin),
+            paragraph_spacing: ov.paragraph_spacing.unwrap_or(self.paragraph_spacing),
+            line_spacing: ov.line_spacing.unwrap_or(self.line_spacing),
+            word_spacing: ov.word_spacing.unwrap_or(self.word_spacing),
         }
     }
 
@@ -1922,11 +1963,16 @@ impl App {
         self.layout = Some(computed);
     }
 
-    /// PRD FR-TH-7 / FR-RD-8: whether inline images render right now — the
-    /// runtime `:set images` (or config) override, else the active theme's
-    /// default.
+    /// PRD FR-TH-7 / FR-RD-8 / FR-PC-4: whether inline images render right
+    /// now for the *active tab* — that tab's own `:set-tab images=`
+    /// override if it has one, else the session-global runtime `:set
+    /// images=` override, else the active theme's default. Same three-rung
+    /// precedence as `layout_options`.
     pub fn images_enabled(&self) -> bool {
-        self.images_override.unwrap_or(self.theme.images)
+        self.active_tab()
+            .overrides
+            .images
+            .unwrap_or(self.images_override.unwrap_or(self.theme.images))
     }
 
     /// The graphics protocol wikitui would use for images right now (PRD
@@ -1953,7 +1999,12 @@ impl App {
         ) {
             return map;
         }
-        let content_width = (self.layout_width as usize).min(self.measure as usize);
+        // PRD FR-PC-4: reads the active tab's *effective* measure (its own
+        // override if it has one, else the session-global setting) — using
+        // the bare session-global `self.measure` here would size an image
+        // box for the wrong content column on a tab that overrode `measure`.
+        let content_width =
+            (self.layout_width as usize).min(self.layout_options().measure as usize);
         let max_cols = content_width.min(layout::IMAGE_MAX_COLS as usize) as u16;
         if max_cols < layout::IMAGE_MIN_COLS {
             return map;
@@ -1988,6 +2039,38 @@ impl App {
     pub fn note_image_state_change(&mut self) {
         self.image_epoch = self.image_epoch.wrapping_add(1);
         self.layout = None;
+    }
+
+    /// PRD FR-PC-4's `:set-tab <key>=<value>` / `:set-tab <key>=`: sets (or,
+    /// given `None`, clears) one render-option override on the *active* tab
+    /// only — every other open tab is untouched, and this tab falls straight
+    /// back to the session-global setting the moment the override is
+    /// cleared. `key` is one of `command::TAB_SCOPED_KEYS`; the value string
+    /// was already validated by the command parser, so parsing here is
+    /// infallible-in-practice the same way `execute_command`'s `Command::
+    /// Set` arms treat their own pre-validated values. Always forces a
+    /// relayout (`self.layout = None`) since every one of these keys feeds
+    /// `layout_options`/`images_enabled`.
+    pub fn set_tab_override(&mut self, key: &str, value: Option<&str>) {
+        let tab = self.active_tab_mut();
+        match key {
+            "measure" => tab.overrides.measure = value.and_then(|v| v.parse().ok()),
+            "ambiguous_width" => tab.overrides.ambiguous_wide = value.map(|v| v == "2"),
+            "images" => tab.overrides.images = value.map(|v| v == "on"),
+            "text_align" => tab.overrides.text_align = value.and_then(layout::TextAlign::parse),
+            "margin" => tab.overrides.margin = value.and_then(|v| v.parse().ok()),
+            "paragraph_spacing" => {
+                tab.overrides.paragraph_spacing = value.and_then(|v| v.parse().ok())
+            }
+            "line_spacing" => tab.overrides.line_spacing = value.and_then(|v| v.parse().ok()),
+            "word_spacing" => tab.overrides.word_spacing = value.and_then(|v| v.parse().ok()),
+            _ => {}
+        }
+        self.layout = None;
+        self.notice = Some(match value {
+            Some(v) => format!("{key}={v} (this tab)"),
+            None => format!("{key}: reset to session default (this tab)"),
+        });
     }
 
     /// Switch the color theme, relayouting only if the change flips whether
@@ -6255,6 +6338,136 @@ mod tests {
         let opts = app.layout_options();
         assert!(opts.accessible);
         assert_eq!(opts.table_col_offset, 3);
+    }
+
+    /// PRD FR-PC-4: `layout_options` merges **config < session (`:set`) <
+    /// this tab's override** — a tab with no override at all sees the
+    /// session-global value; setting a `:set-tab` override on the active tab
+    /// changes only that tab's `layout_options()`, a second tab (freshly
+    /// pushed, no override) still sees the session-global default, and
+    /// resetting (`value: None`) drops the override back to the session
+    /// default for the tab that had it.
+    #[test]
+    fn tab_override_layers_over_session_which_layers_over_config_default() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        // "Config" (here: the built-in default baked into `App::new`) < "session"
+        // (`:set measure=70`, mirroring what `execute_command`'s `measure` arm does).
+        assert_eq!(app.layout_options().measure, 88, "config/session default");
+        app.measure = 70;
+        assert_eq!(
+            app.layout_options().measure,
+            70,
+            "a plain `:set measure=70` changes the session-global value everyone without an override sees"
+        );
+
+        // A second tab, never touched, still sees the session-global value.
+        let second = app.push_blank_tab("en".to_string());
+        assert_eq!(
+            app.layout_options().measure,
+            70,
+            "still on tab 0 — unaffected by pushing a new tab"
+        );
+
+        // `:set-tab measure=50` on the active tab (still tab 0) wins over the
+        // session-global 70 for *this* tab only.
+        app.set_tab_override("measure", Some("50"));
+        assert_eq!(
+            app.layout_options().measure,
+            50,
+            "the active tab's override wins over the session-global setting"
+        );
+
+        // Tab 1 (the one just pushed) was never given an override — switching
+        // to it must show the session-global 70, not tab 0's 50.
+        app.switch_to_tab(app.tab_index_by_id(second).unwrap());
+        assert_eq!(
+            app.layout_options().measure,
+            70,
+            "a different tab with no override of its own is unaffected"
+        );
+
+        // Back on tab 0: the override is still there until explicitly reset.
+        app.switch_to_tab(0);
+        assert_eq!(app.layout_options().measure, 50);
+        app.set_tab_override("measure", None);
+        assert_eq!(
+            app.layout_options().measure,
+            70,
+            "`:set-tab measure=` (reset) falls back to the session-global value"
+        );
+    }
+
+    /// The same three-rung precedence, exercised across every FR-PC-1
+    /// spacing field at once (not just `measure`) plus `ambiguous_width` —
+    /// each field is independent, so overriding one never disturbs another.
+    #[test]
+    fn tab_override_covers_every_spacing_field_independently() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.paragraph_spacing = 1;
+        app.line_spacing = 0;
+        app.word_spacing = 0;
+        app.margin = 0;
+        app.text_align = layout::TextAlign::Center;
+        app.ambiguous_wide = false;
+
+        app.set_tab_override("paragraph_spacing", Some("2"));
+        app.set_tab_override("line_spacing", Some("1"));
+        app.set_tab_override("word_spacing", Some("1"));
+        app.set_tab_override("margin", Some("4"));
+        app.set_tab_override("text_align", Some("left"));
+        app.set_tab_override("ambiguous_width", Some("2"));
+
+        let opts = app.layout_options();
+        assert_eq!(opts.paragraph_spacing, 2);
+        assert_eq!(opts.line_spacing, 1);
+        assert_eq!(opts.word_spacing, 1);
+        assert_eq!(opts.margin, 4);
+        assert_eq!(opts.text_align, layout::TextAlign::Left);
+        assert!(opts.ambiguous_wide);
+
+        // Resetting one field never touches the others.
+        app.set_tab_override("line_spacing", None);
+        let opts = app.layout_options();
+        assert_eq!(opts.line_spacing, 0, "reset back to the session default");
+        assert_eq!(
+            opts.paragraph_spacing, 2,
+            "untouched by the line_spacing reset"
+        );
+        assert_eq!(opts.margin, 4, "untouched by the line_spacing reset");
+    }
+
+    /// PRD FR-PC-4 / FR-TH-7: `:set-tab images=` follows the same
+    /// per-tab-wins-over-session precedence as the layout options, and
+    /// `layout_options().images_on` (the L1 cache-key discriminator) agrees
+    /// with `images_enabled()` at all times.
+    #[test]
+    fn tab_override_for_images_wins_over_the_session_global_toggle() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        assert!(!app.images_enabled(), "terminal theme defaults images off");
+        app.set_images(true);
+        assert!(app.images_enabled(), "session-global :set images=on");
+        assert!(app.layout_options().images_on);
+
+        app.set_tab_override("images", Some("off"));
+        assert!(
+            !app.images_enabled(),
+            "this tab's override wins over the session-global on"
+        );
+        assert!(!app.layout_options().images_on);
+
+        let second = app.push_blank_tab("en".to_string());
+        app.switch_to_tab(app.tab_index_by_id(second).unwrap());
+        assert!(
+            app.images_enabled(),
+            "a tab with no override of its own still sees the session-global on"
+        );
+
+        app.switch_to_tab(0);
+        app.set_tab_override("images", None);
+        assert!(
+            app.images_enabled(),
+            "reset falls back to session-global on"
+        );
     }
 
     /// FR-NV-6b: highlighting now covers every literal occurrence, not just

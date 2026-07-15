@@ -40,6 +40,32 @@ pub struct HistoryEntry {
     pub scroll: u16,
 }
 
+/// PRD FR-PC-4's per-tab render override layer: `:set-tab key=value` sets a
+/// field here; `:set-tab key=` (empty right-hand side) clears it back to
+/// `None`. Every field starts `None` (a fresh tab has no overrides, so it
+/// renders at whatever the session-global `App` field says); `App::
+/// layout_options`/`images_enabled` are the only readers, each falling back
+/// to the session-global setting one field at a time — so a tab override
+/// never has to re-derive the config-then-session precedence chain, only
+/// add one more rung on top of it: **config < session (`:set`) < this
+/// tab's override**. Deliberately narrower than the full session-global
+/// `:set` surface — only the render/typography knobs that actually feed
+/// `layout::LayoutOptions` (plus `images`, which feeds the image box map
+/// alongside it) make sense to vary per article; `theme`/`prefetch`/
+/// `mouse`/`animations`/`hyperlinks`/`reading_wpm` stay session-only
+/// (`command::TAB_SCOPED_KEYS` is the parser's matching allow-list).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TabOverrides {
+    pub measure: Option<u16>,
+    pub ambiguous_wide: Option<bool>,
+    pub images: Option<bool>,
+    pub text_align: Option<layout::TextAlign>,
+    pub margin: Option<u16>,
+    pub paragraph_spacing: Option<u8>,
+    pub line_spacing: Option<u8>,
+    pub word_spacing: Option<u8>,
+}
+
 /// One open reading context. Owns everything that is per-view; the app-global
 /// state (theme, mode, research store, command line…) stays on `App`.
 pub struct Tab {
@@ -69,6 +95,12 @@ pub struct Tab {
     /// leading columns every wide table in the article skips. Reset to 0 when
     /// a new document is installed; adjusted by `App::scroll_tables` (`[`/`]`).
     pub table_col_offset: u16,
+    /// PRD FR-PC-4: this tab's render-option overrides (`:set-tab`). Survives
+    /// a fresh document being installed (`install_document`/`clear_to_blank`
+    /// deliberately don't touch it) — a per-*tab* preference like "this one
+    /// article reads better narrower" is not tied to whichever article
+    /// happens to be open in the tab right now.
+    pub overrides: TabOverrides,
     pub find_input: String,
     pub find_matches: Vec<u16>,
     pub find_occurrences: Vec<layout::Occurrence>,
@@ -123,6 +155,7 @@ impl Tab {
             scroll: 0,
             max_scroll: 0,
             table_col_offset: 0,
+            overrides: TabOverrides::default(),
             find_input: String::new(),
             find_matches: Vec::new(),
             find_occurrences: Vec::new(),

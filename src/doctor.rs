@@ -207,6 +207,20 @@ fn print_resolved_config(resolved: &ResolvedConfig) {
         "  hyperlinks = {:?} ({})",
         t.hyperlinks.value, t.hyperlinks.source
     );
+    let r = &resolved.reading;
+    println!(
+        "  reading.margin = {} ({}); text_align = {:?} ({})",
+        r.margin.value, r.margin.source, r.text_align.value, r.text_align.source
+    );
+    println!(
+        "  reading.paragraph_spacing = {} ({}); line_spacing = {} ({}); word_spacing = {} ({})",
+        r.paragraph_spacing.value,
+        r.paragraph_spacing.source,
+        r.line_spacing.value,
+        r.line_spacing.source,
+        r.word_spacing.value,
+        r.word_spacing.source
+    );
 }
 
 fn print_problems(resolved: &ResolvedConfig) {
