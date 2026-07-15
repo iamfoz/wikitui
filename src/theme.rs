@@ -280,9 +280,11 @@ impl Theme {
     }
 
     /// The theme after this one in `NAMES`, wrapping around — used by the
-    /// `T` keybinding to cycle themes for live preview (PRD FR-TH-2's
-    /// runtime-switching requirement; the `:theme <name>` command syntax
-    /// arrives with the command system, FR-CS-2).
+    /// `Ctrl-T` keybinding (moved off bare `T` when FR-ACC-5's talk-page
+    /// toggle claimed it, see `registry`'s default keymap) to cycle themes
+    /// for live preview (PRD FR-TH-2's runtime-switching requirement; the
+    /// `:theme <name>` command syntax arrives with the command system,
+    /// FR-CS-2).
     pub fn next(&self) -> Self {
         let idx = Self::NAMES
             .iter()

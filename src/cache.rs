@@ -77,6 +77,19 @@ pub const DEFAULT_FORCE_REFETCH_SECS: u64 = 30 * 24 * 60 * 60;
 /// density).
 const ZSTD_LEVEL: i32 = 3;
 
+/// PRD FR-OFF-3 v1.0's SLRU protected-segment budget: the *protected*
+/// segment (see [`Segment`]) may only claim this fraction of the overall
+/// cap. Without a ceiling, "protected" would drift into "un-evictable" if
+/// enough entries earned a second read — this keeps the probationary
+/// segment guaranteed at least `1.0 - PROTECTED_SEGMENT_FRACTION` of the
+/// cap's worth of room to absorb a fresh binge, and gives eviction
+/// somewhere to go (the oldest protected entries beyond the budget) even
+/// when literally everything has been re-read at least once. 80% is the
+/// documented v1.0 default — not user-configurable yet, matching how
+/// `FRESH_TTL_SECS`/`ZSTD_LEVEL` above are also fixed constants rather than
+/// `[cache]` config keys.
+const PROTECTED_SEGMENT_FRACTION: f64 = 0.8;
+
 /// PRD FR-PR-5: resolves the pages-cache root directory — an explicit
 /// `[cache] dir` config override, if given, else the platform cache
 /// directory (`$XDG_CACHE_HOME/wikitui/pages` on Linux, honored
@@ -142,12 +155,43 @@ pub struct CachedPage {
     pub etag: Option<String>,
 }
 
+/// PRD FR-OFF-3 v1.0's SLRU refinement over the MVP's plain-mtime LRU: two
+/// segments, so a binge session's flood of never-revisited articles (all
+/// `Probationary`) can't flush the handful of articles a reader actually
+/// keeps coming back to (`Protected`). New entries always start
+/// `Probationary`; `PageCache::get_current_format` promotes an entry the
+/// *second* time it's read (not the first — a single open is
+/// indistinguishable from a one-off binge read, see that function's doc
+/// comment). Eviction (`evict_to_cap`) always drains every `Probationary`
+/// candidate, oldest first, before touching a single `Protected` one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+enum Segment {
+    #[default]
+    Probationary,
+    Protected,
+}
+
 /// The on-disk shape of a `page/{lang}/{title}.json` title-index entry.
 #[derive(Debug, Serialize, Deserialize)]
 struct IndexEntry {
     revid: u64,
     fetched_at: u64,
     etag: Option<String>,
+    /// PRD FR-OFF-3 v1.0 SLRU: how many times `get` has ever read this entry
+    /// (monotonic, never reset — see `get_current_format`). Only the
+    /// `Probationary` → `Protected` transition at `hits == 2` consults this;
+    /// further reads of an already-`Protected` entry just keep incrementing
+    /// it. `#[serde(default)]` so every entry written before this field
+    /// existed loads as `0` (a fresh `Probationary` entry that simply
+    /// hasn't been read again yet under the new policy — never
+    /// retroactively protected).
+    #[serde(default)]
+    hits: u32,
+    /// PRD FR-OFF-3 v1.0 SLRU: this entry's segment — see [`Segment`].
+    /// `#[serde(default)]` for the same backward-compatibility reason as
+    /// `hits`: every pre-SLRU entry loads as `Probationary`.
+    #[serde(default)]
+    segment: Segment,
     /// PRD FR-PR-3's "cache entries tagged for wipe at session end": `true`
     /// exactly when this entry was written while incognito was active.
     /// `#[serde(default)]` so every entry written before this field existed
@@ -326,7 +370,7 @@ impl PageCache {
     fn get_current_format(&self, lang: &str, title: &str) -> Option<CachedPage> {
         let index_path = self.index_path(lang, title)?;
         let text = std::fs::read_to_string(&index_path).ok()?;
-        let entry: IndexEntry = serde_json::from_str(&text).ok()?;
+        let mut entry: IndexEntry = serde_json::from_str(&text).ok()?;
         let blob_path = self.blob_path(lang, title, entry.revid)?;
         let compressed = std::fs::read(&blob_path).ok()?;
         let html_bytes = zstd::stream::decode_all(compressed.as_slice()).ok()?;
@@ -334,6 +378,19 @@ impl PageCache {
 
         touch_mtime(&index_path);
         touch_mtime(&blob_path);
+
+        // PRD FR-OFF-3 v1.0 SLRU: this read is this entry's Nth ever; the
+        // *second* read (not the first, which is merely "opened once, same
+        // as any binge read") promotes it out of the probationary segment.
+        // Best-effort rewrite — a failure here just means this read didn't
+        // get counted, never a cache miss or a panic.
+        entry.hits = entry.hits.saturating_add(1);
+        if entry.segment == Segment::Probationary && entry.hits >= 2 {
+            entry.segment = Segment::Protected;
+        }
+        if let Ok(json) = serde_json::to_string(&entry) {
+            let _ = std::fs::write(&index_path, json);
+        }
 
         let age_secs = now_unix().saturating_sub(entry.fetched_at);
         Some(CachedPage {
@@ -420,6 +477,20 @@ impl PageCache {
             }
         }
 
+        // PRD FR-OFF-3 v1.0 SLRU: a `put` for a title already in the index
+        // (a revalidation-driven refetch, a ForceRefetch reopen) rewrites
+        // this same JSON file — carry its existing `hits`/`segment` forward
+        // rather than defaulting back to `Probationary`, or every content
+        // refresh would silently strip a reader's established favorite of
+        // its eviction protection. A brand-new title has nothing to carry
+        // forward, so it starts at the same `Probationary`/`0` default a
+        // fresh entry always has.
+        let (hits, segment) = std::fs::read_to_string(&index_path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<IndexEntry>(&text).ok())
+            .map(|existing| (existing.hits, existing.segment))
+            .unwrap_or_default();
+
         let entry = IndexEntry {
             revid,
             fetched_at,
@@ -427,6 +498,8 @@ impl PageCache {
             incognito: self.is_incognito(),
             lang: lang.to_string(),
             title: title.to_string(),
+            hits,
+            segment,
         };
         let Ok(json) = serde_json::to_string(&entry) else {
             return;
@@ -465,29 +538,124 @@ impl PageCache {
         }
     }
 
-    /// Deletes least-recently-read entries (oldest mtime first) until the
-    /// `blob/`+`page/` tree fits its cap again (PRD FR-OFF-3's hard cap +
-    /// LRU) — both trees are summed into one pool of eviction candidates,
-    /// so a title index and its blob compete on equal footing with every
-    /// other entry, not two separate budgets.
+    /// Deletes entries until the `blob/`+`page/` tree fits its cap again
+    /// (PRD FR-OFF-3 v1.0's SLRU refinement over the MVP's hard-cap-plus-
+    /// plain-LRU). Every `Segment::Probationary` candidate is drained
+    /// (oldest mtime first) before a single `Segment::Protected` one is
+    /// touched — see [`Segment`]'s doc comment for the promotion rule that
+    /// gets an entry into the protected segment in the first place.
+    ///
+    /// The protected segment additionally carries its own soft budget,
+    /// [`PROTECTED_SEGMENT_FRACTION`] of the overall cap: if literally every
+    /// entry got re-read at some point, "protected" would otherwise mean
+    /// "un-evictable", and the cache could never shrink back under cap at
+    /// all. So the *oldest* protected entries beyond that budget are
+    /// spliced onto the eviction order right after the (exhausted)
+    /// probationary ones — still oldest-first, never ahead of a genuinely
+    /// untouched probationary entry, but no longer immune either.
+    ///
+    /// A "candidate" here is a *logical* entry — a `page/{lang}/{title}.json`
+    /// index plus the blob it currently points at, evicted together, so
+    /// SLRU segment tracking (which lives in the index JSON) governs both
+    /// halves as one unit. A file this pass can't attribute to a readable
+    /// index — a corrupted index, or a blob orphaned by a superseded revid
+    /// (PRD FR-OFF-1: a title's blob at an old revid is never rewritten,
+    /// just superseded) — is still swept, exactly as the pre-SLRU flat scan
+    /// did: it becomes its own single-file candidate, always `Probationary`
+    /// (the least protected treatment for something this pass knows nothing
+    /// about).
     fn evict_to_cap(&self) {
         let Some(dir) = self.dir.as_ref() else {
             return;
         };
-        let mut entries: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
-        collect_files(&dir.join("blob"), &mut entries);
-        collect_files(&dir.join("page"), &mut entries);
-        let total: u64 = entries.iter().map(|(_, size, _)| size).sum();
+        let mut all_files: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
+        collect_files(&dir.join("blob"), &mut all_files);
+        collect_files(&dir.join("page"), &mut all_files);
+        let total: u64 = all_files.iter().map(|(_, size, _)| size).sum();
         if total <= self.max_bytes {
             return;
         }
-        entries.sort_by_key(|(_, _, mtime)| *mtime);
         let mut excess = total - self.max_bytes;
-        for (path, size, _) in entries {
-            if std::fs::remove_file(&path).is_ok() {
-                excess = excess.saturating_sub(size);
+
+        struct Candidate {
+            files: Vec<(PathBuf, u64)>,
+            mtime: SystemTime,
+            segment: Segment,
+        }
+
+        let mut index_files: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
+        collect_files(&dir.join("page"), &mut index_files);
+
+        let mut claimed: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        let mut candidates: Vec<Candidate> = Vec::new();
+
+        for (index_path, index_size, index_mtime) in &index_files {
+            let Ok(text) = std::fs::read_to_string(index_path) else {
+                continue; // falls through to the orphan pass below.
+            };
+            let Ok(entry) = serde_json::from_str::<IndexEntry>(&text) else {
+                continue; // corrupt index: same fallback.
+            };
+            let mut files = vec![(index_path.clone(), *index_size)];
+            claimed.insert(index_path.clone());
+            if let Some(blob_path) = self.blob_path(&entry.lang, &entry.title, entry.revid)
+                && let Ok(meta) = std::fs::metadata(&blob_path)
+            {
+                files.push((blob_path.clone(), meta.len()));
+                claimed.insert(blob_path);
+            }
+            candidates.push(Candidate {
+                files,
+                mtime: *index_mtime,
+                segment: entry.segment,
+            });
+        }
+
+        // Orphans: anything under blob/ or page/ that no readable index
+        // claimed above.
+        for (path, size, mtime) in &all_files {
+            if !claimed.contains(path) {
+                candidates.push(Candidate {
+                    files: vec![(path.clone(), *size)],
+                    mtime: *mtime,
+                    segment: Segment::Probationary,
+                });
+            }
+        }
+
+        let (mut protected, mut probationary): (Vec<Candidate>, Vec<Candidate>) = candidates
+            .into_iter()
+            .partition(|c| c.segment == Segment::Protected);
+        probationary.sort_by_key(|c| c.mtime);
+        protected.sort_by_key(|c| c.mtime);
+
+        let candidate_size = |c: &Candidate| -> u64 { c.files.iter().map(|(_, s)| s).sum() };
+        let protected_total: u64 = protected.iter().map(candidate_size).sum();
+        let protected_cap = (self.max_bytes as f64 * PROTECTED_SEGMENT_FRACTION) as u64;
+        let mut over_budget = protected_total.saturating_sub(protected_cap);
+        let mut still_protected = Vec::new();
+        let mut protected_overflow = Vec::new();
+        for c in protected {
+            if over_budget > 0 {
+                over_budget = over_budget.saturating_sub(candidate_size(&c));
+                protected_overflow.push(c);
+            } else {
+                still_protected.push(c);
+            }
+        }
+
+        let eviction_order = probationary
+            .into_iter()
+            .chain(protected_overflow)
+            .chain(still_protected);
+
+        'evict: for candidate in eviction_order {
+            for (path, size) in &candidate.files {
                 if excess == 0 {
-                    break;
+                    break 'evict;
+                }
+                if std::fs::remove_file(path).is_ok() {
+                    excess = excess.saturating_sub(*size);
                 }
             }
         }
@@ -823,6 +991,8 @@ mod tests {
             incognito: false,
             lang: "en".to_string(),
             title: "Turing".to_string(),
+            hits: 0,
+            segment: Segment::Probationary,
         };
         std::fs::write(&index_path, serde_json::to_string(&stale).unwrap()).unwrap();
         assert!(cache.get("en", "Turing").unwrap().age_secs >= 100_000 - 5);
@@ -1018,6 +1188,187 @@ mod tests {
             "least recently used: evicted (both its blob and index)"
         );
         assert!(cache.get("en", "Third").is_some(), "just written: kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- SLRU segments (PRD FR-OFF-3 v1.0) ----------------------------------
+
+    /// The core SLRU promise: an entry read *twice* (promoted to
+    /// `Protected`) survives an eviction wave that takes an unread neighbor
+    /// instead — even when the neighbor's raw mtime looks *more* recent, the
+    /// exact scenario plain mtime-LRU (the MVP policy this refines) would
+    /// get backwards. This is what "a binge session doesn't flush favorites"
+    /// means in practice.
+    #[test]
+    fn a_twice_read_entry_survives_eviction_over_a_never_reread_neighbor_even_though_it_is_older() {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "wikitui-cache-slru-protect-{}-{n}",
+            std::process::id()
+        ));
+        let content = pseudo_random_content(2, 400);
+
+        let roomy = PageCache::at(
+            dir.clone(),
+            DEFAULT_MAX_BYTES,
+            FRESH_TTL_SECS,
+            DEFAULT_FORCE_REFETCH_SECS,
+        );
+        roomy.put("en", "Favorite", &content, 1, None);
+        roomy.put("en", "OneOff", &content, 2, None);
+        let cap = dir_size(&dir) + 20;
+
+        let cache = PageCache::at(dir.clone(), cap, FRESH_TTL_SECS, DEFAULT_FORCE_REFETCH_SECS);
+        // Read "Favorite" *twice* — the second read is what promotes it to
+        // the protected segment (see `Segment`'s doc comment).
+        assert!(cache.get("en", "Favorite").is_some());
+        assert!(cache.get("en", "Favorite").is_some());
+        // "OneOff" is read exactly once — a normal open, never a re-visit —
+        // so it stays probationary.
+        assert!(cache.get("en", "OneOff").is_some());
+
+        // Stamp mtimes so plain LRU would evict "Favorite" (older) and keep
+        // "OneOff" (newer) — SLRU must invert that outcome.
+        let now = SystemTime::now();
+        let blob_path = |revid: u64, title: &str| {
+            dir.join("blob")
+                .join("en")
+                .join(format!("{revid}-{:016x}.zst", fnv1a(title.as_bytes())))
+        };
+        let index_path = |title: &str| dir.join("page").join("en").join(format!("{title}.json"));
+        stamp_mtime(&blob_path(1, "Favorite"), now - Duration::from_secs(20));
+        stamp_mtime(&index_path("Favorite"), now - Duration::from_secs(20));
+        stamp_mtime(&blob_path(2, "OneOff"), now - Duration::from_secs(5));
+        stamp_mtime(&index_path("OneOff"), now - Duration::from_secs(5));
+
+        cache.put("en", "Third", &content, 3, None); // pushes total past cap
+
+        assert!(
+            cache.get("en", "Favorite").is_some(),
+            "protected (twice-read) survives despite being the oldest by mtime"
+        );
+        assert!(
+            cache.get("en", "OneOff").is_none(),
+            "probationary (read only once) is evicted first, even though its mtime looked newer"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half of the promotion rule: a *single* read must NOT
+    /// promote — otherwise every merely-opened article would be
+    /// indistinguishable from a genuine favorite, and SLRU would degenerate
+    /// into "protect whatever was read at all."
+    #[test]
+    fn a_once_read_entry_does_not_get_protection_and_is_evicted_like_plain_lru() {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "wikitui-cache-slru-no-promote-{}-{n}",
+            std::process::id()
+        ));
+        let content = pseudo_random_content(3, 400);
+
+        let roomy = PageCache::at(
+            dir.clone(),
+            DEFAULT_MAX_BYTES,
+            FRESH_TTL_SECS,
+            DEFAULT_FORCE_REFETCH_SECS,
+        );
+        roomy.put("en", "ReadOnce", &content, 1, None);
+        roomy.put("en", "NeverRead", &content, 2, None);
+        let cap = dir_size(&dir) + 20;
+
+        let cache = PageCache::at(dir.clone(), cap, FRESH_TTL_SECS, DEFAULT_FORCE_REFETCH_SECS);
+        // Exactly one read — must stay probationary.
+        assert!(cache.get("en", "ReadOnce").is_some());
+
+        let now = SystemTime::now();
+        let blob_path = |revid: u64, title: &str| {
+            dir.join("blob")
+                .join("en")
+                .join(format!("{revid}-{:016x}.zst", fnv1a(title.as_bytes())))
+        };
+        let index_path = |title: &str| dir.join("page").join("en").join(format!("{title}.json"));
+        // "NeverRead" is older by mtime than "ReadOnce" — plain LRU (and
+        // SLRU, since neither is protected) must evict it first regardless
+        // of "ReadOnce" having been opened at all.
+        stamp_mtime(&blob_path(2, "NeverRead"), now - Duration::from_secs(20));
+        stamp_mtime(&index_path("NeverRead"), now - Duration::from_secs(20));
+        stamp_mtime(&blob_path(1, "ReadOnce"), now - Duration::from_secs(10));
+        stamp_mtime(&index_path("ReadOnce"), now - Duration::from_secs(10));
+
+        cache.put("en", "Third", &content, 3, None);
+
+        assert!(
+            cache.get("en", "ReadOnce").is_some(),
+            "still probationary, but more recently touched than NeverRead"
+        );
+        assert!(
+            cache.get("en", "NeverRead").is_none(),
+            "older probationary entry: evicted, same ordering plain LRU would produce"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The protected segment's own budget (PRD FR-OFF-3 v1.0:
+    /// `PROTECTED_SEGMENT_FRACTION`): protection is not unconditional. If
+    /// *every* entry has been re-read (nothing left in probationary), the
+    /// oldest protected entries beyond the protected segment's budget must
+    /// still be evicted — otherwise a cache where everything has been
+    /// opened twice could never shrink back under its cap.
+    #[test]
+    fn protected_segment_over_its_own_budget_still_evicts_its_oldest_members() {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "wikitui-cache-slru-protected-overflow-{}-{n}",
+            std::process::id()
+        ));
+        let content = pseudo_random_content(4, 400);
+
+        let roomy = PageCache::at(
+            dir.clone(),
+            DEFAULT_MAX_BYTES,
+            FRESH_TTL_SECS,
+            DEFAULT_FORCE_REFETCH_SECS,
+        );
+        roomy.put("en", "OldFavorite", &content, 1, None);
+        // Cap sized off *one* entry (not both): tight enough that fitting
+        // all three (two favorites + the fresh probationary "Third" below)
+        // requires evicting into the protected segment, not just draining
+        // probationary.
+        let cap = dir_size(&dir) + 20;
+        roomy.put("en", "NewFavorite", &content, 2, None);
+
+        let cache = PageCache::at(dir.clone(), cap, FRESH_TTL_SECS, DEFAULT_FORCE_REFETCH_SECS);
+        // Both promoted to protected — nothing left in probationary for
+        // eviction to prefer.
+        assert!(cache.get("en", "OldFavorite").is_some());
+        assert!(cache.get("en", "OldFavorite").is_some());
+        assert!(cache.get("en", "NewFavorite").is_some());
+        assert!(cache.get("en", "NewFavorite").is_some());
+
+        let now = SystemTime::now();
+        let blob_path = |revid: u64, title: &str| {
+            dir.join("blob")
+                .join("en")
+                .join(format!("{revid}-{:016x}.zst", fnv1a(title.as_bytes())))
+        };
+        let index_path = |title: &str| dir.join("page").join("en").join(format!("{title}.json"));
+        stamp_mtime(&blob_path(1, "OldFavorite"), now - Duration::from_secs(20));
+        stamp_mtime(&index_path("OldFavorite"), now - Duration::from_secs(20));
+        stamp_mtime(&blob_path(2, "NewFavorite"), now - Duration::from_secs(5));
+        stamp_mtime(&index_path("NewFavorite"), now - Duration::from_secs(5));
+
+        cache.put("en", "Third", &content, 3, None); // both favorites + Third now over cap
+
+        assert!(
+            cache.get("en", "OldFavorite").is_none(),
+            "protected segment is over its own budget with both entries in it: \
+             the OLDEST protected member still gets evicted"
+        );
+        assert!(
+            cache.get("en", "NewFavorite").is_some(),
+            "the newer protected member is spared once the older one covers the excess"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -11,6 +11,8 @@
 //! so a single shared cache serves every tab, and switching tabs is an L1
 //! hit rather than a relayout (§6.8).
 
+use serde::{Deserialize, Serialize};
+
 use crate::app::PendingReload;
 use crate::doc::{Document, LinkRef, SectionRef, collect_links, section_outline};
 use crate::layout;
@@ -27,7 +29,11 @@ pub type TabId = u64;
 /// re-fetch (always an L2 cache hit, so back/forward is instant) plus the
 /// `scroll` offset to restore — "preserving scroll state". Fold state will
 /// join this record with the later folding chunk.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize` (PRD FR-TB-5): a tab's back/forward stacks are
+/// part of what session auto-restore persists (`session::SessionTab`
+/// reuses this type directly rather than a parallel copy).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryEntry {
     pub lang: String,
     pub title: String,

@@ -131,6 +131,13 @@ Language switcher / fallback-chain fixtures (PRD FR-ML-1/2):
   `en`. A request with no `{lang}` segment (every other fixture path, and
   every language not listed in `LANG_MISSING`) is unaffected.
 
+Talk-page fixture (PRD FR-ACC-5):
+
+- `Talk:Alan_Turing` — an ordinary `PAGES` entry under the `Talk:` prefix,
+  with a couple of discussion threads (headings + replies). Proves the `T` /
+  `:talk` toggle (`src/talk.rs`) fetches and renders a talk page through the
+  exact same path as any article — no separate endpoint or mock behavior.
+
 ## Running it
 
 ```sh

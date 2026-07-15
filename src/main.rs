@@ -33,8 +33,10 @@ mod sanitize;
 mod saved;
 mod saved_export;
 mod search_ops;
+mod session;
 mod startpage;
 mod tab;
+mod talk;
 mod target;
 mod theme;
 mod ui;
@@ -508,6 +510,7 @@ async fn main() -> Result<()> {
         resolved.images.value,
         resolved.include_nonfree.value,
         resolved.startpage.value,
+        resolved.restore_session.value,
         prefetch_config_from(&resolved.prefetch),
         resolved.prefetch.enabled.value,
         config_ctx,
@@ -1257,6 +1260,16 @@ fn apply_tab_load_outcome(
                 tab.current_revid = fetch.revid;
                 tab.install_document(document);
             }
+            // PRD FR-TB-5: a session-restore fetch (`main::restore_session_tabs`)
+            // stashed the scroll/fold-set to apply once `install_document`
+            // (just above) finishes resetting both to the top — apply it
+            // now, then forget it; a tab that was never part of a restore
+            // simply has no entry here.
+            if let Some(restore) = app.pending_session_restore.remove(&outcome.tab_id) {
+                let tab = &mut app.tabs[index];
+                tab.scroll = restore.scroll;
+                tab.folded_blocks = restore.folded_blocks;
+            }
             // PRD FR-HS-1: a background tab's fetch landing is "an article
             // successfully renders in a tab" too, same as the active tab's
             // own `App::set_document` — no referrer is captured for a
@@ -1282,11 +1295,17 @@ fn apply_tab_load_outcome(
             {
                 app.pending_revalidations += 1;
             }
+            // PRD FR-TB-5: a background tab's document installing is a
+            // "meaningful change" too — see `App::persist_session`'s doc
+            // comment for the full trigger list.
+            app.persist_session();
         }
         Err(_) => {
             let tab = &mut app.tabs[index];
             tab.loading = false;
             tab.pending_title = Some(format!("{} (failed)", outcome.title));
+            // A restore that never lands has nothing left to apply.
+            app.pending_session_restore.remove(&outcome.tab_id);
         }
     }
 }
@@ -1771,6 +1790,7 @@ async fn run(
     images_config: Option<bool>,
     include_nonfree: bool,
     startpage_config: String,
+    restore_session_config: bool,
     prefetch_config: netqueue::SubstrateConfig,
     prefetch_enabled: bool,
     config_ctx: ConfigContext,
@@ -1823,6 +1843,13 @@ async fn run(
     // FR-HS-4.
     app.history = history::History::open();
     app.history.retention_prune(history_retention_days);
+    // PRD FR-TB-5 (§6.4: sessions live in state): resolved unconditionally,
+    // even under `--incognito` — `App::persist_session` is the one gate
+    // that stops incognito writing anything new, so a later non-incognito
+    // run can still restore whatever the *last* non-incognito session left
+    // behind (see that function's doc comment for why incognito must not
+    // also erase history it didn't ask to touch).
+    app.session_path = session::resolve_session_path();
 
     // Delivers typeahead responses, background revalidation outcomes, and
     // background-tab fetch results back to the loop (PRD FR-SR-1 / FR-OFF-2 /
@@ -1882,17 +1909,28 @@ async fn run(
             &langlinks_tx,
         )
         .await;
-    } else if app.startpage_config == startpage::StartPageConfig::Resume {
-        // PRD FR-DL-1's `startpage = resume`: proper session restore is a
-        // later chunk (B18) — until then this resolves to the single
-        // cheapest approximation already lying around at startup, the most
-        // recent reading-history entry (`History::recent` is already loaded
-        // for the visited-styling feature, so this costs nothing extra).
-        // No history yet (fresh install, or incognito never recorded any)
-        // falls straight through to the feed-backed start page, same as
-        // `startpage = feed` — never an error, never a blank screen with no
+    } else if app.startpage_config == startpage::StartPageConfig::Resume || restore_session_config {
+        // PRD FR-TB-5: `startpage = resume` (or the independent
+        // `restore_session = true`) reopens the persisted tab set — every
+        // tab loads lazily through the same background-tab machinery
+        // `Ctrl-Enter` already uses (`restore_session_tabs`), so this never
+        // blocks startup on the network. Falls back to the single-article
+        // history approximation `resume` used before this chunk existed
+        // when there's no session file (fresh install) or it's empty/corrupt
+        // (`session::load` returns `None`) — and *that* falls through to the
+        // feed-backed start page when there's no history either, exactly as
+        // it always has. Never an error, never a blank screen with no
         // explanation.
-        if let Some(visit) = app.history.recent(1).into_iter().next() {
+        let restored = app
+            .session_path
+            .clone()
+            .and_then(|path| session::load(&path))
+            .map(|state| restore_session_tabs(client, cache, &mut app, state, &open_tx))
+            .unwrap_or(false);
+        if !restored
+            && app.startpage_config == startpage::StartPageConfig::Resume
+            && let Some(visit) = app.history.recent(1).into_iter().next()
+        {
             app.lang = visit.lang.clone();
             open_title(
                 client,
@@ -2621,6 +2659,39 @@ async fn follow_internal_link(
     open_title(client, cache, app, title, revalidate_tx, langlinks_tx).await;
 }
 
+/// PRD FR-ACC-5: `T` (Reading context) or `:talk` flips the active tab
+/// between an article and its talk page (`talk::toggle_target`'s
+/// `Talk:{title}` convention — see that module's doc comment for the v1.0
+/// localized-namespace seam). A talk page is just another ordinary page, so
+/// this reuses the exact link-follow path (`follow_internal_link`) rather
+/// than a second fetch/install pipeline: same redlink guard, same cache/
+/// prefetch/badge machinery, same back-stack push — `H` after toggling
+/// returns to whichever page was on screen before, exactly like following
+/// any other internal link.
+async fn toggle_talk_page(
+    client: &WikiClient,
+    cache: &PageCache,
+    app: &mut App,
+    revalidate_tx: &UnboundedSender<RevalidationOutcome>,
+    langlinks_tx: &UnboundedSender<LangLinksOutcome>,
+) {
+    let Some(current_title) = app.active_tab().doc.as_ref().map(|d| d.title.clone()) else {
+        app.status = "No article open".to_string();
+        return;
+    };
+    let entering_talk = talk::from_talk(&current_title).is_none();
+    let target = talk::toggle_target(&current_title);
+    follow_internal_link(client, cache, app, &target, revalidate_tx, langlinks_tx).await;
+    // A status/notice cue that this is the talk page, not the article
+    // (PRD FR-ACC-5) — on top of the ordinary status line, which already
+    // shows the real (now `Talk:`-prefixed) title. Only on the way in:
+    // flipping back to the article needs no such notice, the title alone
+    // already says so.
+    if entering_talk && app.active_tab().doc.is_some() {
+        app.notice = Some("Viewing the talk page — T to return".to_string());
+    }
+}
+
 /// PRD FR-DL-3/FR-DL-5: after an article installs, opportunistically fetches
 /// its quality-assessment badge and checks its own outgoing links for
 /// redlinks the parse-time `class="new"` signal didn't already catch — both
@@ -2793,6 +2864,11 @@ async fn open_history_entry(
             // reset it to the top); the draw clamps it to the article's real
             // extent, which is unchanged since it's the same article.
             app.active_tab_mut().scroll = entry.scroll;
+            // PRD FR-TB-5: `set_document` just persisted the session with
+            // scroll reset to 0 (its own doc comment covers why); this
+            // restores the *real* scroll a moment later, so it needs its own
+            // save to actually land on disk rather than the stale zero.
+            app.persist_session();
             if let Some(cached_revid) = outcome.revalidate {
                 let tab_id = app.active_tab().id;
                 if fire_revalidation(
@@ -2818,6 +2894,77 @@ async fn open_history_entry(
         }
     }
     app.loading = false;
+}
+
+/// PRD FR-TB-5: reopens a persisted tab set at startup. Every tab's content
+/// loads lazily through the exact same background-tab machinery `Ctrl-Enter`
+/// background opens use (`fire_background_load`/`apply_tab_load_outcome`),
+/// so restore never blocks startup on the network — each tab shows its
+/// target title + "…" in the tab bar until its fetch (cache-first, so
+/// usually instant) lands, exactly like any other background tab. Scroll and
+/// fold state can't be applied until that fetch installs a document
+/// (`Tab::install_document` always resets both) — `apply_tab_load_outcome`
+/// applies them from `app.pending_session_restore` the moment each tab's
+/// fetch completes.
+///
+/// The first persisted tab reuses `App::new`'s already-existing first tab
+/// (id `0`) rather than allocating a new one and discarding it — `App`'s
+/// invariant is "always ≥ 1 tab," so there is always exactly one already
+/// there to repurpose. Returns `false` (nothing restored, caller falls back)
+/// for an empty session — a session that was saved as zero tabs should
+/// never happen in practice (`App` never runs with zero tabs), but a
+/// hand-edited or future-format file could still produce one.
+fn restore_session_tabs(
+    client: &WikiClient,
+    cache: &PageCache,
+    app: &mut App,
+    state: session::SessionState,
+    open_tx: &UnboundedSender<TabLoadOutcome>,
+) -> bool {
+    if state.tabs.is_empty() {
+        return false;
+    }
+    for (i, saved) in state.tabs.iter().enumerate() {
+        let tab_id = if i == 0 {
+            app.tabs[0].id
+        } else {
+            app.push_blank_tab(saved.lang.clone())
+        };
+        let Some(idx) = app.tab_index_by_id(tab_id) else {
+            continue; // unreachable in practice: just allocated or reused.
+        };
+        {
+            let tab = &mut app.tabs[idx];
+            tab.lang = saved.lang.clone();
+            tab.back_stack = saved.back_stack.clone();
+            tab.forward_stack = saved.forward_stack.clone();
+        }
+        if let Some(title) = &saved.title {
+            {
+                let tab = &mut app.tabs[idx];
+                tab.loading = true;
+                tab.pending_title = Some(title.clone());
+            }
+            app.pending_session_restore.insert(
+                tab_id,
+                app::PendingSessionRestore {
+                    scroll: saved.scroll,
+                    folded_blocks: saved.folded_blocks.iter().copied().collect(),
+                },
+            );
+            fire_background_load(
+                client,
+                cache,
+                tab_id,
+                saved.lang.clone(),
+                title.clone(),
+                open_tx,
+            );
+        }
+    }
+    app.active = state.active.min(app.tabs.len() - 1);
+    app.sync_active_tab();
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3920,6 +4067,14 @@ async fn handle_key(
                         app.status = "No recently closed tabs to reopen".to_string();
                     }
                 }
+                // Ctrl-t cycles the theme (PRD FR-TH-2): bare `T` moved to
+                // the talk-page toggle below to match PRD Appendix B's
+                // "Article: T talk page" sketch — see `toggle_talk_page`'s
+                // doc comment for the conflict this resolves. `:theme
+                // <name>`/`:set theme=` remain unchanged.
+                KeyCode::Char('t') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.cycle_theme()
+                }
                 KeyCode::Char('t') if app.active_tab().doc.is_none() => app.reroll_til(),
                 KeyCode::Char('t') => {
                     if app.active_tab().sections.is_empty() {
@@ -3928,7 +4083,10 @@ async fn handle_key(
                         app.mode = Mode::Toc;
                     }
                 }
-                KeyCode::Char('T') => app.cycle_theme(),
+                // PRD FR-ACC-5: flip article ↔ talk page.
+                KeyCode::Char('T') => {
+                    toggle_talk_page(client, cache, app, revalidate_tx, langlinks_tx).await
+                }
                 // PRD FR-OFF-4 / Appendix B ("S save offline"): pin the
                 // current article at the default depth (T0). `:save t1|t2`
                 // pins deeper; `:saved` browses the store.
@@ -4516,6 +4674,9 @@ async fn dispatch_action(
             }
         }
         Action::CycleTheme => app.cycle_theme(),
+        Action::TalkToggle => {
+            toggle_talk_page(client, cache, app, revalidate_tx, langlinks_tx).await
+        }
         Action::Search => {
             app.mode = Mode::Search;
             app.search_input.clear();
@@ -4837,6 +4998,8 @@ async fn execute_command(
         }
         // PRD FR-SR-6: same action as the `gR` keybinding.
         Command::Related => open_related(app, client, related_tx),
+        // PRD FR-ACC-5: same action as the `T` keybinding.
+        Command::Talk => toggle_talk_page(client, cache, app, revalidate_tx, langlinks_tx).await,
         // PRD FR-ML-1/2.
         Command::Lang(None) => open_lang_picker(app, client, langlinks_tx),
         Command::Lang(Some(code)) => {
@@ -5055,6 +5218,166 @@ mod tests {
             &revalidate_tx,
         );
         assert_eq!(app.tabs.len(), 1, "no tab was resurrected");
+    }
+
+    // ---- Session auto-restore (PRD FR-TB-5) --------------------------------
+
+    fn sample_session_state() -> session::SessionState {
+        session::SessionState {
+            active: 1,
+            tabs: vec![
+                session::SessionTab {
+                    lang: "en".to_string(),
+                    title: Some("Alan Turing".to_string()),
+                    scroll: 12,
+                    folded_blocks: vec![2],
+                    current_revid: 1001,
+                    back_stack: vec![HistoryEntry {
+                        lang: "en".to_string(),
+                        title: "Start page".to_string(),
+                        scroll: 0,
+                    }],
+                    forward_stack: Vec::new(),
+                },
+                session::SessionTab {
+                    lang: "en".to_string(),
+                    title: Some("Enigma machine".to_string()),
+                    scroll: 3,
+                    folded_blocks: Vec::new(),
+                    current_revid: 1002,
+                    back_stack: Vec::new(),
+                    forward_stack: Vec::new(),
+                },
+            ],
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_session_tabs_reopens_every_tab_lazily_and_sets_the_active_index() {
+        let client = test_client();
+        let cache = PageCache::disabled();
+        let (open_tx, _rx) = mpsc::unbounded_channel::<TabLoadOutcome>();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        let original_tab0_id = app.tabs[0].id;
+
+        let restored =
+            restore_session_tabs(&client, &cache, &mut app, sample_session_state(), &open_tx);
+
+        assert!(restored);
+        assert_eq!(app.tabs.len(), 2, "both persisted tabs were reopened");
+        assert_eq!(
+            app.tabs[0].id, original_tab0_id,
+            "the first persisted tab reuses App::new's already-existing tab, not a fresh one"
+        );
+        // Every tab shows its target title while loading (PRD FR-TB-3's
+        // background-tab indicator) — never a network call blocking startup.
+        assert!(app.tabs[0].loading);
+        assert_eq!(app.tabs[0].pending_title.as_deref(), Some("Alan Turing"));
+        assert!(app.tabs[1].loading);
+        assert_eq!(app.tabs[1].pending_title.as_deref(), Some("Enigma machine"));
+        // Back/forward stacks apply immediately (install_document doesn't
+        // touch them, so there's no need to defer these like scroll/folds).
+        assert_eq!(app.tabs[0].back_stack.len(), 1);
+        assert_eq!(app.tabs[0].back_stack[0].title, "Start page");
+        // Scroll/folds are stashed for `apply_tab_load_outcome` to apply once
+        // each fetch actually installs a document.
+        let tab0_id = app.tabs[0].id;
+        let tab1_id = app.tabs[1].id;
+        let restore0 = app
+            .pending_session_restore
+            .get(&tab0_id)
+            .expect("tab 0's restore is pending");
+        assert_eq!(restore0.scroll, 12);
+        assert!(restore0.folded_blocks.contains(&2));
+        let restore1 = app
+            .pending_session_restore
+            .get(&tab1_id)
+            .expect("tab 1's restore is pending");
+        assert_eq!(restore1.scroll, 3);
+        // The persisted active index (1) survives the restore.
+        assert_eq!(app.active, 1);
+    }
+
+    #[tokio::test]
+    async fn restore_session_tabs_applies_stashed_scroll_and_folds_once_the_fetch_lands() {
+        let client = test_client();
+        let cache = PageCache::disabled();
+        let (revalidate_tx, _rrx) = mpsc::unbounded_channel::<RevalidationOutcome>();
+        let (open_tx, _rx) = mpsc::unbounded_channel::<TabLoadOutcome>();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+
+        restore_session_tabs(&client, &cache, &mut app, sample_session_state(), &open_tx);
+        let tab0_id = app.tabs[0].id;
+
+        // Simulate tab 0's background fetch landing (bypassing the network —
+        // exactly like `apply_tab_load_outcome`'s other unit tests above).
+        apply_tab_load_outcome(
+            &client,
+            &mut app,
+            TabLoadOutcome {
+                tab_id: tab0_id,
+                lang: "en".to_string(),
+                title: "Alan Turing".to_string(),
+                result: Ok(FetchOutcome {
+                    html: "<html><body><h2>A</h2><p>x</p><h2>B</h2><p>y</p></body></html>"
+                        .to_string(),
+                    source: PageSource::Live,
+                    revid: 1001,
+                    revalidate: None,
+                }),
+            },
+            &revalidate_tx,
+        );
+
+        let tab = app.tabs.iter().find(|t| t.id == tab0_id).unwrap();
+        assert_eq!(tab.scroll, 12, "the persisted scroll was applied");
+        assert!(
+            tab.folded_blocks.contains(&2),
+            "the persisted fold was applied"
+        );
+        assert!(
+            !app.pending_session_restore.contains_key(&tab0_id),
+            "the pending entry is consumed once applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_session_tabs_on_an_empty_session_returns_false_and_touches_nothing() {
+        let client = test_client();
+        let cache = PageCache::disabled();
+        let (open_tx, _rx) = mpsc::unbounded_channel::<TabLoadOutcome>();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        let original_tab0_id = app.tabs[0].id;
+
+        let restored = restore_session_tabs(
+            &client,
+            &cache,
+            &mut app,
+            session::SessionState::default(),
+            &open_tx,
+        );
+
+        assert!(!restored, "an empty session restores nothing");
+        assert_eq!(app.tabs.len(), 1, "the original single tab is untouched");
+        assert_eq!(app.tabs[0].id, original_tab0_id);
+    }
+
+    #[tokio::test]
+    async fn restore_session_tabs_clamps_an_out_of_range_active_index() {
+        let client = test_client();
+        let cache = PageCache::disabled();
+        let (open_tx, _rx) = mpsc::unbounded_channel::<TabLoadOutcome>();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        let mut state = sample_session_state();
+        state.active = 99; // a corrupt/future-format file could have this.
+
+        restore_session_tabs(&client, &cache, &mut app, state, &open_tx);
+
+        assert_eq!(
+            app.active,
+            app.tabs.len() - 1,
+            "an out-of-range active index clamps to the last tab, never panics"
+        );
     }
 
     #[test]

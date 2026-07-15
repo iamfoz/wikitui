@@ -17,6 +17,9 @@ REVIDS = {
     "Math_Showcase": 1009,
     "Redlink_Showcase": 1010,
     "Hyperlink_Scheme_Test": 1011,
+    # PRD FR-ACC-5 talk-page fixture: an ordinary page like any other, just
+    # under the "Talk:" namespace prefix `src/talk.rs::to_talk` derives.
+    "Talk:Alan_Turing": 1012,
 }
 
 # PRD FR-RD-8 media fixture: build a real, tiny PNG at import time (stdlib
@@ -169,6 +172,25 @@ PAGES = {
       <a href="https://example.com/safe">safe https link</a>, a
       <a href="javascript:alert(1)">javascript link</a>, and a
       <a href="data:text/html,evil">data link</a> end this paragraph.</p>
+    </body></html>""",
+
+    # PRD FR-ACC-5 talk-page fixture: an ordinary page under the "Talk:"
+    # namespace prefix, with some discussion content — proves the `T` /
+    # `:talk` toggle fetches and renders it exactly like any other article
+    # (headings, a reply-style thread, an internal link back to the
+    # article it discusses).
+    "Talk:Alan_Turing": """<html><head><title>Talk:Alan Turing</title></head><body>
+      <h2>Merge proposal: Alan Turing and Turing machine</h2>
+      <p>Should the history section here be merged into
+      <a href="./Computer_science">Computer science</a> instead of duplicated? Raising it
+      here before making any changes. ~~~~</p>
+      <p>Oppose — this article's history section is specific to Turing's own biography,
+      not the general computer-science topic. Keep as is. ~~~~</p>
+      <h2>Birth date discrepancy</h2>
+      <p>A couple of older sources give a different birth date than the one currently
+      cited. Can someone with access check the original registry entry? ~~~~</p>
+      <p>Checked — the currently cited date matches the birth certificate reproduced in
+      the Hodges biography. Marking resolved. ~~~~</p>
     </body></html>""",
 
 }

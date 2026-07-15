@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -18,6 +19,7 @@ use crate::prefetch::FeedCache;
 use crate::registry;
 use crate::research::{ResearchStore, SavedCitation};
 use crate::saved::{SavedPages, Tier};
+use crate::session;
 use crate::startpage::{self, OnThisDayModel, OtdType, StartPageConfig, StartPageModel};
 use crate::tab::{HistoryEntry, Tab, TabId};
 use crate::theme::{ColorDepth, LoadedUserTheme, Theme};
@@ -740,6 +742,33 @@ pub struct App {
     /// back/forward navigation and the SWR reload, which restore their own
     /// scroll and must not also raise the cross-session resume prompt.
     pub suppress_resume_once: bool,
+
+    // -- Session auto-restore (PRD FR-TB-5) ---------------------------------
+    /// Where `persist_session` writes (`$XDG_STATE_HOME/wikitui/session.json`
+    /// — see `session::resolve_session_path`), or `None` when no platform
+    /// state directory could be determined (matches `history_path`'s own
+    /// "silently don't persist" degradation) or a test hasn't set one.
+    /// `App::new` leaves this `None` deliberately — every existing
+    /// `App::new` test call site is unaffected by session writes unless it
+    /// opts in by setting this field, the same convention `bookmarks`/
+    /// `saved`/`history` already use (in-memory by default; `main::run`
+    /// is the one place that installs the real on-disk path).
+    pub session_path: Option<PathBuf>,
+    /// Scroll/fold-set to restore once a session-restore background fetch
+    /// (PRD FR-TB-5) lands, keyed by the tab it belongs to — `install_document`
+    /// always resets a tab's scroll/folds to the top, so these can't be
+    /// applied until *after* that reset, once `main::apply_tab_load_outcome`
+    /// sees the fetch complete. An entry lingers harmlessly if its tab
+    /// closes or its fetch fails before landing (removed either way by the
+    /// call site, never read again).
+    pub pending_session_restore: HashMap<TabId, PendingSessionRestore>,
+}
+
+/// See [`App::pending_session_restore`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PendingSessionRestore {
+    pub scroll: u16,
+    pub folded_blocks: HashSet<usize>,
 }
 
 /// PRD FR-NV-8's pending resume: what pressing `r` on the resume toast should
@@ -898,6 +927,8 @@ impl App {
             summary_loading: false,
             pending_resume: None,
             suppress_resume_once: false,
+            session_path: None,
+            pending_session_restore: HashMap::new(),
         }
     }
 
@@ -1491,17 +1522,33 @@ impl App {
         id
     }
 
+    /// Allocates a fresh, unfocused, blank tab — the shared plumbing behind
+    /// `open_background_tab` (which additionally marks it loading with a
+    /// target title) and session restore (PRD FR-TB-5, `main::
+    /// restore_session_tabs`), which sets `loading`/`pending_title` itself
+    /// only for a persisted tab that actually had an article open.
+    pub fn push_blank_tab(&mut self, lang: String) -> TabId {
+        let id = self.allocate_tab_id();
+        self.tabs.push(Tab::new(id, lang));
+        id
+    }
+
     /// PRD FR-TB-3: open `title` in a new, *unfocused* background tab and
     /// return its id so the caller can spawn the keyed fetch. Focus does not
     /// move; the tab shows its target title + "…" in the bar until the fetch
     /// lands (budget-aware prefetch scheduling arrives with a later chunk —
     /// for now the fetch fires immediately via the existing channel pattern).
     pub fn open_background_tab(&mut self, title: String, lang: String) -> TabId {
-        let id = self.allocate_tab_id();
-        let mut tab = Tab::new(id, lang);
+        let id = self.push_blank_tab(lang);
+        let tab = self
+            .tabs
+            .last_mut()
+            .expect("push_blank_tab just pushed one");
         tab.loading = true;
         tab.pending_title = Some(title);
-        self.tabs.push(tab);
+        // PRD FR-TB-5: a new tab is a "meaningful change" — see
+        // `persist_session`'s doc comment for the full trigger list.
+        self.persist_session();
         id
     }
 
@@ -1608,7 +1655,7 @@ impl App {
     /// tab (an L1 hit, not a relayout), re-arm the SWR "updated — r to
     /// reload" notice iff this tab has one pending, land in Reading mode, and
     /// refresh the status line.
-    fn sync_active_tab(&mut self) {
+    pub(crate) fn sync_active_tab(&mut self) {
         self.lang = self.active_tab().lang.clone();
         self.rebuild_citations();
         self.layout = None;
@@ -1621,6 +1668,79 @@ impl App {
             .as_ref()
             .map(|_| "updated — r to reload".to_string());
         self.refresh_reading_status();
+        // PRD FR-TB-5: a tab switch (and, via this shared chokepoint, a tab
+        // close/reopen/new-tab too) is a "meaningful change" — see
+        // `persist_session`'s doc comment for the full trigger list.
+        self.persist_session();
+    }
+
+    // -- Session auto-restore (PRD FR-TB-5) ---------------------------------
+
+    /// Builds the on-disk session shape from the live tab set: each tab's
+    /// `(lang, title, scroll, folded sections, revid)` plus its back/forward
+    /// stacks, and which tab is active. A tab with no installed document
+    /// persists `title: None` unless a background fetch for it is still in
+    /// flight (`pending_title`) — a permanently failed background load
+    /// (`loading` false, `doc` still `None`) persists as blank rather than
+    /// as its "{title} (failed)" placeholder, so a restore never retries a
+    /// title that's spelled wrong or genuinely broken on every single
+    /// launch.
+    fn session_snapshot(&self) -> session::SessionState {
+        session::SessionState {
+            active: self.active,
+            tabs: self
+                .tabs
+                .iter()
+                .map(|t| {
+                    let title = match &t.doc {
+                        Some(doc) => Some(doc.title.clone()),
+                        None if t.loading => t.pending_title.clone(),
+                        None => None,
+                    };
+                    let mut folded_blocks: Vec<usize> = t.folded_blocks.iter().copied().collect();
+                    folded_blocks.sort_unstable();
+                    session::SessionTab {
+                        lang: t.lang.clone(),
+                        title,
+                        scroll: t.scroll,
+                        folded_blocks,
+                        current_revid: t.current_revid,
+                        back_stack: t.back_stack.clone(),
+                        forward_stack: t.forward_stack.clone(),
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    /// Writes the current tab set to `session_path` (PRD FR-TB-5) — a
+    /// complete, atomic snapshot (`session::save`'s temp+fsync+rename, see
+    /// its doc comment) called from every "meaningful change" chokepoint:
+    /// `sync_active_tab` (tab switch/close/reopen/new-tab), `set_document`
+    /// (fresh open, following a link, a bookmark/history-picker reopen, the
+    /// SWR "r to reload"), `open_background_tab`, fold toggles
+    /// (`toggle_fold_at_cursor`/`fold_all`/`unfold_all`), and
+    /// `resume_to_saved_position`. Deliberately *not* called on every scroll
+    /// tick or keystroke — that would mean a disk write on every `j`/`k` —
+    /// so the guarantee is "a crash loses at most whatever changed since the
+    /// last meaningful-change save," not "at most nothing." `open_history_entry`
+    /// (`main.rs`, back/forward) additionally calls this a second time after
+    /// restoring its historical scroll, since that assignment happens after
+    /// `set_document` (which resets scroll to 0) already fired this once.
+    ///
+    /// PRD FR-PR-3's privacy gate: never writes while incognito. Silently a
+    /// no-op when `session_path` is `None` (no platform state directory, or
+    /// a test that never opted in) — the same "storage is best-effort,
+    /// reading must never depend on it" posture every other store in this
+    /// codebase already has.
+    pub fn persist_session(&self) {
+        if self.incognito {
+            return;
+        }
+        let Some(path) = &self.session_path else {
+            return;
+        };
+        let _ = session::save(&self.session_snapshot(), path);
     }
 
     /// Rebuild [`Self::citations`] from the active tab's document (or clear
@@ -2045,6 +2165,11 @@ impl App {
         // wrong page between this install and that fetch landing.
         self.language_hint = None;
         self.refresh_reading_status();
+        // PRD FR-TB-5: installing a document is a "meaningful change" — see
+        // `persist_session`'s doc comment for the full trigger list and why
+        // back/forward navigation additionally calls this a second time
+        // after restoring its historical scroll.
+        self.persist_session();
     }
 
     // -- Reading history (PRD FR-HS-1/2/4) ---------------------------------
@@ -2597,6 +2722,8 @@ impl App {
         } else {
             "Unfolded section".to_string()
         };
+        // PRD FR-TB-5: fold state is part of what a session persists.
+        self.persist_session();
     }
 
     /// `zM` (PRD FR-NV-3): fold every section.
@@ -2614,6 +2741,7 @@ impl App {
         self.fix_focus_after_fold();
         self.clamp_scroll();
         self.status = "Folded all sections (zR to unfold)".to_string();
+        self.persist_session();
     }
 
     /// `zR` (PRD FR-NV-3): unfold every section.
@@ -2625,6 +2753,7 @@ impl App {
         self.active_tab_mut().folded_blocks.clear();
         self.layout = None;
         self.status = "Unfolded all sections".to_string();
+        self.persist_session();
     }
 
     /// After a fold change, move focus off a link that is no longer visible
@@ -2972,6 +3101,8 @@ impl App {
                 }
             }
         }
+        // PRD FR-TB-5: resuming changes scroll/folds, both session-persisted.
+        self.persist_session();
     }
 
     /// The section (index into the active tab's outline) whose title matches
@@ -7358,5 +7489,130 @@ mod tests {
             "the reading cheatsheet has {} rows — it must be scrollable",
             rows.len()
         );
+    }
+
+    // -- Session auto-restore (PRD FR-TB-5) ---------------------------------
+
+    fn session_temp_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "wikitui-session-test-{tag}-{}.json",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn session_snapshot_captures_every_tabs_lang_title_scroll_folds_and_stacks() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(crate::doc::parse_article_html(
+            "Alan Turing",
+            "<html><body><h2>A</h2><p>x</p><h2>B</h2><p>y</p></body></html>",
+        ));
+        app.active_tab_mut().scroll = 7;
+        app.active_tab_mut().folded_blocks = [1usize, 3usize].into_iter().collect();
+        app.active_tab_mut()
+            .back_stack
+            .push(crate::tab::HistoryEntry {
+                lang: "en".to_string(),
+                title: "Earlier".to_string(),
+                scroll: 2,
+            });
+        app.new_foreground_tab(); // tab 1 stays blank.
+
+        let snap = app.session_snapshot();
+        assert_eq!(snap.active, 1);
+        assert_eq!(snap.tabs.len(), 2);
+        assert_eq!(snap.tabs[0].lang, "en");
+        assert_eq!(snap.tabs[0].title.as_deref(), Some("Alan Turing"));
+        assert_eq!(snap.tabs[0].scroll, 7);
+        assert_eq!(snap.tabs[0].folded_blocks, vec![1, 3]);
+        assert_eq!(snap.tabs[0].back_stack.len(), 1);
+        assert_eq!(snap.tabs[0].back_stack[0].title, "Earlier");
+        assert_eq!(
+            snap.tabs[1].title, None,
+            "a blank tab persists with no title"
+        );
+    }
+
+    #[test]
+    fn persist_session_writes_a_file_that_session_load_reads_back() {
+        let path = session_temp_path("roundtrip");
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.session_path = Some(path.clone());
+        app.set_document(crate::doc::parse_article_html(
+            "Alan Turing",
+            "<html><body><p>x</p></body></html>",
+        ));
+        app.active_tab_mut().scroll = 5;
+        app.persist_session();
+
+        let loaded = crate::session::load(&path).expect("persist_session must have written it");
+        assert_eq!(loaded.tabs.len(), 1);
+        assert_eq!(loaded.tabs[0].title.as_deref(), Some("Alan Turing"));
+        assert_eq!(loaded.tabs[0].scroll, 5);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// PRD FR-PR-3: the one privacy gate every session write routes through.
+    #[test]
+    fn persist_session_never_writes_while_incognito() {
+        let path = session_temp_path("incognito");
+        let _ = std::fs::remove_file(&path); // guard against a leftover from a prior failed run
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.session_path = Some(path.clone());
+        app.incognito = true;
+        app.set_document(crate::doc::parse_article_html(
+            "Alan Turing",
+            "<html><body><p>x</p></body></html>",
+        ));
+        assert!(!path.exists(), "incognito must never write a session file");
+    }
+
+    /// PRD FR-TB-5's "crash-safe continuous" guarantee: after *every*
+    /// meaningful-change call, the on-disk file already matches the live
+    /// state at that moment — proving a crash right after any one of these
+    /// steps loses nothing from *before* that step, only (at most) whatever
+    /// hadn't yet triggered a save.
+    #[test]
+    fn a_save_after_each_meaningful_action_reflects_that_actions_own_state() {
+        let path = session_temp_path("crash-safety");
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.session_path = Some(path.clone());
+
+        // Action 1: open an article.
+        app.set_document(crate::doc::parse_article_html(
+            "Alan Turing",
+            "<html><body><h2>A</h2><p>x</p></body></html>",
+        ));
+        let after_open = crate::session::load(&path).unwrap();
+        assert_eq!(after_open.tabs[0].title.as_deref(), Some("Alan Turing"));
+
+        // Action 2: fold a section.
+        app.toggle_fold_at_cursor();
+        let after_fold = crate::session::load(&path).unwrap();
+        assert!(
+            !after_fold.tabs[0].folded_blocks.is_empty(),
+            "the fold must already be on disk"
+        );
+
+        // Action 3: open a second tab and navigate it.
+        app.new_foreground_tab();
+        app.set_document(crate::doc::parse_article_html(
+            "Enigma machine",
+            "<html><body><p>y</p></body></html>",
+        ));
+        let after_new_tab = crate::session::load(&path).unwrap();
+        assert_eq!(after_new_tab.tabs.len(), 2);
+        assert_eq!(after_new_tab.active, 1);
+        assert_eq!(
+            after_new_tab.tabs[1].title.as_deref(),
+            Some("Enigma machine")
+        );
+
+        // Action 4: switch back to the first tab.
+        app.switch_to_tab(0);
+        let after_switch = crate::session::load(&path).unwrap();
+        assert_eq!(after_switch.active, 0);
+
+        let _ = std::fs::remove_file(&path);
     }
 }

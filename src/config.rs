@@ -230,6 +230,13 @@ pub struct ResolvedConfig {
     /// not worth a CLI flag or env var for a single run. Parsed into
     /// `startpage::StartPageConfig` by `App::start_page_for_launch`.
     pub startpage: Valued<String>,
+    /// PRD FR-TB-5: an independent trigger for session auto-restore,
+    /// alongside `startpage = resume` — a reader who prefers `startpage =
+    /// blank`/`feed` for the "look" of that view can still opt into
+    /// reopening their tabs by setting this instead of switching `startpage`.
+    /// File only, default `false` (same scope as `startpage`/
+    /// `include_nonfree` — a preference set once, not a CLI/env concern).
+    pub restore_session: Valued<bool>,
     /// PRD FR-RD-11's reading-time WPM divisor, default 230. File only (like
     /// `startpage`/`include_nonfree`) — also settable at runtime via `:set
     /// reading_wpm=N` (`main::Command::Set`), same split as `measure`'s
@@ -396,6 +403,11 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = "\
 # Start page (FR-DL-1): feed | blank | resume.
 # startpage = \"feed\"
 
+# Session auto-restore (FR-TB-5): reopen the last session's tabs on start.
+# An alternative to `startpage = \"resume\"` for readers who want a
+# different startpage look but still want their tabs back.
+# restore_session = false
+
 # Inline images (FR-TH-7): follow the theme unless set here.
 # images = \"on\"
 
@@ -504,6 +516,7 @@ pub fn resolve(
         "images",
         "include_nonfree",
         "startpage",
+        "restore_session",
         "reading_wpm",
         "prefetch",
         "network",
@@ -594,6 +607,7 @@ pub fn resolve(
     let images = resolve_images(env, &table, &mut issues);
     let include_nonfree = resolve_include_nonfree(&table, &mut issues);
     let startpage = resolve_startpage(&table, &mut issues);
+    let restore_session = resolve_restore_session(&table, &mut issues);
     let reading_wpm = resolve_reading_wpm(&table, &mut issues);
     let prefetch = resolve_prefetch(env, &table, &mut issues);
     let network_contact = resolve_network_contact(env, &table, &mut issues);
@@ -626,6 +640,7 @@ pub fn resolve(
         images,
         include_nonfree,
         startpage,
+        restore_session,
         reading_wpm,
         prefetch,
         network_contact,
@@ -1108,6 +1123,32 @@ fn resolve_include_nonfree(table: &toml::Table, issues: &mut Vec<Issue>) -> Valu
             None => {
                 issues.push(Issue::warning(format!(
                     "include_nonfree must be a boolean; using default {DEFAULT}"
+                )));
+                default
+            }
+        },
+        None => default,
+    }
+}
+
+/// PRD FR-TB-5's `restore_session` (file-only, default false) — mirrors
+/// `resolve_include_nonfree`'s shape exactly (a plain policy bool with no
+/// CLI/env surface).
+fn resolve_restore_session(table: &toml::Table, issues: &mut Vec<Issue>) -> Valued<bool> {
+    const DEFAULT: bool = false;
+    let default = Valued {
+        value: DEFAULT,
+        source: Source::Default,
+    };
+    match table.get("restore_session") {
+        Some(v) => match v.as_bool() {
+            Some(value) => Valued {
+                value,
+                source: Source::File,
+            },
+            None => {
+                issues.push(Issue::warning(format!(
+                    "restore_session must be a boolean; using default {DEFAULT}"
                 )));
                 default
             }
@@ -2463,6 +2504,48 @@ mod tests {
         );
         assert!(from_file.include_nonfree.value);
         assert_eq!(from_file.include_nonfree.source, Source::File);
+        cleanup(&path);
+    }
+
+    /// PRD FR-TB-5: `restore_session` is an independent trigger alongside
+    /// `startpage = resume` — file-only, default false, same shape as
+    /// `include_nonfree`.
+    #[test]
+    fn restore_session_defaults_false_and_honors_file() {
+        let default = resolve(&CliOverrides::default(), &EnvOverrides::default(), None);
+        assert!(!default.restore_session.value);
+        assert_eq!(default.restore_session.source, Source::Default);
+
+        let path = temp_config("restore_session = true\n");
+        let from_file = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert!(from_file.restore_session.value);
+        assert_eq!(from_file.restore_session.source, Source::File);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn restore_session_rejects_a_non_boolean_with_a_warning() {
+        let path = temp_config("restore_session = \"sometimes\"\n");
+        let resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert!(
+            !resolved.restore_session.value,
+            "falls back to default false"
+        );
+        assert_eq!(resolved.restore_session.source, Source::Default);
+        assert!(
+            resolved
+                .issues
+                .iter()
+                .any(|i| i.message.contains("restore_session"))
+        );
         cleanup(&path);
     }
 

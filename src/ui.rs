@@ -927,7 +927,7 @@ fn draw_blank_welcome(frame: &mut Frame, app: &App, area: Rect) {
             colored(app.no_color, app.theme.dim),
         )),
         Line::from(""),
-        Line::from("Press / to search Wikipedia, T to cycle themes, ? for help, q to quit."),
+        Line::from("Press / to search Wikipedia, Ctrl-T to cycle themes, ? for help, q to quit."),
     ]);
     frame.render_widget(
         Paragraph::new(welcome).style(base_style(&app.theme, app.no_color)),
@@ -2560,7 +2560,7 @@ fn help_content(app: &App) -> (String, Vec<Line<'static>>) {
             row(":", "command line"),
             row("Ctrl-p", "command palette"),
             row("gr", "random article"),
-            row("T", "cycle color theme"),
+            row("Ctrl-T", "cycle color theme"),
             row("?", "this help"),
             row("q", "close / quit"),
         ];
@@ -2747,7 +2747,7 @@ fn draw_onboarding(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(""),
         key("/", "search Wikipedia"),
         key("?", "help — every key for the current view"),
-        key("T", "cycle the color theme"),
+        key("Ctrl-T", "cycle the color theme"),
         Line::from(""),
         Line::from(RSpan::styled(
             "A config file with commented defaults is being written",

@@ -71,6 +71,9 @@ pub enum Action {
     // -- views & tools --
     Toc,
     CycleTheme,
+    /// PRD FR-ACC-5: flip the active tab between an article and its talk
+    /// page.
+    TalkToggle,
     Search,
     CommandLine,
     Help,
@@ -353,6 +356,14 @@ pub const COMMANDS: &[Meta] = &[
         name: "cycle-theme",
         display: "Cycle theme",
         help: "cycle to the next color theme",
+        contexts: &[KeyContext::Reading],
+        in_palette: true,
+    },
+    Meta {
+        action: Action::TalkToggle,
+        name: "talk-toggle",
+        display: "Talk page",
+        help: "flip between the article and its talk page",
         contexts: &[KeyContext::Reading],
         in_palette: true,
     },
@@ -837,7 +848,12 @@ impl Keymap {
 
         // Reading — views & tools.
         Keymap::bind(b, Reading, Chord::ch('t'), Toc);
-        Keymap::bind(b, Reading, Chord::ch('T'), CycleTheme);
+        // PRD Appendix B's "Article: T talk page" wins the bare `T` key;
+        // cycle-theme (which Appendix B never actually binds a bare key to —
+        // only `:theme <name>`) moves to Ctrl-t. See `main::toggle_talk_page`
+        // for the conflict this resolves and why.
+        Keymap::bind(b, Reading, Chord::ch('T'), TalkToggle);
+        Keymap::bind(b, Reading, Chord::ctrl_ch('t'), CycleTheme);
         Keymap::bind(b, Reading, Chord::ch('/'), Search);
         Keymap::bind(b, Reading, Chord::ch(':'), CommandLine);
         Keymap::bind(b, Reading, Chord::ch('y'), YankUrl);
@@ -1085,6 +1101,7 @@ pub const READING_HELP_ORDER: &[Action] = &[
     Action::CloseTab,
     Action::Toc,
     Action::CycleTheme,
+    Action::TalkToggle,
     Action::Search,
     Action::FindInPage,
     Action::FindNext,
@@ -1207,6 +1224,8 @@ mod tests {
 
         // Views & tools.
         assert_eq!(km.resolve(Reading, &Chord::ch('t')), Some(Toc));
+        assert_eq!(km.resolve(Reading, &Chord::ch('T')), Some(TalkToggle));
+        assert_eq!(km.resolve(Reading, &Chord::ctrl_ch('t')), Some(CycleTheme));
         assert_eq!(km.resolve(Reading, &Chord::ch('/')), Some(Search));
         assert_eq!(km.resolve(Reading, &Chord::ch(':')), Some(CommandLine));
         assert_eq!(km.resolve(Reading, &Chord::ch('m')), Some(BookmarkToggle));

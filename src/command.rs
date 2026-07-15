@@ -95,6 +95,9 @@ pub enum Command {
     /// `:related` (PRD FR-SR-6) — open the Related panel for the current
     /// article (`morelike:{title}`). Same action as `gR`.
     Related,
+    /// `:talk` (PRD FR-ACC-5) — flip the active tab between an article and
+    /// its talk page. Same action as `T`.
+    Talk,
     /// `:q` / `:quit` — exit.
     Quit,
 }
@@ -145,7 +148,7 @@ pub enum SaveSpec {
 /// parse-time constant so `command` doesn't depend on the render module.
 const SAVE_EXPORT_FORMATS: [&str; 3] = ["md", "txt", "html"];
 
-pub const USAGE: &str = "commands: open <title>, lang [<code>], theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, prefetch-log, start, today, random [good], related, set theme=<name>|images=on|off|prefetch=on|off|measure=N|ambiguous_width=1|2|reading_wpm=N, config reload, help, quit";
+pub const USAGE: &str = "commands: open <title>, lang [<code>], theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, prefetch-log, start, today, random [good], related, talk, set theme=<name>|images=on|off|prefetch=on|off|measure=N|ambiguous_width=1|2|reading_wpm=N, config reload, help, quit";
 
 /// Parses one `:` command line. `user_theme_names` are accepted alongside
 /// the six built-ins for `:theme <name>` and `:set theme=<name>` (PRD
@@ -509,6 +512,8 @@ pub fn parse_with_user_themes(input: &str, user_theme_names: &[String]) -> Resul
         },
         // PRD FR-SR-6.
         "related" => Ok(Command::Related),
+        // PRD FR-ACC-5.
+        "talk" => Ok(Command::Talk),
         "help" | "h" => Ok(Command::Help),
         "q" | "quit" => Ok(Command::Quit),
         "" => Err(USAGE.to_string()),
@@ -967,5 +972,10 @@ mod tests {
     #[test]
     fn related_parses_bare() {
         assert_eq!(parse("related"), Ok(Command::Related));
+    }
+
+    #[test]
+    fn talk_parses_bare() {
+        assert_eq!(parse("talk"), Ok(Command::Talk));
     }
 }
