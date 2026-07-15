@@ -14,16 +14,33 @@
 //!
 //! ```text
 //! <data_dir>/saved/
-//!   saved.jsonl                         -- the index (one SavedRecord per line)
-//!   content/{lang}/{title}.html.zst     -- the pinned Parsoid HTML (zstd)
-//!   thumbs/{lang}/{title}/{n}           -- T1+ thumbnails, raw fetched bytes
+//!   saved.jsonl                            -- the index (one SavedRecord per line)
+//!   content/{wiki}/{lang}/{title}.html.zst -- the pinned Parsoid HTML (zstd)
+//!   thumbs/{wiki}/{lang}/{title}/{n}       -- T1+ thumbnails, raw fetched bytes
 //! ```
 //!
 //! **Compression**: the pinned HTML is zstd-compressed, reusing the cache's
 //! approach (`zstd::stream::{encode,decode}_all`). Pinned content is never
 //! rewritten or evicted, so there is no immutability-by-revid dance like the
-//! cache's — one saved copy per `(lang, title)`, replaced wholesale if the
-//! user saves the same article again.
+//! cache's — one saved copy per `(wiki, lang, title)`, replaced wholesale if
+//! the user saves the same article again.
+//!
+//! ## Wiki scoping (PRD FR-ML-4/5)
+//!
+//! Every key carries a **wiki** dimension (`api::wiki_scope`), exactly like
+//! the page cache (`cache.rs`): a title pinned on one wiki must never be
+//! served — or its integrity checked — against another wiki's copy of the
+//! same `(lang, title)` after a runtime `:wiki` switch. Because saved pages
+//! are the PRD's *pinned, integrity-checked* tier (§5.7, distinct from the
+//! evictable cache), returning the wrong wiki's content here would break the
+//! integrity contract itself, not merely a cache hint. The primary Wikipedia
+//! entry's scope is the empty string, and the `{wiki}` path segment is
+//! *omitted* for it — so `content/{lang}/…` / `thumbs/{lang}/…` are exactly
+//! the paths the pre-multi-wiki code wrote, and a `wiki`-less record left by
+//! that code deserializes (`#[serde(default)]`) as the empty/default scope
+//! and reads back transparently, with no migration pass. A non-default wiki
+//! gets a `{wiki}` segment (`content/legacywiki/{lang}/…`) — a disjoint
+//! subtree, so its pinned copies never collide with the default wiki's.
 //!
 //! ## Tiers (FR-OFF-4)
 //!
@@ -127,6 +144,15 @@ pub struct LinkSummary {
 /// file's records keep loading (the same tolerance `bookmarks.rs` documents).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SavedRecord {
+    /// The wiki scope this page was pinned on (`api::wiki_scope`, PRD
+    /// FR-ML-4) — the empty string for the primary Wikipedia wiki, a registry
+    /// name otherwise. `#[serde(default)]` (empty string) for records written
+    /// before this field existed; an empty `wiki` is exactly the default
+    /// Wikipedia scope those records belong to, so a pre-multi-wiki
+    /// `saved.jsonl` reads back at its original `content/{lang}/…` location
+    /// with no migration (see the module doc comment).
+    #[serde(default)]
+    pub wiki: String,
     pub lang: String,
     pub title: String,
     /// The revid the copy was pinned at (`0` when the server never told us —
@@ -219,33 +245,48 @@ impl SavedPages {
         self.root.as_ref().map(|r| r.join("saved.jsonl"))
     }
 
-    /// The relative content path for `(lang, title)` — `content/{lang}/
-    /// {title}.html.zst`, names filesystem-safe via the same rule the cache
-    /// uses (`cache::safe_name`).
-    fn content_rel(lang: &str, title: &str) -> String {
+    /// The `{wiki}/` path segment for a scope (PRD FR-ML-4), mirroring
+    /// `cache::PageCache::scope_dir`: the default (empty) Wikipedia scope
+    /// contributes *no* segment, so the resulting path is byte-identical to
+    /// the pre-multi-wiki layout — see the module doc comment.
+    fn scope_segment(wiki: &str) -> String {
+        if wiki.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", crate::cache::safe_name(wiki))
+        }
+    }
+
+    /// The relative content path for `(wiki, lang, title)` — `content/{wiki}/
+    /// {lang}/{title}.html.zst` (the `{wiki}/` omitted for the default
+    /// scope), names filesystem-safe via the same rule the cache uses
+    /// (`cache::safe_name`).
+    fn content_rel(wiki: &str, lang: &str, title: &str) -> String {
         format!(
-            "content/{}/{}.html.zst",
+            "content/{}{}/{}.html.zst",
+            Self::scope_segment(wiki),
             crate::cache::safe_name(lang),
             crate::cache::safe_name(title)
         )
     }
 
-    fn thumb_dir_rel(lang: &str, title: &str) -> String {
+    fn thumb_dir_rel(wiki: &str, lang: &str, title: &str) -> String {
         format!(
-            "thumbs/{}/{}",
+            "thumbs/{}{}/{}",
+            Self::scope_segment(wiki),
             crate::cache::safe_name(lang),
             crate::cache::safe_name(title)
         )
     }
 
-    pub fn find(&self, lang: &str, title: &str) -> Option<&SavedRecord> {
+    pub fn find(&self, wiki: &str, lang: &str, title: &str) -> Option<&SavedRecord> {
         self.records
             .iter()
-            .find(|r| r.lang == lang && r.title == title)
+            .find(|r| r.wiki == wiki && r.lang == lang && r.title == title)
     }
 
-    pub fn is_saved(&self, lang: &str, title: &str) -> bool {
-        self.find(lang, title).is_some()
+    pub fn is_saved(&self, wiki: &str, lang: &str, title: &str) -> bool {
+        self.find(wiki, lang, title).is_some()
     }
 
     pub fn list(&self) -> &[SavedRecord] {
@@ -258,16 +299,18 @@ impl SavedPages {
         self.records.iter().map(|r| r.size_total).sum()
     }
 
-    /// Save (pin) `(lang, title)` at `tier`. `html` is the raw Parsoid HTML;
-    /// `thumbs` are `(src, bytes)` pairs already fetched for T1+ (empty for
-    /// T0); `summaries` are the T2 link extracts (empty otherwise). Writes the
-    /// zstd HTML blob and any thumbnails, then appends/replaces the index
-    /// record. Re-saving an already-saved article replaces it wholesale
-    /// (index line + content), so the tier/size/integrity all move forward
-    /// together. Returns the stored record.
+    /// Save (pin) `(wiki, lang, title)` at `tier`. `html` is the raw Parsoid
+    /// HTML; `thumbs` are `(src, bytes)` pairs already fetched for T1+ (empty
+    /// for T0); `summaries` are the T2 link extracts (empty otherwise). Writes
+    /// the zstd HTML blob and any thumbnails under `wiki`'s scope (PRD
+    /// FR-ML-4), then appends/replaces the index record. Re-saving an
+    /// already-saved article on the *same* wiki replaces it wholesale (index
+    /// line + content); the same `(lang, title)` on a *different* wiki is a
+    /// distinct pinned copy, never an overwrite. Returns the stored record.
     #[allow(clippy::too_many_arguments)]
     pub fn save(
         &mut self,
+        wiki: &str,
         lang: &str,
         title: &str,
         revid: u64,
@@ -279,7 +322,7 @@ impl SavedPages {
     ) -> std::io::Result<SavedRecord> {
         let html_bytes = html.len() as u64;
         let sha256 = sha256_hex(html.as_bytes());
-        let content_rel = Self::content_rel(lang, title);
+        let content_rel = Self::content_rel(wiki, lang, title);
 
         // Write the blobs first; only once the content is durably on disk do
         // we commit the index line that promises it exists.
@@ -295,7 +338,7 @@ impl SavedPages {
             std::fs::write(&content_abs, &compressed)?;
 
             if !thumbs.is_empty() {
-                let thumb_dir = root.join(Self::thumb_dir_rel(lang, title));
+                let thumb_dir = root.join(Self::thumb_dir_rel(wiki, lang, title));
                 // A re-save shouldn't leave stale thumbnails behind.
                 let _ = std::fs::remove_dir_all(&thumb_dir);
                 std::fs::create_dir_all(&thumb_dir)?;
@@ -324,6 +367,7 @@ impl SavedPages {
         }
 
         let record = SavedRecord {
+            wiki: wiki.to_string(),
             lang: lang.to_string(),
             title: title.to_string(),
             revid,
@@ -339,17 +383,19 @@ impl SavedPages {
             summaries,
         };
 
-        // Replace any existing index line for this (lang, title), else append.
+        // Replace any existing index line for this (wiki, lang, title), else
+        // append. The wiki dimension keeps a same-titled article pinned on
+        // another wiki from being clobbered by this save (PRD FR-ML-4).
         if let Some(pos) = self
             .records
             .iter()
-            .position(|r| r.lang == lang && r.title == title)
+            .position(|r| r.wiki == wiki && r.lang == lang && r.title == title)
         {
             self.records[pos] = record.clone();
             if let Some(index) = self.index_path() {
                 let _ = crate::jsonl::rewrite_matching::<SavedRecord, _>(
                     &index,
-                    |r| r.lang == lang && r.title == title,
+                    |r| r.wiki == wiki && r.lang == lang && r.title == title,
                     Some(&record),
                 );
             }
@@ -366,8 +412,8 @@ impl SavedPages {
     /// blob. `None` on a miss or unreadable content — a corrupt pinned copy is
     /// a miss here (the caller falls back to the cache/offline card), while
     /// `verify` reports the corruption explicitly for the browser.
-    pub fn get(&self, lang: &str, title: &str) -> Option<SavedContent> {
-        let record = self.find(lang, title)?;
+    pub fn get(&self, wiki: &str, lang: &str, title: &str) -> Option<SavedContent> {
+        let record = self.find(wiki, lang, title)?;
         let root = self.root.as_ref()?;
         let compressed = std::fs::read(root.join(&record.content_file)).ok()?;
         let html_bytes = zstd::stream::decode_all(compressed.as_slice()).ok()?;
@@ -388,22 +434,22 @@ impl SavedPages {
         })
     }
 
-    /// The raw thumbnail bytes stored for `(lang, title)`, keyed by source URL
-    /// — used by the HTML export to embed pinned images when the non-free
-    /// opt-in allows it (`saved_export`).
-    pub fn thumb_bytes(&self, lang: &str, title: &str, src: &str) -> Option<Vec<u8>> {
-        let record = self.find(lang, title)?;
+    /// The raw thumbnail bytes stored for `(wiki, lang, title)`, keyed by
+    /// source URL — used by the HTML export to embed pinned images when the
+    /// non-free opt-in allows it (`saved_export`).
+    pub fn thumb_bytes(&self, wiki: &str, lang: &str, title: &str, src: &str) -> Option<Vec<u8>> {
+        let record = self.find(wiki, lang, title)?;
         let root = self.root.as_ref()?;
         let thumb = record.thumbs.iter().find(|t| t.src == src)?;
-        let dir = root.join(Self::thumb_dir_rel(lang, title));
+        let dir = root.join(Self::thumb_dir_rel(wiki, lang, title));
         std::fs::read(dir.join(&thumb.file)).ok()
     }
 
     /// PRD's integrity contract: recompute the sha256 of the stored HTML and
     /// compare it to the record. `Corrupt` when the content is missing, won't
     /// decompress, or its hash no longer matches (a tampered/bit-rotted blob).
-    pub fn verify(&self, lang: &str, title: &str) -> Integrity {
-        let Some(record) = self.find(lang, title) else {
+    pub fn verify(&self, wiki: &str, lang: &str, title: &str) -> Integrity {
+        let Some(record) = self.find(wiki, lang, title) else {
             return Integrity::Corrupt;
         };
         let Some(root) = self.root.as_ref() else {
@@ -424,42 +470,46 @@ impl SavedPages {
         }
     }
 
-    /// Verify every saved page, returning `(lang, title, integrity)` per
-    /// record — the `:saved` browser's ok/corrupt column.
-    pub fn verify_all(&self) -> Vec<(String, String, Integrity)> {
+    /// Verify every saved page, returning `(wiki, lang, title, integrity)` per
+    /// record — the `:saved` browser's ok/corrupt column. The wiki is carried
+    /// (PRD FR-ML-4) so the verdict is recomputed against each record's own
+    /// wiki-scoped content path, never another wiki's identically-named copy.
+    pub fn verify_all(&self) -> Vec<(String, String, String, Integrity)> {
         self.records
             .iter()
             .map(|r| {
                 (
+                    r.wiki.clone(),
                     r.lang.clone(),
                     r.title.clone(),
-                    self.verify(&r.lang, &r.title),
+                    self.verify(&r.wiki, &r.lang, &r.title),
                 )
             })
             .collect()
     }
 
-    /// Un-pin `(lang, title)`: drops the index line (via the jsonl safe-delete)
-    /// and removes the content blob and any thumbnails. Returns the removed
-    /// record and whether the index rewrite persisted.
+    /// Un-pin `(wiki, lang, title)`: drops the index line (via the jsonl
+    /// safe-delete) and removes the content blob and any thumbnails. Returns
+    /// the removed record and whether the index rewrite persisted.
     pub fn remove(
         &mut self,
+        wiki: &str,
         lang: &str,
         title: &str,
     ) -> Option<(SavedRecord, std::io::Result<()>)> {
         let pos = self
             .records
             .iter()
-            .position(|r| r.lang == lang && r.title == title)?;
+            .position(|r| r.wiki == wiki && r.lang == lang && r.title == title)?;
         let removed = self.records.remove(pos);
         if let Some(root) = &self.root {
             let _ = std::fs::remove_file(root.join(&removed.content_file));
-            let _ = std::fs::remove_dir_all(root.join(Self::thumb_dir_rel(lang, title)));
+            let _ = std::fs::remove_dir_all(root.join(Self::thumb_dir_rel(wiki, lang, title)));
         }
         let persisted = match self.index_path() {
             Some(index) => crate::jsonl::rewrite_matching::<SavedRecord, _>(
                 &index,
-                |r| r.lang == removed.lang && r.title == removed.title,
+                |r| r.wiki == removed.wiki && r.lang == removed.lang && r.title == removed.title,
                 None,
             )
             .map(|_| ()),
@@ -521,10 +571,11 @@ mod tests {
     #[test]
     fn save_get_remove_round_trip() {
         let (mut store, root) = temp_store();
-        assert!(!store.is_saved("en", "Alan Turing"));
+        assert!(!store.is_saved("", "en", "Alan Turing"));
 
         let rec = store
             .save(
+                "",
                 "en",
                 "Alan Turing",
                 1001,
@@ -536,21 +587,21 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rec.tier, Tier::T0);
-        assert!(store.is_saved("en", "Alan Turing"));
+        assert!(store.is_saved("", "en", "Alan Turing"));
 
-        let got = store.get("en", "Alan Turing").expect("served offline");
+        let got = store.get("", "en", "Alan Turing").expect("served offline");
         assert_eq!(got.html, "<html><body><p>hi</p></body></html>");
         assert_eq!(got.revid, 1001);
 
         // A fresh load from the same root sees the persisted record.
         let reloaded = SavedPages::at(root.clone());
-        assert!(reloaded.is_saved("en", "Alan Turing"));
+        assert!(reloaded.is_saved("", "en", "Alan Turing"));
 
-        let (removed, persisted) = store.remove("en", "Alan Turing").unwrap();
+        let (removed, persisted) = store.remove("", "en", "Alan Turing").unwrap();
         assert_eq!(removed.title, "Alan Turing");
         assert!(persisted.is_ok());
-        assert!(!store.is_saved("en", "Alan Turing"));
-        assert!(store.get("en", "Alan Turing").is_none());
+        assert!(!store.is_saved("", "en", "Alan Turing"));
+        assert!(store.get("", "en", "Alan Turing").is_none());
         // The content blob is gone from disk too.
         assert!(!root.join(&removed.content_file).exists());
         let _ = std::fs::remove_dir_all(&root);
@@ -561,6 +612,7 @@ mod tests {
         let (mut store, root) = temp_store();
         let rec = store
             .save(
+                "",
                 "en",
                 "Turing",
                 1,
@@ -571,14 +623,14 @@ mod tests {
                 "",
             )
             .unwrap();
-        assert_eq!(store.verify("en", "Turing"), Integrity::Ok);
+        assert_eq!(store.verify("", "en", "Turing"), Integrity::Ok);
 
         // Tamper with the on-disk content: overwrite with different (valid
         // zstd) bytes so it decompresses but no longer matches the sha256.
         let tampered = zstd::stream::encode_all("<p>TAMPERED</p>".as_bytes(), ZSTD_LEVEL).unwrap();
         std::fs::write(root.join(&rec.content_file), &tampered).unwrap();
         assert_eq!(
-            store.verify("en", "Turing"),
+            store.verify("", "en", "Turing"),
             Integrity::Corrupt,
             "a changed HTML blob must fail the sha256 check"
         );
@@ -589,11 +641,11 @@ mod tests {
     fn integrity_corrupt_when_content_unreadable() {
         let (mut store, root) = temp_store();
         let rec = store
-            .save("en", "Turing", 1, Tier::T0, "<p>x</p>", &[], vec![], "")
+            .save("", "en", "Turing", 1, Tier::T0, "<p>x</p>", &[], vec![], "")
             .unwrap();
         // Non-zstd garbage → decode fails → corrupt.
         std::fs::write(root.join(&rec.content_file), b"not zstd at all").unwrap();
-        assert_eq!(store.verify("en", "Turing"), Integrity::Corrupt);
+        assert_eq!(store.verify("", "en", "Turing"), Integrity::Corrupt);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -602,7 +654,7 @@ mod tests {
         let (mut store, root) = temp_store();
 
         let t0 = store
-            .save("en", "A", 1, Tier::T0, "<p>a</p>", &[], vec![], "")
+            .save("", "en", "A", 1, Tier::T0, "<p>a</p>", &[], vec![], "")
             .unwrap();
         assert!(t0.thumbs.is_empty(), "T0 stores HTML only");
         assert!(t0.summaries.is_empty());
@@ -610,6 +662,7 @@ mod tests {
 
         let t1 = store
             .save(
+                "",
                 "en",
                 "B",
                 1,
@@ -626,7 +679,7 @@ mod tests {
         // The thumbnail bytes are actually on disk and retrievable by src.
         assert_eq!(
             store
-                .thumb_bytes("en", "B", "http://example/img.png")
+                .thumb_bytes("", "en", "B", "http://example/img.png")
                 .map(|b| b.len()),
             Some(100)
         );
@@ -636,7 +689,7 @@ mod tests {
             extract: "A short extract.".to_string(),
         }];
         let t2 = store
-            .save("en", "C", 1, Tier::T2, "<p>c</p>", &[], summaries, "")
+            .save("", "en", "C", 1, Tier::T2, "<p>c</p>", &[], summaries, "")
             .unwrap();
         assert_eq!(t2.summaries.len(), 1, "T2 stores link summaries");
         assert_eq!(t2.summaries[0].title, "Linked");
@@ -650,7 +703,17 @@ mod tests {
             .map(|i| (format!("http://example/{i}.png"), vec![0u8; 10]))
             .collect();
         let rec = store
-            .save("en", "Gallery", 1, Tier::T1, "<p>g</p>", &many, vec![], "")
+            .save(
+                "",
+                "en",
+                "Gallery",
+                1,
+                Tier::T1,
+                "<p>g</p>",
+                &many,
+                vec![],
+                "",
+            )
             .unwrap();
         assert_eq!(
             rec.thumbs.len(),
@@ -664,10 +727,20 @@ mod tests {
     fn total_bytes_sums_html_and_thumbs() {
         let (mut store, root) = temp_store();
         store
-            .save("en", "A", 1, Tier::T0, "12345", &[], vec![], "")
+            .save("", "en", "A", 1, Tier::T0, "12345", &[], vec![], "")
             .unwrap();
         store
-            .save("en", "B", 1, Tier::T1, "12345", &[thumb(20)], vec![], "")
+            .save(
+                "",
+                "en",
+                "B",
+                1,
+                Tier::T1,
+                "12345",
+                &[thumb(20)],
+                vec![],
+                "",
+            )
             .unwrap();
         // 5 + 5 HTML bytes + 20 thumb bytes.
         assert_eq!(store.total_bytes(), 5 + 5 + 20);
@@ -678,10 +751,11 @@ mod tests {
     fn re_saving_replaces_rather_than_duplicates() {
         let (mut store, root) = temp_store();
         store
-            .save("en", "A", 1, Tier::T0, "<p>v1</p>", &[], vec![], "")
+            .save("", "en", "A", 1, Tier::T0, "<p>v1</p>", &[], vec![], "")
             .unwrap();
         store
             .save(
+                "",
                 "en",
                 "A",
                 2,
@@ -695,12 +769,12 @@ mod tests {
         assert_eq!(
             store.records.len(),
             1,
-            "same (lang,title) is not duplicated"
+            "same (wiki,lang,title) is not duplicated"
         );
-        let got = store.get("en", "A").unwrap();
+        let got = store.get("", "en", "A").unwrap();
         assert_eq!(got.html, "<p>v2</p>");
         assert_eq!(got.revid, 2);
-        assert_eq!(store.find("en", "A").unwrap().tier, Tier::T1);
+        assert_eq!(store.find("", "en", "A").unwrap().tier, Tier::T1);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -721,6 +795,7 @@ mod tests {
         let mut store = SavedPages::at(saved_root.clone());
         store
             .save(
+                "",
                 "en",
                 "Pinned",
                 1,
@@ -740,19 +815,241 @@ mod tests {
 
         // The saved page is untouched by any of that.
         assert!(
-            store.get("en", "Pinned").is_some(),
+            store.get("", "en", "Pinned").is_some(),
             "cache eviction must never reach the pinned saved store"
         );
-        assert_eq!(store.verify("en", "Pinned"), Integrity::Ok);
+        assert_eq!(store.verify("", "en", "Pinned"), Integrity::Ok);
         let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
     fn get_on_missing_and_disabled_store() {
         let (store, root) = temp_store();
-        assert!(store.get("en", "Nope").is_none());
+        assert!(store.get("", "en", "Nope").is_none());
         let mem = SavedPages::in_memory();
-        assert!(mem.get("en", "Nope").is_none());
+        assert!(mem.get("", "en", "Nope").is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// PRD FR-ML-4 — the headline correctness fix for the *pinned* store. The
+    /// same `(lang, title)` saved on two different wikis must never collide:
+    /// `is_saved`/`get` for wiki B miss a title only wiki A pinned (so the
+    /// reader never sees B "already saved" pointing at A's content), each
+    /// wiki serves its own bytes, and wiki A's copy is left intact. Against
+    /// the pre-scoping store — keyed on `(lang, title)` alone — the second
+    /// save would have overwritten the first and `get` would have served the
+    /// wrong wiki's pinned article, breaking §5.7's integrity contract.
+    #[test]
+    fn same_title_on_two_wikis_never_collides() {
+        let (mut store, root) = temp_store();
+        store
+            .save(
+                "wikipedia_x",
+                "en",
+                "Installation",
+                10,
+                Tier::T0,
+                "<p>encyclopedia article</p>",
+                &[],
+                vec![],
+                "",
+            )
+            .unwrap();
+
+        // A different wiki has never pinned this title — a miss, not wiki A's
+        // content offered under the wrong project.
+        assert!(
+            !store.is_saved("archwiki", "en", "Installation"),
+            "a different wiki must miss, never inherit another wiki's pinned copy"
+        );
+        assert!(store.get("archwiki", "en", "Installation").is_none());
+
+        // Saving it on wiki B pins B's own content; both wikis now serve their
+        // own, neither store record is clobbered, and both verify intact.
+        store
+            .save(
+                "archwiki",
+                "en",
+                "Installation",
+                20,
+                Tier::T0,
+                "<p>distro install guide</p>",
+                &[],
+                vec![],
+                "",
+            )
+            .unwrap();
+        assert_eq!(store.records.len(), 2, "each wiki keeps its own record");
+        assert_eq!(
+            store.get("wikipedia_x", "en", "Installation").unwrap().html,
+            "<p>encyclopedia article</p>"
+        );
+        assert_eq!(
+            store.get("archwiki", "en", "Installation").unwrap().html,
+            "<p>distro install guide</p>"
+        );
+        assert_eq!(
+            store.verify("wikipedia_x", "en", "Installation"),
+            Integrity::Ok
+        );
+        assert_eq!(
+            store.verify("archwiki", "en", "Installation"),
+            Integrity::Ok
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The default (Wikipedia) scope is the empty string, and its on-disk
+    /// content path carries no `{wiki}` segment — byte-identical to what the
+    /// pre-multi-wiki code wrote. This pins that: a default-scope save lands
+    /// exactly at `content/{lang}/…`, so an existing `saved/` tree is read
+    /// back with no migration; a non-default wiki gets its own `{wiki}`
+    /// subtree instead, and removing one leaves the other's blob on disk.
+    #[test]
+    fn default_wiki_uses_the_legacy_pathless_layout_and_others_get_a_subtree() {
+        let (mut store, root) = temp_store();
+        let default = store
+            .save(
+                "",
+                "en",
+                "Turing",
+                1,
+                Tier::T0,
+                "<p>default</p>",
+                &[],
+                vec![],
+                "",
+            )
+            .unwrap();
+        let sister = store
+            .save(
+                "wiktionary",
+                "en",
+                "Turing",
+                2,
+                Tier::T0,
+                "<p>sister</p>",
+                &[],
+                vec![],
+                "",
+            )
+            .unwrap();
+
+        // Default scope: no wiki segment (the exact pre-scoping location).
+        assert_eq!(default.content_file, "content/en/Turing.html.zst");
+        assert!(
+            root.join("content")
+                .join("en")
+                .join("Turing.html.zst")
+                .exists()
+        );
+        // Non-default scope: a disjoint subtree.
+        assert_eq!(sister.content_file, "content/wiktionary/en/Turing.html.zst");
+        assert!(
+            root.join("content")
+                .join("wiktionary")
+                .join("en")
+                .join("Turing.html.zst")
+                .exists()
+        );
+
+        // Removing the sister leaves the default wiki's blob untouched.
+        let (_, persisted) = store.remove("wiktionary", "en", "Turing").unwrap();
+        assert!(persisted.is_ok());
+        assert!(store.get("", "en", "Turing").is_some());
+        assert!(store.get("wiktionary", "en", "Turing").is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Migration proof: a `saved.jsonl` record written before the `wiki` field
+    /// existed (its JSON has no `wiki` key) loads via `#[serde(default)]` as
+    /// the empty/default scope, and — because its `content_file` was already
+    /// the segment-less `content/{lang}/…` path the default scope still uses —
+    /// its pinned blob is served to the default wiki with no refetch and no
+    /// crash, while a non-default wiki correctly misses it.
+    #[test]
+    fn a_pre_wiki_record_is_read_as_the_default_wiki() {
+        let (root, blob_rel) = {
+            let (mut store, root) = temp_store();
+            // Write the blob at the default (segment-less) location via a
+            // normal save, then hand-write an index line with no `wiki` key —
+            // exactly what the pre-multi-wiki code left on disk.
+            let rec = store
+                .save(
+                    "",
+                    "en",
+                    "Legacy",
+                    7,
+                    Tier::T0,
+                    "<p>old content</p>",
+                    &[],
+                    vec![],
+                    "",
+                )
+                .unwrap();
+            (root, rec.content_file)
+        };
+        let index = root.join("saved.jsonl");
+        let line = format!(
+            r#"{{"lang":"en","title":"Legacy","revid":7,"tier":"T0","saved_at":"2020-01-01T00:00:00+00:00","html_bytes":18,"size_total":18,"sha256":"{}","content_file":"{}"}}"#,
+            sha256_hex("<p>old content</p>".as_bytes()),
+            blob_rel
+        );
+        std::fs::write(&index, format!("{line}\n")).unwrap();
+
+        let store = SavedPages::at(root.clone());
+        assert_eq!(
+            store.list()[0].wiki,
+            "",
+            "a record with no wiki key deserializes as the default scope"
+        );
+        assert!(store.is_saved("", "en", "Legacy"));
+        assert_eq!(
+            store.get("", "en", "Legacy").unwrap().html,
+            "<p>old content</p>",
+            "a pre-wiki record must read back as the default wiki, no refetch"
+        );
+        assert_eq!(store.verify("", "en", "Legacy"), Integrity::Ok);
+        assert!(
+            !store.is_saved("wiktionary", "en", "Legacy"),
+            "a non-default wiki must not inherit the default wiki's legacy record"
+        );
+        assert!(store.get("wiktionary", "en", "Legacy").is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `list()`/`verify_all()` carry each record's wiki so the `:saved`
+    /// browser can show — and open — a saved page under its own project.
+    #[test]
+    fn list_and_verify_all_carry_the_wiki() {
+        let (mut store, root) = temp_store();
+        store
+            .save("", "en", "Home", 1, Tier::T0, "<p>a</p>", &[], vec![], "")
+            .unwrap();
+        store
+            .save(
+                "archwiki",
+                "en",
+                "Home",
+                2,
+                Tier::T0,
+                "<p>b</p>",
+                &[],
+                vec![],
+                "",
+            )
+            .unwrap();
+
+        let wikis: Vec<&str> = store.list().iter().map(|r| r.wiki.as_str()).collect();
+        assert!(wikis.contains(&""));
+        assert!(wikis.contains(&"archwiki"));
+
+        let verdicts = store.verify_all();
+        assert_eq!(verdicts.len(), 2);
+        assert!(
+            verdicts.iter().all(|(_, _, _, v)| *v == Integrity::Ok),
+            "each record verifies against its own wiki-scoped path"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

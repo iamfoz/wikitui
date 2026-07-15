@@ -4989,29 +4989,28 @@ impl App {
         };
     }
 
-    /// The `(lang, title)` the saved-browser selection refers to, or `None`
-    /// when the store is empty.
-    pub fn selected_saved_target(&self) -> Option<(String, String)> {
+    /// The `(wiki, lang, title)` the saved-browser selection refers to, or
+    /// `None` when the store is empty. The wiki (PRD FR-ML-4) lets Enter open
+    /// — and `d` un-pin — the exact pinned copy, even across wikis.
+    pub fn selected_saved_target(&self) -> Option<(String, String, String)> {
         self.saved
             .list()
             .get(self.selected_saved)
-            .map(|r| (r.lang.clone(), r.title.clone()))
+            .map(|r| (r.wiki.clone(), r.lang.clone(), r.title.clone()))
     }
 
     /// `d` in the saved browser: un-pin the selection, keeping the cursor in
     /// range over whatever remains.
     pub fn delete_selected_saved(&mut self) {
-        let Some((lang, title)) = self.selected_saved_target() else {
+        let Some((wiki, lang, title)) = self.selected_saved_target() else {
             return;
         };
-        if let Some((removed, persisted)) = self.saved.remove(&lang, &title) {
+        if let Some((removed, persisted)) = self.saved.remove(&wiki, &lang, &title) {
             // PRD FR-SR-7: an un-saved page must stop showing up in offline
-            // search. `saved.rs` has no wiki dimension of its own yet (see
-            // `offline_search`'s module doc's documented limitation), so this
-            // removes under the *active* wiki scope — right for the common
-            // case of saving and un-saving on the same wiki.
-            self.search_index
-                .remove(self.active_wiki_scope(), &lang, &title);
+            // search. The index row is removed under the record's own wiki
+            // scope (PRD FR-ML-4), so un-saving a cross-wiki page prunes the
+            // right row regardless of which wiki is currently active.
+            self.search_index.remove(&wiki, &lang, &title);
             let len = self.saved.list().len();
             self.selected_saved = if len == 0 {
                 0
@@ -5149,14 +5148,18 @@ impl App {
         };
         let lang = self.active_tab().lang.clone();
         let title = doc.title.clone();
+        // PRD FR-ML-4: the pinned copy (and its thumbnails) live under the
+        // on-screen tab's own wiki scope — a same-titled page pinned on
+        // another wiki has its own separate thumbnails.
+        let wiki = self.active_tab().wiki.clone();
 
         let stored_thumbs = self
             .saved
-            .find(&lang, &title)
+            .find(&wiki, &lang, &title)
             .map(|r| r.thumbs.clone())
             .unwrap_or_default();
         let thumbs = crate::saved_export::embeddable_from(&stored_thumbs, |src| {
-            self.saved.thumb_bytes(&lang, &title, src)
+            self.saved.thumb_bytes(&wiki, &lang, &title, src)
         });
 
         let Some(content) =
@@ -9199,20 +9202,26 @@ mod tests {
         let mut app = App::new("en".to_string(), Theme::terminal(), false);
         app.saved = crate::saved::SavedPages::in_memory();
         app.saved
-            .save("en", "A", 1, Tier::T0, "<p>a</p>", &[], vec![], "")
+            .save("", "en", "A", 1, Tier::T0, "<p>a</p>", &[], vec![], "")
             .unwrap();
         app.saved
-            .save("en", "B", 1, Tier::T0, "<p>b</p>", &[], vec![], "")
+            .save("", "en", "B", 1, Tier::T0, "<p>b</p>", &[], vec![], "")
             .unwrap();
         app.open_saved_picker();
         assert_eq!(app.mode, Mode::SavedPicker);
-        assert_eq!(app.selected_saved_target(), Some(("en".into(), "A".into())));
-        app.cycle_saved(true);
-        assert_eq!(app.selected_saved_target(), Some(("en".into(), "B".into())));
+        assert_eq!(
+            app.selected_saved_target(),
+            Some(("".into(), "en".into(), "A".into()))
+        );
         app.cycle_saved(true);
         assert_eq!(
             app.selected_saved_target(),
-            Some(("en".into(), "A".into())),
+            Some(("".into(), "en".into(), "B".into()))
+        );
+        app.cycle_saved(true);
+        assert_eq!(
+            app.selected_saved_target(),
+            Some(("".into(), "en".into(), "A".into())),
             "wraps"
         );
 

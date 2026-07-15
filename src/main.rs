@@ -159,11 +159,11 @@ struct SaveOutcome {
 /// Everything fetched for one saved page, ready for `SavedPages::save` to pin
 /// on the main thread (the store is not `Send`-shared).
 struct SaveFetched {
-    /// The wiki this save ran on (PRD FR-ML-4's `api::wiki_scope`), carried
-    /// through so `apply_save_outcome` can tag the offline-search index row
-    /// correctly (PRD FR-SR-7) — `saved::SavedPages` itself has no wiki
-    /// dimension yet (see `offline_search`'s module doc's documented
-    /// limitation), but the index still gets this one right.
+    /// The wiki this save ran on (PRD FR-ML-4's `api::wiki_scope`) — the
+    /// on-screen tab's own wiki for a single `S` save, the active wiki for a
+    /// bulk run. Carried through so `apply_save_outcome` pins the copy under
+    /// this wiki's scope (`saved::SavedPages::save`) and tags the matching
+    /// offline-search index row (PRD FR-SR-7) the same way.
     wiki: String,
     lang: String,
     title: String,
@@ -1939,6 +1939,10 @@ fn start_current_save(
     };
     let title = doc.title.clone();
     let lang = app.active_tab().lang.clone();
+    // PRD FR-ML-4: pin under the *on-screen tab's* own wiki, never a wiki a
+    // later `:wiki` switched the active default to — the article being saved
+    // is the one this tab is showing.
+    let wiki = app.active_tab().wiki.clone();
     // PRD FR-PF-3: saving an article is the strongest positive signal (+5.0)
     // on its topics — the reader deliberately kept this page. Gated on
     // `interest_active` (off in incognito), so an incognito save still pins
@@ -1948,6 +1952,7 @@ fn start_current_save(
         client,
         cache,
         app,
+        wiki,
         vec![(lang, title)],
         tier,
         "S save".to_string(),
@@ -1976,10 +1981,12 @@ fn request_bulk_save(app: &mut App, label: String, tier: Tier, targets: Vec<(Str
 /// `SaveOutcome`, so a big save never blocks the reader and the store is only
 /// touched on the main thread (`apply_save_outcome`). `pending_saves` keeps
 /// the loop polling until every outcome has landed.
+#[allow(clippy::too_many_arguments)]
 fn fire_save_job(
     client: &WikiClient,
     cache: &PageCache,
     app: &mut App,
+    wiki: String,
     targets: Vec<(String, String)>,
     tier: Tier,
     source_note: String,
@@ -1997,6 +2004,7 @@ fn fire_save_job(
             let result = fetch_for_save(
                 &client,
                 &cache,
+                &wiki,
                 &lang,
                 &title,
                 tier,
@@ -2019,9 +2027,11 @@ fn fire_save_job(
 /// the same sanitized image sources shown transiently in the reading view; the
 /// non-free *export* exclusion (§10) is enforced at export time, not here (see
 /// `saved.rs`'s module doc).
+#[allow(clippy::too_many_arguments)]
 async fn fetch_for_save(
     client: &WikiClient,
     cache: &PageCache,
+    wiki: &str,
     lang: &str,
     title: &str,
     tier: Tier,
@@ -2029,14 +2039,17 @@ async fn fetch_for_save(
     source_note: &str,
 ) -> Result<SaveFetched> {
     // HTML: prefer the cache (the article on screen is already there) and fall
-    // back to a fresh fetch for a target that has never been opened.
-    let wiki = client.wiki_scope();
-    let (html, revid) = match cache.get(&wiki, lang, title) {
+    // back to a fresh fetch for a target that has never been opened. The cache
+    // key and the pinned copy both carry `wiki` — the wiki the reader was
+    // actually on when the save was requested (the on-screen tab's wiki for a
+    // single save, the active wiki for a bulk run), not a wiki `:wiki` may
+    // have switched to since (PRD FR-ML-4).
+    let (html, revid) = match cache.get(wiki, lang, title) {
         Some(page) => (page.html, page.revid),
         None => {
             let fetched = client.fetch_article_html(lang, title).await?;
             cache.put(
-                &wiki,
+                wiki,
                 lang,
                 title,
                 &fetched.html,
@@ -2090,7 +2103,7 @@ async fn fetch_for_save(
     }
 
     Ok(SaveFetched {
-        wiki,
+        wiki: wiki.to_string(),
         lang: lang.to_string(),
         title: title.to_string(),
         revid,
@@ -2109,6 +2122,7 @@ fn apply_save_outcome(app: &mut App, outcome: SaveOutcome) {
     app.pending_saves = app.pending_saves.saturating_sub(1);
     match outcome.result {
         Ok(f) => match app.saved.save(
+            &f.wiki,
             &f.lang,
             &f.title,
             f.revid,
@@ -2121,13 +2135,15 @@ fn apply_save_outcome(app: &mut App, outcome: SaveOutcome) {
             Ok(record) => {
                 // PRD FR-SR-7: a saved page is offline-searchable the moment
                 // it's pinned — see `offline_search`'s module doc's
-                // "Populate / remove".
+                // "Populate / remove". The index row is tagged with the store's
+                // now-authoritative wiki (`record.wiki`, PRD FR-ML-4), so an
+                // offline search and the pinned copy it opens agree on the wiki.
                 let document = doc::parse_article_html(&f.title, &f.html);
                 let plain = doc::render_plain(&document, &f.lang);
                 app.search_index.index(
-                    &f.wiki,
-                    &f.lang,
-                    &f.title,
+                    &record.wiki,
+                    &record.lang,
+                    &record.title,
                     offline_search::Kind::Saved,
                     &plain,
                 );
@@ -2163,10 +2179,12 @@ fn human_bytes(bytes: u64) -> String {
 }
 
 /// Serve a pinned saved page for reading (PRD §5.7): decompress from the saved
-/// store and install it with the ▣ Saved indicator, no network involved. The
-/// `:saved` browser's Enter and the offline fallback both route here.
-fn open_saved(app: &mut App, lang: &str, title: &str) {
-    match app.saved.get(lang, title) {
+/// store — under `wiki`'s scope (PRD FR-ML-4), so a same-titled article pinned
+/// on another wiki is never served here — and install it with the ▣ Saved
+/// indicator, no network involved. The `:saved` browser's Enter and the
+/// offline fallback both route here.
+fn open_saved(app: &mut App, wiki: &str, lang: &str, title: &str) {
+    match app.saved.get(wiki, lang, title) {
         Some(content) => {
             let document = doc::parse_article_html(title, &content.html);
             {
@@ -2177,6 +2195,12 @@ fn open_saved(app: &mut App, lang: &str, title: &str) {
                 tab.current_revid = content.revid;
             }
             app.open_document(document);
+            // `set_document` stamps the tab with the *active* wiki; a saved
+            // page belongs to the wiki it was pinned on, so re-stamp it here
+            // (PRD FR-ML-4) — reading a cross-wiki saved page from the `:saved`
+            // browser then keys its link-peek/enrich on the right wiki. For
+            // the same-wiki open paths this is the value already stamped.
+            app.active_tab_mut().wiki = wiki.to_string();
         }
         None => {
             app.notice = Some(format!("Saved page \"{title}\" is unavailable or corrupt"));
@@ -3391,10 +3415,10 @@ async fn open_title(
                 // — but never over a live/fresh copy, which is genuinely
                 // newer.
                 if matches!(outcome.source, PageSource::Offline { .. })
-                    && app.saved.is_saved(lang, title)
+                    && app.saved.is_saved(&client.wiki_scope(), lang, title)
                 {
                     app.loading = false;
-                    open_saved(app, lang, title);
+                    open_saved(app, &client.wiki_scope(), lang, title);
                     return;
                 }
                 let document = doc::parse_article_html(title, &outcome.html);
@@ -3440,8 +3464,8 @@ async fn open_title(
     // Every language in the chain came back with nothing.
     app.loading = false;
     let lang = chain.first().cloned().unwrap_or_else(|| app.lang.clone());
-    if app.saved.is_saved(&lang, title) {
-        open_saved(app, &lang, title);
+    if app.saved.is_saved(&client.wiki_scope(), &lang, title) {
+        open_saved(app, &client.wiki_scope(), &lang, title);
     } else {
         // §7's "Offline, uncached link": the network failed and nothing is
         // cached, in every language tried. Offer the queue-for-fetch /
@@ -3666,10 +3690,15 @@ async fn handle_key(
         match code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 let source_note = format!("bulk: {}", request.label);
+                // PRD FR-ML-4: a bulk save's targets were gathered from the
+                // active wiki's search/category results, so they pin under the
+                // active wiki's scope.
+                let wiki = app.active_wiki_scope().to_string();
                 fire_save_job(
                     client,
                     cache,
                     app,
+                    wiki,
                     request.targets,
                     request.tier,
                     source_note,
@@ -4409,10 +4438,10 @@ async fn handle_key(
             KeyCode::Char('k') | KeyCode::Up => app.cycle_saved(false),
             KeyCode::Char('d') => app.delete_selected_saved(),
             KeyCode::Enter => {
-                if let Some((lang, title)) = app.selected_saved_target() {
+                if let Some((wiki, lang, title)) = app.selected_saved_target() {
                     app.lang = lang.clone();
                     app.mode = Mode::Reading;
-                    open_saved(app, &lang, &title);
+                    open_saved(app, &wiki, &lang, &title);
                 }
             }
             KeyCode::Char('?') => {
@@ -7278,8 +7307,8 @@ fn run_offline_search(app: &mut App) {
 /// module doc) — reports the gap and prunes the stale row so the next
 /// search doesn't offer it again.
 fn open_offline_result(cache: &PageCache, app: &mut App, wiki: &str, lang: &str, title: &str) {
-    if app.saved.is_saved(lang, title) {
-        open_saved(app, lang, title);
+    if app.saved.is_saved(wiki, lang, title) {
+        open_saved(app, wiki, lang, title);
         return;
     }
     if let Some(page) = cache.get(wiki, lang, title) {
@@ -7306,11 +7335,10 @@ fn open_offline_result(cache: &PageCache, app: &mut App, wiki: &str, lang: &str,
 /// reducing each to plain text the same way the interactive populate hooks
 /// do (`doc::parse_article_html` + `doc::render_plain`). A standalone,
 /// TUI-free subcommand like `stats`/`clear-data` — no terminal or network
-/// access needed to walk what's already on disk. Saved pages are indexed
-/// under the default wiki scope (see `offline_search`'s module doc's
-/// documented limitation: `saved::SavedPages` itself has no wiki dimension
-/// yet); cached pages carry their own real wiki scope
-/// (`cache::PageCache::list_entries`'s stored `wiki` field).
+/// access needed to walk what's already on disk. Both stores now carry their
+/// own real wiki scope (PRD FR-ML-4): a saved page under its record's `wiki`
+/// (`saved::SavedRecord::wiki`), a cached page under
+/// `cache::PageCache::list_entries`'s stored `wiki` field.
 fn run_reindex(resolved: &config::ResolvedConfig) -> i32 {
     let saved = saved::SavedPages::load();
     let cache = cache::PageCache::open(
@@ -7326,11 +7354,11 @@ fn run_reindex(resolved: &config::ResolvedConfig) -> i32 {
 
     let mut docs = Vec::new();
     for record in saved.list() {
-        if let Some(content) = saved.get(&record.lang, &record.title) {
+        if let Some(content) = saved.get(&record.wiki, &record.lang, &record.title) {
             let document = doc::parse_article_html(&record.title, &content.html);
             let plain = doc::render_plain(&document, &record.lang);
             docs.push((
-                String::new(),
+                record.wiki.clone(),
                 record.lang.clone(),
                 record.title.clone(),
                 offline_search::Kind::Saved,

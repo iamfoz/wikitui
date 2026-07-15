@@ -2184,11 +2184,21 @@ fn draw_saved_picker(frame: &mut Frame, app: &App, area: Rect) {
         .map(|(i, rec)| {
             let ok = integrity
                 .get(i)
-                .map(|(_, _, v)| *v == crate::saved::Integrity::Ok)
+                .map(|(_, _, _, v)| *v == crate::saved::Integrity::Ok)
                 .unwrap_or(true);
             let integrity_note = if ok { "ok" } else { "CORRUPT" };
+            // PRD FR-ML-4: the `:saved` browser lists pages across every wiki
+            // (a pinned page must always be findable, never hidden by the
+            // active wiki), naming the wiki only when it isn't the default
+            // Wikipedia one — so `[en]` stays as before and `[en · archwiki]`
+            // marks a sister/third-party save.
+            let scope = if rec.wiki.is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", rec.wiki)
+            };
             let detail = format!(
-                "   [{}] {}   {}   saved {}   integrity: {integrity_note}",
+                "   [{}{scope}] {}   {}   saved {}   integrity: {integrity_note}",
                 rec.lang,
                 rec.tier.label(),
                 human_size(rec.size_total),
