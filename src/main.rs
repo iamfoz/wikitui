@@ -9083,4 +9083,125 @@ mod tests {
         assert_eq!(state.mirrored, vec!["Alan Turing".to_string()]);
         let _ = std::fs::remove_file(&state_path);
     }
+
+    // ---- PRD FR-PC-2: TTS guard clauses ------------------------------------
+    //
+    // `start_tts_playback`/`stop_tts_playback` take no `Terminal`, unlike
+    // `execute_command`/`dispatch_action`/`handle_key` (which this file's
+    // test module never calls directly — constructing a real `Terminal<
+    // CrosstermBackend<Stdout>>` in a test would paint raw ANSI/cursor
+    // escapes onto the test binary's real stdout, corrupting whatever CI or
+    // a developer's terminal is doing at the time), so their synchronous
+    // guard clauses (the paths that never reach `tokio::spawn`) are safe to
+    // exercise directly here.
+
+    #[test]
+    fn start_tts_playback_notices_when_tts_command_is_unset() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(crate::doc::parse_article_html(
+            "Alan Turing",
+            "<html><body><p>Some text.</p></body></html>",
+        ));
+        assert!(app.tts_command.is_none());
+        start_tts_playback(&mut app);
+        let notice = app.notice.clone().unwrap_or_default();
+        assert!(notice.contains("tts_command"), "{notice:?}");
+        assert!(!app.tts_playing, "an unset command never starts playback");
+    }
+
+    #[test]
+    fn start_tts_playback_notices_when_the_command_is_blank() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.tts_command = Some("   ".to_string());
+        app.set_document(crate::doc::parse_article_html(
+            "Alan Turing",
+            "<html><body><p>Some text.</p></body></html>",
+        ));
+        start_tts_playback(&mut app);
+        let notice = app.notice.clone().unwrap_or_default();
+        assert!(notice.contains("blank"), "{notice:?}");
+        assert!(!app.tts_playing);
+    }
+
+    #[test]
+    fn start_tts_playback_notices_when_no_article_is_open() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.tts_command = Some("espeak-ng".to_string());
+        start_tts_playback(&mut app);
+        let notice = app.notice.clone().unwrap_or_default();
+        assert!(notice.contains("Open an article first"), "{notice:?}");
+        assert!(!app.tts_playing);
+    }
+
+    #[test]
+    fn start_tts_playback_notices_when_the_article_has_nothing_readable_from_the_cursor() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.tts_command = Some("espeak-ng".to_string());
+        // A document made entirely of blocks `tts::paragraphs_from` skips
+        // (a lone horizontal rule) has nothing to read.
+        app.set_document(crate::doc::parse_article_html(
+            "Empty",
+            "<html><body><hr></body></html>",
+        ));
+        start_tts_playback(&mut app);
+        let notice = app.notice.clone().unwrap_or_default();
+        assert!(notice.contains("Nothing left to read"), "{notice:?}");
+        assert!(!app.tts_playing);
+    }
+
+    /// `#[tokio::test]`, not `#[test]`: `start_tts_playback`'s success path
+    /// reaches `tokio::spawn` (the background paragraph loop), which panics
+    /// without a runtime context on the current thread. A command that
+    /// fails to spawn is fine here — this test only asserts the synchronous
+    /// half (the notice and `tts_playing` flag), never the spawned task's
+    /// own outcome (covered instead by `tts::speak_one`'s own tests and the
+    /// pty verification).
+    #[tokio::test]
+    async fn start_tts_playback_begins_playing_and_reports_the_paragraph_count() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.tts_command = Some("wikitui-tts-test-binary-does-not-exist".to_string());
+        app.set_document(crate::doc::parse_article_html(
+            "Alan Turing",
+            "<html><body><p>First.</p><p>Second.</p></body></html>",
+        ));
+        start_tts_playback(&mut app);
+        let notice = app.notice.clone().unwrap_or_default();
+        assert!(notice.contains("Speaking 2 paragraphs"), "{notice:?}");
+        assert!(app.tts_playing);
+    }
+
+    #[test]
+    fn stop_tts_playback_reports_stopped_and_clears_the_playing_flag() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.tts_playing = true;
+        stop_tts_playback(&mut app);
+        assert_eq!(app.notice.as_deref(), Some("TTS stopped"));
+        assert!(!app.tts_playing);
+    }
+
+    // ---- PRD FR-TB-5: :mksession / :sessions guard clauses -----------------
+
+    #[test]
+    fn cmd_mksession_rejects_an_unsafe_name_without_touching_disk() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        cmd_mksession(&mut app, "../escape");
+        let notice = app.notice.clone().unwrap_or_default();
+        assert!(notice.contains("not a usable session name"), "{notice:?}");
+    }
+
+    #[test]
+    fn cmd_list_sessions_reports_none_saved_when_the_directory_is_empty_or_missing() {
+        // A sandboxed test environment typically has no real
+        // `sessions/` directory yet — `list_named_sessions` degrades to
+        // empty rather than erroring (see its own doc comment), and
+        // `cmd_list_sessions` must turn that into an honest "none yet"
+        // notice rather than an empty/blank one.
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        cmd_list_sessions(&mut app);
+        let notice = app.notice.clone().unwrap_or_default();
+        assert!(
+            notice.contains("No saved sessions yet") || notice.contains("Saved sessions:"),
+            "{notice:?}"
+        );
+    }
 }
