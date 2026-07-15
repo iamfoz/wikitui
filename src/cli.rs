@@ -138,6 +138,13 @@ pub enum Commands {
         /// A wiki-tui `config.toml` file, or a directory containing one.
         path: PathBuf,
     },
+    /// PRD FR-SR-7: rebuild the offline full-text search index from scratch
+    /// over every currently saved and cached page — a standalone, TUI-free
+    /// subcommand like `stats`/`clear-data`. Recovery path for a corrupted
+    /// or missing `search-index.sqlite`, and the first-run seed for an
+    /// install that already has saved/cached content from before this
+    /// feature existed.
+    Reindex,
 }
 
 #[derive(Subcommand, Debug)]

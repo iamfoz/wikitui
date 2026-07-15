@@ -27,6 +27,7 @@ mod jsonl;
 mod layout;
 mod migrate;
 mod netqueue;
+mod offline_search;
 mod prefetch;
 mod privacy;
 mod random;
@@ -158,6 +159,12 @@ struct SaveOutcome {
 /// Everything fetched for one saved page, ready for `SavedPages::save` to pin
 /// on the main thread (the store is not `Send`-shared).
 struct SaveFetched {
+    /// The wiki this save ran on (PRD FR-ML-4's `api::wiki_scope`), carried
+    /// through so `apply_save_outcome` can tag the offline-search index row
+    /// correctly (PRD FR-SR-7) — `saved::SavedPages` itself has no wiki
+    /// dimension yet (see `offline_search`'s module doc's documented
+    /// limitation), but the index still gets this one right.
+    wiki: String,
     lang: String,
     title: String,
     revid: u64,
@@ -281,6 +288,18 @@ async fn main() -> Result<()> {
             config::resolve_config_path(cli.config.clone(), std::env::var("WIKITUI_CONFIG").ok());
         let resolved = config::resolve(&cli_overrides, &env_overrides, config_path.as_deref());
         std::process::exit(stats::run(&resolved, *explain));
+    }
+
+    // PRD FR-SR-7: `wikitui reindex` rebuilds the offline search index from
+    // scratch — another standalone, TUI-free subcommand; no terminal or
+    // network access needed to walk what's already saved/cached on disk.
+    if let Some(Commands::Reindex) = &cli.command {
+        let cli_overrides = cli_overrides_from(&cli);
+        let env_overrides = config::EnvOverrides::from_process_env();
+        let config_path =
+            config::resolve_config_path(cli.config.clone(), std::env::var("WIKITUI_CONFIG").ok());
+        let resolved = config::resolve(&cli_overrides, &env_overrides, config_path.as_deref());
+        std::process::exit(run_reindex(&resolved));
     }
 
     // PRD FR-TH-8 / goal G3: `wikitui import-wiki-tui <path>` is the third
@@ -452,9 +471,14 @@ async fn main() -> Result<()> {
         // deliver a background revalidation's result into, so it never
         // spawns one — the reader gets whatever's freshest synchronously
         // (fresh cache, or a network round trip on a stale/missing one).
+        // The offline search index is a session-lived construct with no
+        // reader here to search it, so `--dump` indexes into a throwaway
+        // in-memory instance rather than touching the real on-disk one for
+        // a process that exits immediately after printing.
         let outcome = fetch_page(
             &client,
             &page_cache,
+            &offline_search::OfflineIndex::in_memory(),
             &client.wiki_scope(),
             &resolved.lang.value,
             &title,
@@ -772,6 +796,7 @@ struct FetchOutcome {
 async fn fetch_page(
     client: &WikiClient,
     cache: &PageCache,
+    search_index: &offline_search::OfflineIndex,
     wiki: &str,
     lang: &str,
     title: &str,
@@ -814,14 +839,20 @@ async fn fetch_page(
     }
     match client.fetch_article_html(lang, title).await {
         Ok(fetched) => {
+            let wiki = client.wiki_scope();
             cache.put(
-                &client.wiki_scope(),
+                &wiki,
                 lang,
                 title,
                 &fetched.html,
                 fetched.revid,
                 fetched.etag.as_deref(),
             );
+            // PRD FR-SR-7: index the freshly cached HTML for offline search
+            // right where it's cached — see `offline_search`'s module doc's
+            // "Populate / remove". Best-effort like the cache write itself;
+            // a parse failure here never blocks the article from opening.
+            index_cached_html(search_index, &wiki, lang, title, &fetched.html);
             Ok(FetchOutcome {
                 html: fetched.html,
                 source: PageSource::Live,
@@ -841,6 +872,25 @@ async fn fetch_page(
             None => Err(network_error),
         },
     }
+}
+
+/// Extracts plain text from freshly cached (or saved) HTML and upserts it
+/// into the offline index (PRD FR-SR-7) — the one place `main.rs` turns raw
+/// Parsoid HTML into what `offline_search::OfflineIndex::index` wants,
+/// shared by every cache-populating call site so the extraction step
+/// (`doc::parse_article_html` then `doc::render_plain`) has exactly one
+/// implementation. Best-effort like the index write itself: a malformed
+/// document never blocks the read path that called this.
+fn index_cached_html(
+    search_index: &offline_search::OfflineIndex,
+    wiki: &str,
+    lang: &str,
+    title: &str,
+    html: &str,
+) {
+    let document = doc::parse_article_html(title, html);
+    let plain = doc::render_plain(&document, lang);
+    search_index.index(wiki, lang, title, offline_search::Kind::Cached, &plain);
 }
 
 /// Spawns the background staleness check (PRD FR-OFF-2): a cheap
@@ -892,9 +942,14 @@ fn fire_revalidation(
 /// background tab never blocks the reader, and reports the outcome tagged
 /// with the tab's id. The cache is cheap to clone (a directory path plus a
 /// few counters).
+// `search_index` (PRD FR-SR-7) is one dimension past clippy's arg ceiling,
+// same shape as `cache`/`client` beside it — bundling them into a struct
+// would only move the noise, not remove it.
+#[allow(clippy::too_many_arguments)]
 fn fire_background_load(
     client: &WikiClient,
     cache: &PageCache,
+    search_index: &offline_search::OfflineIndex,
     tab_id: TabId,
     wiki: String,
     lang: String,
@@ -903,13 +958,14 @@ fn fire_background_load(
 ) {
     let client = client.clone();
     let cache = cache.clone();
+    let search_index = search_index.clone();
     let tx = tx.clone();
     tokio::spawn(async move {
         // The tab belongs to `wiki` (its active wiki when opened, or its
         // persisted wiki on restore) — cache reads and the tab's own scope
         // key on it, not on a wiki `:wiki` may have switched to since (PRD
         // FR-ML-4).
-        let result = fetch_page(&client, &cache, &wiki, &lang, &title)
+        let result = fetch_page(&client, &cache, &search_index, &wiki, &lang, &title)
             .await
             .map_err(|e| e.to_string());
         let _ = tx.send(TabLoadOutcome {
@@ -956,6 +1012,7 @@ async fn revalidate(
 struct BgExecutor {
     client: WikiClient,
     cache: PageCache,
+    search_index: offline_search::OfflineIndex,
     revalidate_tx: UnboundedSender<RevalidationOutcome>,
     feed_cache: Arc<std::sync::Mutex<prefetch::FeedCache>>,
     weights: netqueue::RankWeights,
@@ -969,6 +1026,7 @@ impl netqueue::Executor for BgExecutor {
     ) -> impl std::future::Future<Output = netqueue::ExecResult> + Send {
         let client = self.client.clone();
         let cache = self.cache.clone();
+        let search_index = self.search_index.clone();
         let tx = self.revalidate_tx.clone();
         let feed_cache = self.feed_cache.clone();
         let weights = self.weights;
@@ -982,7 +1040,7 @@ impl netqueue::Executor for BgExecutor {
                     cached_revid,
                 } => execute_revalidation(&client, &tx, tab_id, lang, title, cached_revid).await,
                 netqueue::Job::PrefetchArticle { lang, title, .. } => {
-                    execute_prefetch_article(&client, &cache, &lang, &title).await
+                    execute_prefetch_article(&client, &cache, &search_index, &lang, &title).await
                 }
                 netqueue::Job::RankLinks {
                     lang,
@@ -1029,6 +1087,7 @@ fn bg_failure_to_outcome(e: api::BgFailure) -> netqueue::Outcome {
 async fn execute_prefetch_article(
     client: &WikiClient,
     cache: &PageCache,
+    search_index: &offline_search::OfflineIndex,
     lang: &str,
     title: &str,
 ) -> netqueue::ExecResult {
@@ -1045,6 +1104,10 @@ async fn execute_prefetch_article(
         Ok(a) => {
             // Prefetch fills L2 only — no L1 render, no images (PRD §5.8).
             cache.put(&wiki, lang, title, &a.html, a.revid, a.etag.as_deref());
+            // PRD FR-SR-7: a prefetched article is genuinely cached content —
+            // offline search should find it exactly like an interactively
+            // opened one (see `offline_search`'s module doc).
+            index_cached_html(search_index, &wiki, lang, title, &a.html);
             netqueue::ExecResult {
                 outcome: netqueue::Outcome::Done { bytes: a.bytes },
                 follow_ups: Vec::new(),
@@ -1545,6 +1608,16 @@ fn apply_revalidation_outcome(app: &mut App, cache: &PageCache, outcome: Revalid
                 revid,
                 etag.as_deref(),
             );
+            // PRD FR-SR-7: a revalidation-driven refetch is new cached
+            // content — keep the offline index's snippet current rather
+            // than serving a stale one from before the update.
+            index_cached_html(
+                &app.search_index,
+                &outcome.wiki,
+                &outcome.lang,
+                &outcome.title,
+                &html,
+            );
             let Some(index) = app.tab_index_by_id(outcome.tab_id) else {
                 return; // the tab closed — nothing to notify.
             };
@@ -1789,7 +1862,7 @@ async fn enqueue_read_later(client: &WikiClient, cache: &PageCache, app: &mut Ap
     // tracking, integrity checks) is a later chunk — this is the minimal
     // seam read-later needs now: an ordinary L2 cache write via the same
     // fetch path every other open already uses, just with no tab attached.
-    let saved_offline = ensure_cached(client, cache, &lang, &title).await;
+    let saved_offline = ensure_cached(client, cache, &app.search_index, &lang, &title).await;
     app.readlater.enqueue(ReadLaterEntry {
         title: title.clone(),
         lang,
@@ -1815,7 +1888,13 @@ async fn enqueue_read_later(client: &WikiClient, cache: &PageCache, app: &mut Ap
 /// reported to the reader, not retried — the queue entry still gets
 /// created either way; opening it later tries again via the normal fetch
 /// path).
-async fn ensure_cached(client: &WikiClient, cache: &PageCache, lang: &str, title: &str) -> bool {
+async fn ensure_cached(
+    client: &WikiClient,
+    cache: &PageCache,
+    search_index: &offline_search::OfflineIndex,
+    lang: &str,
+    title: &str,
+) -> bool {
     let wiki = client.wiki_scope();
     if cache.get(&wiki, lang, title).is_some() {
         return true;
@@ -1830,6 +1909,7 @@ async fn ensure_cached(client: &WikiClient, cache: &PageCache, lang: &str, title
                 fetched.revid,
                 fetched.etag.as_deref(),
             );
+            index_cached_html(search_index, &wiki, lang, title, &fetched.html);
             true
         }
         Err(_) => false,
@@ -2010,6 +2090,7 @@ async fn fetch_for_save(
     }
 
     Ok(SaveFetched {
+        wiki,
         lang: lang.to_string(),
         title: title.to_string(),
         revid,
@@ -2038,6 +2119,18 @@ fn apply_save_outcome(app: &mut App, outcome: SaveOutcome) {
             &f.source_note,
         ) {
             Ok(record) => {
+                // PRD FR-SR-7: a saved page is offline-searchable the moment
+                // it's pinned — see `offline_search`'s module doc's
+                // "Populate / remove".
+                let document = doc::parse_article_html(&f.title, &f.html);
+                let plain = doc::render_plain(&document, &f.lang);
+                app.search_index.index(
+                    &f.wiki,
+                    &f.lang,
+                    &f.title,
+                    offline_search::Kind::Saved,
+                    &plain,
+                );
                 // PRD FR-PR-3: `S`/`:save` is an explicit save (the reader
                 // named this article) — warn, don't suppress; see
                 // `App::toggle_bookmark`'s doc comment.
@@ -2105,7 +2198,7 @@ async fn drain_fetch_queue(client: &WikiClient, cache: &PageCache, app: &mut App
     }
     let (mut ok, mut fail) = (0u32, 0u32);
     for q in queued {
-        if ensure_cached(client, cache, &q.lang, &q.title).await {
+        if ensure_cached(client, cache, &app.search_index, &q.lang, &q.title).await {
             app.fetch_queue.remove(&q.lang, &q.title);
             ok += 1;
         } else {
@@ -2235,6 +2328,11 @@ async fn run(
     // FR-HS-4.
     app.history = history::History::open();
     app.history.retention_prune(history_retention_days);
+    // PRD FR-SR-7: the real, on-disk offline search index (PRD §6.4's cache
+    // dir) — `App::new` defaults to an in-memory store for the same reason
+    // `history` does (see `App.search_index`'s doc comment); this is the one
+    // place production opens the durable one.
+    app.search_index = offline_search::OfflineIndex::open();
     // PRD FR-PF-3 / FR-PR-2: the local, private interest model — loaded from
     // `$XDG_STATE/wikitui/interest.json` (a fast local read, no network) with
     // the config half-life. Like history, `App::new` defaults to an empty
@@ -2333,6 +2431,7 @@ async fn run(
     let executor = BgExecutor {
         client: client.clone(),
         cache: cache.clone(),
+        search_index: app.search_index.clone(),
         revalidate_tx: revalidate_tx.clone(),
         feed_cache,
         weights: substrate.weights(),
@@ -3275,7 +3374,15 @@ async fn open_title(
                 .prefetch
                 .as_ref()
                 .map(netqueue::SubstrateHandle::foreground_guard);
-            fetch_page(client, cache, &client.wiki_scope(), lang, title).await
+            fetch_page(
+                client,
+                cache,
+                &app.search_index,
+                &client.wiki_scope(),
+                lang,
+                title,
+            )
+            .await
         };
         match outcome {
             Ok(outcome) => {
@@ -3370,7 +3477,15 @@ async fn open_history_entry(
         // Read L2 in the history entry's *own* wiki scope (PRD FR-ML-4), not
         // the current active wiki — a back/forward hop to an article read on
         // another wiki before a `:wiki` switch still finds its cached copy.
-        fetch_page(client, cache, &entry.wiki, &entry.lang, &entry.title).await
+        fetch_page(
+            client,
+            cache,
+            &app.search_index,
+            &entry.wiki,
+            &entry.lang,
+            &entry.title,
+        )
+        .await
     };
     match outcome {
         Ok(outcome) => {
@@ -3488,6 +3603,7 @@ fn restore_session_tabs(
             fire_background_load(
                 client,
                 cache,
+                &app.search_index,
                 tab_id,
                 saved.wiki.clone(),
                 saved.lang.clone(),
@@ -3883,6 +3999,7 @@ async fn handle_key(
                             fire_background_load(
                                 client,
                                 cache,
+                                &app.search_index,
                                 id,
                                 client.wiki_scope(),
                                 lang,
@@ -3945,19 +4062,31 @@ async fn handle_key(
             }
             KeyCode::Enter => {
                 if let Some(result) = app.results.get(app.selected_result).cloned() {
-                    open_title(
-                        client,
-                        cache,
-                        app,
-                        &result.title,
-                        revalidate_tx,
-                        langlinks_tx,
-                    )
-                    .await;
+                    if app.results_offline {
+                        // PRD FR-SR-7: an offline result opens from the
+                        // local saved/cache stores only — never a network
+                        // fetch (see `open_offline_result`'s doc comment).
+                        let wiki = app.active_wiki_scope().to_string();
+                        let lang = app.lang.clone();
+                        open_offline_result(cache, app, &wiki, &lang, &result.title);
+                    } else {
+                        open_title(
+                            client,
+                            cache,
+                            app,
+                            &result.title,
+                            revalidate_tx,
+                            langlinks_tx,
+                        )
+                        .await;
+                    }
                 } else if let Some(suggestion) = app.search_suggestion.clone() {
                     // PRD FR-SR-4 / §7's zero-results row: "Did you mean X?
                     // (Enter to search)" — re-runs the search with the
-                    // suggested spelling.
+                    // suggested spelling. `search_suggestion` is always
+                    // `None` for offline results (`run_offline_search`), so
+                    // this arm only ever fires for an online zero-results
+                    // screen.
                     app.search_input = suggestion;
                     run_search(client, app).await;
                 }
@@ -4753,6 +4882,7 @@ async fn handle_key(
                             fire_background_load(
                                 client,
                                 cache,
+                                &app.search_index,
                                 id,
                                 client.wiki_scope(),
                                 lang,
@@ -5385,6 +5515,7 @@ async fn dispatch_action(
                     fire_background_load(
                         client,
                         cache,
+                        &app.search_index,
                         id,
                         client.wiki_scope(),
                         lang,
@@ -6864,6 +6995,17 @@ async fn execute_command(
         Command::Wiki(Some(name)) => {
             switch_wiki(client, app, &name);
         }
+        // PRD FR-SR-7: flips the explicit offline-search toggle; the next
+        // `run_search` (Tab in Mode::Search, or a redlink card's `s`) reads
+        // it fresh, so this never has to reach into an in-flight search.
+        Command::SearchOffline => {
+            app.force_offline_search = !app.force_offline_search;
+            app.notice = Some(if app.force_offline_search {
+                "Offline search on — the search box now queries saved/cached pages only".to_string()
+            } else {
+                "Offline search off — the search box uses the API again".to_string()
+            });
+        }
         // PRD FR-ACC-1 / §5.9.
         Command::Login(LoginMode::Loopback) => cmd_login_loopback(terminal, client, app).await,
         Command::Login(LoginMode::Paste) => cmd_login_paste(app),
@@ -7020,9 +7162,16 @@ async fn fetch_on_this_day(client: &WikiClient, app: &mut App) {
 }
 
 async fn run_search(client: &WikiClient, app: &mut App) {
+    // PRD FR-SR-7's explicit toggle (`:search-offline`): go straight to the
+    // local index without ever attempting the API, even while online.
+    if app.force_offline_search {
+        run_offline_search(app);
+        return;
+    }
     app.loading = true;
     match client.search(&app.lang, &app.search_input, 20).await {
         Ok(outcome) => {
+            app.results_offline = false;
             app.results = outcome.results;
             app.search_suggestion = outcome.suggestion;
             app.selected_result = 0;
@@ -7060,11 +7209,156 @@ async fn run_search(client: &WikiClient, app: &mut App) {
             }
         }
         Err(e) => {
-            app.status = format!("Search error: {e}");
-            app.mode = Mode::Reading;
+            // PRD FR-SR-7 / NF-NET-8: the API failed or timed out (the
+            // client's own 5s timeout, or a genuinely offline network) —
+            // fall back to the local index instead of a bare error, labeled
+            // so the reader knows these results aren't live.
+            app.notice = Some(format!(
+                "Search unavailable ({e}) — showing offline results"
+            ));
+            run_offline_search(app);
+            return;
         }
     }
     app.loading = false;
+}
+
+/// PRD FR-SR-7's offline path: queries the local FTS index instead of the
+/// API, scoped to the active wiki + language (matching online search's own
+/// per-wiki scope — see `offline_search::OfflineIndex::search`'s doc
+/// comment). Shares `Mode::Results`/`app.results` with the online path —
+/// `ui::draw_results` needs no offline-specific rendering, because
+/// `offline_search`'s snippet already carries the same `<span
+/// class="searchmatch">` markup the online `search/page` endpoint's
+/// excerpts use, so `ui::parse_searchmatch` highlights it unchanged. The one
+/// visible difference is `app.results_offline`, which relabels the results
+/// header (PRD §7's "offline-results section") and routes `Mode::Results`'
+/// Enter to `open_offline_result`'s local-only serve instead of
+/// `open_title`'s network-first one.
+fn run_offline_search(app: &mut App) {
+    let wiki = app.active_wiki_scope().to_string();
+    let lang = app.lang.clone();
+    let hits = app.search_index.search(&wiki, &lang, &app.search_input, 20);
+    app.results = hits
+        .into_iter()
+        .map(|hit| SearchResult {
+            title: hit.title,
+            // FR-SR-7's "labels results '(offline)'" — carried per-result
+            // (not just in the header) so the provenance (a pinned save vs.
+            // an evictable cache hit) is visible in the same description
+            // line an online result's Wikidata one-liner would occupy.
+            description: Some(format!("(offline · {})", hit.kind.label())),
+            excerpt: Some(hit.snippet),
+            size: None,
+            wordcount: None,
+            timestamp: None,
+        })
+        .collect();
+    app.results_offline = true;
+    // FR-SR-4's "did you mean" is an online-only affordance (it comes from
+    // the API's own `suggestion` field) — never carried over from whatever
+    // the last online search happened to leave behind.
+    app.search_suggestion = None;
+    app.selected_result = 0;
+    app.mode = Mode::Results;
+    app.loading = false;
+}
+
+/// Serves an offline search result for reading (PRD FR-SR-7's "Enter opens
+/// the article"): tries the pinned saved store first (§5.7's precedence — a
+/// pinned copy beats a merely-cached one, same rule `open_title` already
+/// applies), then the evictable L2 cache. Neither store is consulted over
+/// the network — an offline search result is, by construction, a promise
+/// this content already exists locally, so opening it must never attempt a
+/// fetch (that would defeat the point of an *offline* result, and could
+/// hang or error on a genuinely dead connection).
+///
+/// A miss — the content was evicted or removed since the search ran, PRD
+/// FR-SR-7's accepted "eviction-driven staleness" (see `offline_search`'s
+/// module doc) — reports the gap and prunes the stale row so the next
+/// search doesn't offer it again.
+fn open_offline_result(cache: &PageCache, app: &mut App, wiki: &str, lang: &str, title: &str) {
+    if app.saved.is_saved(lang, title) {
+        open_saved(app, lang, title);
+        return;
+    }
+    if let Some(page) = cache.get(wiki, lang, title) {
+        let document = doc::parse_article_html(title, &page.html);
+        {
+            let tab = app.active_tab_mut();
+            tab.page_source = PageSource::Offline {
+                age_secs: page.age_secs,
+            };
+            tab.current_revid = page.revid;
+        }
+        app.open_document(document);
+        return;
+    }
+    app.notice = Some(format!(
+        "\"{title}\" is no longer available offline — removed from the search index"
+    ));
+    app.search_index.remove(wiki, lang, title);
+}
+
+/// `wikitui reindex` (PRD FR-SR-7): rebuilds the offline search index from
+/// scratch over every currently saved page (`saved::SavedPages`) and every
+/// page the L2 cache currently holds (`cache::PageCache::list_entries`),
+/// reducing each to plain text the same way the interactive populate hooks
+/// do (`doc::parse_article_html` + `doc::render_plain`). A standalone,
+/// TUI-free subcommand like `stats`/`clear-data` — no terminal or network
+/// access needed to walk what's already on disk. Saved pages are indexed
+/// under the default wiki scope (see `offline_search`'s module doc's
+/// documented limitation: `saved::SavedPages` itself has no wiki dimension
+/// yet); cached pages carry their own real wiki scope
+/// (`cache::PageCache::list_entries`'s stored `wiki` field).
+fn run_reindex(resolved: &config::ResolvedConfig) -> i32 {
+    let saved = saved::SavedPages::load();
+    let cache = cache::PageCache::open(
+        resolved.cache_dir.value.clone(),
+        resolved.cache_max_mb.value.saturating_mul(1024 * 1024),
+        resolved.cache_fresh_ttl_hours.value.saturating_mul(3600),
+        resolved
+            .cache_force_refetch_days
+            .value
+            .saturating_mul(86_400),
+    );
+    let index = offline_search::OfflineIndex::open();
+
+    let mut docs = Vec::new();
+    for record in saved.list() {
+        if let Some(content) = saved.get(&record.lang, &record.title) {
+            let document = doc::parse_article_html(&record.title, &content.html);
+            let plain = doc::render_plain(&document, &record.lang);
+            docs.push((
+                String::new(),
+                record.lang.clone(),
+                record.title.clone(),
+                offline_search::Kind::Saved,
+                plain,
+            ));
+        }
+    }
+    for (wiki, lang, title) in cache.list_entries() {
+        if let Some(page) = cache.get(&wiki, &lang, &title) {
+            let document = doc::parse_article_html(&title, &page.html);
+            let plain = doc::render_plain(&document, &lang);
+            docs.push((wiki, lang, title, offline_search::Kind::Cached, plain));
+        }
+    }
+
+    let saved_count = saved.list().len();
+    let cached_count = cache.list_entries().len();
+    let report = index.reindex(docs);
+    if index.is_empty() {
+        println!("wikitui: reindex: nothing to index — no saved or cached pages found");
+    } else {
+        println!(
+            "wikitui: reindex: {} document(s) indexed ({saved_count} saved, {cached_count} cached), {} row(s) now in the index",
+            report.indexed,
+            index.len()
+        );
+    }
+    0
 }
 
 #[cfg(test)]

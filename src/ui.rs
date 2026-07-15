@@ -1475,11 +1475,23 @@ fn draw_results(frame: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
-    let title = format!(
-        "Results for \"{}\" ({} found)",
-        app.search_input,
-        app.results.len()
-    );
+    // PRD FR-SR-7 / §7's "offline-results section": a header label, distinct
+    // from each result's own "(offline · saved|cached)" description line
+    // (`main::run_offline_search`) — the header marks the whole list, the
+    // per-row text marks each result's provenance.
+    let title = if app.results_offline {
+        format!(
+            "Offline results for \"{}\" ({} found)",
+            app.search_input,
+            app.results.len()
+        )
+    } else {
+        format!(
+            "Results for \"{}\" ({} found)",
+            app.search_input,
+            app.results.len()
+        )
+    };
     let list = List::new(items)
         .style(base_style(&app.theme, app.no_color))
         .block(UiBlock::default().borders(Borders::ALL).title(title));
@@ -1601,8 +1613,17 @@ fn human_bytes(bytes: u64) -> String {
 /// suggestion (when the server sent one) in place of an empty list, with
 /// the exact "(Enter to search)" affordance §7 specifies.
 fn draw_zero_results(frame: &mut Frame, app: &App, area: Rect) {
-    let message =
-        crate::app::zero_results_message(&app.search_input, app.search_suggestion.as_deref());
+    // PRD FR-SR-7: an offline zero-results screen gets its own graceful
+    // message — "did you mean" is an online-only affordance
+    // (`app.search_suggestion` is always `None` here for an offline search,
+    // see `main::run_offline_search`), so a plain "no offline results" line
+    // is more honest than a message shaped for a suggestion that never
+    // comes.
+    let message = if app.results_offline {
+        format!("No offline results for \"{}\"", app.search_input)
+    } else {
+        crate::app::zero_results_message(&app.search_input, app.search_suggestion.as_deref())
+    };
     let text = Text::from(vec![
         Line::from(""),
         Line::from(RSpan::styled(
@@ -1610,7 +1631,11 @@ fn draw_zero_results(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().add_modifier(Modifier::BOLD),
         )),
     ]);
-    let title = format!("Results for \"{}\" (0 found)", app.search_input);
+    let title = if app.results_offline {
+        format!("Offline results for \"{}\" (0 found)", app.search_input)
+    } else {
+        format!("Results for \"{}\" (0 found)", app.search_input)
+    };
     frame.render_widget(
         Paragraph::new(text)
             .style(base_style(&app.theme, app.no_color))

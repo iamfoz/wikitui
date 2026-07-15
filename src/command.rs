@@ -158,6 +158,12 @@ pub enum Command {
     /// `:bilingual` / `:bi` (PRD FR-ML-3) — open the current article in a split
     /// alongside the same article in another language (via langlinks).
     Bilingual,
+    /// `:search-offline` (PRD FR-SR-7): toggles `App::force_offline_search`
+    /// — while on, the search box goes straight to the local saved/cached
+    /// index instead of the API, even while online. Independent of the
+    /// automatic offline/API-failure fallback, which applies regardless of
+    /// this toggle.
+    SearchOffline,
     /// `:wiki` (bare) — opens the wiki-switcher picker (PRD FR-ML-4):
     /// Wikipedia and the four sister projects. `:wiki <name>` switches
     /// directly, without the picker — `name` may be a sister project or any
@@ -390,7 +396,7 @@ fn validate_set_value(
     }
 }
 
-pub const USAGE: &str = "commands: open <title>, lang [<code>], theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, prefetch-log, interests, not-interested, stats, start, today, random [good], related, talk, info, set theme=<name>|images=on|off|prefetch=on|off|measure=N|ambiguous_width=1|2|reading_wpm=N|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N, set-tab measure=N|images=on|off|ambiguous_width=1|2|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N (or set-tab key= to reset), config reload, vsplit, only, bilingual, wiki [<name>], set scrollbind, watchlist, notifications, contribs [username], prefs, sync, mirror-watchlist, help, quit";
+pub const USAGE: &str = "commands: open <title>, lang [<code>], theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, prefetch-log, interests, not-interested, stats, start, today, random [good], related, talk, info, set theme=<name>|images=on|off|prefetch=on|off|measure=N|ambiguous_width=1|2|reading_wpm=N|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N, set-tab measure=N|images=on|off|ambiguous_width=1|2|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N (or set-tab key= to reset), config reload, vsplit, only, bilingual, wiki [<name>], set scrollbind, watchlist, notifications, contribs [username], prefs, sync, mirror-watchlist, search-offline, help, quit";
 
 /// Parses one `:` command line. `user_theme_names` are accepted alongside
 /// the six built-ins for `:theme <name>` and `:set theme=<name>` (PRD
@@ -437,6 +443,10 @@ pub fn parse_with_user_themes(input: &str, user_theme_names: &[String]) -> Resul
         // switches directly. Unlike `:lang`, there's no shape check here —
         // a wiki name has no fixed format the way a language code does, so
         // "known or not" is entirely `main::switch_wiki`'s call.
+        // PRD FR-SR-7: no argument — a bare toggle, same shape as `:set
+        // scrollbind`'s on/off flip, except this one needs no explicit
+        // on/off spelling since there's only one thing to flip.
+        "search-offline" | "searchoffline" => Ok(Command::SearchOffline),
         "wiki" => {
             if arg.is_empty() {
                 Ok(Command::Wiki(None))
@@ -846,6 +856,14 @@ mod tests {
             parse("wiki archwiki"),
             Ok(Command::Wiki(Some("archwiki".to_string())))
         );
+    }
+
+    /// PRD FR-SR-7: `:search-offline` (and its no-hyphen alias) parses as a
+    /// bare toggle command, taking no argument.
+    #[test]
+    fn search_offline_parses_bare_and_its_alias() {
+        assert_eq!(parse("search-offline"), Ok(Command::SearchOffline));
+        assert_eq!(parse("searchoffline"), Ok(Command::SearchOffline));
     }
 
     #[test]

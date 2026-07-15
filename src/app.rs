@@ -348,6 +348,18 @@ pub struct App {
     /// search, shown by the zero-results view; `None` when the search had
     /// results or hasn't run yet.
     pub search_suggestion: Option<String>,
+    /// PRD FR-SR-7: whether `results` came from the local offline index
+    /// rather than the API — set by `main::run_offline_search`, consulted
+    /// by `ui::draw_results`/`draw_zero_results` (the "(offline)" header
+    /// label) and by `Mode::Results`'s Enter handler (routes to
+    /// `main::open_offline_result`'s local-only serve instead of
+    /// `main::open_title`'s network-first one).
+    pub results_offline: bool,
+    /// PRD FR-SR-7's explicit `:search-offline` toggle: when set, `run_search`
+    /// skips the API entirely and goes straight to the local index, even
+    /// while online — independent of the automatic offline/API-failure
+    /// fallback, which applies regardless of this flag.
+    pub force_offline_search: bool,
     /// PRD FR-SR-3b: the operator cheat-sheet overlay, toggled by `?` while
     /// in `Mode::Search` — deliberately not the generic `Mode::Help` (whose
     /// "any key closes" doesn't fit a prompt still being typed into): only
@@ -650,6 +662,18 @@ pub struct App {
     /// The pinned saved-pages store (PRD FR-OFF-4). Distinct from the
     /// evictable `PageCache` in `main` — see `saved.rs`.
     pub saved: SavedPages,
+    /// PRD FR-SR-7's local full-text index over saved + cached pages — see
+    /// `offline_search`'s module doc. Defaults to an in-memory store for the
+    /// same reason `history` does (its doc comment explains why): several
+    /// `main.rs` functions index as a side effect of ordinary navigation
+    /// (opening or saving an article), so a real on-disk default here would
+    /// make `cargo test` write into the developer's actual cache directory
+    /// on every test that opens a document through those paths.
+    /// `main::run` swaps in the real on-disk index right after construction,
+    /// same as `history`. `Clone`-able (an `Arc`-backed handle) so `main.rs`
+    /// also keeps its own copy to pass into spawned background tasks that
+    /// have no `&mut App` to read this field from.
+    pub search_index: crate::offline_search::OfflineIndex,
     /// Selection cursor for the `:saved` browser.
     pub selected_saved: usize,
     /// The mode `open_saved_picker` was entered from, restored on Esc.
@@ -1144,6 +1168,8 @@ impl App {
             selected_suggestion: 0,
             search_debounce_at: None,
             search_suggestion: None,
+            results_offline: false,
+            force_offline_search: false,
             search_operator_help: false,
             should_quit: false,
             lang,
@@ -1223,6 +1249,7 @@ impl App {
             history_pick_filter: String::new(),
             history_pick_prior_mode: Mode::Reading,
             saved: SavedPages::load(),
+            search_index: crate::offline_search::OfflineIndex::in_memory(),
             selected_saved: 0,
             saved_prior_mode: Mode::Reading,
             fetch_queue: FetchQueue::load(),
@@ -4978,6 +5005,13 @@ impl App {
             return;
         };
         if let Some((removed, persisted)) = self.saved.remove(&lang, &title) {
+            // PRD FR-SR-7: an un-saved page must stop showing up in offline
+            // search. `saved.rs` has no wiki dimension of its own yet (see
+            // `offline_search`'s module doc's documented limitation), so this
+            // removes under the *active* wiki scope — right for the common
+            // case of saving and un-saving on the same wiki.
+            self.search_index
+                .remove(self.active_wiki_scope(), &lang, &title);
             let len = self.saved.list().len();
             self.selected_saved = if len == 0 {
                 0

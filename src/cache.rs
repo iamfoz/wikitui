@@ -759,6 +759,35 @@ impl PageCache {
         }
         report
     }
+
+    /// Every currently-cached `(wiki, lang, title)` triple, read straight
+    /// from the `page/` title-index JSON files (which already carry all
+    /// three — see `IndexEntry`'s doc comment) rather than a second on-disk
+    /// naming scheme. `offline_search`'s `reindex` (PRD FR-SR-7) is the one
+    /// caller: it walks this list and re-fetches each entry's HTML via
+    /// [`Self::get`] to rebuild the search index from whatever L2 currently
+    /// holds. An unreadable or corrupt index file is skipped, the same
+    /// best-effort posture every other read in this module takes — a
+    /// reindex over a partially corrupt cache still indexes everything it
+    /// can, rather than refusing outright.
+    pub fn list_entries(&self) -> Vec<(String, String, String)> {
+        let Some(dir) = self.dir.as_ref() else {
+            return Vec::new();
+        };
+        let mut index_files = Vec::new();
+        collect_files(&dir.join("page"), &mut index_files);
+        let mut out = Vec::new();
+        for (path, _, _) in index_files {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(entry) = serde_json::from_str::<IndexEntry>(&text) else {
+                continue;
+            };
+            out.push((entry.wiki, entry.lang, entry.title));
+        }
+        out
+    }
 }
 
 fn touch_mtime(path: &Path) {
@@ -1738,6 +1767,54 @@ mod tests {
                 .incognito,
             "toggling incognito on a clone must be visible to every other clone"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- list_entries (PRD FR-SR-7's reindex) --------------------------------
+
+    #[test]
+    fn list_entries_reports_every_cached_wiki_lang_title_triple() {
+        let (cache, dir) = temp_cache(DEFAULT_MAX_BYTES);
+        cache.put("", "en", "Alan Turing", "html", 1, None);
+        cache.put("wiktionary", "en", "Mercury", "html", 2, None);
+        cache.put("", "de", "Turing", "html", 3, None);
+
+        let mut entries = cache.list_entries();
+        entries.sort();
+        let mut expected = vec![
+            ("".to_string(), "en".to_string(), "Alan Turing".to_string()),
+            (
+                "wiktionary".to_string(),
+                "en".to_string(),
+                "Mercury".to_string(),
+            ),
+            ("".to_string(), "de".to_string(), "Turing".to_string()),
+        ];
+        expected.sort();
+        assert_eq!(entries, expected);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_entries_is_empty_for_a_fresh_or_disabled_cache() {
+        let (cache, dir) = temp_cache(DEFAULT_MAX_BYTES);
+        assert!(cache.list_entries().is_empty());
+        assert!(PageCache::disabled().list_entries().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_entries_skips_a_corrupt_index_file() {
+        let (cache, dir) = temp_cache(DEFAULT_MAX_BYTES);
+        cache.put("", "en", "Good", "html", 1, None);
+        std::fs::write(dir.join("page").join("en").join("Corrupt.json"), "not json").unwrap();
+        let entries = cache.list_entries();
+        assert_eq!(
+            entries.len(),
+            1,
+            "the corrupt entry must be skipped, not panic"
+        );
+        assert_eq!(entries[0].2, "Good");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
