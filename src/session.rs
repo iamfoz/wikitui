@@ -41,6 +41,13 @@ use crate::tab::HistoryEntry;
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionTab {
     pub lang: String,
+    /// PRD FR-ML-4: the wiki scope (`api::wiki_scope`) this tab's article was
+    /// read on, so a restored tab reopens — and caches — under the same wiki
+    /// it belonged to, not whatever the active wiki happens to be at restore.
+    /// `#[serde(default)]` (empty = default Wikipedia) so a `session.json`
+    /// written before wiki scoping existed restores as the default wiki.
+    #[serde(default)]
+    pub wiki: String,
     /// `None` for a tab with nothing open (a blank `:tab new`, or a
     /// background load that failed and never landed) — restored as an
     /// empty tab, never a fetch of nothing.
@@ -156,11 +163,13 @@ mod tests {
             tabs: vec![
                 SessionTab {
                     lang: "en".to_string(),
+                    wiki: String::new(),
                     title: Some("Alan Turing".to_string()),
                     scroll: 12,
                     folded_blocks: vec![2, 5],
                     current_revid: 1001,
                     back_stack: vec![HistoryEntry {
+                        wiki: String::new(),
                         lang: "en".to_string(),
                         title: "Start page".to_string(),
                         scroll: 0,
@@ -169,12 +178,14 @@ mod tests {
                 },
                 SessionTab {
                     lang: "en".to_string(),
+                    wiki: "wiktionary".to_string(),
                     title: Some("Enigma machine".to_string()),
                     scroll: 0,
                     folded_blocks: Vec::new(),
                     current_revid: 1002,
                     back_stack: Vec::new(),
                     forward_stack: vec![HistoryEntry {
+                        wiki: "wiktionary".to_string(),
                         lang: "en".to_string(),
                         title: "Bletchley Park".to_string(),
                         scroll: 40,

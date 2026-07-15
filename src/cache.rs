@@ -8,10 +8,24 @@
 //!
 //! ```text
 //! <cache_dir>/pages/
-//!   blob/{lang}/{revid}-{title_hash:016x}.zst   -- content, immutable per revid
-//!   page/{lang}/{title_or_hash}.json            -- {revid, fetched_at, etag}
-//!   {lang}/{title_or_hash}.html                 -- pre-upgrade format (see below)
+//!   blob/{wiki}/{lang}/{revid}-{title_hash:016x}.zst  -- content, immutable per revid
+//!   page/{wiki}/{lang}/{title_or_hash}.json           -- {wiki, revid, fetched_at, etag}
+//!   {lang}/{title_or_hash}.html                       -- pre-upgrade format (see below)
 //! ```
+//!
+//! ## Wiki scoping (PRD FR-ML-4/5)
+//!
+//! Every key carries a **wiki** dimension (`api::wiki_scope`) so a title
+//! opened on one wiki can never be served another wiki's cached copy of the
+//! same `(lang, title)` after a runtime `:wiki` switch. The primary
+//! Wikipedia entry's scope is the empty string, and the `{wiki}` path
+//! segment is *omitted* for it — so `blob/en/…` / `page/en/…` are exactly
+//! the paths the pre-multi-wiki code wrote. Every entry that code left on
+//! disk is therefore read back transparently as the default wiki's, with no
+//! migration pass and no refetch (see `wiki_scope`'s own doc comment). A
+//! non-default wiki gets a `{wiki}` segment (`blob/wiktionary/en/…`) — a
+//! disjoint subtree, so its entries and eviction accounting never touch the
+//! default wiki's.
 //!
 //! Content is keyed by **revid** where the server tells us one (via the
 //! `ETag` on the HTML response, parsed in `api::parse_revid_from_etag`):
@@ -171,7 +185,7 @@ enum Segment {
     Protected,
 }
 
-/// The on-disk shape of a `page/{lang}/{title}.json` title-index entry.
+/// The on-disk shape of a `page/{wiki}/{lang}/{title}.json` title-index entry.
 #[derive(Debug, Serialize, Deserialize)]
 struct IndexEntry {
     revid: u64,
@@ -202,13 +216,18 @@ struct IndexEntry {
     /// existing content is still current, it isn't a new write.
     #[serde(default)]
     incognito: bool,
-    /// `lang`/`title` as passed to `put`, carried in the index entry itself
-    /// (not just encoded in its filename) so `wipe_incognito_entries` can
-    /// recompute the exact blob path to delete alongside a tagged index,
-    /// without re-deriving a title from a percent-encoded (or, for very
-    /// long titles, hashed — see `safe_name`) filename. `#[serde(default)]`
-    /// (empty string) for entries written before this field existed; those
-    /// are never `incognito = true` either, so they're never consulted.
+    /// `wiki`/`lang`/`title` as passed to `put`, carried in the index entry
+    /// itself (not just encoded in its path) so `evict_to_cap` and
+    /// `wipe_incognito_entries` can recompute the exact blob path to delete
+    /// alongside a tagged index, without re-deriving a title from a
+    /// percent-encoded (or, for very long titles, hashed — see `safe_name`)
+    /// filename. `#[serde(default)]` (empty string) for entries written
+    /// before these fields existed; an empty `wiki` is exactly the default
+    /// Wikipedia scope those entries belong to (see the module doc comment),
+    /// so a pre-multi-wiki index reads back at its original `blob/{lang}/…`
+    /// location with no special case.
+    #[serde(default)]
+    wiki: String,
     #[serde(default)]
     lang: String,
     #[serde(default)]
@@ -328,21 +347,32 @@ impl PageCache {
         swr_decision(age_secs, self.fresh_ttl_secs, self.force_refetch_secs)
     }
 
-    fn blob_path(&self, lang: &str, title: &str, revid: u64) -> Option<PathBuf> {
+    /// The wiki+lang path components shared by `blob_path`/`index_path`. The
+    /// empty (default Wikipedia) scope contributes *no* `{wiki}` segment, so
+    /// the resulting path is byte-identical to the pre-multi-wiki layout —
+    /// see the module doc comment.
+    fn scope_dir(root: PathBuf, wiki: &str, lang: &str) -> PathBuf {
+        let root = if wiki.is_empty() {
+            root
+        } else {
+            root.join(safe_name(wiki))
+        };
+        root.join(safe_name(lang))
+    }
+
+    fn blob_path(&self, wiki: &str, lang: &str, title: &str, revid: u64) -> Option<PathBuf> {
         let dir = self.dir.as_ref()?;
         let title_hash = fnv1a(title.as_bytes());
         Some(
-            dir.join("blob")
-                .join(safe_name(lang))
+            Self::scope_dir(dir.join("blob"), wiki, lang)
                 .join(format!("{revid}-{title_hash:016x}.zst")),
         )
     }
 
-    fn index_path(&self, lang: &str, title: &str) -> Option<PathBuf> {
+    fn index_path(&self, wiki: &str, lang: &str, title: &str) -> Option<PathBuf> {
         let dir = self.dir.as_ref()?;
         Some(
-            dir.join("page")
-                .join(safe_name(lang))
+            Self::scope_dir(dir.join("page"), wiki, lang)
                 .join(format!("{}.json", safe_name(title))),
         )
     }
@@ -357,21 +387,22 @@ impl PageCache {
         )
     }
 
-    /// Looks up a page. Tries the current two-layer format first; on a
-    /// miss, falls back to a pre-upgrade flat file and migrates it in
-    /// place (see the module doc comment) rather than refusing content
-    /// that's still perfectly good. Either path touches mtimes as the LRU
-    /// signal that this entry is still wanted.
-    pub fn get(&self, lang: &str, title: &str) -> Option<CachedPage> {
-        self.get_current_format(lang, title)
-            .or_else(|| self.migrate_legacy_entry(lang, title))
+    /// Looks up a page in `wiki`'s scope. Tries the current two-layer format
+    /// first; on a miss *for the default wiki only*, falls back to a
+    /// pre-upgrade flat file and migrates it in place (see the module doc
+    /// comment) rather than refusing content that's still perfectly good.
+    /// Either path touches mtimes as the LRU signal that this entry is still
+    /// wanted.
+    pub fn get(&self, wiki: &str, lang: &str, title: &str) -> Option<CachedPage> {
+        self.get_current_format(wiki, lang, title)
+            .or_else(|| self.migrate_legacy_entry(wiki, lang, title))
     }
 
-    fn get_current_format(&self, lang: &str, title: &str) -> Option<CachedPage> {
-        let index_path = self.index_path(lang, title)?;
+    fn get_current_format(&self, wiki: &str, lang: &str, title: &str) -> Option<CachedPage> {
+        let index_path = self.index_path(wiki, lang, title)?;
         let text = std::fs::read_to_string(&index_path).ok()?;
         let mut entry: IndexEntry = serde_json::from_str(&text).ok()?;
-        let blob_path = self.blob_path(lang, title, entry.revid)?;
+        let blob_path = self.blob_path(wiki, lang, title, entry.revid)?;
         let compressed = std::fs::read(&blob_path).ok()?;
         let html_bytes = zstd::stream::decode_all(compressed.as_slice()).ok()?;
         let html = String::from_utf8(html_bytes).ok()?;
@@ -401,7 +432,14 @@ impl PageCache {
         })
     }
 
-    fn migrate_legacy_entry(&self, lang: &str, title: &str) -> Option<CachedPage> {
+    fn migrate_legacy_entry(&self, wiki: &str, lang: &str, title: &str) -> Option<CachedPage> {
+        // The pre-upgrade flat-file format predates multi-wiki support, so it
+        // only ever existed for the default Wikipedia scope; a non-default
+        // wiki has no legacy file to fold in (and must not read the default
+        // wiki's).
+        if !wiki.is_empty() {
+            return None;
+        }
         let old_path = self.legacy_path(lang, title)?;
         let raw = std::fs::read_to_string(&old_path).ok()?;
         let (first_line, html) = raw.split_once('\n')?;
@@ -411,7 +449,7 @@ impl PageCache {
         // honest age, not a falsely-fresh "just fetched now") before ever
         // returning success, then remove the old file — the "read once,
         // then rewritten" migration this module documents.
-        self.put_at(lang, title, html, 0, None, fetched_at);
+        self.put_at(wiki, lang, title, html, 0, None, fetched_at);
         let _ = std::fs::remove_file(&old_path);
 
         let age_secs = now_unix().saturating_sub(fetched_at);
@@ -430,12 +468,25 @@ impl PageCache {
     /// only the title index's bookkeeping moves forward); everything else
     /// (a full miss, or a full disk) degrades to a silent no-op rather
     /// than breaking reading.
-    pub fn put(&self, lang: &str, title: &str, html: &str, revid: u64, etag: Option<&str>) {
-        self.put_at(lang, title, html, revid, etag, now_unix());
+    pub fn put(
+        &self,
+        wiki: &str,
+        lang: &str,
+        title: &str,
+        html: &str,
+        revid: u64,
+        etag: Option<&str>,
+    ) {
+        self.put_at(wiki, lang, title, html, revid, etag, now_unix());
     }
 
+    // Wiki + lang + title + html + revid + etag + fetched_at: the wiki scope
+    // (PRD FR-ML-4) is one dimension past clippy's arg ceiling, but bundling
+    // the cache key into a struct would only move the noise, not remove it.
+    #[allow(clippy::too_many_arguments)]
     fn put_at(
         &self,
+        wiki: &str,
         lang: &str,
         title: &str,
         html: &str,
@@ -454,8 +505,8 @@ impl PageCache {
             "a cache write must never be denied outright — see privacy's module doc comment"
         );
         let (Some(blob_path), Some(index_path)) = (
-            self.blob_path(lang, title, revid),
-            self.index_path(lang, title),
+            self.blob_path(wiki, lang, title, revid),
+            self.index_path(wiki, lang, title),
         ) else {
             return;
         };
@@ -496,6 +547,7 @@ impl PageCache {
             fetched_at,
             etag: etag.map(str::to_string),
             incognito: self.is_incognito(),
+            wiki: wiki.to_string(),
             lang: lang.to_string(),
             title: title.to_string(),
             hits,
@@ -519,8 +571,8 @@ impl PageCache {
     /// doesn't pay for another revalidation for another TTL window. Never
     /// shown to the user (no notice, no status line change); a missing or
     /// corrupt index entry is a silent no-op like every other cache miss.
-    pub fn touch_fetched_at(&self, lang: &str, title: &str) {
-        let Some(index_path) = self.index_path(lang, title) else {
+    pub fn touch_fetched_at(&self, wiki: &str, lang: &str, title: &str) {
+        let Some(index_path) = self.index_path(wiki, lang, title) else {
             return;
         };
         let Ok(text) = std::fs::read_to_string(&index_path) else {
@@ -533,7 +585,7 @@ impl PageCache {
         if let Ok(json) = serde_json::to_string(&entry) {
             let _ = std::fs::write(&index_path, json);
         }
-        if let Some(blob_path) = self.blob_path(lang, title, entry.revid) {
+        if let Some(blob_path) = self.blob_path(wiki, lang, title, entry.revid) {
             touch_mtime(&blob_path);
         }
     }
@@ -598,7 +650,8 @@ impl PageCache {
             };
             let mut files = vec![(index_path.clone(), *index_size)];
             claimed.insert(index_path.clone());
-            if let Some(blob_path) = self.blob_path(&entry.lang, &entry.title, entry.revid)
+            if let Some(blob_path) =
+                self.blob_path(&entry.wiki, &entry.lang, &entry.title, entry.revid)
                 && let Ok(meta) = std::fs::metadata(&blob_path)
             {
                 files.push((blob_path.clone(), meta.len()));
@@ -692,7 +745,8 @@ impl PageCache {
                 continue;
             }
             let mut freed = 0u64;
-            if let Some(blob_path) = self.blob_path(&entry.lang, &entry.title, entry.revid)
+            if let Some(blob_path) =
+                self.blob_path(&entry.wiki, &entry.lang, &entry.title, entry.revid)
                 && let Ok(blob_meta) = std::fs::metadata(&blob_path)
             {
                 freed += blob_meta.len();
@@ -799,13 +853,14 @@ mod tests {
     fn round_trips_a_page_and_reports_a_small_age() {
         let (cache, dir) = temp_cache(DEFAULT_MAX_BYTES);
         cache.put(
+            "",
             "en",
             "Alan Turing",
             "<html>body</html>",
             100,
             Some("W/\"100/abc\""),
         );
-        let hit = cache.get("en", "Alan Turing").expect("hit");
+        let hit = cache.get("", "en", "Alan Turing").expect("hit");
         assert_eq!(hit.html, "<html>body</html>");
         assert_eq!(hit.revid, 100);
         assert_eq!(hit.etag.as_deref(), Some("W/\"100/abc\""));
@@ -824,12 +879,12 @@ mod tests {
     #[test]
     fn html_survives_zstd_round_trip_including_empty_and_multibyte_content() {
         let (cache, dir) = temp_cache(DEFAULT_MAX_BYTES);
-        cache.put("en", "Empty", "", 1, None);
-        assert_eq!(cache.get("en", "Empty").unwrap().html, "");
+        cache.put("", "en", "Empty", "", 1, None);
+        assert_eq!(cache.get("", "en", "Empty").unwrap().html, "");
 
         let multibyte = "<p>チューリング — café — 🎉</p>".repeat(200);
-        cache.put("en", "Multibyte", &multibyte, 2, None);
-        assert_eq!(cache.get("en", "Multibyte").unwrap().html, multibyte);
+        cache.put("", "en", "Multibyte", &multibyte, 2, None);
+        assert_eq!(cache.get("", "en", "Multibyte").unwrap().html, multibyte);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -838,14 +893,14 @@ mod tests {
     #[test]
     fn index_entry_header_round_trips_with_and_without_an_etag() {
         let (cache, dir) = temp_cache(DEFAULT_MAX_BYTES);
-        cache.put("en", "WithEtag", "html", 42, Some("W/\"42/xyz\""));
-        cache.put("en", "NoEtag", "html", 0, None);
+        cache.put("", "en", "WithEtag", "html", 42, Some("W/\"42/xyz\""));
+        cache.put("", "en", "NoEtag", "html", 0, None);
 
-        let with = cache.get("en", "WithEtag").unwrap();
+        let with = cache.get("", "en", "WithEtag").unwrap();
         assert_eq!(with.revid, 42);
         assert_eq!(with.etag.as_deref(), Some("W/\"42/xyz\""));
 
-        let without = cache.get("en", "NoEtag").unwrap();
+        let without = cache.get("", "en", "NoEtag").unwrap();
         assert_eq!(without.revid, 0);
         assert_eq!(without.etag, None);
         let _ = std::fs::remove_dir_all(&dir);
@@ -858,8 +913,9 @@ mod tests {
     #[test]
     fn content_at_a_given_revid_is_never_rewritten() {
         let (cache, dir) = temp_cache(DEFAULT_MAX_BYTES);
-        cache.put("en", "Turing", "version one", 7, Some("W/\"7/aaa\""));
+        cache.put("", "en", "Turing", "version one", 7, Some("W/\"7/aaa\""));
         cache.put(
+            "",
             "en",
             "Turing",
             "version two — must not land",
@@ -867,7 +923,7 @@ mod tests {
             Some("W/\"7/bbb\""),
         );
 
-        let hit = cache.get("en", "Turing").unwrap();
+        let hit = cache.get("", "en", "Turing").unwrap();
         assert_eq!(
             hit.html, "version one",
             "the blob at revid 7 must be untouched"
@@ -885,9 +941,9 @@ mod tests {
     #[test]
     fn a_new_revid_for_the_same_title_is_a_new_blob_not_an_overwrite() {
         let (cache, dir) = temp_cache(DEFAULT_MAX_BYTES);
-        cache.put("en", "Turing", "old content", 1, None);
-        cache.put("en", "Turing", "new content", 2, None);
-        assert_eq!(cache.get("en", "Turing").unwrap().html, "new content");
+        cache.put("", "en", "Turing", "old content", 1, None);
+        cache.put("", "en", "Turing", "new content", 2, None);
+        assert_eq!(cache.get("", "en", "Turing").unwrap().html, "new content");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -910,32 +966,145 @@ mod tests {
     #[test]
     fn miss_on_unknown_title_and_on_disabled_cache() {
         let (cache, dir) = temp_cache(DEFAULT_MAX_BYTES);
-        assert!(cache.get("en", "Nonexistent").is_none());
+        assert!(cache.get("", "en", "Nonexistent").is_none());
         let disabled = PageCache::disabled();
-        disabled.put("en", "X", "<html/>", 1, None); // must not panic
-        assert!(disabled.get("en", "X").is_none());
+        disabled.put("", "en", "X", "<html/>", 1, None); // must not panic
+        assert!(disabled.get("", "en", "X").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn titles_are_isolated_per_language_and_from_each_other() {
         let (cache, dir) = temp_cache(DEFAULT_MAX_BYTES);
-        cache.put("en", "Turing", "english", 1, None);
-        cache.put("de", "Turing", "german", 1, None);
-        cache.put("en", "Church", "church", 2, None);
-        assert_eq!(cache.get("en", "Turing").unwrap().html, "english");
-        assert_eq!(cache.get("de", "Turing").unwrap().html, "german");
-        assert_eq!(cache.get("en", "Church").unwrap().html, "church");
+        cache.put("", "en", "Turing", "english", 1, None);
+        cache.put("", "de", "Turing", "german", 1, None);
+        cache.put("", "en", "Church", "church", 2, None);
+        assert_eq!(cache.get("", "en", "Turing").unwrap().html, "english");
+        assert_eq!(cache.get("", "de", "Turing").unwrap().html, "german");
+        assert_eq!(cache.get("", "en", "Church").unwrap().html, "church");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PRD FR-ML-4 — the headline correctness fix. The same `(lang, title)`
+    /// stored on two different wikis must never collide: a `get` on wiki B
+    /// for a title only wiki A has cached is a **miss** (so the caller
+    /// fetches B's real content), and wiki A's entry is left intact. Against
+    /// the pre-scoping code — where the on-disk key had no wiki dimension —
+    /// this `get` would have returned wiki A's content, silently serving the
+    /// wrong wiki's article. It now fails that way no more.
+    #[test]
+    fn same_title_on_two_wikis_never_collides() {
+        let (cache, dir) = temp_cache(DEFAULT_MAX_BYTES);
+        cache.put("wikipedia_x", "en", "Alan Turing", "encyclopedia", 10, None);
+
+        // A different wiki has never cached this title — a miss, not wiki A's
+        // content served under the wrong project.
+        assert!(
+            cache.get("wiktionary", "en", "Alan Turing").is_none(),
+            "a different wiki must miss, never inherit another wiki's cached copy"
+        );
+
+        // Fetching it on wiki B stores B's own content; both wikis now serve
+        // their own, and neither can see the other's.
+        cache.put("wiktionary", "en", "Alan Turing", "dictionary", 20, None);
+        assert_eq!(
+            cache.get("wikipedia_x", "en", "Alan Turing").unwrap().html,
+            "encyclopedia"
+        );
+        assert_eq!(
+            cache.get("wiktionary", "en", "Alan Turing").unwrap().html,
+            "dictionary"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The default (Wikipedia) scope is the empty string, and its on-disk
+    /// paths carry no `{wiki}` segment — byte-identical to what the
+    /// pre-multi-wiki code wrote. This pins that: a default-scope entry lands
+    /// exactly at `page/{lang}/…` and `blob/{lang}/…`, so every cache
+    /// warmed before wikis could be switched is read back with no migration.
+    /// A non-default wiki gets its own `{wiki}` subtree instead.
+    #[test]
+    fn default_wiki_uses_the_legacy_pathless_layout_and_others_get_a_subtree() {
+        let (cache, dir) = temp_cache(DEFAULT_MAX_BYTES);
+        cache.put("", "en", "Turing", "default", 1, None);
+        cache.put("wiktionary", "en", "Turing", "sister", 2, None);
+
+        // Default scope: no wiki segment (the exact pre-scoping location).
+        assert!(dir.join("page").join("en").join("Turing.json").exists());
+        assert!(
+            dir.join("blob")
+                .join("en")
+                .join(format!("1-{:016x}.zst", fnv1a(b"Turing")))
+                .exists()
+        );
+        // Non-default scope: a disjoint subtree, so it can never overwrite or
+        // be evicted alongside the default wiki's identically-named entry.
+        assert!(
+            dir.join("page")
+                .join("wiktionary")
+                .join("en")
+                .join("Turing.json")
+                .exists()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Migration proof: a new-format index written before the `wiki` field
+    /// existed (so its JSON has no `wiki` key) loads via `#[serde(default)]`
+    /// as the empty/default scope and is served to the default wiki — never
+    /// refetched, never lost — while a non-default wiki correctly misses it.
+    #[test]
+    fn a_pre_wiki_index_entry_is_read_as_the_default_wiki() {
+        let (cache, dir) = temp_cache(DEFAULT_MAX_BYTES);
+        // Write the blob at the default (segment-less) location, then hand-write
+        // an index JSON with no `wiki` field — exactly what the old code left.
+        cache.put("", "en", "Legacy", "old content", 0, None);
+        let index_path = dir.join("page").join("en").join("Legacy.json");
+        std::fs::write(
+            &index_path,
+            r#"{"revid":0,"fetched_at":1,"etag":null,"lang":"en","title":"Legacy"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cache.get("", "en", "Legacy").unwrap().html,
+            "old content",
+            "a pre-wiki index entry must read back as the default wiki"
+        );
+        assert!(
+            cache.get("wiktionary", "en", "Legacy").is_none(),
+            "a non-default wiki must not inherit the default wiki's legacy entry"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pre-upgrade flat `.html` file predates multi-wiki support, so it is
+    /// migrated only for the default wiki; a non-default wiki must not read
+    /// (or migrate) it as its own.
+    #[test]
+    fn a_non_default_wiki_ignores_the_legacy_flat_file() {
+        let (cache, dir) = temp_cache(DEFAULT_MAX_BYTES);
+        write_legacy_entry(&dir, "en", "Turing", now_unix(), "<html>legacy</html>");
+        assert!(
+            cache.get("wiktionary", "en", "Turing").is_none(),
+            "the pre-upgrade flat file belongs to the default wiki only"
+        );
+        // The default wiki still migrates it, so nothing is lost.
+        assert_eq!(
+            cache.get("", "en", "Turing").unwrap().html,
+            "<html>legacy</html>"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn slashes_and_spaces_in_titles_are_safe() {
         let (cache, dir) = temp_cache(DEFAULT_MAX_BYTES);
-        cache.put("en", "AC/DC", "band", 1, None);
-        cache.put("en", "New York City", "city", 2, None);
-        assert_eq!(cache.get("en", "AC/DC").unwrap().html, "band");
-        assert_eq!(cache.get("en", "New York City").unwrap().html, "city");
+        cache.put("", "en", "AC/DC", "band", 1, None);
+        cache.put("", "en", "New York City", "city", 2, None);
+        assert_eq!(cache.get("", "en", "AC/DC").unwrap().html, "band");
+        assert_eq!(cache.get("", "en", "New York City").unwrap().html, "city");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -944,34 +1113,34 @@ mod tests {
         let (cache, dir) = temp_cache(DEFAULT_MAX_BYTES);
         let long_a = "統合デジタル通信網".repeat(15); // percent-encodes far past 200 bytes
         let long_b = format!("{long_a}違"); // near-identical sibling must not collide
-        cache.put("en", &long_a, "content a", 1, None);
-        cache.put("en", &long_b, "content b", 2, None);
-        assert_eq!(cache.get("en", &long_a).unwrap().html, "content a");
-        assert_eq!(cache.get("en", &long_b).unwrap().html, "content b");
+        cache.put("", "en", &long_a, "content a", 1, None);
+        cache.put("", "en", &long_b, "content b", 2, None);
+        assert_eq!(cache.get("", "en", &long_a).unwrap().html, "content a");
+        assert_eq!(cache.get("", "en", &long_b).unwrap().html, "content b");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn corrupt_index_entry_is_a_miss_not_a_panic() {
         let (cache, dir) = temp_cache(DEFAULT_MAX_BYTES);
-        cache.put("en", "Turing", "good", 1, None);
+        cache.put("", "en", "Turing", "good", 1, None);
         // Overwrite the index (not the blob) with garbage JSON.
         let index_path = dir.join("page").join("en").join("Turing.json");
         std::fs::write(&index_path, "not json").unwrap();
-        assert!(cache.get("en", "Turing").is_none());
+        assert!(cache.get("", "en", "Turing").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn corrupt_blob_is_a_miss_not_a_panic() {
         let (cache, dir) = temp_cache(DEFAULT_MAX_BYTES);
-        cache.put("en", "Turing", "good", 5, None);
+        cache.put("", "en", "Turing", "good", 5, None);
         let blob_path = dir
             .join("blob")
             .join("en")
             .join(format!("5-{:016x}.zst", fnv1a(b"Turing")));
         std::fs::write(&blob_path, b"not zstd data at all").unwrap();
-        assert!(cache.get("en", "Turing").is_none());
+        assert!(cache.get("", "en", "Turing").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -980,7 +1149,7 @@ mod tests {
     #[test]
     fn touch_fetched_at_refreshes_age_without_changing_content() {
         let (cache, dir) = temp_cache(DEFAULT_MAX_BYTES);
-        cache.put("en", "Turing", "content", 3, None);
+        cache.put("", "en", "Turing", "content", 3, None);
         // Force an old fetched_at directly so the "before" age is visibly
         // large, then touch and confirm it collapses back near zero.
         let index_path = dir.join("page").join("en").join("Turing.json");
@@ -989,16 +1158,17 @@ mod tests {
             fetched_at: now_unix() - 100_000,
             etag: None,
             incognito: false,
+            wiki: String::new(),
             lang: "en".to_string(),
             title: "Turing".to_string(),
             hits: 0,
             segment: Segment::Probationary,
         };
         std::fs::write(&index_path, serde_json::to_string(&stale).unwrap()).unwrap();
-        assert!(cache.get("en", "Turing").unwrap().age_secs >= 100_000 - 5);
+        assert!(cache.get("", "en", "Turing").unwrap().age_secs >= 100_000 - 5);
 
-        cache.touch_fetched_at("en", "Turing");
-        let touched = cache.get("en", "Turing").unwrap();
+        cache.touch_fetched_at("", "en", "Turing");
+        let touched = cache.get("", "en", "Turing").unwrap();
         assert!(
             touched.age_secs < 5,
             "touch must reset the age, got {}",
@@ -1014,7 +1184,7 @@ mod tests {
     #[test]
     fn touch_fetched_at_on_missing_entry_does_not_panic() {
         let (cache, dir) = temp_cache(DEFAULT_MAX_BYTES);
-        cache.touch_fetched_at("en", "Nonexistent"); // must not panic
+        cache.touch_fetched_at("", "en", "Nonexistent"); // must not panic
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1036,7 +1206,7 @@ mod tests {
         write_legacy_entry(&dir, "en", "Turing", old_fetched_at, "<html>legacy</html>");
 
         let hit = cache
-            .get("en", "Turing")
+            .get("", "en", "Turing")
             .expect("legacy entry must still be readable");
         assert_eq!(hit.html, "<html>legacy</html>");
         assert_eq!(hit.revid, 0, "revid is unknown for pre-upgrade entries");
@@ -1053,7 +1223,7 @@ mod tests {
         // A second read no longer touches (or needs) the old path at all —
         // it's served straight from the new format now.
         let second = cache
-            .get("en", "Turing")
+            .get("", "en", "Turing")
             .expect("still readable after migration");
         assert_eq!(second.html, "<html>legacy</html>");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1065,21 +1235,21 @@ mod tests {
         let path = dir.join("en").join("Turing.html");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "not-a-timestamp\nhtml").unwrap();
-        assert!(cache.get("en", "Turing").is_none());
+        assert!(cache.get("", "en", "Turing").is_none());
         // And a file with no newline at all:
         std::fs::write(&path, "no newline here").unwrap();
-        assert!(cache.get("en", "Turing").is_none());
+        assert!(cache.get("", "en", "Turing").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn new_format_entry_is_preferred_over_a_stale_leftover_old_format_file() {
         let (cache, dir) = temp_cache(DEFAULT_MAX_BYTES);
-        cache.put("en", "Turing", "new content", 9, None);
+        cache.put("", "en", "Turing", "new content", 9, None);
         // A leftover old-format file for the same title must never be
         // consulted once the new format has an entry.
         write_legacy_entry(&dir, "en", "Turing", now_unix(), "stale old content");
-        assert_eq!(cache.get("en", "Turing").unwrap().html, "new content");
+        assert_eq!(cache.get("", "en", "Turing").unwrap().html, "new content");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1152,8 +1322,8 @@ mod tests {
             FRESH_TTL_SECS,
             DEFAULT_FORCE_REFETCH_SECS,
         );
-        roomy.put("en", "First", &content, 1, None);
-        roomy.put("en", "Second", &content, 2, None);
+        roomy.put("", "en", "First", &content, 1, None);
+        roomy.put("", "en", "Second", &content, 2, None);
         // Small safety margin: at this cap, adding a same-sized third entry
         // forces eviction of exactly one LRU victim, never two.
         let cap = dir_size(&dir) + 20;
@@ -1161,7 +1331,7 @@ mod tests {
         let cache = PageCache::at(dir.clone(), cap, FRESH_TTL_SECS, DEFAULT_FORCE_REFETCH_SECS);
         // Read First so Second becomes the least-recently-used entry —
         // proving eviction follows reads, not just insertion order.
-        assert!(cache.get("en", "First").is_some());
+        assert!(cache.get("", "en", "First").is_some());
 
         // `get` just touched First's mtime to real "now", but real
         // wall-clock mtimes aren't a reliable ordering signal on their own
@@ -1180,14 +1350,17 @@ mod tests {
         stamp_mtime(&blob_path(1, "First"), now - Duration::from_secs(10));
         stamp_mtime(&index_path("First"), now - Duration::from_secs(10));
 
-        cache.put("en", "Third", &content, 3, None); // pushes total past cap
+        cache.put("", "en", "Third", &content, 3, None); // pushes total past cap
 
-        assert!(cache.get("en", "First").is_some(), "recently read: kept");
         assert!(
-            cache.get("en", "Second").is_none(),
+            cache.get("", "en", "First").is_some(),
+            "recently read: kept"
+        );
+        assert!(
+            cache.get("", "en", "Second").is_none(),
             "least recently used: evicted (both its blob and index)"
         );
-        assert!(cache.get("en", "Third").is_some(), "just written: kept");
+        assert!(cache.get("", "en", "Third").is_some(), "just written: kept");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1214,18 +1387,18 @@ mod tests {
             FRESH_TTL_SECS,
             DEFAULT_FORCE_REFETCH_SECS,
         );
-        roomy.put("en", "Favorite", &content, 1, None);
-        roomy.put("en", "OneOff", &content, 2, None);
+        roomy.put("", "en", "Favorite", &content, 1, None);
+        roomy.put("", "en", "OneOff", &content, 2, None);
         let cap = dir_size(&dir) + 20;
 
         let cache = PageCache::at(dir.clone(), cap, FRESH_TTL_SECS, DEFAULT_FORCE_REFETCH_SECS);
         // Read "Favorite" *twice* — the second read is what promotes it to
         // the protected segment (see `Segment`'s doc comment).
-        assert!(cache.get("en", "Favorite").is_some());
-        assert!(cache.get("en", "Favorite").is_some());
+        assert!(cache.get("", "en", "Favorite").is_some());
+        assert!(cache.get("", "en", "Favorite").is_some());
         // "OneOff" is read exactly once — a normal open, never a re-visit —
         // so it stays probationary.
-        assert!(cache.get("en", "OneOff").is_some());
+        assert!(cache.get("", "en", "OneOff").is_some());
 
         // Stamp mtimes so plain LRU would evict "Favorite" (older) and keep
         // "OneOff" (newer) — SLRU must invert that outcome.
@@ -1241,14 +1414,14 @@ mod tests {
         stamp_mtime(&blob_path(2, "OneOff"), now - Duration::from_secs(5));
         stamp_mtime(&index_path("OneOff"), now - Duration::from_secs(5));
 
-        cache.put("en", "Third", &content, 3, None); // pushes total past cap
+        cache.put("", "en", "Third", &content, 3, None); // pushes total past cap
 
         assert!(
-            cache.get("en", "Favorite").is_some(),
+            cache.get("", "en", "Favorite").is_some(),
             "protected (twice-read) survives despite being the oldest by mtime"
         );
         assert!(
-            cache.get("en", "OneOff").is_none(),
+            cache.get("", "en", "OneOff").is_none(),
             "probationary (read only once) is evicted first, even though its mtime looked newer"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1273,13 +1446,13 @@ mod tests {
             FRESH_TTL_SECS,
             DEFAULT_FORCE_REFETCH_SECS,
         );
-        roomy.put("en", "ReadOnce", &content, 1, None);
-        roomy.put("en", "NeverRead", &content, 2, None);
+        roomy.put("", "en", "ReadOnce", &content, 1, None);
+        roomy.put("", "en", "NeverRead", &content, 2, None);
         let cap = dir_size(&dir) + 20;
 
         let cache = PageCache::at(dir.clone(), cap, FRESH_TTL_SECS, DEFAULT_FORCE_REFETCH_SECS);
         // Exactly one read — must stay probationary.
-        assert!(cache.get("en", "ReadOnce").is_some());
+        assert!(cache.get("", "en", "ReadOnce").is_some());
 
         let now = SystemTime::now();
         let blob_path = |revid: u64, title: &str| {
@@ -1296,14 +1469,14 @@ mod tests {
         stamp_mtime(&blob_path(1, "ReadOnce"), now - Duration::from_secs(10));
         stamp_mtime(&index_path("ReadOnce"), now - Duration::from_secs(10));
 
-        cache.put("en", "Third", &content, 3, None);
+        cache.put("", "en", "Third", &content, 3, None);
 
         assert!(
-            cache.get("en", "ReadOnce").is_some(),
+            cache.get("", "en", "ReadOnce").is_some(),
             "still probationary, but more recently touched than NeverRead"
         );
         assert!(
-            cache.get("en", "NeverRead").is_none(),
+            cache.get("", "en", "NeverRead").is_none(),
             "older probationary entry: evicted, same ordering plain LRU would produce"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1330,21 +1503,21 @@ mod tests {
             FRESH_TTL_SECS,
             DEFAULT_FORCE_REFETCH_SECS,
         );
-        roomy.put("en", "OldFavorite", &content, 1, None);
+        roomy.put("", "en", "OldFavorite", &content, 1, None);
         // Cap sized off *one* entry (not both): tight enough that fitting
         // all three (two favorites + the fresh probationary "Third" below)
         // requires evicting into the protected segment, not just draining
         // probationary.
         let cap = dir_size(&dir) + 20;
-        roomy.put("en", "NewFavorite", &content, 2, None);
+        roomy.put("", "en", "NewFavorite", &content, 2, None);
 
         let cache = PageCache::at(dir.clone(), cap, FRESH_TTL_SECS, DEFAULT_FORCE_REFETCH_SECS);
         // Both promoted to protected — nothing left in probationary for
         // eviction to prefer.
-        assert!(cache.get("en", "OldFavorite").is_some());
-        assert!(cache.get("en", "OldFavorite").is_some());
-        assert!(cache.get("en", "NewFavorite").is_some());
-        assert!(cache.get("en", "NewFavorite").is_some());
+        assert!(cache.get("", "en", "OldFavorite").is_some());
+        assert!(cache.get("", "en", "OldFavorite").is_some());
+        assert!(cache.get("", "en", "NewFavorite").is_some());
+        assert!(cache.get("", "en", "NewFavorite").is_some());
 
         let now = SystemTime::now();
         let blob_path = |revid: u64, title: &str| {
@@ -1358,15 +1531,15 @@ mod tests {
         stamp_mtime(&blob_path(2, "NewFavorite"), now - Duration::from_secs(5));
         stamp_mtime(&index_path("NewFavorite"), now - Duration::from_secs(5));
 
-        cache.put("en", "Third", &content, 3, None); // both favorites + Third now over cap
+        cache.put("", "en", "Third", &content, 3, None); // both favorites + Third now over cap
 
         assert!(
-            cache.get("en", "OldFavorite").is_none(),
+            cache.get("", "en", "OldFavorite").is_none(),
             "protected segment is over its own budget with both entries in it: \
              the OLDEST protected member still gets evicted"
         );
         assert!(
-            cache.get("en", "NewFavorite").is_some(),
+            cache.get("", "en", "NewFavorite").is_some(),
             "the newer protected member is spared once the older one covers the excess"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1467,9 +1640,9 @@ mod tests {
     #[test]
     fn entries_written_while_incognito_are_tagged_and_ordinary_entries_are_not() {
         let (cache, dir) = temp_cache(DEFAULT_MAX_BYTES);
-        cache.put("en", "Ordinary", "html", 1, None);
+        cache.put("", "en", "Ordinary", "html", 1, None);
         cache.set_incognito(true);
-        cache.put("en", "Secret", "html", 2, None);
+        cache.put("", "en", "Secret", "html", 2, None);
 
         let ordinary_index =
             std::fs::read_to_string(dir.join("page").join("en").join("Ordinary.json")).unwrap();
@@ -1491,24 +1664,24 @@ mod tests {
     #[test]
     fn wipe_incognito_entries_removes_only_tagged_entries_and_their_blobs() {
         let (cache, dir) = temp_cache(DEFAULT_MAX_BYTES);
-        cache.put("en", "Ordinary", "kept content", 1, None);
+        cache.put("", "en", "Ordinary", "kept content", 1, None);
         cache.set_incognito(true);
-        cache.put("en", "Secret", "gone content", 2, None);
+        cache.put("", "en", "Secret", "gone content", 2, None);
         cache.set_incognito(false);
 
-        assert!(cache.get("en", "Ordinary").is_some());
-        assert!(cache.get("en", "Secret").is_some());
+        assert!(cache.get("", "en", "Ordinary").is_some());
+        assert!(cache.get("", "en", "Secret").is_some());
 
         let report = cache.wipe_incognito_entries();
         assert_eq!(report.entries, 1, "exactly the one tagged entry");
         assert!(report.bytes > 0);
 
         assert!(
-            cache.get("en", "Ordinary").is_some(),
+            cache.get("", "en", "Ordinary").is_some(),
             "a non-incognito entry must survive the wipe"
         );
         assert!(
-            cache.get("en", "Secret").is_none(),
+            cache.get("", "en", "Secret").is_none(),
             "the incognito-tagged entry must be gone after the wipe"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1517,14 +1690,14 @@ mod tests {
     #[test]
     fn wipe_incognito_entries_is_idempotent_and_harmless_on_a_clean_or_disabled_cache() {
         let (cache, dir) = temp_cache(DEFAULT_MAX_BYTES);
-        cache.put("en", "Ordinary", "html", 1, None);
+        cache.put("", "en", "Ordinary", "html", 1, None);
         assert_eq!(cache.wipe_incognito_entries(), WipeReport::default());
         assert_eq!(
             cache.wipe_incognito_entries(),
             WipeReport::default(),
             "calling it again over an already-clean tree finds nothing new"
         );
-        assert!(cache.get("en", "Ordinary").is_some());
+        assert!(cache.get("", "en", "Ordinary").is_some());
 
         let disabled = PageCache::disabled();
         assert_eq!(disabled.wipe_incognito_entries(), WipeReport::default());
@@ -1539,13 +1712,13 @@ mod tests {
         // `touch_fetched_at` never re-derives the tag from the current
         // session, only preserves whatever was already stored.
         let (cache, dir) = temp_cache(DEFAULT_MAX_BYTES);
-        cache.put("en", "Turing", "content", 1, None);
+        cache.put("", "en", "Turing", "content", 1, None);
         cache.set_incognito(true);
-        cache.touch_fetched_at("en", "Turing");
+        cache.touch_fetched_at("", "en", "Turing");
 
         let report = cache.wipe_incognito_entries();
         assert_eq!(report.entries, 0);
-        assert!(cache.get("en", "Turing").is_some());
+        assert!(cache.get("", "en", "Turing").is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1554,7 +1727,7 @@ mod tests {
         let (cache, dir) = temp_cache(DEFAULT_MAX_BYTES);
         let clone = cache.clone();
         clone.set_incognito(true);
-        cache.put("en", "SeenThroughAClone", "html", 1, None);
+        cache.put("", "en", "SeenThroughAClone", "html", 1, None);
 
         let index =
             std::fs::read_to_string(dir.join("page").join("en").join("SeenThroughAClone.json"))

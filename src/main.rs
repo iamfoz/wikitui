@@ -108,6 +108,11 @@ struct TypeaheadOutcome {
 /// still shows that article before arming a reload notice.
 struct RevalidationOutcome {
     tab_id: TabId,
+    /// The wiki scope this revalidation actually addressed (PRD FR-ML-4),
+    /// captured when the fetch ran so the cache write lands under the same
+    /// wiki the content came from — never a different wiki's key, even if
+    /// `:wiki` switched the active wiki between firing and completion.
+    wiki: String,
     lang: String,
     title: String,
     /// `None` on any network failure along the way (bare-metadata call or
@@ -122,6 +127,10 @@ struct RevalidationOutcome {
 /// result here, keyed to the tab it belongs to.
 struct TabLoadOutcome {
     tab_id: TabId,
+    /// The wiki scope this background tab was fetched from (PRD FR-ML-4), so
+    /// the tab is stamped with — and caches under — its own wiki, not
+    /// whatever the active wiki is by the time the load lands.
+    wiki: String,
     lang: String,
     title: String,
     result: std::result::Result<FetchOutcome, String>,
@@ -168,6 +177,9 @@ struct SaveFetched {
 /// since navigated away from is still cache-worthy (`App::deliver_related`)
 /// without pretending to update a panel that's no longer showing it.
 struct RelatedOutcome {
+    /// The wiki scope this article belongs to (PRD FR-ML-4), so the session
+    /// cache keys never collide with a same-titled article on another wiki.
+    wiki: String,
     lang: String,
     title: String,
     result: std::result::Result<Vec<SearchResult>, String>,
@@ -191,6 +203,8 @@ struct SummaryOutcome {
 /// session cache (`App::deliver_langlinks`) without touching whatever is on
 /// screen now.
 struct LangLinksOutcome {
+    /// The source article's wiki scope (PRD FR-ML-4) — see `RelatedOutcome`.
+    wiki: String,
     lang: String,
     title: String,
     result: std::result::Result<Vec<api::LangLink>, String>,
@@ -438,7 +452,14 @@ async fn main() -> Result<()> {
         // deliver a background revalidation's result into, so it never
         // spawns one — the reader gets whatever's freshest synchronously
         // (fresh cache, or a network round trip on a stale/missing one).
-        let outcome = fetch_page(&client, &page_cache, &resolved.lang.value, &title).await?;
+        let outcome = fetch_page(
+            &client,
+            &page_cache,
+            &client.wiki_scope(),
+            &resolved.lang.value,
+            &title,
+        )
+        .await?;
         let document = doc::parse_article_html(&title, &outcome.html);
         print!("{}", doc::render_plain(&document, &resolved.lang.value));
         // `--dump` never reaches `run`'s own end-of-session wipe below, so it
@@ -751,10 +772,18 @@ struct FetchOutcome {
 async fn fetch_page(
     client: &WikiClient,
     cache: &PageCache,
+    wiki: &str,
     lang: &str,
     title: &str,
 ) -> Result<FetchOutcome> {
-    let cached = cache.get(lang, title);
+    // The cache read (and the offline fallback) are scoped to `wiki` — the
+    // wiki this open belongs to (the active wiki for a fresh open, or the
+    // history entry's own wiki for back/forward), so a `:wiki`-switched open
+    // of a title already cached on another wiki is a miss, never a wrong-wiki
+    // hit (PRD FR-ML-4). The network write below is keyed by the wiki the
+    // request *actually* hit (the client's active wiki), so fetched content
+    // never lands under a different wiki's key.
+    let cached = cache.get(wiki, lang, title);
     if let Some(page) = &cached {
         match cache.swr_decision(page.age_secs) {
             SwrDecision::Fresh => {
@@ -786,6 +815,7 @@ async fn fetch_page(
     match client.fetch_article_html(lang, title).await {
         Ok(fetched) => {
             cache.put(
+                &client.wiki_scope(),
                 lang,
                 title,
                 &fetched.html,
@@ -844,9 +874,11 @@ fn fire_revalidation(
     let client = client.clone();
     let tx = tx.clone();
     tokio::spawn(async move {
+        let wiki = client.wiki_scope();
         let result = revalidate(&client, &lang, &title, cached_revid).await;
         let _ = tx.send(RevalidationOutcome {
             tab_id,
+            wiki,
             lang,
             title,
             result,
@@ -864,6 +896,7 @@ fn fire_background_load(
     client: &WikiClient,
     cache: &PageCache,
     tab_id: TabId,
+    wiki: String,
     lang: String,
     title: String,
     tx: &UnboundedSender<TabLoadOutcome>,
@@ -872,11 +905,16 @@ fn fire_background_load(
     let cache = cache.clone();
     let tx = tx.clone();
     tokio::spawn(async move {
-        let result = fetch_page(&client, &cache, &lang, &title)
+        // The tab belongs to `wiki` (its active wiki when opened, or its
+        // persisted wiki on restore) — cache reads and the tab's own scope
+        // key on it, not on a wiki `:wiki` may have switched to since (PRD
+        // FR-ML-4).
+        let result = fetch_page(&client, &cache, &wiki, &lang, &title)
             .await
             .map_err(|e| e.to_string());
         let _ = tx.send(TabLoadOutcome {
             tab_id,
+            wiki,
             lang,
             title,
             result,
@@ -994,7 +1032,8 @@ async fn execute_prefetch_article(
     lang: &str,
     title: &str,
 ) -> netqueue::ExecResult {
-    if cache.get(lang, title).is_some() {
+    let wiki = client.wiki_scope();
+    if cache.get(&wiki, lang, title).is_some() {
         return netqueue::ExecResult {
             outcome: netqueue::Outcome::Skipped {
                 note: "already cached".to_string(),
@@ -1005,7 +1044,7 @@ async fn execute_prefetch_article(
     match client.fetch_article_html_bg(lang, title).await {
         Ok(a) => {
             // Prefetch fills L2 only — no L1 render, no images (PRD §5.8).
-            cache.put(lang, title, &a.html, a.revid, a.etag.as_deref());
+            cache.put(&wiki, lang, title, &a.html, a.revid, a.etag.as_deref());
             netqueue::ExecResult {
                 outcome: netqueue::Outcome::Done { bytes: a.bytes },
                 follow_ups: Vec::new(),
@@ -1273,11 +1312,15 @@ async fn execute_revalidation(
     cached_revid: u64,
 ) -> netqueue::ExecResult {
     let none = Vec::new();
+    // The wiki the metadata/HTML below is actually fetched from — the cache
+    // write keyed by it can never land under another wiki's key (PRD FR-ML-4).
+    let wiki = client.wiki_scope();
     match client.fetch_bare_metadata_bg(&lang, &title).await {
         Ok(latest) => match cache::revalidate_action(cached_revid, latest) {
             RevalidateAction::Touch => {
                 let _ = tx.send(RevalidationOutcome {
                     tab_id,
+                    wiki,
                     lang,
                     title,
                     result: Some(RevalidationResult::Unchanged),
@@ -1291,6 +1334,7 @@ async fn execute_revalidation(
                 Ok(a) => {
                     let _ = tx.send(RevalidationOutcome {
                         tab_id,
+                        wiki,
                         lang,
                         title,
                         result: Some(RevalidationResult::Changed {
@@ -1307,6 +1351,7 @@ async fn execute_revalidation(
                 Err(e) => {
                     let _ = tx.send(RevalidationOutcome {
                         tab_id,
+                        wiki,
                         lang,
                         title,
                         result: None,
@@ -1321,6 +1366,7 @@ async fn execute_revalidation(
         Err(e) => {
             let _ = tx.send(RevalidationOutcome {
                 tab_id,
+                wiki,
                 lang,
                 title,
                 result: None,
@@ -1391,8 +1437,11 @@ fn schedule_link_prefetch(app: &App) {
     // affinity term then contributes nothing.
     let mut affinity = std::collections::HashMap::new();
     if app.interest_active() {
+        // Link targets share the active tab's wiki scope (PRD FR-ML-4), so
+        // affinity is read from that wiki's slice of the category cache.
+        let wiki = &tab.wiki;
         for c in &candidates {
-            let a = app.interest.affinity_of_title(&c.title);
+            let a = app.interest.affinity_of_title(wiki, &c.title);
             if a != 0.0 {
                 affinity.insert(c.title.clone(), a);
             }
@@ -1485,15 +1534,26 @@ fn apply_revalidation_outcome(app: &mut App, cache: &PageCache, outcome: Revalid
     };
     match result {
         RevalidationResult::Unchanged => {
-            cache.touch_fetched_at(&outcome.lang, &outcome.title);
+            cache.touch_fetched_at(&outcome.wiki, &outcome.lang, &outcome.title);
         }
         RevalidationResult::Changed { html, revid, etag } => {
-            cache.put(&outcome.lang, &outcome.title, &html, revid, etag.as_deref());
+            cache.put(
+                &outcome.wiki,
+                &outcome.lang,
+                &outcome.title,
+                &html,
+                revid,
+                etag.as_deref(),
+            );
             let Some(index) = app.tab_index_by_id(outcome.tab_id) else {
                 return; // the tab closed — nothing to notify.
             };
             let tab = &mut app.tabs[index];
-            let still_open = tab.lang == outcome.lang
+            // The notice must only fire for a tab that is genuinely showing
+            // the wiki+lang+title this content is for — a same-titled article
+            // on a different wiki (or lang) is a different page (PRD FR-ML-4).
+            let still_open = tab.wiki == outcome.wiki
+                && tab.lang == outcome.lang
                 && tab.doc.as_ref().is_some_and(|d| d.title == outcome.title);
             if still_open {
                 tab.pending_reload = Some(PendingReload {
@@ -1531,6 +1591,10 @@ fn apply_tab_load_outcome(
                 let tab = &mut app.tabs[index];
                 tab.loading = false;
                 tab.lang = outcome.lang.clone();
+                // PRD FR-ML-4: stamp the background tab with the wiki it was
+                // fetched from (`install_document` doesn't touch app-global
+                // state, so unlike `set_document` it can't derive this).
+                tab.wiki = outcome.wiki.clone();
                 tab.page_source = fetch.source;
                 tab.current_revid = fetch.revid;
                 tab.install_document(document);
@@ -1752,12 +1816,14 @@ async fn enqueue_read_later(client: &WikiClient, cache: &PageCache, app: &mut Ap
 /// created either way; opening it later tries again via the normal fetch
 /// path).
 async fn ensure_cached(client: &WikiClient, cache: &PageCache, lang: &str, title: &str) -> bool {
-    if cache.get(lang, title).is_some() {
+    let wiki = client.wiki_scope();
+    if cache.get(&wiki, lang, title).is_some() {
         return true;
     }
     match client.fetch_article_html(lang, title).await {
         Ok(fetched) => {
             cache.put(
+                &wiki,
                 lang,
                 title,
                 &fetched.html,
@@ -1884,11 +1950,13 @@ async fn fetch_for_save(
 ) -> Result<SaveFetched> {
     // HTML: prefer the cache (the article on screen is already there) and fall
     // back to a fresh fetch for a target that has never been opened.
-    let (html, revid) = match cache.get(lang, title) {
+    let wiki = client.wiki_scope();
+    let (html, revid) = match cache.get(&wiki, lang, title) {
         Some(page) => (page.html, page.revid),
         None => {
             let fetched = client.fetch_article_html(lang, title).await?;
             cache.put(
+                &wiki,
                 lang,
                 title,
                 &fetched.html,
@@ -2516,7 +2584,7 @@ async fn run(
             // session cache (and, if the panel is still open on the same
             // article, the live view too).
             while let Ok(outcome) = related_rx.try_recv() {
-                app.deliver_related(outcome.lang, outcome.title, outcome.result);
+                app.deliver_related(outcome.wiki, outcome.lang, outcome.title, outcome.result);
             }
             // PRD FR-NV-5: install a completed link-preview summary; fills the
             // popup in place if it's still open on this target.
@@ -2571,7 +2639,7 @@ async fn run(
         // through the scoped-poll branch specifically.
         while let Ok(outcome) = langlinks_rx.try_recv() {
             app.pending_langlinks = app.pending_langlinks.saturating_sub(1);
-            app.deliver_langlinks(outcome.lang, outcome.title, outcome.result);
+            app.deliver_langlinks(outcome.wiki, outcome.lang, outcome.title, outcome.result);
         }
 
         if app.should_quit {
@@ -2630,6 +2698,9 @@ fn fire_related(
     let client = client.clone();
     let tx = tx.clone();
     tokio::spawn(async move {
+        // The wiki this morelike search actually addresses — keys the session
+        // cache under the same wiki the results came from (PRD FR-ML-4).
+        let wiki = client.wiki_scope();
         let query = format!("morelike:{title}");
         let result = client
             .search(&lang, &query, RELATED_LIMIT)
@@ -2637,6 +2708,7 @@ fn fire_related(
             .map(|outcome| outcome.results)
             .map_err(|e| e.to_string());
         let _ = tx.send(RelatedOutcome {
+            wiki,
             lang,
             title,
             result,
@@ -2706,11 +2778,13 @@ fn fire_langlinks(
     let client = client.clone();
     let tx = tx.clone();
     tokio::spawn(async move {
+        let wiki = client.wiki_scope();
         let result = client
             .fetch_langlinks(&lang, &title)
             .await
             .map_err(|e| e.to_string());
         let _ = tx.send(LangLinksOutcome {
+            wiki,
             lang,
             title,
             result,
@@ -3130,7 +3204,11 @@ async fn toggle_talk_page(
 /// (kill switch or incognito) — FR-DL-5's "skippable on budget", realized as
 /// "skippable when the reader already said no to background traffic."
 async fn enrich_article(client: &WikiClient, app: &mut App, lang: &str, title: &str) {
-    let key = (lang.to_string(), title.to_string());
+    // Every session-state key here is scoped to the wiki the article was
+    // fetched from (PRD FR-ML-4), so a same-titled article on another wiki
+    // gets its own quality badge / redlink set, never this one's.
+    let wiki = client.wiki_scope();
+    let key = (wiki.clone(), lang.to_string(), title.to_string());
     // PRD FR-ML-5: a wiki without PageAssessments never gets the lookup
     // attempted, so `quality_cache` simply never gains an entry for it — the
     // same visible result (no badge) as a wiki that has the extension but no
@@ -3146,8 +3224,11 @@ async fn enrich_article(client: &WikiClient, app: &mut App, lang: &str, title: &
     if app.prefetch_active() && !app.checked_redlink_sources.contains(&key) {
         app.checked_redlink_sources.insert(key.clone());
         if let Ok(missing) = client.fetch_missing_links(lang, title).await {
-            app.confirmed_redlinks
-                .extend(missing.into_iter().map(|t| (lang.to_string(), t)));
+            app.confirmed_redlinks.extend(
+                missing
+                    .into_iter()
+                    .map(|t| (wiki.clone(), lang.to_string(), t)),
+            );
         }
     }
 
@@ -3158,7 +3239,7 @@ async fn enrich_article(client: &WikiClient, app: &mut App, lang: &str, title: &
     // driven `morelike:` prefetch. All gated on `interest_active` (learning on
     // and not incognito), so incognito reads leave the model untouched.
     if app.interest_active() {
-        let raw = if app.interest.knows_categories(title) {
+        let raw = if app.interest.knows_categories(&wiki, title) {
             Vec::new()
         } else {
             client
@@ -3168,7 +3249,7 @@ async fn enrich_article(client: &WikiClient, app: &mut App, lang: &str, title: &
                 .and_then(|mut m| m.remove(title))
                 .unwrap_or_default()
         };
-        app.note_article_read(title, &raw);
+        app.note_article_read(&wiki, title, &raw);
         schedule_interest_prefetch(app);
     }
 }
@@ -3194,7 +3275,7 @@ async fn open_title(
                 .prefetch
                 .as_ref()
                 .map(netqueue::SubstrateHandle::foreground_guard);
-            fetch_page(client, cache, lang, title).await
+            fetch_page(client, cache, &client.wiki_scope(), lang, title).await
         };
         match outcome {
             Ok(outcome) => {
@@ -3286,13 +3367,17 @@ async fn open_history_entry(
             .prefetch
             .as_ref()
             .map(netqueue::SubstrateHandle::foreground_guard);
-        fetch_page(client, cache, &entry.lang, &entry.title).await
+        // Read L2 in the history entry's *own* wiki scope (PRD FR-ML-4), not
+        // the current active wiki — a back/forward hop to an article read on
+        // another wiki before a `:wiki` switch still finds its cached copy.
+        fetch_page(client, cache, &entry.wiki, &entry.lang, &entry.title).await
     };
     match outcome {
         Ok(outcome) => {
             let document = doc::parse_article_html(&entry.title, &outcome.html);
             let article_title = document.title.clone();
             let entry_lang = entry.lang.clone();
+            let entry_wiki = entry.wiki.clone();
             {
                 let tab = app.active_tab_mut();
                 tab.page_source = outcome.source;
@@ -3302,6 +3387,10 @@ async fn open_history_entry(
             // just below, so it must not also raise the resume toast.
             app.suppress_resume_once = true;
             app.set_document(document);
+            // `set_document` stamps the tab with the *active* wiki; this
+            // navigation is to the entry's own wiki, so restore that (PRD
+            // FR-ML-4) alongside the scroll below.
+            app.active_tab_mut().wiki = entry_wiki;
             // Restore the scroll position we left this page at (set_document
             // reset it to the top); the draw clamps it to the article's real
             // extent, which is unchanged since it's the same article.
@@ -3378,6 +3467,8 @@ fn restore_session_tabs(
         {
             let tab = &mut app.tabs[idx];
             tab.lang = saved.lang.clone();
+            // PRD FR-ML-4: a restored tab keeps the wiki it was saved on.
+            tab.wiki = saved.wiki.clone();
             tab.back_stack = saved.back_stack.clone();
             tab.forward_stack = saved.forward_stack.clone();
         }
@@ -3398,6 +3489,7 @@ fn restore_session_tabs(
                 client,
                 cache,
                 tab_id,
+                saved.wiki.clone(),
                 saved.lang.clone(),
                 title.clone(),
                 open_tx,
@@ -3788,7 +3880,15 @@ async fn handle_key(
                         Some(app::HintFollowAction::Background(title)) => {
                             let lang = app.lang.clone();
                             let id = app.open_background_tab(title.clone(), lang.clone());
-                            fire_background_load(client, cache, id, lang, title, open_tx);
+                            fire_background_load(
+                                client,
+                                cache,
+                                id,
+                                client.wiki_scope(),
+                                lang,
+                                title,
+                                open_tx,
+                            );
                             app.status = "Opening in a background tab…".to_string();
                         }
                         Some(app::HintFollowAction::External(href)) => {
@@ -4650,7 +4750,15 @@ async fn handle_key(
                         Some(title) => {
                             let lang = app.lang.clone();
                             let id = app.open_background_tab(title.clone(), lang.clone());
-                            fire_background_load(client, cache, id, lang, title, open_tx);
+                            fire_background_load(
+                                client,
+                                cache,
+                                id,
+                                client.wiki_scope(),
+                                lang,
+                                title,
+                                open_tx,
+                            );
                             app.status = "Opening in a background tab…".to_string();
                         }
                         None => {
@@ -5274,7 +5382,15 @@ async fn dispatch_action(
                 Some(title) => {
                     let lang = app.lang.clone();
                     let id = app.open_background_tab(title.clone(), lang.clone());
-                    fire_background_load(client, cache, id, lang, title, open_tx);
+                    fire_background_load(
+                        client,
+                        cache,
+                        id,
+                        client.wiki_scope(),
+                        lang,
+                        title,
+                        open_tx,
+                    );
                     app.status = "Opening in a background tab…".to_string();
                 }
                 None => app.status = "No internal link focused to open in a tab".to_string(),
@@ -6828,7 +6944,12 @@ async fn cmd_bilingual(
     if app.bilingual_target().is_none()
         && let Ok(links) = client.fetch_langlinks(&cur_lang, &cur_title).await
     {
-        app.deliver_langlinks(cur_lang.clone(), cur_title.clone(), Ok(links));
+        app.deliver_langlinks(
+            client.wiki_scope(),
+            cur_lang.clone(),
+            cur_title.clone(),
+            Ok(links),
+        );
     }
     let Some((code, title)) = app.bilingual_target() else {
         app.notice = Some("no other-language edition available for this article".to_string());
@@ -6912,11 +7033,17 @@ async fn run_search(client: &WikiClient, app: &mut App) {
             // zero results, or where every title is already cached, skips
             // the request entirely.
             let lang = app.lang.clone();
+            // The search ran on the client's active wiki, so its result badges
+            // are keyed under that wiki's scope (PRD FR-ML-4).
+            let wiki = client.wiki_scope();
             let uncached: Vec<String> = app
                 .results
                 .iter()
                 .map(|r| r.title.clone())
-                .filter(|t| !app.quality_cache.contains_key(&(lang.clone(), t.clone())))
+                .filter(|t| {
+                    !app.quality_cache
+                        .contains_key(&(wiki.clone(), lang.clone(), t.clone()))
+                })
                 .collect();
             // PRD FR-ML-5: same capability gate as `enrich_article` — a wiki
             // without PageAssessments never gets the batched lookup
@@ -6928,7 +7055,7 @@ async fn run_search(client: &WikiClient, app: &mut App) {
                 app.quality_cache.extend(
                     assessments
                         .into_iter()
-                        .map(|(title, class)| ((lang.clone(), title), class)),
+                        .map(|(title, class)| ((wiki.clone(), lang.clone(), title), class)),
                 );
             }
         }
@@ -7181,6 +7308,7 @@ mod tests {
             &mut app,
             TabLoadOutcome {
                 tab_id: id,
+                wiki: String::new(),
                 lang: "en".to_string(),
                 title: "Enigma machine".to_string(),
                 result: Ok(FetchOutcome {
@@ -7216,6 +7344,7 @@ mod tests {
             &mut app,
             TabLoadOutcome {
                 tab_id: id,
+                wiki: String::new(),
                 lang: "en".to_string(),
                 title: "Enigma machine".to_string(),
                 result: Ok(FetchOutcome {
@@ -7238,11 +7367,13 @@ mod tests {
             tabs: vec![
                 session::SessionTab {
                     lang: "en".to_string(),
+                    wiki: String::new(),
                     title: Some("Alan Turing".to_string()),
                     scroll: 12,
                     folded_blocks: vec![2],
                     current_revid: 1001,
                     back_stack: vec![HistoryEntry {
+                        wiki: String::new(),
                         lang: "en".to_string(),
                         title: "Start page".to_string(),
                         scroll: 0,
@@ -7251,6 +7382,7 @@ mod tests {
                 },
                 session::SessionTab {
                     lang: "en".to_string(),
+                    wiki: String::new(),
                     title: Some("Enigma machine".to_string()),
                     scroll: 3,
                     folded_blocks: Vec::new(),
@@ -7326,6 +7458,7 @@ mod tests {
             &mut app,
             TabLoadOutcome {
                 tab_id: tab0_id,
+                wiki: String::new(),
                 lang: "en".to_string(),
                 title: "Alan Turing".to_string(),
                 result: Ok(FetchOutcome {
@@ -7417,6 +7550,7 @@ mod tests {
             &cache,
             RevalidationOutcome {
                 tab_id: tab1,
+                wiki: String::new(),
                 lang: "en".to_string(),
                 title: "B".to_string(),
                 result: Some(RevalidationResult::Changed {

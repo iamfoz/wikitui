@@ -51,7 +51,7 @@ use rusqlite::{Connection, params};
 /// Schema version this build understands (the `PRAGMA user_version`
 /// counterpart of `config::CONFIG_VERSION`). Bump alongside a new branch in
 /// `migrate` when the shape of `visits` changes.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// One logged page view (PRD FR-HS-1's "title, wiki, timestamp, dwell time,
 /// referrer article").
@@ -214,11 +214,16 @@ impl History {
     }
 
     /// PRD FR-NV-8: save (replacing any prior) the reading position for
-    /// `(lang, title)`. Best-effort like the other passive writes here — a
-    /// failure is swallowed to a log line, never surfaced. `folds` is stored as
-    /// a sorted comma-separated block-index list.
+    /// `(wiki, lang, title)`. Best-effort like the other passive writes here —
+    /// a failure is swallowed to a log line, never surfaced. `folds` is stored
+    /// as a sorted comma-separated block-index list.
+    // The wiki scope (PRD FR-ML-4) puts this one dimension past clippy's arg
+    // ceiling; the fields are a flat position record, not a struct worth
+    // naming.
+    #[allow(clippy::too_many_arguments)]
     pub fn save_position(
         &mut self,
+        wiki: &str,
         lang: &str,
         title: &str,
         revid: u64,
@@ -233,11 +238,12 @@ impl History {
             .join(",");
         let now = now_unix();
         if let Err(e) = self.conn.execute(
-            "INSERT INTO positions (lang, title, revid, scroll, folds, anchor, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(lang, title) DO UPDATE SET
-                revid = ?3, scroll = ?4, folds = ?5, anchor = ?6, updated_at = ?7",
+            "INSERT INTO positions (wiki, lang, title, revid, scroll, folds, anchor, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(wiki, lang, title) DO UPDATE SET
+                revid = ?4, scroll = ?5, folds = ?6, anchor = ?7, updated_at = ?8",
             params![
+                wiki,
                 lang,
                 title,
                 revid as i64,
@@ -251,12 +257,15 @@ impl History {
         }
     }
 
-    /// PRD FR-NV-8: the saved reading position for `(lang, title)`, or `None`
-    /// if none was ever stored (or the read failed).
-    pub fn position(&self, lang: &str, title: &str) -> Option<SavedPosition> {
+    /// PRD FR-NV-8: the saved reading position for `(wiki, lang, title)`, or
+    /// `None` if none was ever stored (or the read failed). The wiki scope
+    /// (PRD FR-ML-4) keeps a resume from ever restoring another wiki's
+    /// position onto a same-titled article.
+    pub fn position(&self, wiki: &str, lang: &str, title: &str) -> Option<SavedPosition> {
         let row = self.conn.query_row(
-            "SELECT revid, scroll, folds, anchor FROM positions WHERE lang = ?1 AND title = ?2",
-            params![lang, title],
+            "SELECT revid, scroll, folds, anchor FROM positions \
+             WHERE wiki = ?1 AND lang = ?2 AND title = ?3",
+            params![wiki, lang, title],
             |row| {
                 let revid: i64 = row.get(0)?;
                 let scroll: i64 = row.get(1)?;
@@ -527,6 +536,34 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             PRAGMA user_version = 2;",
         )?;
     }
+    if version < 3 {
+        // PRD FR-ML-4: reading-position memory gains a wiki dimension so a
+        // resume never crosses wikis (a same-titled article on another wiki
+        // is a different page). SQLite can't add a column to a composite
+        // PRIMARY KEY in place, so the table is rebuilt: every existing row
+        // is the default Wikipedia scope (the only wiki before this), copied
+        // over with `wiki = ''` — no position is lost. `IF NOT EXISTS`/the
+        // idempotent copy make a fresh database (which just created the v2
+        // shape above) migrate forward cleanly too.
+        conn.execute_batch(
+            "CREATE TABLE positions_v3 (
+                wiki TEXT NOT NULL DEFAULT '',
+                lang TEXT NOT NULL,
+                title TEXT NOT NULL,
+                revid INTEGER NOT NULL DEFAULT 0,
+                scroll INTEGER NOT NULL DEFAULT 0,
+                folds TEXT NOT NULL DEFAULT '',
+                anchor TEXT,
+                updated_at INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (wiki, lang, title)
+            );
+            INSERT INTO positions_v3 (wiki, lang, title, revid, scroll, folds, anchor, updated_at)
+                SELECT '', lang, title, revid, scroll, folds, anchor, updated_at FROM positions;
+            DROP TABLE positions;
+            ALTER TABLE positions_v3 RENAME TO positions;
+            PRAGMA user_version = 3;",
+        )?;
+    }
     Ok(())
 }
 
@@ -630,9 +667,9 @@ mod tests {
     #[test]
     fn save_and_read_a_reading_position_round_trips() {
         let mut history = History::in_memory();
-        assert!(history.position("en", "Alan Turing").is_none());
-        history.save_position("en", "Alan Turing", 42, 17, &[3, 8], Some("Legacy"));
-        let pos = history.position("en", "Alan Turing").expect("saved");
+        assert!(history.position("", "en", "Alan Turing").is_none());
+        history.save_position("", "en", "Alan Turing", 42, 17, &[3, 8], Some("Legacy"));
+        let pos = history.position("", "en", "Alan Turing").expect("saved");
         assert_eq!(pos.revid, 42);
         assert_eq!(pos.scroll, 17);
         assert_eq!(pos.folds, vec![3, 8]);
@@ -642,9 +679,9 @@ mod tests {
     #[test]
     fn saving_a_position_replaces_the_prior_one_for_that_article() {
         let mut history = History::in_memory();
-        history.save_position("en", "Alan Turing", 1, 5, &[], None);
-        history.save_position("en", "Alan Turing", 2, 30, &[], Some("History"));
-        let pos = history.position("en", "Alan Turing").unwrap();
+        history.save_position("", "en", "Alan Turing", 1, 5, &[], None);
+        history.save_position("", "en", "Alan Turing", 2, 30, &[], Some("History"));
+        let pos = history.position("", "en", "Alan Turing").unwrap();
         assert_eq!(pos.revid, 2);
         assert_eq!(pos.scroll, 30);
         assert_eq!(pos.anchor.as_deref(), Some("History"));
@@ -655,12 +692,87 @@ mod tests {
         let path = temp_path();
         {
             let mut history = History::open_at(&path);
-            history.save_position("en", "Alan Turing", 7, 12, &[1], Some("Career"));
+            history.save_position("", "en", "Alan Turing", 7, 12, &[1], Some("Career"));
         }
         let reopened = History::open_at(&path);
-        let pos = reopened.position("en", "Alan Turing").expect("persisted");
+        let pos = reopened
+            .position("", "en", "Alan Turing")
+            .expect("persisted");
         assert_eq!(pos.scroll, 12);
         assert_eq!(pos.folds, vec![1]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// PRD FR-ML-4: a saved position is scoped to its wiki, so the *same*
+    /// `(lang, title)` on two different wikis keeps two independent positions
+    /// — a resume never restores one wiki's scroll/fold onto another wiki's
+    /// same-titled article.
+    #[test]
+    fn positions_are_isolated_per_wiki() {
+        let mut history = History::in_memory();
+        history.save_position("", "en", "Mercury", 1, 10, &[], Some("Planet"));
+        history.save_position(
+            "wiktionary",
+            "en",
+            "Mercury",
+            2,
+            90,
+            &[3],
+            Some("Etymology"),
+        );
+
+        let default = history.position("", "en", "Mercury").expect("default wiki");
+        assert_eq!(default.scroll, 10);
+        assert_eq!(default.anchor.as_deref(), Some("Planet"));
+
+        let sister = history
+            .position("wiktionary", "en", "Mercury")
+            .expect("sister wiki");
+        assert_eq!(sister.scroll, 90);
+        assert_eq!(sister.folds, vec![3]);
+
+        assert!(
+            history.position("wikivoyage", "en", "Mercury").is_none(),
+            "a third wiki has its own (empty) position, never another wiki's"
+        );
+    }
+
+    /// Migration proof (PRD FR-ML-4): a v2 database (positions with no wiki
+    /// column) migrates to v3 with every existing row preserved under the
+    /// empty/default-Wikipedia scope — no position is lost when wiki scoping
+    /// is introduced.
+    #[test]
+    fn a_v2_position_migrates_forward_as_the_default_wiki() {
+        let path = temp_path();
+        {
+            // Hand-build the exact v2 schema and seed one row, bypassing the
+            // v3-aware `save_position`.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE positions (
+                    lang TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    revid INTEGER NOT NULL DEFAULT 0,
+                    scroll INTEGER NOT NULL DEFAULT 0,
+                    folds TEXT NOT NULL DEFAULT '',
+                    anchor TEXT,
+                    updated_at INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (lang, title)
+                );
+                INSERT INTO positions (lang, title, revid, scroll, folds, anchor, updated_at)
+                    VALUES ('en', 'Alan Turing', 7, 33, '1,4', 'Career', 100);
+                PRAGMA user_version = 2;",
+            )
+            .unwrap();
+        }
+        // Opening runs the v2 -> v3 migration.
+        let history = History::open_at(&path);
+        let pos = history
+            .position("", "en", "Alan Turing")
+            .expect("the pre-wiki row must survive as the default wiki");
+        assert_eq!(pos.scroll, 33);
+        assert_eq!(pos.folds, vec![1, 4]);
+        assert_eq!(pos.anchor.as_deref(), Some("Career"));
         let _ = std::fs::remove_file(&path);
     }
 

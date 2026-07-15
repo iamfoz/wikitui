@@ -35,6 +35,13 @@ pub type TabId = u64;
 /// reuses this type directly rather than a parallel copy).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryEntry {
+    /// The wiki scope (`api::wiki_scope`) this entry was read on (PRD
+    /// FR-ML-4), so back/forward re-reads the *right* wiki's cache even after
+    /// `:wiki` switched the active wiki. `#[serde(default)]` (empty =
+    /// default Wikipedia) so a back/forward stack persisted before wiki
+    /// scoping existed restores as the default wiki.
+    #[serde(default)]
+    pub wiki: String,
     pub lang: String,
     pub title: String,
     pub scroll: u16,
@@ -75,6 +82,14 @@ pub struct Tab {
     /// history entries and background completions restore/route to the right
     /// wiki even after `:lang` changed the app-global default.
     pub lang: String,
+    /// PRD FR-ML-4: the wiki scope (`api::wiki_scope`) this tab's article was
+    /// fetched from — the *tab's own* wiki, frozen at open time. Every cache
+    /// read/write and session-state lookup this tab drives keys on this, not
+    /// on `App`'s current active wiki, so a `:wiki` switch changes only what
+    /// *new* opens address while every existing tab keeps serving — and
+    /// caching — its own wiki's content. Empty string is the default
+    /// Wikipedia scope (see `api::wiki_scope`).
+    pub wiki: String,
     pub doc: Option<Document>,
     pub links: Vec<LinkRef>,
     pub focused_link: Option<usize>,
@@ -148,11 +163,14 @@ pub struct Tab {
 }
 
 impl Tab {
-    /// A fresh, empty tab for `lang`.
+    /// A fresh, empty tab for `lang` on the default (Wikipedia) wiki scope.
+    /// The wiki is set to the article's real scope when a document is
+    /// installed (`App::set_document`) or a background load completes.
     pub fn new(id: TabId, lang: String) -> Self {
         Self {
             id,
             lang,
+            wiki: String::new(),
             doc: None,
             links: Vec::new(),
             focused_link: None,
@@ -272,6 +290,7 @@ impl Tab {
     /// article onto a stack before navigating away.
     pub fn current_entry(&self) -> Option<HistoryEntry> {
         self.doc.as_ref().map(|d| HistoryEntry {
+            wiki: self.wiki.clone(),
             lang: self.lang.clone(),
             title: d.title.clone(),
             scroll: self.scroll,
@@ -302,11 +321,13 @@ mod tests {
         tab.scroll = 12;
         tab.focused_link = Some(0);
         tab.back_stack.push(HistoryEntry {
+            wiki: String::new(),
             lang: "en".to_string(),
             title: "Earlier Article".to_string(),
             scroll: 3,
         });
         tab.forward_stack.push(HistoryEntry {
+            wiki: String::new(),
             lang: "en".to_string(),
             title: "Later Article".to_string(),
             scroll: 0,

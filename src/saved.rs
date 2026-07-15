@@ -735,8 +735,8 @@ mod tests {
         // A cache with an absurdly small cap; writing two entries forces the
         // LRU eviction path to run.
         let cache = PageCache::at(cache_dir, 64, crate::cache::FRESH_TTL_SECS, u64::MAX);
-        cache.put("en", "One", &"x".repeat(4096), 1, None);
-        cache.put("en", "Two", &"y".repeat(4096), 2, None);
+        cache.put("", "en", "One", &"x".repeat(4096), 1, None);
+        cache.put("", "en", "Two", &"y".repeat(4096), 2, None);
 
         // The saved page is untouched by any of that.
         assert!(

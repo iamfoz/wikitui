@@ -163,11 +163,14 @@ pub struct InterestModel {
     /// twice or against a second, independently-read "now".
     #[serde(default)]
     last_update: i64,
-    /// Session-only `title -> cleaned categories` cache (see the module doc
-    /// comment): powers `affinity_of_title` (the w3 term) and `morelike_seeds`.
-    /// Never serialized — `interest.json` is the category vector alone.
+    /// Session-only `(wiki, title) -> cleaned categories` cache (see the
+    /// module doc comment): powers `affinity_of_title` (the w3 term) and
+    /// `morelike_seeds`. Keyed by wiki scope too (PRD FR-ML-4) so a
+    /// same-titled article on a different wiki never lends its categories to
+    /// this one's affinity. Never serialized — `interest.json` is the
+    /// category vector alone.
     #[serde(skip)]
-    article_categories: HashMap<String, Vec<String>>,
+    article_categories: HashMap<(String, String), Vec<String>>,
 }
 
 fn default_half_life() -> f64 {
@@ -245,13 +248,13 @@ impl InterestModel {
     /// `morelike_seeds`). This is the one place a signal and a categories-cache
     /// update happen together, because "we now know this article's categories"
     /// and "the article was opened" are the same event.
-    pub fn note_open(&mut self, title: &str, raw_categories: &[String], now: i64) {
+    pub fn note_open(&mut self, wiki: &str, title: &str, raw_categories: &[String], now: i64) {
         let clean = clean_categories(raw_categories);
         self.decay(now);
         for cat in &clean {
             *self.categories.entry(cat.clone()).or_insert(0.0) += SIGNAL_OPEN;
         }
-        self.remember_article(title, clean);
+        self.remember_article(wiki, title, clean);
     }
 
     /// Apply `amount` (a signal weight) to `title`'s known categories, if we
@@ -260,8 +263,18 @@ impl InterestModel {
     /// session), which the caller surfaces rather than silently doing nothing.
     /// The bookmark/save/scroll/dwell/not-interested signals all route through
     /// here.
-    pub fn apply_signal_for_title(&mut self, title: &str, amount: f64, now: i64) -> bool {
-        let Some(clean) = self.article_categories.get(title).cloned() else {
+    pub fn apply_signal_for_title(
+        &mut self,
+        wiki: &str,
+        title: &str,
+        amount: f64,
+        now: i64,
+    ) -> bool {
+        let Some(clean) = self
+            .article_categories
+            .get(&(wiki.to_string(), title.to_string()))
+            .cloned()
+        else {
             return false;
         };
         if clean.is_empty() {
@@ -277,8 +290,8 @@ impl InterestModel {
     /// FR-PF-3's explicit "not interested": tank `title`'s categories by
     /// [`SIGNAL_NOT_INTERESTED`]. Convenience wrapper over
     /// [`apply_signal_for_title`].
-    pub fn not_interested(&mut self, title: &str, now: i64) -> bool {
-        self.apply_signal_for_title(title, SIGNAL_NOT_INTERESTED, now)
+    pub fn not_interested(&mut self, wiki: &str, title: &str, now: i64) -> bool {
+        self.apply_signal_for_title(wiki, title, SIGNAL_NOT_INTERESTED, now)
     }
 
     /// Store `title`'s cleaned categories in the session cache, bounding it so
@@ -286,31 +299,33 @@ impl InterestModel {
     /// arbitrarily-chosen oldest-by-key entry is dropped — this is a
     /// best-effort lookup cache for w3/morelike, not the model, so a cache miss
     /// only means "no affinity boost for that target," never wrong data.
-    fn remember_article(&mut self, title: &str, clean: Vec<String>) {
+    fn remember_article(&mut self, wiki: &str, title: &str, clean: Vec<String>) {
         const MAX_ARTICLE_CATEGORIES: usize = 512;
-        if !self.article_categories.contains_key(title)
+        let key = (wiki.to_string(), title.to_string());
+        if !self.article_categories.contains_key(&key)
             && self.article_categories.len() >= MAX_ARTICLE_CATEGORIES
             && let Some(victim) = self.article_categories.keys().next().cloned()
         {
             self.article_categories.remove(&victim);
         }
-        self.article_categories.insert(title.to_string(), clean);
+        self.article_categories.insert(key, clean);
     }
 
-    /// Whether this title's categories are already known this session (in the
-    /// article cache) — so the caller can skip re-fetching them and apply the
-    /// open signal from the cache instead.
-    pub fn knows_categories(&self, title: &str) -> bool {
-        self.article_categories.contains_key(title)
-    }
-
-    /// The summed affinity of `title`'s categories — the FR-PF-1 w3 term for a
-    /// link *to* this title. `0.0` for a title whose categories we haven't seen
-    /// this session (see the module doc comment's w3 section): unknown targets
-    /// get no affinity boost, they never get a fabricated one.
-    pub fn affinity_of_title(&self, title: &str) -> f64 {
+    /// Whether this `(wiki, title)`'s categories are already known this session
+    /// (in the article cache) — so the caller can skip re-fetching them and
+    /// apply the open signal from the cache instead.
+    pub fn knows_categories(&self, wiki: &str, title: &str) -> bool {
         self.article_categories
-            .get(title)
+            .contains_key(&(wiki.to_string(), title.to_string()))
+    }
+
+    /// The summed affinity of `(wiki, title)`'s categories — the FR-PF-1 w3
+    /// term for a link *to* this title. `0.0` for a title whose categories we
+    /// haven't seen this session (see the module doc comment's w3 section):
+    /// unknown targets get no affinity boost, they never get a fabricated one.
+    pub fn affinity_of_title(&self, wiki: &str, title: &str) -> f64 {
+        self.article_categories
+            .get(&(wiki.to_string(), title.to_string()))
             .map(|cats| self.sum_affinity(cats))
             .unwrap_or(0.0)
     }
@@ -350,7 +365,15 @@ impl InterestModel {
         let mut seeds: Vec<MorelikeSeed> = recent_titles
             .iter()
             .filter_map(|title| {
-                let cats = self.article_categories.get(title)?;
+                // Recent-reads arrive as bare titles, so a seed matches this
+                // title in *any* wiki scope (PRD FR-ML-4): the category cache
+                // is `(wiki, title)`-keyed, but seed selection is a heuristic
+                // over "articles you engaged with", not a wiki-exact lookup.
+                let cats = self
+                    .article_categories
+                    .iter()
+                    .find(|((_, t), _)| t == title)
+                    .map(|(_, cats)| cats)?;
                 let affinity = self.sum_affinity(cats);
                 if affinity <= 0.0 {
                     return None;
@@ -580,6 +603,7 @@ mod tests {
     fn open_signal_adds_one_to_each_topic_category() {
         let mut m = InterestModel::new(30.0);
         m.note_open(
+            "",
             "Enigma machine",
             &cats(&["Category:Cryptography", "Category:Encryption devices"]),
             1_000,
@@ -592,16 +616,16 @@ mod tests {
     fn each_signal_type_adds_its_documented_amount() {
         let mut m = InterestModel::new(30.0);
         // Seed the article's categories (an open) so title-keyed signals apply.
-        m.note_open("Enigma machine", &cats(&["Category:Cryptography"]), 0);
+        m.note_open("", "Enigma machine", &cats(&["Category:Cryptography"]), 0);
         assert_eq!(score(&m, "Cryptography"), 1.0, "open = +1.0");
 
-        assert!(m.apply_signal_for_title("Enigma machine", SIGNAL_BOOKMARK, 0));
+        assert!(m.apply_signal_for_title("", "Enigma machine", SIGNAL_BOOKMARK, 0));
         assert_eq!(score(&m, "Cryptography"), 1.0 + 3.0, "bookmark = +3.0");
 
-        assert!(m.apply_signal_for_title("Enigma machine", SIGNAL_SAVE, 0));
+        assert!(m.apply_signal_for_title("", "Enigma machine", SIGNAL_SAVE, 0));
         assert_eq!(score(&m, "Cryptography"), 4.0 + 5.0, "save = +5.0");
 
-        assert!(m.apply_signal_for_title("Enigma machine", SIGNAL_SCROLL, 0));
+        assert!(m.apply_signal_for_title("", "Enigma machine", SIGNAL_SCROLL, 0));
         assert_eq!(score(&m, "Cryptography"), 9.0 + 1.0, "scroll = +1.0");
     }
 
@@ -609,7 +633,7 @@ mod tests {
     fn a_signal_for_an_unknown_article_is_a_no_op_and_reports_false() {
         let mut m = InterestModel::new(30.0);
         assert!(
-            !m.apply_signal_for_title("Never Opened", SIGNAL_BOOKMARK, 0),
+            !m.apply_signal_for_title("", "Never Opened", SIGNAL_BOOKMARK, 0),
             "no categories known → no-op, reported to the caller"
         );
         assert!(m.is_empty());
@@ -630,12 +654,12 @@ mod tests {
     #[test]
     fn not_interested_tanks_the_articles_categories() {
         let mut m = InterestModel::new(30.0);
-        m.note_open("Enigma machine", &cats(&["Category:Cryptography"]), 0);
+        m.note_open("", "Enigma machine", &cats(&["Category:Cryptography"]), 0);
         // A few positive signals build it up...
-        m.apply_signal_for_title("Enigma machine", SIGNAL_SAVE, 0);
+        m.apply_signal_for_title("", "Enigma machine", SIGNAL_SAVE, 0);
         assert!(score(&m, "Cryptography") > 0.0);
         // ...then "not interested" drives it strongly negative.
-        assert!(m.not_interested("Enigma machine", 0));
+        assert!(m.not_interested("", "Enigma machine", 0));
         assert_eq!(score(&m, "Cryptography"), 1.0 + 5.0 - 10.0);
         assert!(
             score(&m, "Cryptography") < 0.0,
@@ -650,7 +674,7 @@ mod tests {
         let mut m = InterestModel::new(30.0);
         // +4.0 to Cryptography at t0 (four opens, say).
         for _ in 0..4 {
-            m.note_open("X", &cats(&["Category:Cryptography"]), 0);
+            m.note_open("", "X", &cats(&["Category:Cryptography"]), 0);
         }
         assert_eq!(score(&m, "Cryptography"), 4.0);
         // Decay to exactly one half-life later: 4.0 -> 2.0.
@@ -666,10 +690,10 @@ mod tests {
         let mut m = InterestModel::new(30.0);
         // Build Cryptography to 4.0 at t0.
         for _ in 0..4 {
-            m.note_open("X", &cats(&["Category:Cryptography"]), 0);
+            m.note_open("", "X", &cats(&["Category:Cryptography"]), 0);
         }
         // One half-life later, a fresh open (+1.0). Decay-then-add: 4*0.5 + 1.
-        m.note_open("Y", &cats(&["Category:Cryptography"]), 30 * DAY);
+        m.note_open("", "Y", &cats(&["Category:Cryptography"]), 30 * DAY);
         assert!(
             (score(&m, "Cryptography") - 3.0).abs() < 1e-9,
             "decay (4->2) then add (+1) = 3.0, not (4+1) then decay"
@@ -679,7 +703,7 @@ mod tests {
     #[test]
     fn decayed_near_zero_scores_are_pruned_to_keep_the_file_small() {
         let mut m = InterestModel::new(30.0);
-        m.note_open("X", &cats(&["Category:Cryptography"]), 0);
+        m.note_open("", "X", &cats(&["Category:Cryptography"]), 0);
         // Many half-lives later the score is negligible and dropped entirely.
         m.decay(3000 * DAY);
         assert!(
@@ -693,13 +717,18 @@ mod tests {
     #[test]
     fn affinity_of_a_seen_title_sums_its_categories_unseen_is_zero() {
         let mut m = InterestModel::new(30.0);
-        m.note_open("Enigma machine", &cats(&["Category:Cryptography"]), 0);
-        m.apply_signal_for_title("Enigma machine", SIGNAL_SAVE, 0); // Crypto = 6.0
-        m.note_open("Computer science", &cats(&["Category:Computer science"]), 0); // CS = 1.0
-        assert_eq!(m.affinity_of_title("Enigma machine"), 6.0);
-        assert_eq!(m.affinity_of_title("Computer science"), 1.0);
+        m.note_open("", "Enigma machine", &cats(&["Category:Cryptography"]), 0);
+        m.apply_signal_for_title("", "Enigma machine", SIGNAL_SAVE, 0); // Crypto = 6.0
+        m.note_open(
+            "",
+            "Computer science",
+            &cats(&["Category:Computer science"]),
+            0,
+        ); // CS = 1.0
+        assert_eq!(m.affinity_of_title("", "Enigma machine"), 6.0);
+        assert_eq!(m.affinity_of_title("", "Computer science"), 1.0);
         assert_eq!(
-            m.affinity_of_title("Some Unread Target"),
+            m.affinity_of_title("", "Some Unread Target"),
             0.0,
             "an unseen target gets no fabricated affinity (the w3 resolution)"
         );
@@ -713,13 +742,19 @@ mod tests {
         // Enigma carries two crypto-ish topics and gets saved → highest
         // article affinity; Alan Turing shares only one; CS is unrelated.
         m.note_open(
+            "",
             "Enigma machine",
             &cats(&["Category:Cryptography", "Category:Encryption devices"]),
             0,
         );
-        m.note_open("Alan Turing", &cats(&["Category:Cryptography"]), 0);
-        m.apply_signal_for_title("Enigma machine", SIGNAL_SAVE, 0); // Crypto & EncDev boosted
-        m.note_open("Computer science", &cats(&["Category:Computer science"]), 0);
+        m.note_open("", "Alan Turing", &cats(&["Category:Cryptography"]), 0);
+        m.apply_signal_for_title("", "Enigma machine", SIGNAL_SAVE, 0); // Crypto & EncDev boosted
+        m.note_open(
+            "",
+            "Computer science",
+            &cats(&["Category:Computer science"]),
+            0,
+        );
 
         let recent = cats(&["Computer science", "Alan Turing", "Enigma machine"]);
         let seeds = m.morelike_seeds(&recent, 2);
@@ -735,8 +770,8 @@ mod tests {
     #[test]
     fn morelike_seeds_skip_vetoed_and_unknown_articles() {
         let mut m = InterestModel::new(30.0);
-        m.note_open("Enigma machine", &cats(&["Category:Cryptography"]), 0);
-        m.not_interested("Enigma machine", 0); // now negative affinity
+        m.note_open("", "Enigma machine", &cats(&["Category:Cryptography"]), 0);
+        m.not_interested("", "Enigma machine", 0); // now negative affinity
         let recent = cats(&["Enigma machine", "Never Opened"]);
         assert!(
             m.morelike_seeds(&recent, 5).is_empty(),
@@ -755,8 +790,8 @@ mod tests {
         ));
         let path = dir.join("interest.json");
         let mut m = InterestModel::new(30.0);
-        m.note_open("Enigma machine", &cats(&["Category:Cryptography"]), 42);
-        m.apply_signal_for_title("Enigma machine", SIGNAL_BOOKMARK, 42);
+        m.note_open("", "Enigma machine", &cats(&["Category:Cryptography"]), 42);
+        m.apply_signal_for_title("", "Enigma machine", SIGNAL_BOOKMARK, 42);
         m.save(&path).expect("save");
 
         // The file is human-readable JSON naming the category and its score.
@@ -786,9 +821,9 @@ mod tests {
     #[test]
     fn top_categories_orders_by_score_then_name() {
         let mut m = InterestModel::new(30.0);
-        m.note_open("A", &cats(&["Category:Zebra topic"]), 0);
-        m.note_open("B", &cats(&["Category:Cryptography"]), 0);
-        m.apply_signal_for_title("B", SIGNAL_SAVE, 0); // Crypto highest
+        m.note_open("", "A", &cats(&["Category:Zebra topic"]), 0);
+        m.note_open("", "B", &cats(&["Category:Cryptography"]), 0);
+        m.apply_signal_for_title("", "B", SIGNAL_SAVE, 0); // Crypto highest
         let top = m.top_categories(10);
         assert_eq!(top[0].0, "Cryptography");
         assert_eq!(top[1].0, "Zebra topic");

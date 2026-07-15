@@ -57,17 +57,18 @@ fn visited_titles_for<'a>(app: &'a App, tab: &'a crate::tab::Tab) -> HashSet<&'a
 /// built fresh each draw exactly like `visited_titles` reads
 /// `history::History` fresh each draw rather than caching a snapshot.
 fn confirmed_redlink_titles(app: &App) -> HashSet<&str> {
-    confirmed_redlink_titles_for(app, &app.active_tab().lang)
+    let tab = app.active_tab();
+    confirmed_redlink_titles_for(app, &tab.wiki, &tab.lang)
 }
 
-/// PRD FR-DL-5 confirmed redlinks for a *specific* wiki edition (split panes
-/// may hold two languages). The active-tab [`confirmed_redlink_titles`]
-/// delegates here.
-fn confirmed_redlink_titles_for<'a>(app: &'a App, lang: &str) -> HashSet<&'a str> {
+/// PRD FR-DL-5 confirmed redlinks for a *specific* wiki+language edition
+/// (split panes may hold two editions, and a `:wiki` switch two projects).
+/// The active-tab [`confirmed_redlink_titles`] delegates here.
+fn confirmed_redlink_titles_for<'a>(app: &'a App, wiki: &str, lang: &str) -> HashSet<&'a str> {
     app.confirmed_redlinks
         .iter()
-        .filter(|(l, _)| l == lang)
-        .map(|(_, title)| title.as_str())
+        .filter(|(w, l, _)| w == wiki && l == lang)
+        .map(|(_, _, title)| title.as_str())
         .collect()
 }
 
@@ -1176,7 +1177,7 @@ fn paint_pane(
     match layout {
         Some(layout) => {
             let visited = visited_titles_for(app, tab);
-            let redlinks = confirmed_redlink_titles_for(app, &tab.lang);
+            let redlinks = confirmed_redlink_titles_for(app, &tab.wiki, &tab.lang);
             let text = paint_document(
                 &layout.lines,
                 tab.focused_link,
@@ -1424,7 +1425,7 @@ fn draw_results(frame: &mut Frame, app: &App, area: Rect) {
             // right after the search that produced these results), so a wiki
             // with no PageAssessments support (or an unassessed title) simply
             // shows no prefix.
-            let title = match app.quality_badge_for(&r.title) {
+            let title = match app.quality_badge_for(app.active_wiki_scope(), &r.title) {
                 Some(badge) => format!("{badge} {}", r.title),
                 None => r.title.clone(),
             };

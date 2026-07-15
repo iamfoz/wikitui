@@ -190,6 +190,37 @@ impl ParserMode {
     }
 }
 
+/// The stable per-wiki key that scopes the page cache, the session-state
+/// maps, and reading-position memory (PRD FR-ML-4/5). Derived from the
+/// registry *name* the reader selected via `active_wiki`/`:wiki <name>`,
+/// which is lang-independent and stable across a session and across runs.
+///
+/// The primary `"wikipedia"` entry maps to the **empty** scope on purpose:
+/// its on-disk cache layout (`blob/{lang}/…`, `page/{lang}/…`) and every
+/// session-map key then stay byte-identical to the pre-multi-wiki code, so
+/// a normal Wikipedia session behaves exactly as before *and* every cache
+/// entry written before wikis could be switched (all of which were, by
+/// construction, Wikipedia's) is read back transparently as this wiki's —
+/// no migration pass, no refetch storm. Every other wiki gets its own
+/// registry name as a distinct scope, so a `:wiki`-switched article can
+/// never be served another wiki's cached copy of the same `(lang, title)`.
+///
+/// The name — not the resolved host — is the key because it is the identity
+/// the reader actually chose and it needs no host parsing or `{lang}`
+/// substitution. Two differently-named `[wiki.<name>]` sections that happen
+/// to point at the same host keep separate caches; that is a negligible
+/// duplication, never a correctness problem, whereas the reverse (a
+/// collision) is exactly the bug this scoping fixes. The mapping is a
+/// bijection (`""`⇄`"wikipedia"`, every other name maps to itself), so the
+/// registry name is always recoverable from a stored scope.
+pub fn wiki_scope(name: &str) -> &str {
+    if name == crate::sisters::WIKIPEDIA.name {
+        ""
+    } else {
+        name
+    }
+}
+
 /// One entry in the client's wiki registry (PRD FR-ML-4/5): everything
 /// needed to point requests at a wiki by name — built once at startup from
 /// `config::ResolvedWikiRegistry` (Wikipedia, the four sister projects, and
@@ -784,6 +815,14 @@ impl WikiClient {
             .unwrap_or_else(|e| e.into_inner())
             .name
             .clone()
+    }
+
+    /// The wiki-scope key for the wiki this client currently addresses — see
+    /// the free function [`wiki_scope`]. Threaded into every cache read/write
+    /// and session-state key so a `:wiki`-switched article never collides
+    /// with another wiki's cached copy of the same `(lang, title)`.
+    pub fn wiki_scope(&self) -> String {
+        wiki_scope(&self.active.read().unwrap_or_else(|e| e.into_inner()).name).to_string()
     }
 
     /// The current wiki's feature-degradation matrix (PRD FR-ML-5) — cheap

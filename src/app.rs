@@ -668,7 +668,7 @@ pub struct App {
     /// `main::open_title`/`open_history_entry` (one title) and `main::
     /// run_search` (one batched call for every result row) — never a
     /// per-article fanout (§6.2 rule 10 / NF-NET-5).
-    pub quality_cache: HashMap<(String, String), crate::api::QualityClass>,
+    pub quality_cache: HashMap<(String, String, String), crate::api::QualityClass>,
     /// PRD FR-DL-5: `(lang, title)` pairs the batched `generator=links&
     /// prop=info` missing-flag check has confirmed don't exist — the
     /// async-checked complement to a `LinkRef`'s own parse-time `redlink`
@@ -677,12 +677,12 @@ pub struct App {
     /// coloring) and by `is_redlink` before following a link, so a redlink
     /// this session already confirmed never even attempts a fetch that would
     /// just 404 a second time.
-    pub confirmed_redlinks: HashSet<(String, String)>,
+    pub confirmed_redlinks: HashSet<(String, String, String)>,
     /// PRD FR-DL-5: `(lang, title)` source articles `enrich_article`'s
     /// batched `generator=links&prop=info` check has already run for this
     /// session — a source with zero redlinks would otherwise leave no trace
     /// in `confirmed_redlinks` and get re-checked on every revisit.
-    pub checked_redlink_sources: HashSet<(String, String)>,
+    pub checked_redlink_sources: HashSet<(String, String, String)>,
     /// The `(lang, title)` the redlink card (PRD FR-DL-5 / §7 "Redlink
     /// followed") is currently showing — `Some` exactly while `mode ==
     /// Mode::RedlinkCard`. Mirrors `offline_card_target`'s shape.
@@ -763,7 +763,7 @@ pub struct App {
     /// panel never re-fetches for an article it has already shown this
     /// session (switching tabs, reopening the panel, revisiting the
     /// article). Never persisted — a fresh launch starts empty.
-    pub related_cache: HashMap<(String, String), Vec<SearchResult>>,
+    pub related_cache: HashMap<(String, String, String), Vec<SearchResult>>,
     /// Selection cursor into `App::related_items()`.
     pub selected_related: usize,
     /// The mode `open_related` was entered from, restored on close.
@@ -787,7 +787,7 @@ pub struct App {
     /// `related_cache`'s shape and reasoning: switching tabs, reopening the
     /// picker, or revisiting the article later are all cache hits. Never
     /// persisted.
-    pub langlinks_cache: HashMap<(String, String), Vec<crate::api::LangLink>>,
+    pub langlinks_cache: HashMap<(String, String, String), Vec<crate::api::LangLink>>,
     /// Selection cursor into `App::lang_picker_rows()`.
     pub selected_lang: usize,
     /// The mode `open_lang_picker` was entered from, restored on close.
@@ -843,7 +843,7 @@ pub struct App {
     /// shares the same "fetched lazily, never blocks, cached for the session"
     /// idiom as `related_cache`/`langlinks_cache`, and doubles as the peek's
     /// loading indicator (absent entry = still loading). Never persisted.
-    pub summary_cache: HashMap<(String, String), crate::api::SummaryData>,
+    pub summary_cache: HashMap<(String, String, String), crate::api::SummaryData>,
     /// A link-preview summary fetch for the open popup is in flight (PRD
     /// FR-NV-5's "don't block; show loading… then fill") — mirrors
     /// `related_loading` for the scoped-poll keep-awake.
@@ -1467,16 +1467,16 @@ impl App {
     /// whose categories are already cached this session, `raw_categories` may
     /// be empty — the model applies the open signal from the cached categories.
     /// Persists the model afterward (best-effort).
-    pub fn note_article_read(&mut self, title: &str, raw_categories: &[String]) {
+    pub fn note_article_read(&mut self, wiki: &str, title: &str, raw_categories: &[String]) {
         if !self.interest_active() {
             return;
         }
         let now = Self::interest_now();
-        if self.interest.knows_categories(title) {
+        if self.interest.knows_categories(wiki, title) {
             self.interest
-                .apply_signal_for_title(title, crate::interest::SIGNAL_OPEN, now);
+                .apply_signal_for_title(wiki, title, crate::interest::SIGNAL_OPEN, now);
         } else {
-            self.interest.note_open(title, raw_categories, now);
+            self.interest.note_open(wiki, title, raw_categories, now);
         }
         self.persist_interest();
     }
@@ -1493,9 +1493,10 @@ impl App {
         let Some(title) = self.active_tab().doc.as_ref().map(|d| d.title.clone()) else {
             return false;
         };
-        let changed = self
-            .interest
-            .apply_signal_for_title(&title, amount, Self::interest_now());
+        let wiki = self.active_tab().wiki.clone();
+        let changed =
+            self.interest
+                .apply_signal_for_title(&wiki, &title, amount, Self::interest_now());
         if changed {
             self.persist_interest();
         }
@@ -1519,7 +1520,11 @@ impl App {
             self.notice = Some("No article open".to_string());
             return;
         };
-        if self.interest.not_interested(&title, Self::interest_now()) {
+        let wiki = self.active_tab().wiki.clone();
+        if self
+            .interest
+            .not_interested(&wiki, &title, Self::interest_now())
+        {
             self.persist_interest();
             self.notice = Some(format!(
                 "Marked \"{title}\" not interesting — its topics dropped"
@@ -1979,15 +1984,16 @@ impl App {
 
     // -- Related panel (PRD FR-SR-6) -----------------------------------------
 
-    /// The active tab's `(lang, title)` session-cache key, or `None` when no
-    /// document is open — shared by the Related panel (nothing to be
-    /// "related to" then) and the language picker (nothing to fetch
-    /// langlinks for).
-    fn current_article_key(&self) -> Option<(String, String)> {
+    /// The active tab's `(wiki, lang, title)` session-cache key, or `None`
+    /// when no document is open — shared by the Related panel (nothing to be
+    /// "related to" then) and the language picker (nothing to fetch langlinks
+    /// for). The wiki dimension (PRD FR-ML-4) keeps a same-titled article on
+    /// two different wikis from colliding in any of the session maps.
+    fn current_article_key(&self) -> Option<(String, String, String)> {
         let tab = self.active_tab();
         tab.doc
             .as_ref()
-            .map(|doc| (tab.lang.clone(), doc.title.clone()))
+            .map(|doc| (tab.wiki.clone(), tab.lang.clone(), doc.title.clone()))
     }
 
     /// Opens the Related panel for the active tab's article. Returns
@@ -2078,14 +2084,15 @@ impl App {
     /// update if the panel is still showing exactly this article.
     pub fn deliver_related(
         &mut self,
+        wiki: String,
         lang: String,
         title: String,
         result: Result<Vec<SearchResult>, String>,
     ) {
         let items = result.unwrap_or_default();
         let is_current_and_open = self.mode == Mode::Related
-            && self.current_article_key() == Some((lang.clone(), title.clone()));
-        self.related_cache.insert((lang, title), items);
+            && self.current_article_key() == Some((wiki.clone(), lang.clone(), title.clone()));
+        self.related_cache.insert((wiki, lang, title), items);
         if is_current_and_open {
             self.related_loading = false;
             self.status = if self.related_items().is_empty() {
@@ -2218,13 +2225,15 @@ impl App {
     /// to surface passively.
     pub fn deliver_langlinks(
         &mut self,
+        wiki: String,
         lang: String,
         title: String,
         result: Result<Vec<crate::api::LangLink>, String>,
     ) {
         let links = result.unwrap_or_default();
-        let is_current = self.current_article_key() == Some((lang.clone(), title.clone()));
-        self.langlinks_cache.insert((lang, title), links);
+        let is_current =
+            self.current_article_key() == Some((wiki.clone(), lang.clone(), title.clone()));
+        self.langlinks_cache.insert((wiki, lang, title), links);
         if is_current {
             self.refresh_language_hint();
             if self.mode == Mode::LangPicker {
@@ -2254,6 +2263,17 @@ impl App {
 
     pub fn active_tab_mut(&mut self) -> &mut Tab {
         &mut self.tabs[self.active]
+    }
+
+    /// The cache/session-state scope key (`api::wiki_scope`) for the wiki new
+    /// opens currently address — i.e. the app-global active wiki (PRD
+    /// FR-ML-4). A freshly installed document is stamped with this so its tab
+    /// remembers the wiki it came from; an *existing* tab keeps whatever it
+    /// was stamped with, so a `:wiki` switch never retroactively rebrands
+    /// already-open tabs. Mirrors `client.wiki_scope()` for code that only
+    /// has `&App`.
+    pub fn active_wiki_scope(&self) -> &str {
+        crate::api::wiki_scope(&self.active_wiki_name)
     }
 
     /// Index of the tab with the given stable id, if it is still open (PRD
@@ -2681,6 +2701,7 @@ impl App {
                     folded_blocks.sort_unstable();
                     session::SessionTab {
                         lang: t.lang.clone(),
+                        wiki: t.wiki.clone(),
                         title,
                         scroll: t.scroll,
                         folded_blocks,
@@ -3254,9 +3275,16 @@ impl App {
         self.citations = citations;
         self.selected_citation = 0;
 
+        let wiki = self.active_wiki_scope().to_string();
         {
             let tab = self.active_tab_mut();
             tab.lang = lang;
+            // PRD FR-ML-4: stamp the tab with the wiki this open addressed, so
+            // every cache read/write and session-state lookup it later drives
+            // keys on its own wiki — never on a subsequently-switched active
+            // wiki. Back/forward overrides this afterward for a cross-wiki
+            // history entry (see `main::open_history_entry`).
+            tab.wiki = wiki;
             tab.install_document(doc);
         }
         self.record_history_visit(index, referrer);
@@ -3358,15 +3386,16 @@ impl App {
             return;
         };
         let title = doc.title.clone();
+        let wiki = tab.wiki.clone();
         let words = crate::doc::word_count(doc);
         let expected = (words as f64 / self.reading_wpm.max(1) as f64) * 60.0;
         let amount = crate::interest::normalized_dwell(dwell_secs as i64, expected);
         if amount <= 0.0 {
             return;
         }
-        let changed = self
-            .interest
-            .apply_signal_for_title(&title, amount, Self::interest_now());
+        let changed =
+            self.interest
+                .apply_signal_for_title(&wiki, &title, amount, Self::interest_now());
         if let Some(tab) = self.tabs.get_mut(index) {
             tab.interest_dwell_signaled = true;
         }
@@ -3498,7 +3527,10 @@ impl App {
             return;
         };
         self.notice = None;
-        if let Some(page) = cache.get(&pending.lang, &pending.title) {
+        // The reload reads L2 in the active tab's own wiki scope (PRD
+        // FR-ML-4) — the wiki the revalidation wrote this content under.
+        let wiki = self.active_tab().wiki.clone();
+        if let Some(page) = cache.get(&wiki, &pending.lang, &pending.title) {
             let document = crate::doc::parse_article_html(&pending.title, &page.html);
             {
                 let tab = self.active_tab_mut();
@@ -4054,10 +4086,11 @@ impl App {
                     title: title.clone(),
                 });
                 self.mode = Mode::Peek;
-                if self
-                    .summary_cache
-                    .contains_key(&(lang.clone(), title.clone()))
-                {
+                if self.summary_cache.contains_key(&(
+                    self.active_tab().wiki.clone(),
+                    lang.clone(),
+                    title.clone(),
+                )) {
                     self.summary_loading = false;
                     self.status = "Link preview — Ctrl-o/Esc: close   Enter: open".to_string();
                     None
@@ -4086,9 +4119,13 @@ impl App {
     /// is still loading (the popup then shows "loading…").
     pub fn peek_summary(&self) -> Option<&crate::api::SummaryData> {
         match &self.peek {
-            Some(PeekPopup::LinkPreview { lang, title }) => {
-                self.summary_cache.get(&(lang.clone(), title.clone()))
-            }
+            // The preview targets an internal link in the active tab's
+            // article, so it shares that tab's wiki scope (PRD FR-ML-4).
+            Some(PeekPopup::LinkPreview { lang, title }) => self.summary_cache.get(&(
+                self.active_tab().wiki.clone(),
+                lang.clone(),
+                title.clone(),
+            )),
             _ => None,
         }
     }
@@ -4118,7 +4155,8 @@ impl App {
                 &self.peek,
                 Some(PeekPopup::LinkPreview { lang: l, title: t }) if *l == lang && *t == title
             );
-        self.summary_cache.insert((lang, title), data);
+        let wiki = self.active_tab().wiki.clone();
+        self.summary_cache.insert((wiki, lang, title), data);
         if is_current {
             self.summary_loading = false;
             self.status = "Link preview — Ctrl-o/Esc: close   Enter: open".to_string();
@@ -4213,12 +4251,20 @@ impl App {
         };
         let title = doc.title.clone();
         let lang = tab.lang.clone();
+        let wiki = tab.wiki.clone();
         let revid = tab.current_revid;
         let scroll = tab.scroll;
         let mut folds: Vec<usize> = tab.folded_blocks.iter().copied().collect();
         folds.sort_unstable();
-        self.history
-            .save_position(&lang, &title, revid, scroll, &folds, anchor.as_deref());
+        self.history.save_position(
+            &wiki,
+            &lang,
+            &title,
+            revid,
+            scroll,
+            &folds,
+            anchor.as_deref(),
+        );
     }
 
     /// PRD FR-NV-8: after installing a document, raise the "resume at §… (r)"
@@ -4238,8 +4284,9 @@ impl App {
         };
         let title = doc.title.clone();
         let lang = tab.lang.clone();
+        let wiki = tab.wiki.clone();
         let revid = tab.current_revid;
-        let Some(saved) = self.history.position(&lang, &title) else {
+        let Some(saved) = self.history.position(&wiki, &lang, &title) else {
             return;
         };
         if saved.scroll == 0 && saved.folds.is_empty() {
@@ -4522,7 +4569,9 @@ impl App {
         let Some(title) = tab.doc.as_ref().map(|d| d.title.clone()) else {
             return;
         };
+        let wiki = tab.wiki.clone();
         let changed = self.interest.apply_signal_for_title(
+            &wiki,
             &title,
             crate::interest::SIGNAL_SCROLL,
             Self::interest_now(),
@@ -4994,7 +5043,7 @@ impl App {
     pub fn is_redlink(&self, title: &str) -> bool {
         let tab = self.active_tab();
         self.confirmed_redlinks
-            .contains(&(tab.lang.clone(), title.to_string()))
+            .contains(&(tab.wiki.clone(), tab.lang.clone(), title.to_string()))
             || tab
                 .links
                 .iter()
@@ -5031,16 +5080,24 @@ impl App {
     pub fn current_quality_badge(&self) -> Option<&'static str> {
         let tab = self.active_tab();
         let title = tab.doc.as_ref()?.title.as_str();
-        self.quality_badge_for(title)
+        // The badge for the open article lives in that tab's own wiki scope.
+        self.quality_badge_for(&tab.wiki, title)
     }
 
-    /// `title`'s quality badge from the session cache, for the active tab's
-    /// language — shared by `current_quality_badge` and the search-results
-    /// list (`ui::draw_results`), so both read the exact same map regardless
-    /// of which one caused it to be populated first.
-    pub fn quality_badge_for(&self, title: &str) -> Option<&'static str> {
+    /// `title`'s quality badge from the session cache, in `wiki`'s scope for
+    /// the active tab's language — shared by `current_quality_badge` (which
+    /// passes the active tab's own wiki) and the search-results list
+    /// (`ui::draw_results`, which passes the active wiki the search ran on),
+    /// so both read the exact same map regardless of which one populated it
+    /// first. The wiki dimension (PRD FR-ML-4) keeps a same-titled article on
+    /// another wiki from showing this wiki's badge.
+    pub fn quality_badge_for(&self, wiki: &str, title: &str) -> Option<&'static str> {
         self.quality_cache
-            .get(&(self.active_tab().lang.clone(), title.to_string()))
+            .get(&(
+                wiki.to_string(),
+                self.active_tab().lang.clone(),
+                title.to_string(),
+            ))
             .map(|class| class.badge())
     }
 
@@ -5859,6 +5916,7 @@ mod tests {
         assert!(app.related_loading);
 
         app.deliver_related(
+            "".to_string(),
             "en".to_string(),
             "Alan Turing".to_string(),
             Ok(vec![related_result("Enigma machine", "cipher device")]),
@@ -5880,6 +5938,7 @@ mod tests {
         app.open_document(doc("Alan Turing"));
         app.open_related();
         app.deliver_related(
+            "".to_string(),
             "en".to_string(),
             "Alan Turing".to_string(),
             Ok(vec![
@@ -5916,6 +5975,7 @@ mod tests {
         app.open_document(doc("Alan Turing"));
         app.open_related();
         app.deliver_related(
+            "".to_string(),
             "en".to_string(),
             "Alan Turing".to_string(),
             Err("network error".to_string()),
@@ -5941,6 +6001,7 @@ mod tests {
         app.close_related(); // reader backed out before the fetch landed
 
         app.deliver_related(
+            "".to_string(),
             "en".to_string(),
             "Alan Turing".to_string(),
             Ok(vec![related_result("Enigma machine", "cipher device")]),
@@ -6127,6 +6188,7 @@ mod tests {
         assert!(app.lang_loading);
 
         app.deliver_langlinks(
+            "".to_string(),
             "en".to_string(),
             "Alan Turing".to_string(),
             Ok(vec![langlink("de", "Deutsch", "German", "Alan Turing")]),
@@ -6147,6 +6209,7 @@ mod tests {
         app.open_document(doc("Alan Turing"));
         app.open_lang_picker();
         app.deliver_langlinks(
+            "".to_string(),
             "en".to_string(),
             "Alan Turing".to_string(),
             Ok(vec![
@@ -6218,6 +6281,7 @@ mod tests {
         app.open_document(doc("Alan Turing"));
         app.open_lang_picker();
         app.deliver_langlinks(
+            "".to_string(),
             "en".to_string(),
             "Alan Turing".to_string(),
             Err("network error".to_string()),
@@ -6245,7 +6309,7 @@ mod tests {
         assert_eq!(app.lang_link_title_for_code("de"), None);
 
         app.langlinks_cache.insert(
-            ("en".to_string(), "Alan Turing".to_string()),
+            (String::new(), "en".to_string(), "Alan Turing".to_string()),
             vec![langlink("ja", "日本語", "Japanese", "アラン・チューリング")],
         );
         assert_eq!(
@@ -6750,7 +6814,7 @@ mod tests {
         // Directly seed a saved position at an anchor, with a revid that won't
         // match, to exercise the fallback path deterministically.
         app.history
-            .save_position("en", "Alan Turing", 5, 99, &[], Some("Legacy"));
+            .save_position("", "en", "Alan Turing", 5, 99, &[], Some("Legacy"));
         app.active_tab_mut().current_revid = 9; // different revision
         app.set_document(crate::doc::parse_article_html("Alan Turing", RESUME_HTML));
         assert!(app.pending_resume.is_some());
@@ -6791,7 +6855,7 @@ mod tests {
             RESUME_HTML,
         ));
         assert!(
-            app.history.position("en", "Alan Turing").is_none(),
+            app.history.position("", "en", "Alan Turing").is_none(),
             "incognito must not persist a reading position (privacy gate)"
         );
     }
@@ -7058,6 +7122,7 @@ mod tests {
             crate::cache::DEFAULT_FORCE_REFETCH_SECS,
         );
         cache.put(
+            "",
             "en",
             "Alan Turing",
             "<html><body><p>updated body</p></body></html>",
@@ -8699,6 +8764,7 @@ mod tests {
         let mut app = App::new("en".to_string(), Theme::terminal(), false);
         app.open_document(doc("Enigma machine"));
         app.note_article_read(
+            "",
             "Enigma machine",
             &cats(&[
                 "Category:Cryptography",
@@ -8722,7 +8788,7 @@ mod tests {
         let mut app = App::new("en".to_string(), Theme::terminal(), false);
         app.incognito = true;
         app.open_document(doc("Enigma machine"));
-        app.note_article_read("Enigma machine", &cats(&["Category:Cryptography"]));
+        app.note_article_read("", "Enigma machine", &cats(&["Category:Cryptography"]));
         assert!(
             app.interest.is_empty(),
             "incognito must leave the interest model untouched (privacy gate)"
@@ -8735,7 +8801,7 @@ mod tests {
         let mut app = App::new("en".to_string(), Theme::terminal(), false);
         app.interest_learning = false;
         app.open_document(doc("Enigma machine"));
-        app.note_article_read("Enigma machine", &cats(&["Category:Cryptography"]));
+        app.note_article_read("", "Enigma machine", &cats(&["Category:Cryptography"]));
         assert!(app.interest.is_empty(), "learning off → no model updates");
     }
 
@@ -8746,7 +8812,7 @@ mod tests {
         // tests and can hit the Removed branch (no signal) nondeterministically.
         let mut app = app_with_bookmarks();
         app.open_document(doc("Enigma machine"));
-        app.note_article_read("Enigma machine", &cats(&["Category:Cryptography"]));
+        app.note_article_read("", "Enigma machine", &cats(&["Category:Cryptography"]));
         app.toggle_bookmark();
         // Approximate, not exact: the two signals go through the app's real
         // wall clock (`interest_now`), so a second boundary crossing between
@@ -8764,7 +8830,7 @@ mod tests {
     fn not_interested_drives_the_current_articles_topics_negative() {
         let mut app = App::new("en".to_string(), Theme::terminal(), false);
         app.open_document(doc("Enigma machine"));
-        app.note_article_read("Enigma machine", &cats(&["Category:Cryptography"]));
+        app.note_article_read("", "Enigma machine", &cats(&["Category:Cryptography"]));
         app.mark_not_interested();
         assert!(
             score_of(&app, "Cryptography") < 0.0,
@@ -8970,8 +9036,11 @@ mod tests {
             "not yet confirmed by anything"
         );
 
-        app.confirmed_redlinks
-            .insert(("en".to_string(), "Uncharted Topic Y".to_string()));
+        app.confirmed_redlinks.insert((
+            String::new(),
+            "en".to_string(),
+            "Uncharted Topic Y".to_string(),
+        ));
         assert!(
             app.is_redlink("Uncharted Topic Y"),
             "the batched-check signal alone must be sufficient"
@@ -8984,17 +9053,17 @@ mod tests {
     fn quality_badge_for_reads_the_session_cache_by_lang_and_title() {
         let mut app = App::new("en".to_string(), Theme::terminal(), false);
         assert_eq!(
-            app.quality_badge_for("Alan Turing"),
+            app.quality_badge_for("", "Alan Turing"),
             None,
             "nothing cached yet"
         );
         app.quality_cache.insert(
-            ("en".to_string(), "Alan Turing".to_string()),
+            (String::new(), "en".to_string(), "Alan Turing".to_string()),
             crate::api::QualityClass::Fa,
         );
-        assert_eq!(app.quality_badge_for("Alan Turing"), Some("★FA"));
+        assert_eq!(app.quality_badge_for("", "Alan Turing"), Some("★FA"));
         assert_eq!(
-            app.quality_badge_for("Some Other Article"),
+            app.quality_badge_for("", "Some Other Article"),
             None,
             "a different title must not pick up an unrelated cache entry"
         );
@@ -9019,10 +9088,76 @@ mod tests {
             "open, but nothing cached for it yet"
         );
         app.quality_cache.insert(
-            ("en".to_string(), "Enigma machine".to_string()),
+            (
+                String::new(),
+                "en".to_string(),
+                "Enigma machine".to_string(),
+            ),
             crate::api::QualityClass::Ga,
         );
         assert_eq!(app.current_quality_badge(), Some("+GA"));
+    }
+
+    /// PRD FR-ML-4: a tab remembers the wiki it was opened on. Switching the
+    /// app-global active wiki afterward must not retroactively rebrand an
+    /// already-open tab — its session-cache key still targets its own wiki.
+    #[test]
+    fn a_tab_keeps_its_wiki_when_the_active_wiki_switches() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        // Open an article while the active wiki is a sister project.
+        app.active_wiki_name = "wiktionary".to_string();
+        app.open_document(doc("Mercury"));
+        assert_eq!(app.active_tab().wiki, "wiktionary");
+        assert_eq!(
+            app.current_article_key(),
+            Some((
+                "wiktionary".to_string(),
+                "en".to_string(),
+                "Mercury".to_string()
+            ))
+        );
+
+        // A `:wiki` switch changes only what NEW opens address; this tab keeps
+        // serving — and keying — its own wiki.
+        app.active_wiki_name = "wikipedia".to_string();
+        assert_eq!(app.active_tab().wiki, "wiktionary");
+        assert_eq!(
+            app.current_article_key(),
+            Some((
+                "wiktionary".to_string(),
+                "en".to_string(),
+                "Mercury".to_string()
+            )),
+            "the tab's cache lookup still targets the wiki it was opened on"
+        );
+    }
+
+    /// PRD FR-ML-4: the same `(lang, title)` cached for two different wikis in
+    /// a session map never collides — langlinks delivered for Wikipedia's
+    /// "Mercury" and a sister's "Mercury" are kept independently, and the
+    /// picker reads only the active tab's wiki's slice.
+    #[test]
+    fn session_langlinks_are_isolated_per_wiki() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.deliver_langlinks(
+            String::new(),
+            "en".to_string(),
+            "Mercury".to_string(),
+            Ok(vec![langlink("de", "Merkur", "German", "Merkur (Planet)")]),
+        );
+        app.deliver_langlinks(
+            "wiktionary".to_string(),
+            "en".to_string(),
+            "Mercury".to_string(),
+            Ok(vec![langlink("fr", "mercure", "French", "mercure")]),
+        );
+
+        // The active tab is on the default wiki, so its picker sees only the
+        // Wikipedia langlinks, never the wiktionary ones.
+        app.open_document(doc("Mercury"));
+        assert_eq!(app.active_tab().wiki, "");
+        let codes: Vec<&str> = app.lang_links().iter().map(|l| l.code.as_str()).collect();
+        assert_eq!(codes, vec!["de"], "only this wiki's langlinks are visible");
     }
 
     #[test]
@@ -9147,6 +9282,7 @@ mod tests {
         app.active_tab_mut()
             .back_stack
             .push(crate::tab::HistoryEntry {
+                wiki: String::new(),
                 lang: "en".to_string(),
                 title: "Earlier".to_string(),
                 scroll: 2,
