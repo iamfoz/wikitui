@@ -14,6 +14,8 @@ mod cleardata;
 mod cli;
 mod command;
 mod config;
+#[cfg(test)]
+mod corpus_tests;
 mod crashguard;
 mod doc;
 mod doctor;
