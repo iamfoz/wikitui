@@ -120,8 +120,15 @@ pub enum ClearRange {
     /// Every visit opened at or after `cutoff` — `:history clear today`'s
     /// shape (cutoff = local midnight, `today_start_unix`).
     Since(i64),
-    /// Every visit to one article — the picker's `d`.
-    Article { lang: String, title: String },
+    /// Every visit to one article — the picker's `d`. Scoped by `wiki`
+    /// (PRD FR-ML-4, `api::wiki_scope`; `""` = default Wikipedia) as well as
+    /// `lang`/`title`, so deleting one wiki's row for a title never also
+    /// deletes a same-titled article read on a different wiki.
+    Article {
+        wiki: String,
+        lang: String,
+        title: String,
+    },
 }
 
 pub struct History {
@@ -462,9 +469,9 @@ impl History {
             ClearRange::Since(cutoff) => self
                 .conn
                 .execute("DELETE FROM visits WHERE opened_at >= ?1", params![cutoff])?,
-            ClearRange::Article { lang, title } => self.conn.execute(
-                "DELETE FROM visits WHERE lang = ?1 AND title = ?2",
-                params![lang, title],
+            ClearRange::Article { wiki, lang, title } => self.conn.execute(
+                "DELETE FROM visits WHERE wiki = ?1 AND lang = ?2 AND title = ?3",
+                params![wiki, lang, title],
             )?,
         };
         self.visited = load_visited(&self.conn);
@@ -1328,6 +1335,7 @@ mod tests {
         history.record_visit("", "en", "Enigma machine", None);
         let removed = history
             .clear(ClearRange::Article {
+                wiki: String::new(),
                 lang: "en".to_string(),
                 title: "Alan Turing".to_string(),
             })
@@ -1335,6 +1343,35 @@ mod tests {
         assert_eq!(removed, 1);
         assert!(!history.is_visited("", "en", "Alan Turing"));
         assert!(history.is_visited("", "en", "Enigma machine"));
+    }
+
+    /// CORR-M5: `ClearRange::Article` is scoped by wiki, so the picker's `d`
+    /// on one wiki's row for a title never also deletes a same-titled article
+    /// read on a different wiki. Before wiki-scoping the DELETE, clearing the
+    /// Wiktionary "Mercury" row would also drop Wikipedia's, since the
+    /// predicate matched only `lang`/`title`.
+    #[test]
+    fn clear_one_article_on_one_wiki_leaves_the_same_title_on_another_wiki() {
+        let mut history = History::in_memory();
+        history.record_visit("", "en", "Mercury", None);
+        history.record_visit("wiktionary", "en", "Mercury", None);
+
+        let removed = history
+            .clear(ClearRange::Article {
+                wiki: "wiktionary".to_string(),
+                lang: "en".to_string(),
+                title: "Mercury".to_string(),
+            })
+            .unwrap();
+        assert_eq!(removed, 1, "only the Wiktionary row is deleted");
+        assert!(
+            !history.is_visited("wiktionary", "en", "Mercury"),
+            "the cleared wiki's row is gone"
+        );
+        assert!(
+            history.is_visited("", "en", "Mercury"),
+            "the other wiki's same-titled article survives"
+        );
     }
 
     // ---- retention prune --------------------------------------------------------

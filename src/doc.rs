@@ -2005,6 +2005,29 @@ fn page_display_title(parsed: &Html) -> Option<String> {
     (!normalized.is_empty()).then_some(normalized)
 }
 
+/// H2 (PRD FR-OFF-2, FR-ML-4): the canonical title `parse_article_html` would
+/// assign as `Document::title` for this HTML — the Parsoid `<head><title>`
+/// (spaces, canonical casing), falling back to `fallback` when the HTML has no
+/// usable title, then run through the same SEC-1 sanitizer. This is the
+/// "string-becomes-key" boundary the L2 cache normalizes on: a fetch of a
+/// redirect alias or a case/spacing variant (`"nyc"`, `"alan turing"`) is
+/// *stored* under this canonical title, so the next open by the canonical
+/// title (which is what history/bookmarks/saved all key on) is a cache hit
+/// rather than a redundant refetch or a duplicate alias entry. Guaranteed
+/// byte-equal to `parse_article_html(fallback, html).title` by construction —
+/// same head-title extraction, same fallback, same sanitize — so the cache
+/// key never drifts from what every other store records.
+pub fn resolved_title(html: &str, fallback: &str) -> String {
+    // The same SEC-3 caps `parse_article_html` applies before parsing, in the
+    // same order — so the parse (and therefore the extracted title) sees
+    // byte-identical input and this can never disagree with `Document::title`.
+    let (html, _) = cap_html_size(html);
+    let (html, _) = cap_html_nesting_depth(html, MAX_DOM_DEPTH);
+    let parsed = Html::parse_document(html);
+    let raw = page_display_title(&parsed).unwrap_or_else(|| fallback.to_string());
+    sanitize::sanitize_and_cap_single_line(&raw, sanitize::MAX_SPAN_CHARS)
+}
+
 /// PRD SEC-3: truncates `html` to at most `MAX_ARTICLE_HTML_BYTES` bytes (on
 /// a UTF-8 char boundary, never splitting a multi-byte character) before it
 /// ever reaches the parser. Returns `(slice, was_truncated)`. This is the

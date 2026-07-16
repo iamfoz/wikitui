@@ -3916,6 +3916,7 @@ impl App {
             return;
         };
         self.status = match self.history.clear(crate::history::ClearRange::Article {
+            wiki: visit.wiki.clone(),
             lang: visit.lang.clone(),
             title: visit.title.clone(),
         }) {
@@ -5347,10 +5348,13 @@ impl App {
         };
         let title = doc.title.clone();
         let lang = self.active_tab().lang.clone();
+        // PRD FR-ML-4: bookmark under the on-screen tab's own wiki scope, so a
+        // same-titled article on another wiki is an independent bookmark.
+        let wiki = self.active_tab().wiki.clone();
         let revid = self.active_tab().current_revid;
         let revid = (revid != 0).then_some(revid);
 
-        match self.bookmarks.toggle(&lang, &title, revid) {
+        match self.bookmarks.toggle(&wiki, &lang, &title, revid) {
             ToggleOutcome::Added => {
                 // PRD FR-PF-3: a bookmark is a strong interest signal (+3.0)
                 // on the article's topics — applied only when the add half
@@ -5472,10 +5476,11 @@ impl App {
     /// to the picker.
     pub fn commit_tag_edit(&mut self) {
         if let Some(bookmark) = self.selected_bookmark_entry() {
+            let wiki = bookmark.wiki.clone();
             let lang = bookmark.lang.clone();
             let title = bookmark.title.clone();
             let tags = bookmarks::parse_tags(&self.bookmark_tag_input);
-            self.bookmarks.set_tags(&lang, &title, tags);
+            self.bookmarks.set_tags(&wiki, &lang, &title, tags);
         }
         self.mode = Mode::BookmarkPicker;
     }
@@ -9232,12 +9237,12 @@ mod tests {
         app.active_tab_mut().current_revid = 7;
 
         app.toggle_bookmark();
-        assert!(app.bookmarks.is_bookmarked("en", "Alan Turing"));
+        assert!(app.bookmarks.is_bookmarked("", "en", "Alan Turing"));
         assert!(app.notice.as_deref().unwrap().contains("Bookmarked"));
         assert_eq!(app.bookmarks.bookmarks[0].revid_at_bookmark, Some(7));
 
         app.toggle_bookmark();
-        assert!(!app.bookmarks.is_bookmarked("en", "Alan Turing"));
+        assert!(!app.bookmarks.is_bookmarked("", "en", "Alan Turing"));
         assert!(app.notice.as_deref().unwrap().contains("Removed"));
     }
 
@@ -9248,13 +9253,33 @@ mod tests {
         assert!(app.status.contains("Open an article first"));
     }
 
+    /// H1 (PRD FR-ML-4): `m` bookmarks under the on-screen tab's own wiki, so
+    /// the same title bookmarked while reading a non-default wiki is stored
+    /// under that wiki — independent of the default wiki's same-titled page.
+    #[test]
+    fn toggle_bookmark_records_under_the_tabs_wiki() {
+        let mut app = app_with_bookmarks();
+        app.set_document(doc("Mercury"));
+        app.active_tab_mut().wiki = "wiktionary".to_string();
+
+        app.toggle_bookmark();
+        assert!(
+            app.bookmarks.is_bookmarked("wiktionary", "en", "Mercury"),
+            "bookmarked under the tab's wiki"
+        );
+        assert!(
+            !app.bookmarks.is_bookmarked("", "en", "Mercury"),
+            "not under the default wiki the tab isn't on"
+        );
+    }
+
     #[test]
     fn bookmark_picker_filter_narrows_the_visible_list() {
         let mut app = app_with_bookmarks();
-        app.bookmarks.toggle("en", "Enigma machine", None);
+        app.bookmarks.toggle("", "en", "Enigma machine", None);
         app.bookmarks
-            .set_tags("en", "Enigma machine", vec!["crypto".into()]);
-        app.bookmarks.toggle("en", "Ada Lovelace", None);
+            .set_tags("", "en", "Enigma machine", vec!["crypto".into()]);
+        app.bookmarks.toggle("", "en", "Ada Lovelace", None);
 
         app.open_bookmark_picker();
         assert_eq!(
@@ -9283,11 +9308,11 @@ mod tests {
     #[test]
     fn cycle_bookmark_wraps_over_the_filtered_list_not_the_whole_store() {
         let mut app = app_with_bookmarks();
-        app.bookmarks.toggle("en", "A", None);
-        app.bookmarks.set_tags("en", "A", vec!["x".into()]);
-        app.bookmarks.toggle("en", "B", None); // untagged
-        app.bookmarks.toggle("en", "C", None);
-        app.bookmarks.set_tags("en", "C", vec!["x".into()]);
+        app.bookmarks.toggle("", "en", "A", None);
+        app.bookmarks.set_tags("", "en", "A", vec!["x".into()]);
+        app.bookmarks.toggle("", "en", "B", None); // untagged
+        app.bookmarks.toggle("", "en", "C", None);
+        app.bookmarks.set_tags("", "en", "C", vec!["x".into()]);
 
         app.open_bookmark_picker();
         app.bookmark_filter_input = "#x".to_string();
@@ -9303,21 +9328,21 @@ mod tests {
     #[test]
     fn delete_selected_bookmark_removes_it_and_keeps_selection_in_range() {
         let mut app = app_with_bookmarks();
-        app.bookmarks.toggle("en", "A", None);
-        app.bookmarks.toggle("en", "B", None);
+        app.bookmarks.toggle("", "en", "A", None);
+        app.bookmarks.toggle("", "en", "B", None);
         app.open_bookmark_picker();
         app.selected_bookmark = 1; // "B"
 
         app.delete_selected_bookmark();
-        assert!(!app.bookmarks.is_bookmarked("en", "B"));
-        assert!(app.bookmarks.is_bookmarked("en", "A"));
+        assert!(!app.bookmarks.is_bookmarked("", "en", "B"));
+        assert!(app.bookmarks.is_bookmarked("", "en", "A"));
         assert_eq!(app.selected_bookmark, 0);
     }
 
     #[test]
     fn tag_edit_round_trips_through_the_prompt() {
         let mut app = app_with_bookmarks();
-        app.bookmarks.toggle("en", "Alan Turing", None);
+        app.bookmarks.toggle("", "en", "Alan Turing", None);
         app.open_bookmark_picker();
 
         app.begin_tag_edit();
@@ -9331,7 +9356,7 @@ mod tests {
         app.commit_tag_edit();
         assert_eq!(app.mode, Mode::BookmarkPicker);
         assert_eq!(
-            app.bookmarks.find("en", "Alan Turing").unwrap().tags,
+            app.bookmarks.find("", "en", "Alan Turing").unwrap().tags,
             vec!["crypto", "ww2"]
         );
 
@@ -9388,12 +9413,14 @@ mod tests {
         app.readlater.enqueue(crate::bookmarks::ReadLaterEntry {
             title: "First".to_string(),
             lang: "en".to_string(),
+            wiki: String::new(),
             enqueued_at: crate::bookmarks::now_ts(),
             priority: 0,
         });
         app.readlater.enqueue(crate::bookmarks::ReadLaterEntry {
             title: "Second".to_string(),
             lang: "en".to_string(),
+            wiki: String::new(),
             enqueued_at: crate::bookmarks::now_ts(),
             priority: 0,
         });
@@ -9428,6 +9455,7 @@ mod tests {
         app.readlater.enqueue(crate::bookmarks::ReadLaterEntry {
             title: "Keep me queued".to_string(),
             lang: "en".to_string(),
+            wiki: String::new(),
             enqueued_at: crate::bookmarks::now_ts(),
             priority: 0,
         });
@@ -9448,6 +9476,7 @@ mod tests {
         app.readlater.enqueue(crate::bookmarks::ReadLaterEntry {
             title: "Gone".to_string(),
             lang: "en".to_string(),
+            wiki: String::new(),
             enqueued_at: crate::bookmarks::now_ts(),
             priority: 0,
         });
@@ -9459,7 +9488,7 @@ mod tests {
     #[test]
     fn export_bookmarks_writes_the_file_and_requires_a_second_run_to_overwrite() {
         let mut app = app_with_bookmarks();
-        app.bookmarks.toggle("en", "Alan Turing", Some(1));
+        app.bookmarks.toggle("", "en", "Alan Turing", Some(1));
 
         let dir = std::env::temp_dir().join(format!(
             "wikitui-bookmark-export-test-{}",
@@ -9512,7 +9541,7 @@ mod tests {
     #[test]
     fn export_bookmarks_rejects_an_unknown_format() {
         let mut app = app_with_bookmarks();
-        app.bookmarks.toggle("en", "Alan Turing", None);
+        app.bookmarks.toggle("", "en", "Alan Turing", None);
         app.export_bookmarks("carrier-pigeon", None);
         assert!(
             app.notice

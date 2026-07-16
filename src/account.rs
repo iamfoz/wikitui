@@ -98,15 +98,26 @@ fn clean_text(s: &str) -> String {
 // CSRF / watch tokens (PRD §6.2 rule 8)
 // ---------------------------------------------------------------------------
 
+/// The cache key for a token: `(wiki_scope, lang)`. MediaWiki tokens are
+/// per-wiki — each `[wiki.<name>]` edition and each language (`en`/`de`/…) is
+/// a distinct login session with its own csrf/watch token, and a token minted
+/// on one is rejected (`badtoken`) on another. `wiki_scope` is
+/// `api::wiki_scope` (`""` = default Wikipedia), matching every other
+/// wiki-scoped store; `lang` is the edition the token was fetched for.
+type TokenKey = (String, String);
+
 /// Caches the two token kinds this build's writes need (`csrf` for thank/
-/// echomarkread, `watch` for watch/unwatch) so a session fetches each at
-/// most once — until a badtoken forces a refetch. Lives on `App` for the
-/// whole process lifetime; cleared on logout (there is nothing to reuse
-/// against a session that no longer exists).
+/// echomarkread, `watch` for watch/unwatch), **keyed by `(wiki, lang)`** so a
+/// session fetches each at most once per wiki edition — until a badtoken
+/// forces a refetch. Keyed rather than a single slot per kind (CORR-M7):
+/// watching on `en` then `:sync`ing on `de` (or a `[wiki.<name>]` project)
+/// must NOT reuse `en`'s token, which the server rejects as `badtoken`.
+/// Lives on `App` for the whole process lifetime; cleared on logout (there is
+/// nothing to reuse against a session that no longer exists).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct TokenCache {
-    csrf: Option<String>,
-    watch: Option<String>,
+    csrf: HashMap<TokenKey, String>,
+    watch: HashMap<TokenKey, String>,
 }
 
 impl TokenCache {
@@ -114,55 +125,59 @@ impl TokenCache {
         Self::default()
     }
 
-    /// The cached CSRF token, fetching it if this is the first write of the
-    /// session.
+    /// The cached CSRF token for this session's `(wiki, lang)`, fetching it if
+    /// this is the first such write of the session.
     pub async fn csrf_token(
         &mut self,
         client: &WikiClient,
         lang: &str,
         access_token: &str,
     ) -> Result<String> {
-        if let Some(t) = &self.csrf {
+        let key = (client.wiki_scope(), lang.to_string());
+        if let Some(t) = self.csrf.get(&key) {
             return Ok(t.clone());
         }
         let t = client.fetch_token(lang, access_token, "csrf").await?;
-        self.csrf = Some(t.clone());
+        self.csrf.insert(key, t.clone());
         Ok(t)
     }
 
-    /// The cached watch token, fetching it if this is the first watch/
-    /// unwatch of the session.
+    /// The cached watch token for this session's `(wiki, lang)`, fetching it
+    /// if this is the first watch/unwatch of the session on that wiki.
     pub async fn watch_token(
         &mut self,
         client: &WikiClient,
         lang: &str,
         access_token: &str,
     ) -> Result<String> {
-        if let Some(t) = &self.watch {
+        let key = (client.wiki_scope(), lang.to_string());
+        if let Some(t) = self.watch.get(&key) {
             return Ok(t.clone());
         }
         let t = client.fetch_token(lang, access_token, "watch").await?;
-        self.watch = Some(t.clone());
+        self.watch.insert(key, t.clone());
         Ok(t)
     }
 
-    /// Drops the cached CSRF token — called after a `badtoken` response, so
-    /// the next `csrf_token` call fetches a fresh one instead of handing
-    /// back the same stale value.
-    pub fn invalidate_csrf(&mut self) {
-        self.csrf = None;
+    /// Drops the cached CSRF token for `(wiki, lang)` — called after a
+    /// `badtoken` response, so the next `csrf_token` call for that wiki
+    /// fetches a fresh one instead of handing back the same stale value.
+    /// Only that wiki's token is dropped; another wiki's cached token is a
+    /// different session and stays valid.
+    pub fn invalidate_csrf(&mut self, wiki: &str, lang: &str) {
+        self.csrf.remove(&(wiki.to_string(), lang.to_string()));
     }
 
     /// The watch-token counterpart of [`invalidate_csrf`](Self::invalidate_csrf).
-    pub fn invalidate_watch(&mut self) {
-        self.watch = None;
+    pub fn invalidate_watch(&mut self, wiki: &str, lang: &str) {
+        self.watch.remove(&(wiki.to_string(), lang.to_string()));
     }
 
     /// PRD FR-ACC-9 / logout: nothing cached here can outlive the session it
     /// was minted for.
     pub fn clear(&mut self) {
-        self.csrf = None;
-        self.watch = None;
+        self.csrf.clear();
+        self.watch.clear();
     }
 }
 
@@ -1683,21 +1698,67 @@ mod tests {
     fn token_cache_starts_empty_and_clears_both_kinds() {
         let mut cache = TokenCache::new();
         assert_eq!(cache, TokenCache::default());
-        cache.csrf = Some("c".to_string());
-        cache.watch = Some("w".to_string());
+        cache.csrf.insert(("".into(), "en".into()), "c".into());
+        cache.watch.insert(("".into(), "en".into()), "w".into());
         cache.clear();
         assert_eq!(cache, TokenCache::default());
     }
 
     #[test]
-    fn token_cache_invalidate_only_clears_its_own_kind() {
-        let mut cache = TokenCache {
-            csrf: Some("c".to_string()),
-            watch: Some("w".to_string()),
-        };
-        cache.invalidate_csrf();
-        assert_eq!(cache.csrf, None);
-        assert_eq!(cache.watch.as_deref(), Some("w"));
+    fn token_cache_invalidate_only_clears_its_own_kind_and_scope() {
+        let mut cache = TokenCache::default();
+        cache.csrf.insert(("".into(), "en".into()), "c".into());
+        cache.watch.insert(("".into(), "en".into()), "w".into());
+        cache.invalidate_csrf("", "en");
+        assert!(
+            cache.csrf.is_empty(),
+            "the csrf token for that scope is gone"
+        );
+        assert_eq!(
+            cache
+                .watch
+                .get(&("".to_string(), "en".to_string()))
+                .map(String::as_str),
+            Some("w"),
+            "the watch token of the same scope is untouched"
+        );
+    }
+
+    /// CORR-M7: tokens are keyed by `(wiki, lang)`, so invalidating one
+    /// wiki's token leaves another wiki's (same kind) cached token intact —
+    /// they are distinct login sessions with distinct tokens.
+    #[test]
+    fn token_cache_is_keyed_per_wiki_and_lang() {
+        let mut cache = TokenCache::default();
+        cache.watch.insert(("".into(), "en".into()), "EN_WP".into());
+        cache
+            .watch
+            .insert(("wiktionary".into(), "en".into()), "EN_WKT".into());
+        cache.watch.insert(("".into(), "de".into()), "DE_WP".into());
+
+        // Invalidating en-Wikipedia touches only that scope.
+        cache.invalidate_watch("", "en");
+        assert!(
+            !cache
+                .watch
+                .contains_key(&("".to_string(), "en".to_string()))
+        );
+        assert_eq!(
+            cache
+                .watch
+                .get(&("wiktionary".to_string(), "en".to_string()))
+                .map(String::as_str),
+            Some("EN_WKT"),
+            "another wiki's token is a different session, kept"
+        );
+        assert_eq!(
+            cache
+                .watch
+                .get(&("".to_string(), "de".to_string()))
+                .map(String::as_str),
+            Some("DE_WP"),
+            "another lang's token is a different session, kept"
+        );
     }
 
     // ---- FR-BM-5: ReadingLists parse + setup-needed signal ----------------

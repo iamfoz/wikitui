@@ -309,6 +309,7 @@ mod tests {
         Bookmark {
             title: title.to_string(),
             lang: "en".to_string(),
+            wiki: String::new(),
             revid_at_bookmark: Some(42),
             section_anchor: None,
             created_at: "2026-07-13T10:00:00-07:00".to_string(),

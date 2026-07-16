@@ -497,7 +497,7 @@ async fn main() -> Result<()> {
             &title,
         )
         .await?;
-        let document = doc::parse_article_html(&title, &outcome.html);
+        let document = doc::parse_article_html(&outcome.resolved_title, &outcome.html);
         print!("{}", doc::render_plain(&document, &resolved.lang.value));
         // `--dump` never reaches `run`'s own end-of-session wipe below, so it
         // does its own — a one-shot process is still a "session" for FR-PR-3's
@@ -796,6 +796,18 @@ struct FetchOutcome {
     html: String,
     source: PageSource,
     revid: u64,
+    /// H2 (PRD FR-OFF-2, FR-ML-4): the canonical title this content is keyed
+    /// on — Parsoid's `<head><title>` (`doc::resolved_title`), which is what
+    /// history/bookmarks/saved/trail all key on via `doc.title`. On a fresh
+    /// network fetch this is the *resolved* title (a redirect alias or a
+    /// case/spacing variant becomes its canonical form), and the L2 cache is
+    /// written under it — not the requested string — so the next open by the
+    /// canonical title is a cache hit rather than a redundant refetch or a
+    /// duplicate alias entry. On a cache hit it is the requested title, which
+    /// is exactly the key that matched (the entry was itself stored under its
+    /// canonical title). Callers parse with this as the title so the rendered
+    /// `Document::title` and the cache key can never diverge.
+    resolved_title: String,
     /// `Some(cached_revid)` exactly when the caller should spawn a
     /// background revalidation (PRD FR-OFF-2's stale-while-revalidate);
     /// `None` for a fresh cache hit (nothing to check yet) or a live/
@@ -837,6 +849,10 @@ async fn fetch_page(
                         age_secs: page.age_secs,
                     },
                     revid: page.revid,
+                    // A hit's key is the requested title itself (the entry was
+                    // stored under its own canonical title, so requesting the
+                    // canonical is what matched here).
+                    resolved_title: title.to_string(),
                     revalidate: None,
                 });
             }
@@ -847,6 +863,7 @@ async fn fetch_page(
                         age_secs: page.age_secs,
                     },
                     revid: page.revid,
+                    resolved_title: title.to_string(),
                     revalidate: Some(page.revid),
                 });
             }
@@ -859,23 +876,37 @@ async fn fetch_page(
     match client.fetch_article_html(lang, title).await {
         Ok(fetched) => {
             let wiki = client.wiki_scope();
+            // H2 (PRD FR-OFF-2, FR-ML-4): key the cache write on the *resolved*
+            // canonical title (Parsoid `<head><title>`), not the requested
+            // string. A redirect alias ("NYC") or a case/spacing variant
+            // ("alan turing") is thereby cached under its canonical title
+            // ("New York City" / "Alan Turing") — the same title
+            // history/bookmarks/saved key on — so reopening the canonical
+            // title is a hit, redirects don't pile up as duplicate cache
+            // entries, and the cache dedups what those stores already treat as
+            // one page. The first fetch was still *requested* by the raw
+            // string (its cache miss above was correct); only the write
+            // normalizes.
+            let resolved_title = doc::resolved_title(&fetched.html, title);
             cache.put(
                 &wiki,
                 lang,
-                title,
+                &resolved_title,
                 &fetched.html,
                 fetched.revid,
                 fetched.etag.as_deref(),
             );
             // PRD FR-SR-7: index the freshly cached HTML for offline search
-            // right where it's cached — see `offline_search`'s module doc's
-            // "Populate / remove". Best-effort like the cache write itself;
-            // a parse failure here never blocks the article from opening.
-            index_cached_html(search_index, &wiki, lang, title, &fetched.html);
+            // right where it's cached — under the same canonical title the
+            // cache used, so search and cache agree. Best-effort like the
+            // cache write itself; a parse failure here never blocks the
+            // article from opening.
+            index_cached_html(search_index, &wiki, lang, &resolved_title, &fetched.html);
             Ok(FetchOutcome {
                 html: fetched.html,
                 source: PageSource::Live,
                 revid: fetched.revid,
+                resolved_title,
                 revalidate: None,
             })
         }
@@ -886,6 +917,7 @@ async fn fetch_page(
                     age_secs: page.age_secs,
                 },
                 revid: page.revid,
+                resolved_title: title.to_string(),
                 revalidate: None,
             }),
             None => Err(network_error),
@@ -1678,7 +1710,7 @@ fn apply_tab_load_outcome(
     };
     match outcome.result {
         Ok(fetch) => {
-            let document = doc::parse_article_html(&outcome.title, &fetch.html);
+            let document = doc::parse_article_html(&fetch.resolved_title, &fetch.html);
             {
                 let tab = &mut app.tabs[index];
                 tab.loading = false;
@@ -1781,6 +1813,8 @@ fn annotate_current_article(terminal: &mut Terminal<CrosstermBackend<Stdout>>, a
     };
     let title = doc.title.clone();
     let lang = app.active_tab().lang.clone();
+    // PRD FR-ML-4: annotate/auto-bookmark under the on-screen tab's own wiki.
+    let wiki = app.active_tab().wiki.clone();
     let revid = app.active_tab().current_revid;
     let revid = (revid != 0).then_some(revid);
 
@@ -1793,10 +1827,10 @@ fn annotate_current_article(terminal: &mut Terminal<CrosstermBackend<Stdout>>, a
         return;
     };
 
-    let was_new = app.bookmarks.ensure_bookmarked(&lang, &title, revid);
+    let was_new = app.bookmarks.ensure_bookmarked(&wiki, &lang, &title, revid);
     let existing_note = app
         .bookmarks
-        .find(&lang, &title)
+        .find(&wiki, &lang, &title)
         .and_then(|b| b.note.clone());
 
     let tmp = std::env::temp_dir().join(format!(
@@ -1832,7 +1866,7 @@ fn annotate_current_article(terminal: &mut Terminal<CrosstermBackend<Stdout>>, a
 
     match saved_note {
         Some(note) => {
-            app.bookmarks.set_note(&lang, &title, note);
+            app.bookmarks.set_note(&wiki, &lang, &title, note);
             // PRD FR-PR-3: `ba` is `toggle_bookmark`'s explicit-save sibling
             // — `ensure_bookmarked` above persists a bookmark exactly like
             // `m` does, so the same warning applies when it actually created
@@ -1872,7 +1906,11 @@ async fn enqueue_read_later(client: &WikiClient, cache: &PageCache, app: &mut Ap
         app.notice = Some("Open an article first".to_string());
         return;
     };
-    if app.readlater.contains(&lang, &title) {
+    // PRD FR-ML-4: the read-later target (a focused internal link, or the
+    // article itself) belongs to the on-screen tab's wiki — internal links
+    // never cross wikis, so the active tab's scope is the target's scope.
+    let wiki = app.active_tab().wiki.clone();
+    if app.readlater.contains(&wiki, &lang, &title) {
         app.notice = Some(format!("\"{title}\" is already in the read-later queue"));
         return;
     }
@@ -1885,6 +1923,7 @@ async fn enqueue_read_later(client: &WikiClient, cache: &PageCache, app: &mut Ap
     app.readlater.enqueue(ReadLaterEntry {
         title: title.clone(),
         lang,
+        wiki,
         enqueued_at: bookmarks::now_ts(),
         priority: 0,
     });
@@ -3689,7 +3728,7 @@ async fn open_title(
                     open_saved(app, &client.wiki_scope(), lang, title);
                     return;
                 }
-                let document = doc::parse_article_html(title, &outcome.html);
+                let document = doc::parse_article_html(&outcome.resolved_title, &outcome.html);
                 let article_title = document.title.clone();
                 app.lang = lang.clone();
                 {
@@ -3788,7 +3827,7 @@ async fn open_history_entry(
     };
     match outcome {
         Ok(outcome) => {
-            let document = doc::parse_article_html(&entry.title, &outcome.html);
+            let document = doc::parse_article_html(&outcome.resolved_title, &outcome.html);
             let article_title = document.title.clone();
             let entry_lang = entry.lang.clone();
             let entry_wiki = entry.wiki.clone();
@@ -3879,7 +3918,7 @@ async fn open_trail_node(
                 open_saved(app, wiki, lang, title);
                 return;
             }
-            let document = doc::parse_article_html(title, &outcome.html);
+            let document = doc::parse_article_html(&outcome.resolved_title, &outcome.html);
             app.lang = lang.to_string();
             {
                 let tab = app.active_tab_mut();
@@ -7233,7 +7272,8 @@ async fn edit_with_retry(
     if !account::is_badtoken_response(&body) {
         return Ok(body);
     }
-    app.tokens.invalidate_csrf();
+    app.tokens
+        .invalidate_csrf(&client.wiki_scope(), &pending.lang);
     let fresh = app
         .tokens
         .csrf_token(client, &pending.lang, access_token)
@@ -7289,10 +7329,42 @@ async fn watch_with_retry(
     if !account::is_badtoken_response(&body) {
         return Ok(body);
     }
-    app.tokens.invalidate_watch();
+    app.tokens.invalidate_watch(&client.wiki_scope(), lang);
     let fresh = app.tokens.watch_token(client, lang, access_token).await?;
     client
         .watch_raw(lang, access_token, title, &fresh, unwatch)
+        .await
+}
+
+/// PRD §6.2 rule 8's badtoken retry for the *batched* `action=watch`
+/// (`titles=A|B|C`) the watch-mirror uses — the CORR-M7 counterpart of
+/// [`watch_with_retry`] for the single-title path. Every single-write path in
+/// this file already retries a stale token exactly once; the batch path did
+/// not, so a token that went stale (or, before tokens were wiki-keyed, was
+/// minted for a different wiki) produced an empty watch outcome with no retry,
+/// silently dropping titles from the local mirror while they stayed watched on
+/// the server. Fetches (or reuses) the wiki+lang-scoped token, attempts the
+/// batch, and — only on a `badtoken` — invalidates that scope's token, fetches
+/// one fresh, and retries exactly once more.
+async fn watch_batch_with_retry(
+    app: &mut App,
+    client: &WikiClient,
+    lang: &str,
+    access_token: &str,
+    titles: &[String],
+    unwatch: bool,
+) -> Result<Vec<u8>> {
+    let token = app.tokens.watch_token(client, lang, access_token).await?;
+    let body = client
+        .watch_batch_raw(lang, access_token, titles, &token, unwatch)
+        .await?;
+    if !account::is_badtoken_response(&body) {
+        return Ok(body);
+    }
+    app.tokens.invalidate_watch(&client.wiki_scope(), lang);
+    let fresh = app.tokens.watch_token(client, lang, access_token).await?;
+    client
+        .watch_batch_raw(lang, access_token, titles, &fresh, unwatch)
         .await
 }
 
@@ -7432,7 +7504,7 @@ async fn echomarkread_with_retry(
     if !account::is_badtoken_response(&body) {
         return Ok(body);
     }
-    app.tokens.invalidate_csrf();
+    app.tokens.invalidate_csrf(&client.wiki_scope(), lang);
     let fresh = app.tokens.csrf_token(client, lang, access_token).await?;
     client
         .echomarkread_raw(lang, access_token, &fresh, all, ids)
@@ -7522,7 +7594,7 @@ async fn thank_with_retry(
     if !account::is_badtoken_response(&body) {
         return Ok(body);
     }
-    app.tokens.invalidate_csrf();
+    app.tokens.invalidate_csrf(&client.wiki_scope(), lang);
     let fresh = app.tokens.csrf_token(client, lang, access_token).await?;
     client.thank_raw(lang, access_token, revid, &fresh).await
 }
@@ -7632,6 +7704,11 @@ async fn sync_reading_list(
     lang: &str,
     access_token: &str,
 ) -> String {
+    // PRD FR-ML-4: Reading List sync is per-wiki — every local bookmark this
+    // reconcile reads, pulls, or reorders is scoped to the session's active
+    // wiki, so a same-titled bookmark on another wiki is neither synced here
+    // nor reordered by this wiki's server order.
+    let wiki = client.wiki_scope();
     let lists = match fetch_readinglists_with_setup(app, client, lang, access_token).await {
         Ok(lists) => lists,
         Err(e) => return format!("Reading List sync failed: {e}"),
@@ -7668,7 +7745,7 @@ async fn sync_reading_list(
         .bookmarks
         .bookmarks
         .iter()
-        .filter(|b| b.lang == lang)
+        .filter(|b| b.wiki == wiki && b.lang == lang)
         .map(|b| b.title.clone())
         .collect();
 
@@ -7705,7 +7782,8 @@ async fn sync_reading_list(
             // bookmark that didn't already exist locally (that's exactly
             // what `plan.pull` means), so there is no existing tags/note to
             // clobber — `ensure_bookmarked` starts both empty, same as `m`.
-            app.bookmarks.ensure_bookmarked(lang, &entry.title, None);
+            app.bookmarks
+                .ensure_bookmarked(&wiki, lang, &entry.title, None);
             new_pulled.push((entry.title.clone(), entry.id));
             pulled += 1;
         }
@@ -7749,11 +7827,11 @@ async fn sync_reading_list(
         .bookmarks
         .bookmarks
         .iter()
-        .filter(|b| b.lang == lang)
+        .filter(|b| b.wiki == wiki && b.lang == lang)
         .map(|b| b.title.clone())
         .collect();
     let new_order = account::apply_server_order(&server_order, &local_titles_after);
-    let _ = app.bookmarks.reorder(lang, &new_order);
+    let _ = app.bookmarks.reorder(&wiki, lang, &new_order);
 
     // Recompute the sync-mapping: everything matched (untouched this round),
     // freshly pushed, and freshly pulled — an entry that was deleted
@@ -7822,11 +7900,19 @@ async fn mirror_watchlist(
     access_token: &str,
 ) -> String {
     let mirror_tag = app.watchlist_mirror_tag.clone();
+    // PRD FR-ML-4: the mirror watches the active wiki's own watchlist, so only
+    // bookmarks on this wiki are candidates — a same-tagged bookmark on
+    // another wiki belongs to that wiki's watchlist, not this one's.
+    let wiki = client.wiki_scope();
     let tagged_titles: Vec<String> = app
         .bookmarks
         .bookmarks
         .iter()
-        .filter(|b| b.lang == lang && b.tags.iter().any(|t| t.eq_ignore_ascii_case(&mirror_tag)))
+        .filter(|b| {
+            b.wiki == wiki
+                && b.lang == lang
+                && b.tags.iter().any(|t| t.eq_ignore_ascii_case(&mirror_tag))
+        })
         .map(|b| b.title.clone())
         .collect();
 
@@ -7840,10 +7926,8 @@ async fn mirror_watchlist(
 
     let mut confirmed_watched: std::collections::HashSet<String> = std::collections::HashSet::new();
     if !plan.to_watch.is_empty()
-        && let Ok(token) = app.tokens.watch_token(client, lang, access_token).await
-        && let Ok(body) = client
-            .watch_batch_raw(lang, access_token, &plan.to_watch, &token, false)
-            .await
+        && let Ok(body) =
+            watch_batch_with_retry(app, client, lang, access_token, &plan.to_watch, false).await
     {
         confirmed_watched = account::parse_watch_batch_outcome(&body)
             .into_iter()
@@ -7854,10 +7938,8 @@ async fn mirror_watchlist(
     let mut confirmed_unwatched: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     if !plan.to_unwatch.is_empty()
-        && let Ok(token) = app.tokens.watch_token(client, lang, access_token).await
-        && let Ok(body) = client
-            .watch_batch_raw(lang, access_token, &plan.to_unwatch, &token, true)
-            .await
+        && let Ok(body) =
+            watch_batch_with_retry(app, client, lang, access_token, &plan.to_unwatch, true).await
     {
         confirmed_unwatched = account::parse_watch_batch_outcome(&body)
             .into_iter()
@@ -9310,6 +9392,7 @@ mod tests {
                     html: "<html><body><p>rotor cipher</p></body></html>".to_string(),
                     source: PageSource::Live,
                     revid: 42,
+                    resolved_title: "Enigma machine".to_string(),
                     revalidate: None,
                 }),
             },
@@ -9346,6 +9429,7 @@ mod tests {
                     html: "<html><body><p>x</p></body></html>".to_string(),
                     source: PageSource::Live,
                     revid: 1,
+                    resolved_title: "Enigma machine".to_string(),
                     revalidate: None,
                 }),
             },
@@ -9461,6 +9545,7 @@ mod tests {
                         .to_string(),
                     source: PageSource::Live,
                     revid: 1001,
+                    resolved_title: "Alan Turing".to_string(),
                     revalidate: None,
                 }),
             },
@@ -10263,7 +10348,7 @@ mod tests {
         let client = WikiClient::new(base).unwrap();
         let mut app = App::new("en".to_string(), Theme::terminal(), false);
         app.bookmarks = bookmarks::BookmarkStore::in_memory();
-        app.bookmarks.toggle("en", "Alan Turing", None);
+        app.bookmarks.toggle("", "en", "Alan Turing", None);
         let state_path = temp_state_path("sync-push");
         app.readinglist_sync_state_path = Some(state_path.clone());
 
@@ -10296,18 +10381,18 @@ mod tests {
         let client = WikiClient::new(base).unwrap();
         let mut app = App::new("en".to_string(), Theme::terminal(), false);
         app.bookmarks = bookmarks::BookmarkStore::in_memory();
-        app.bookmarks.toggle("en", "Alan Turing", None);
+        app.bookmarks.toggle("", "en", "Alan Turing", None);
         app.bookmarks
-            .set_tags("en", "Alan Turing", vec!["crypto".to_string()]);
+            .set_tags("", "en", "Alan Turing", vec!["crypto".to_string()]);
         app.bookmarks
-            .set_note("en", "Alan Turing", Some("great read".to_string()));
+            .set_note("", "en", "Alan Turing", Some("great read".to_string()));
         let state_path = temp_state_path("sync-matched");
         app.readinglist_sync_state_path = Some(state_path.clone());
 
         let report = sync_reading_list(&client, &mut app, "en", "access-tok").await;
         assert_eq!(report, "Reading List: pushed 0, pulled 0");
 
-        let b = app.bookmarks.find("en", "Alan Turing").unwrap();
+        let b = app.bookmarks.find("", "en", "Alan Turing").unwrap();
         assert_eq!(b.tags, vec!["crypto"]);
         assert_eq!(b.note.as_deref(), Some("great read"));
         let _ = std::fs::remove_file(&state_path);
@@ -10352,7 +10437,7 @@ mod tests {
             "a server-delete is neither a push nor a pull"
         );
         assert!(
-            !app.bookmarks.is_bookmarked("en", "Alan Turing"),
+            !app.bookmarks.is_bookmarked("", "en", "Alan Turing"),
             "the deleted title must never be pulled back"
         );
 
@@ -10378,9 +10463,9 @@ mod tests {
         let client = WikiClient::new(base).unwrap();
         let mut app = App::new("en".to_string(), Theme::terminal(), false);
         app.bookmarks = bookmarks::BookmarkStore::in_memory();
-        app.bookmarks.toggle("en", "Alan Turing", None);
+        app.bookmarks.toggle("", "en", "Alan Turing", None);
         app.bookmarks
-            .set_tags("en", "Alan Turing", vec!["watched".to_string()]);
+            .set_tags("", "en", "Alan Turing", vec!["watched".to_string()]);
         let state_path = temp_state_path("watchmirror");
         account::save_watch_mirror_state(
             &state_path,
@@ -10397,6 +10482,122 @@ mod tests {
         let state = account::load_watch_mirror_state(&state_path);
         assert_eq!(state.mirrored, vec!["Alan Turing".to_string()]);
         let _ = std::fs::remove_file(&state_path);
+    }
+
+    /// CORR-M7: the batched watch path performs §6.2 rule 8's badtoken retry,
+    /// exactly like the single-write paths — the first batch with the cached
+    /// token comes back `badtoken`, which must invalidate that scope's token,
+    /// fetch exactly one fresh token, and retry the batch exactly once more,
+    /// landing on success. Four scripted responses in order (token, failed
+    /// batch, refetched token, successful batch); a 5th (unscripted) request
+    /// would hang the test, so a missing-or-double retry fails loudly rather
+    /// than passing silently — the same proof technique as
+    /// `watch_with_retry_refetches_once_on_badtoken_and_succeeds`.
+    #[tokio::test]
+    async fn watch_batch_with_retry_refetches_once_on_badtoken_and_succeeds() {
+        let base = spawn_scripted_server(vec![
+            r#"{"query":{"tokens":{"watchtoken":"STALE"}}}"#,
+            r#"{"error":{"code":"badtoken","info":"stale token"}}"#,
+            r#"{"query":{"tokens":{"watchtoken":"FRESH"}}}"#,
+            r#"{"watch":[{"ns":0,"title":"Alan Turing","watched":true}]}"#,
+        ]);
+        let client = WikiClient::new(base).unwrap();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        let titles = ["Alan Turing".to_string()];
+        let body = watch_batch_with_retry(&mut app, &client, "en", "access-tok", &titles, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            account::parse_watch_batch_outcome(&body),
+            vec![("Alan Turing".to_string(), account::WatchOutcome::Watched)]
+        );
+        // The cache now holds the retry's fresh token, not the stale one —
+        // reading it makes no further request, so this needs no 5th response.
+        let cached = app
+            .tokens
+            .watch_token(&client, "en", "access-tok")
+            .await
+            .unwrap();
+        assert_eq!(cached, "FRESH");
+    }
+
+    /// Serves exactly one article-HTML response (Parsoid REST shape) whose
+    /// `<head><title>` is `canonical`, with an ETag so the fetch parses a
+    /// revid. One-shot: a *second* network fetch (which the H2 fix must avoid
+    /// by hitting the cache) would find the listener gone.
+    fn spawn_one_article(canonical: &str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = format!(
+            "<html><head><title>{canonical}</title></head><body><p>content</p></body></html>"
+        );
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut discard = [0u8; 8192];
+                let _ = stream.read(&mut discard);
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nETag: W/\"7777/mock-uuid\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body.as_bytes());
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// H2 (PRD FR-OFF-2, FR-ML-4): the L2 cache is keyed on the *resolved*
+    /// canonical `doc.title`, not the requested string. Fetching a lowercase
+    /// variant ("alan turing") that resolves to "Alan Turing" must store the
+    /// entry under "Alan Turing" — the title history/bookmarks/saved key on —
+    /// so reopening the canonical title is a cache hit with no second network
+    /// round trip. Before the fix the entry was keyed on the typed string, so
+    /// the canonical open was a miss (a redundant refetch and a duplicate
+    /// alias entry).
+    #[tokio::test]
+    async fn fetch_page_keys_the_cache_on_the_resolved_canonical_title() {
+        let base = spawn_one_article("Alan Turing");
+        let client = WikiClient::new(base).unwrap();
+        let dir = temp_state_path("h2-cache").with_extension("cachedir");
+        let cache = PageCache::at(dir.clone(), 10_000_000, 86_400, 604_800);
+        let index = offline_search::OfflineIndex::in_memory();
+
+        // First open by the lowercase variant: a genuine cache miss, so it
+        // goes to the network and resolves to the canonical title.
+        let first = fetch_page(&client, &cache, &index, "", "en", "alan turing")
+            .await
+            .unwrap();
+        assert!(matches!(first.source, PageSource::Live));
+        assert_eq!(
+            first.resolved_title, "Alan Turing",
+            "the fetch resolves the typed string to the canonical title"
+        );
+
+        // The cache entry lives under the canonical title, NOT the typed one.
+        assert!(
+            cache.get("", "en", "Alan Turing").is_some(),
+            "the cache is keyed on the resolved canonical title"
+        );
+        assert!(
+            cache.get("", "en", "alan turing").is_none(),
+            "and NOT on the requested string (no duplicate alias entry)"
+        );
+
+        // Reopening the canonical title is a cache hit — the one-shot server is
+        // already spent, so a Live/Offline source here would mean a (buggy)
+        // second network attempt; `Cached` proves it never touched the wire.
+        let second = fetch_page(&client, &cache, &index, "", "en", "Alan Turing")
+            .await
+            .unwrap();
+        assert!(
+            matches!(second.source, PageSource::Cached { .. }),
+            "reopening the canonical title hits the cache, no refetch: {:?}",
+            second.source
+        );
+        assert_eq!(second.revid, first.revid);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- PRD FR-PC-2: TTS guard clauses ------------------------------------

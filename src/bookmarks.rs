@@ -7,12 +7,22 @@
 //! (mirroring `app::resolve_hint_action`'s split between "what should
 //! happen" and "make it happen").
 //!
-//! `(lang, title)` is the natural key for both stores: a bookmark or
-//! read-later entry is "this article, in this wiki edition", not an
-//! arbitrary opaque id — which is also what makes `m`'s bookmark/unbookmark
-//! toggle possible (PRD FR-BM-1's documented idiom: bookmarking an
+//! `(wiki, lang, title)` is the natural key for both stores: a bookmark or
+//! read-later entry is "this article, on this wiki, in this language edition",
+//! not an arbitrary opaque id — which is also what makes `m`'s bookmark/
+//! unbookmark toggle possible (PRD FR-BM-1's documented idiom: bookmarking an
 //! already-bookmarked article removes it, rather than erroring or needing a
 //! separate unbookmark key).
+//!
+//! The `wiki` dimension (PRD FR-ML-4, `api::wiki_scope`; `""` = the default
+//! Wikipedia) is what keeps `en:Mercury` on Wikipedia and on Wiktionary two
+//! independent bookmarks: without it, the bookmarked-indicator would be wrong
+//! on the other wiki, toggling on one wiki would silently remove the other's,
+//! and the read-later queue would dedup a title across wikis. Both stored
+//! records carry it as a `#[serde(default)]` field — mirroring
+//! `cache::IndexEntry` — so a `bookmarks.jsonl`/`readlater.jsonl` written
+//! before this dimension existed reads every record back as the default wiki
+//! (`""`), a free migration with no rewrite pass.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -24,6 +34,13 @@ use std::path::PathBuf;
 pub struct Bookmark {
     pub title: String,
     pub lang: String,
+    /// PRD FR-ML-4: the `api::wiki_scope` this article was bookmarked on
+    /// (`""` = default Wikipedia), the same dimension `cache::IndexEntry`/
+    /// `saved`/`history` key on. `#[serde(default)]` so a bookmark written
+    /// before wikis could be switched reads back as the default wiki — a free
+    /// migration, byte-identical to the pre-multi-wiki `bookmarks.jsonl`.
+    #[serde(default)]
+    pub wiki: String,
     /// The revid on screen at bookmark time, when known — `None` in
     /// degraded mode (PRD `Tab::current_revid`'s own doc comment: `0` there
     /// means "no real revid", which this field represents honestly as
@@ -51,6 +68,12 @@ pub struct Bookmark {
 pub struct ReadLaterEntry {
     pub title: String,
     pub lang: String,
+    /// PRD FR-ML-4: the `api::wiki_scope` this entry was queued on (`""` =
+    /// default Wikipedia), so `contains`'s dedup keeps a same-titled article
+    /// on two wikis as two distinct queue slots. `#[serde(default)]` for the
+    /// same free-migration reason as `Bookmark::wiki`.
+    #[serde(default)]
+    pub wiki: String,
     pub enqueued_at: String,
     /// Priority queue support (PRD FR-BM-3's "FIFO/priority"): `0` today —
     /// nothing yet reorders by it, but the field is here so a future
@@ -116,45 +139,56 @@ impl BookmarkStore {
         }
     }
 
-    pub fn find(&self, lang: &str, title: &str) -> Option<&Bookmark> {
+    pub fn find(&self, wiki: &str, lang: &str, title: &str) -> Option<&Bookmark> {
         self.bookmarks
             .iter()
-            .find(|b| b.lang == lang && b.title == title)
+            .find(|b| b.wiki == wiki && b.lang == lang && b.title == title)
     }
 
-    pub fn is_bookmarked(&self, lang: &str, title: &str) -> bool {
-        self.find(lang, title).is_some()
+    pub fn is_bookmarked(&self, wiki: &str, lang: &str, title: &str) -> bool {
+        self.find(wiki, lang, title).is_some()
     }
 
-    /// `m` (PRD FR-BM-1): bookmarks `(lang, title)`, or un-bookmarks it if
-    /// it's already saved — the toggle idiom means there's no separate
-    /// "unbookmark" key to discover or forget.
-    pub fn toggle(&mut self, lang: &str, title: &str, revid: Option<u64>) -> ToggleOutcome {
+    /// `m` (PRD FR-BM-1): bookmarks `(wiki, lang, title)`, or un-bookmarks it
+    /// if it's already saved — the toggle idiom means there's no separate
+    /// "unbookmark" key to discover or forget. Scoped by `wiki` (PRD FR-ML-4)
+    /// so toggling `en:Mercury` on one wiki never removes the same-titled
+    /// bookmark on a different wiki.
+    pub fn toggle(
+        &mut self,
+        wiki: &str,
+        lang: &str,
+        title: &str,
+        revid: Option<u64>,
+    ) -> ToggleOutcome {
         if let Some(pos) = self
             .bookmarks
             .iter()
-            .position(|b| b.lang == lang && b.title == title)
+            .position(|b| b.wiki == wiki && b.lang == lang && b.title == title)
         {
             let removed = self.bookmarks.remove(pos);
             if let Some(path) = &self.path {
                 let _ = crate::jsonl::rewrite_matching::<Bookmark, _>(
                     path,
-                    |b| b.lang == removed.lang && b.title == removed.title,
+                    |b| {
+                        b.wiki == removed.wiki && b.lang == removed.lang && b.title == removed.title
+                    },
                     None,
                 );
             }
             ToggleOutcome::Removed
         } else {
-            self.add(lang, title, revid);
+            self.add(wiki, lang, title, revid);
             ToggleOutcome::Added
         }
     }
 
-    fn add(&mut self, lang: &str, title: &str, revid: Option<u64>) {
+    fn add(&mut self, wiki: &str, lang: &str, title: &str, revid: Option<u64>) {
         let now = now_ts();
         let bookmark = Bookmark {
             title: title.to_string(),
             lang: lang.to_string(),
+            wiki: wiki.to_string(),
             revid_at_bookmark: revid,
             section_anchor: None,
             created_at: now.clone(),
@@ -168,14 +202,20 @@ impl BookmarkStore {
         self.bookmarks.push(bookmark);
     }
 
-    /// Bookmarks `(lang, title)` unless it already is one (PRD FR-BM-2's
+    /// Bookmarks `(wiki, lang, title)` unless it already is one (PRD FR-BM-2's
     /// `ba` auto-bookmark: annotating implies wanting to keep the article).
     /// Returns whether a new bookmark was actually created.
-    pub fn ensure_bookmarked(&mut self, lang: &str, title: &str, revid: Option<u64>) -> bool {
-        if self.is_bookmarked(lang, title) {
+    pub fn ensure_bookmarked(
+        &mut self,
+        wiki: &str,
+        lang: &str,
+        title: &str,
+        revid: Option<u64>,
+    ) -> bool {
+        if self.is_bookmarked(wiki, lang, title) {
             return false;
         }
-        self.add(lang, title, revid);
+        self.add(wiki, lang, title, revid);
         true
     }
 
@@ -190,7 +230,7 @@ impl BookmarkStore {
         let persisted = match &self.path {
             Some(path) => crate::jsonl::rewrite_matching::<Bookmark, _>(
                 path,
-                |b| b.lang == removed.lang && b.title == removed.title,
+                |b| b.wiki == removed.wiki && b.lang == removed.lang && b.title == removed.title,
                 None,
             )
             .map(|_| ()),
@@ -199,25 +239,31 @@ impl BookmarkStore {
         Some((removed, persisted))
     }
 
-    /// Replaces the tag set on `(lang, title)` (the picker's `t`). `false`
-    /// if no such bookmark exists.
-    pub fn set_tags(&mut self, lang: &str, title: &str, tags: Vec<String>) -> bool {
-        self.update(lang, title, |b| b.tags = tags)
+    /// Replaces the tag set on `(wiki, lang, title)` (the picker's `t`).
+    /// `false` if no such bookmark exists.
+    pub fn set_tags(&mut self, wiki: &str, lang: &str, title: &str, tags: Vec<String>) -> bool {
+        self.update(wiki, lang, title, |b| b.tags = tags)
     }
 
-    /// Replaces the note on `(lang, title)` (PRD FR-BM-2's `ba`, once the
-    /// editor exits successfully). `false` if no such bookmark exists —
+    /// Replaces the note on `(wiki, lang, title)` (PRD FR-BM-2's `ba`, once
+    /// the editor exits successfully). `false` if no such bookmark exists —
     /// `main.rs`'s annotate flow calls `ensure_bookmarked` first so this
     /// path is always reachable from `ba`.
-    pub fn set_note(&mut self, lang: &str, title: &str, note: Option<String>) -> bool {
-        self.update(lang, title, |b| b.note = note)
+    pub fn set_note(&mut self, wiki: &str, lang: &str, title: &str, note: Option<String>) -> bool {
+        self.update(wiki, lang, title, |b| b.note = note)
     }
 
-    fn update(&mut self, lang: &str, title: &str, f: impl FnOnce(&mut Bookmark)) -> bool {
+    fn update(
+        &mut self,
+        wiki: &str,
+        lang: &str,
+        title: &str,
+        f: impl FnOnce(&mut Bookmark),
+    ) -> bool {
         let Some(pos) = self
             .bookmarks
             .iter()
-            .position(|b| b.lang == lang && b.title == title)
+            .position(|b| b.wiki == wiki && b.lang == lang && b.title == title)
         else {
             return false;
         };
@@ -227,7 +273,7 @@ impl BookmarkStore {
             let updated = self.bookmarks[pos].clone();
             let _ = crate::jsonl::rewrite_matching::<Bookmark, _>(
                 path,
-                |b| b.lang == lang && b.title == title,
+                |b| b.wiki == wiki && b.lang == lang && b.title == title,
                 Some(&updated),
             );
         }
@@ -235,10 +281,12 @@ impl BookmarkStore {
     }
 
     /// PRD FR-BM-5's "server wins on order" conflict-policy half: re-sorts
-    /// only the bookmarks in `lang`, in place — every slot in `self.
-    /// bookmarks` occupied by a *different* lang is never written to, so a
-    /// `de` bookmark's absolute position is unaffected by reordering `en`.
-    /// Among the `lang`-matching bookmarks, ranking follows `order`; a title
+    /// only the bookmarks in `(wiki, lang)`, in place — every slot in `self.
+    /// bookmarks` occupied by a *different* wiki or lang is never written to,
+    /// so a `de` (or other-wiki) bookmark's absolute position is unaffected by
+    /// reordering `en` on this wiki (PRD FR-ML-4: Reading List sync is
+    /// per-wiki, `main::sync_reading_list` passes the active wiki's scope).
+    /// Among the `(wiki, lang)`-matching bookmarks, ranking follows `order`; a title
     /// `order` doesn't mention (shouldn't happen given how `main::
     /// sync_reading_list` builds `order`, but this stays total rather than
     /// panicking on it) keeps its prior relative position among them,
@@ -255,12 +303,12 @@ impl BookmarkStore {
     /// (The earlier `jsonl::rewrite_all` from the in-memory snapshot erased all
     /// three, since the snapshot had already dropped unparseable lines at load
     /// and never saw the concurrent append.)
-    pub fn reorder(&mut self, lang: &str, order: &[String]) -> std::io::Result<()> {
+    pub fn reorder(&mut self, wiki: &str, lang: &str, order: &[String]) -> std::io::Result<()> {
         let slots: Vec<usize> = self
             .bookmarks
             .iter()
             .enumerate()
-            .filter(|(_, b)| b.lang == lang)
+            .filter(|(_, b)| b.wiki == wiki && b.lang == lang)
             .map(|(i, _)| i)
             .collect();
         let rank = |b: &Bookmark| {
@@ -279,11 +327,12 @@ impl BookmarkStore {
             self.bookmarks[slot] = bookmark;
         }
         if let Some(path) = &self.path {
+            let wiki = wiki.to_string();
             let lang = lang.to_string();
             let order = order.to_vec();
             crate::jsonl::reorder_matching::<Bookmark, _, _>(
                 path,
-                move |b| b.lang == lang,
+                move |b| b.wiki == wiki && b.lang == lang,
                 move |mut matching: Vec<Bookmark>| {
                     // Stable sort by rank in `order`; ties (and titles `order`
                     // never mentions, ranked `usize::MAX`) keep their prior
@@ -336,17 +385,19 @@ impl ReadLaterStore {
         }
     }
 
-    pub fn contains(&self, lang: &str, title: &str) -> bool {
+    pub fn contains(&self, wiki: &str, lang: &str, title: &str) -> bool {
         self.entries
             .iter()
-            .any(|e| e.lang == lang && e.title == title)
+            .any(|e| e.wiki == wiki && e.lang == lang && e.title == title)
     }
 
-    /// Enqueues `entry` unless `(lang, title)` is already queued (PRD
+    /// Enqueues `entry` unless `(wiki, lang, title)` is already queued (PRD
     /// FR-BM-3: the same article doesn't need two competing slots in one
-    /// reading queue). Returns whether it was actually added.
+    /// reading queue). Scoped by `wiki` (PRD FR-ML-4) so a same-titled
+    /// article on a different wiki is a distinct queue entry, not a dedup.
+    /// Returns whether it was actually added.
     pub fn enqueue(&mut self, entry: ReadLaterEntry) -> bool {
-        if self.contains(&entry.lang, &entry.title) {
+        if self.contains(&entry.wiki, &entry.lang, &entry.title) {
             return false;
         }
         if let Some(path) = &self.path {
@@ -508,29 +559,29 @@ mod tests {
     #[test]
     fn toggle_adds_then_removes_the_same_article() {
         let mut store = BookmarkStore::in_memory();
-        assert!(!store.is_bookmarked("en", "Alan Turing"));
+        assert!(!store.is_bookmarked("", "en", "Alan Turing"));
 
-        let outcome = store.toggle("en", "Alan Turing", Some(7));
+        let outcome = store.toggle("", "en", "Alan Turing", Some(7));
         assert_eq!(outcome, ToggleOutcome::Added);
-        assert!(store.is_bookmarked("en", "Alan Turing"));
+        assert!(store.is_bookmarked("", "en", "Alan Turing"));
         assert_eq!(store.bookmarks[0].revid_at_bookmark, Some(7));
 
-        let outcome = store.toggle("en", "Alan Turing", Some(7));
+        let outcome = store.toggle("", "en", "Alan Turing", Some(7));
         assert_eq!(outcome, ToggleOutcome::Removed);
-        assert!(!store.is_bookmarked("en", "Alan Turing"));
+        assert!(!store.is_bookmarked("", "en", "Alan Turing"));
     }
 
     #[test]
     fn toggle_persists_across_a_fresh_load_from_the_same_path() {
         let path = temp_path("bookmarks-roundtrip");
         let mut store = BookmarkStore::load_from(path.clone());
-        store.toggle("en", "Alan Turing", None);
-        store.toggle("de", "Berlin", Some(3));
+        store.toggle("", "en", "Alan Turing", None);
+        store.toggle("", "de", "Berlin", Some(3));
 
         let reloaded = BookmarkStore::load_from(path.clone());
         assert_eq!(reloaded.bookmarks.len(), 2);
-        assert!(reloaded.is_bookmarked("en", "Alan Turing"));
-        assert!(reloaded.is_bookmarked("de", "Berlin"));
+        assert!(reloaded.is_bookmarked("", "en", "Alan Turing"));
+        assert!(reloaded.is_bookmarked("", "de", "Berlin"));
 
         let _ = std::fs::remove_file(&path);
     }
@@ -539,9 +590,9 @@ mod tests {
     fn toggle_off_removes_exactly_that_line_and_survives_a_reload() {
         let path = temp_path("bookmarks-toggle-off");
         let mut store = BookmarkStore::load_from(path.clone());
-        store.toggle("en", "A", None);
-        store.toggle("en", "B", None);
-        store.toggle("en", "A", None); // un-bookmark A
+        store.toggle("", "en", "A", None);
+        store.toggle("", "en", "B", None);
+        store.toggle("", "en", "A", None); // un-bookmark A
 
         let reloaded = BookmarkStore::load_from(path.clone());
         let titles: Vec<_> = reloaded
@@ -557,8 +608,8 @@ mod tests {
     fn remove_preserves_lines_it_cannot_parse() {
         let path = temp_path("bookmarks-corrupt");
         let mut store = BookmarkStore::load_from(path.clone());
-        store.toggle("en", "Delete me", None);
-        store.toggle("en", "Keep me", None);
+        store.toggle("", "en", "Delete me", None);
+        store.toggle("", "en", "Keep me", None);
 
         let mut raw = std::fs::read_to_string(&path).unwrap();
         raw.push_str("{\"not\":\"a bookmark\"}\n");
@@ -575,9 +626,9 @@ mod tests {
     #[test]
     fn ensure_bookmarked_is_a_no_op_when_already_bookmarked() {
         let mut store = BookmarkStore::in_memory();
-        assert!(store.ensure_bookmarked("en", "Alan Turing", None));
+        assert!(store.ensure_bookmarked("", "en", "Alan Turing", None));
         assert_eq!(store.bookmarks.len(), 1);
-        assert!(!store.ensure_bookmarked("en", "Alan Turing", None));
+        assert!(!store.ensure_bookmarked("", "en", "Alan Turing", None));
         assert_eq!(store.bookmarks.len(), 1, "must not create a duplicate");
     }
 
@@ -585,14 +636,14 @@ mod tests {
     fn set_tags_and_set_note_persist_and_touch_updated_at() {
         let path = temp_path("bookmarks-update");
         let mut store = BookmarkStore::load_from(path.clone());
-        store.toggle("en", "Alan Turing", None);
+        store.toggle("", "en", "Alan Turing", None);
         let created = store.bookmarks[0].created_at.clone();
 
-        assert!(store.set_tags("en", "Alan Turing", vec!["crypto".into(), "ww2".into()]));
-        assert!(store.set_note("en", "Alan Turing", Some("great article".into())));
+        assert!(store.set_tags("", "en", "Alan Turing", vec!["crypto".into(), "ww2".into()]));
+        assert!(store.set_note("", "en", "Alan Turing", Some("great article".into())));
 
         let reloaded = BookmarkStore::load_from(path.clone());
-        let b = reloaded.find("en", "Alan Turing").unwrap();
+        let b = reloaded.find("", "en", "Alan Turing").unwrap();
         assert_eq!(b.tags, vec!["crypto", "ww2"]);
         assert_eq!(b.note.as_deref(), Some("great article"));
         assert_eq!(b.created_at, created, "created_at must never change");
@@ -607,20 +658,21 @@ mod tests {
     #[test]
     fn set_tags_on_a_missing_bookmark_reports_false() {
         let mut store = BookmarkStore::in_memory();
-        assert!(!store.set_tags("en", "Nope", vec!["x".into()]));
-        assert!(!store.set_note("en", "Nope", Some("x".into())));
+        assert!(!store.set_tags("", "en", "Nope", vec!["x".into()]));
+        assert!(!store.set_note("", "en", "Nope", Some("x".into())));
     }
 
     #[test]
     fn reorder_matches_the_given_order_and_persists() {
         let path = temp_path("bookmarks-reorder");
         let mut store = BookmarkStore::load_from(path.clone());
-        store.toggle("en", "Alan Turing", None);
-        store.toggle("en", "Enigma machine", None);
-        store.toggle("en", "Bombe", None);
+        store.toggle("", "en", "Alan Turing", None);
+        store.toggle("", "en", "Enigma machine", None);
+        store.toggle("", "en", "Bombe", None);
 
         store
             .reorder(
+                "",
                 "en",
                 &[
                     "Bombe".to_string(),
@@ -649,12 +701,13 @@ mod tests {
     #[test]
     fn reorder_leaves_a_title_the_order_omits_after_every_ranked_one() {
         let mut store = BookmarkStore::in_memory();
-        store.toggle("en", "Alan Turing", None);
-        store.toggle("en", "Unranked", None);
-        store.toggle("en", "Enigma machine", None);
+        store.toggle("", "en", "Alan Turing", None);
+        store.toggle("", "en", "Unranked", None);
+        store.toggle("", "en", "Enigma machine", None);
 
         store
             .reorder(
+                "",
                 "en",
                 &["Enigma machine".to_string(), "Alan Turing".to_string()],
             )
@@ -670,12 +723,13 @@ mod tests {
     #[test]
     fn reorder_never_touches_a_different_langs_bookmarks() {
         let mut store = BookmarkStore::in_memory();
-        store.toggle("de", "Berlin", None);
-        store.toggle("en", "Alan Turing", None);
-        store.toggle("en", "Enigma machine", None);
+        store.toggle("", "de", "Berlin", None);
+        store.toggle("", "en", "Alan Turing", None);
+        store.toggle("", "en", "Enigma machine", None);
 
         store
             .reorder(
+                "",
                 "en",
                 &["Enigma machine".to_string(), "Alan Turing".to_string()],
             )
@@ -695,8 +749,8 @@ mod tests {
     fn reorder_preserves_concurrent_append_unparseable_and_other_lang_lines() {
         let path = temp_path("bookmarks-reorder-concurrent");
         let mut store = BookmarkStore::load_from(path.clone());
-        store.toggle("en", "X", None);
-        store.toggle("en", "Y", None);
+        store.toggle("", "en", "X", None);
+        store.toggle("", "en", "Y", None);
 
         // A second instance appends a third `en` bookmark and a `de` bookmark
         // after this store loaded, plus a hand-corrupted line — none of which
@@ -704,6 +758,7 @@ mod tests {
         let concurrent_z = Bookmark {
             title: "Z".to_string(),
             lang: "en".to_string(),
+            wiki: String::new(),
             revid_at_bookmark: None,
             section_anchor: None,
             created_at: now_ts(),
@@ -723,7 +778,7 @@ mod tests {
         crate::jsonl::append(&path, &concurrent_de).unwrap();
 
         store
-            .reorder("en", &["Y".to_string(), "X".to_string()])
+            .reorder("", "en", &["Y".to_string(), "X".to_string()])
             .unwrap();
 
         let reloaded = BookmarkStore::load_from(path.clone());
@@ -757,13 +812,79 @@ mod tests {
 
     #[test]
     fn pre_tags_jsonl_lines_still_deserialize() {
-        // A line written before `tags`/`note`/`section_anchor` existed.
+        // A line written before `tags`/`note`/`section_anchor`/`wiki` existed.
         let old = r#"{"title":"Alan Turing","lang":"en","created_at":"2026-01-01T00:00:00-00:00","updated_at":"2026-01-01T00:00:00-00:00"}"#;
         let parsed: Bookmark = serde_json::from_str(old).expect("old format must parse");
         assert!(parsed.tags.is_empty());
         assert!(parsed.note.is_none());
         assert!(parsed.section_anchor.is_none());
         assert!(parsed.revid_at_bookmark.is_none());
+        // H1 free migration: a wiki-less record reads back as the default wiki.
+        assert_eq!(
+            parsed.wiki, "",
+            "a pre-multi-wiki bookmark is the default wiki, not a lost scope"
+        );
+    }
+
+    /// H1 (PRD FR-ML-4): a bookmark is keyed on `(wiki, lang, title)`, so
+    /// `en:Mercury` bookmarked on one wiki is independent of the same title on
+    /// another. Before the `wiki` dimension, `is_bookmarked` reported the
+    /// wrong indicator on the other wiki and toggling on one wiki removed the
+    /// other's row — both matched on `(lang, title)` alone.
+    #[test]
+    fn a_bookmark_is_scoped_by_wiki_and_never_collides_across_wikis() {
+        let mut store = BookmarkStore::in_memory();
+        store.toggle("wikipedia_x", "en", "Mercury", None);
+
+        // The same title on a different wiki is NOT bookmarked.
+        assert!(store.is_bookmarked("wikipedia_x", "en", "Mercury"));
+        assert!(
+            !store.is_bookmarked("wiktionary", "en", "Mercury"),
+            "a same-titled article on another wiki must not read as bookmarked"
+        );
+
+        // Toggling on wiki B adds B's own; it does not remove wiki A's.
+        assert_eq!(
+            store.toggle("wiktionary", "en", "Mercury", None),
+            ToggleOutcome::Added
+        );
+        assert!(store.is_bookmarked("wikipedia_x", "en", "Mercury"));
+        assert!(store.is_bookmarked("wiktionary", "en", "Mercury"));
+        assert_eq!(store.bookmarks.len(), 2, "two independent bookmarks");
+
+        // Un-toggling B leaves A intact.
+        assert_eq!(
+            store.toggle("wiktionary", "en", "Mercury", None),
+            ToggleOutcome::Removed
+        );
+        assert!(
+            store.is_bookmarked("wikipedia_x", "en", "Mercury"),
+            "un-bookmarking one wiki must not remove the other wiki's bookmark"
+        );
+        assert!(!store.is_bookmarked("wiktionary", "en", "Mercury"));
+    }
+
+    /// H1: an old `bookmarks.jsonl` record (no `wiki` field) is the default
+    /// wiki `""`, so it round-trips through the store keyed on the default
+    /// scope — the free migration in action end to end (not just at the serde
+    /// boundary above).
+    #[test]
+    fn a_pre_wiki_bookmark_file_reads_back_as_the_default_wiki() {
+        let path = temp_path("bookmarks-legacy-migration");
+        let old = r#"{"title":"Alan Turing","lang":"en","created_at":"2026-01-01T00:00:00-00:00","updated_at":"2026-01-01T00:00:00-00:00"}"#;
+        std::fs::write(&path, format!("{old}\n")).unwrap();
+
+        let store = BookmarkStore::load_from(path.clone());
+        assert_eq!(store.bookmarks.len(), 1);
+        assert!(
+            store.is_bookmarked("", "en", "Alan Turing"),
+            "a wiki-less record is found under the default wiki scope"
+        );
+        assert!(
+            !store.is_bookmarked("wiktionary", "en", "Alan Turing"),
+            "and not under any non-default wiki"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     // ---- ReadLaterStore ---------------------------------------------------
@@ -772,6 +893,7 @@ mod tests {
         ReadLaterEntry {
             title: title.to_string(),
             lang: "en".to_string(),
+            wiki: String::new(),
             enqueued_at: now_ts(),
             priority: 0,
         }
@@ -793,9 +915,47 @@ mod tests {
         assert!(store.enqueue(entry("Alan Turing")));
         assert!(
             !store.enqueue(entry("Alan Turing")),
-            "the same (lang, title) must not get a second queue slot"
+            "the same (wiki, lang, title) must not get a second queue slot"
         );
         assert_eq!(store.entries.len(), 1);
+    }
+
+    /// H1 (PRD FR-ML-4): `contains`'s dedup is scoped by wiki, so the same
+    /// title on two different wikis is two distinct queue entries — before the
+    /// `wiki` dimension the second enqueue was wrongly rejected as a dup.
+    #[test]
+    fn enqueue_does_not_dedup_the_same_title_across_wikis() {
+        let mut store = ReadLaterStore::in_memory();
+        let on = |wiki: &str, title: &str| ReadLaterEntry {
+            title: title.to_string(),
+            lang: "en".to_string(),
+            wiki: wiki.to_string(),
+            enqueued_at: now_ts(),
+            priority: 0,
+        };
+        assert!(store.enqueue(on("wikipedia_x", "Mercury")));
+        assert!(
+            store.enqueue(on("wiktionary", "Mercury")),
+            "the same title on another wiki is a distinct queue entry, not a dup"
+        );
+        assert!(
+            !store.enqueue(on("wiktionary", "Mercury")),
+            "but a genuine same-wiki duplicate is still rejected"
+        );
+        assert_eq!(store.entries.len(), 2);
+        assert!(store.contains("wikipedia_x", "en", "Mercury"));
+        assert!(store.contains("wiktionary", "en", "Mercury"));
+    }
+
+    /// H1 free migration: an old `readlater.jsonl` record with no `wiki`
+    /// field reads back as the default wiki.
+    #[test]
+    fn pre_wiki_readlater_lines_default_to_the_default_wiki() {
+        let old =
+            r#"{"title":"Alan Turing","lang":"en","enqueued_at":"2026-01-01T00:00:00-00:00"}"#;
+        let parsed: ReadLaterEntry = serde_json::from_str(old).expect("old format must parse");
+        assert_eq!(parsed.wiki, "");
+        assert_eq!(parsed.priority, 0);
     }
 
     #[test]
@@ -821,6 +981,7 @@ mod tests {
         Bookmark {
             title: title.to_string(),
             lang: "en".to_string(),
+            wiki: String::new(),
             revid_at_bookmark: None,
             section_anchor: None,
             created_at: now_ts(),
