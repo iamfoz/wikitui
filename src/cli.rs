@@ -82,6 +82,21 @@ pub struct Cli {
     /// always outranks a blanket session restore.
     #[arg(long, value_name = "NAME")]
     pub session: Option<String>,
+
+    /// PRD FR-OFF-8: open a Kiwix ZIM archive as an additional offline
+    /// source before anything else runs — see `zim::ZimArchive`'s module
+    /// doc for the format/crate rationale. With a TITLE argument, the
+    /// article still opens through the ordinary network-first path
+    /// (`main::open_title`); the loaded archive only kicks in as its last
+    /// fallback, after every configured language *and* the pinned
+    /// saved-pages store have come up empty (`main::try_open_from_zim`) —
+    /// the same "genuinely offline" precedence saved pages already have.
+    /// With no title (and no `--search`/`--session`/resume), the archive's
+    /// own main page opens directly if it declares one. A bad or missing
+    /// path degrades to a status-bar notice, never a crash — the rest of
+    /// the app runs exactly as if `--zim` had not been given.
+    #[arg(long, value_name = "PATH")]
+    pub zim: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]

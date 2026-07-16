@@ -56,6 +56,7 @@ mod trail;
 mod trail_export;
 mod tts;
 mod ui;
+mod zim;
 
 use anyhow::Result;
 use clap::Parser;
@@ -2224,6 +2225,59 @@ fn open_saved(app: &mut App, wiki: &str, lang: &str, title: &str) {
     }
 }
 
+/// `:zim open <path>` / `--zim <path>` (PRD FR-OFF-8): opens and indexes a
+/// `.zim` file, replacing whatever archive (if any) was already loaded. A
+/// bad path or malformed archive reports a clean notice and leaves `app.zim`
+/// untouched — never crashes, never half-replaces the previous archive.
+fn open_zim_archive(app: &mut App, path: &std::path::Path) {
+    match crate::zim::ZimArchive::open(path) {
+        Ok(archive) => {
+            app.notice = Some(format!(
+                "Opened ZIM archive \"{}\" — {} articles ({} indexed titles)",
+                archive.path().display(),
+                archive.article_count(),
+                archive.indexed_title_count()
+            ));
+            app.zim = Some(archive);
+        }
+        Err(e) => {
+            app.notice = Some(format!("Couldn't open ZIM archive {}: {e}", path.display()));
+        }
+    }
+}
+
+/// Looks up `title` in the currently loaded ZIM archive (if any) and, on a
+/// hit, installs it into the active tab exactly like `open_saved` does for a
+/// pinned saved page — same "fresh navigation" semantics
+/// (`App::open_document`), but with no revid: a ZIM article isn't
+/// revisioned the way a cached/saved MediaWiki page is. Returns the resolved
+/// title on success; on failure, a ready-to-display message (no archive
+/// loaded, title not found, unsupported compression, …) — callers decide
+/// whether to add anything further (the `:zim <title>` handler appends
+/// candidate titles; `open_title`'s offline fallback doesn't, since it
+/// already has its own message for "nothing worked").
+fn try_open_from_zim(app: &mut App, title: &str) -> Result<String, String> {
+    let Some(archive) = app.zim.as_ref() else {
+        return Err("No ZIM archive is open — :zim open <path>".to_string());
+    };
+    match archive.article_html(title) {
+        Ok((resolved_title, html)) => {
+            let document = doc::parse_article_html(&resolved_title, &html);
+            {
+                let tab = app.active_tab_mut();
+                tab.page_source = PageSource::Zim;
+                // `Tab::current_revid`'s established "0 means degraded/
+                // unknown" convention (see the Lift Wing fallback's own use
+                // of it) — a ZIM article has no MediaWiki revid at all.
+                tab.current_revid = 0;
+            }
+            app.open_document(document);
+            Ok(resolved_title)
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 /// `:fetch-queue` (PRD FR-OFF-6): drain the offline fetch queue now — fetch
 /// every queued title into the cache, dropping the ones that land. Runs
 /// synchronously on the trigger (a deliberate, explicit action; the mock makes
@@ -2514,6 +2568,16 @@ async fn run(
     };
     tokio::spawn(substrate.clone().run(executor));
 
+    // PRD FR-OFF-8: `--zim <path>` loads the archive before the ordinary
+    // search/title/session/resume dispatch below runs, so it's available to
+    // `open_title`'s offline fallback (`try_open_from_zim`) the moment a
+    // TITLE argument needs it. A bad path degrades to a notice, never a
+    // crash — the dispatch below proceeds exactly as if `--zim` had not
+    // been given.
+    if let Some(path) = cli.zim.clone() {
+        open_zim_archive(&mut app, &path);
+    }
+
     if let Some(query) = cli.search {
         app.search_input = query;
         run_search(client, &mut app).await;
@@ -2578,6 +2642,21 @@ async fn run(
                 &langlinks_tx,
             )
             .await;
+        }
+    } else if let Some(main_title) = app
+        .zim
+        .as_ref()
+        .and_then(crate::zim::ZimArchive::main_page_title)
+    {
+        // PRD FR-OFF-8: `--zim <path>` with no title/search/session/resume —
+        // land on the archive's own declared main page, the same "something
+        // useful on screen by default" posture the feed start page gives.
+        // Sits last in this chain: an explicit session/resume request still
+        // wins over a bare `--zim` with nothing else asked for.
+        if try_open_from_zim(&mut app, &main_title).is_err() {
+            app.notice = Some(format!(
+                "ZIM archive has no readable main page (tried \"{main_title}\") — try :zim <title>"
+            ));
         }
     }
 
@@ -3597,11 +3676,18 @@ async fn open_title(
     let lang = chain.first().cloned().unwrap_or_else(|| app.lang.clone());
     if app.saved.is_saved(&client.wiki_scope(), &lang, title) {
         open_saved(app, &client.wiki_scope(), &lang, title);
+    } else if try_open_from_zim(app, title).is_ok() {
+        // PRD FR-OFF-8: the network and the pinned saved-pages store both
+        // came up empty — a loaded ZIM archive is the last offline source
+        // before giving up to the offline card, "bridging online + Kiwix
+        // worlds" the way §3.3 describes rather than requiring the reader
+        // to know in advance which of the two an article lives in.
     } else {
         // §7's "Offline, uncached link": the network failed and nothing is
-        // cached, in every language tried. Offer the queue-for-fetch /
-        // search-saved card (FR-OFF-6) for the chain's first (primary)
-        // language, same as the pre-fallback-chain error path.
+        // cached, in every language tried (and no ZIM archive has it
+        // either). Offer the queue-for-fetch / search-saved card (FR-OFF-6)
+        // for the chain's first (primary) language, same as the
+        // pre-fallback-chain error path.
         app.status = format!(
             "Error: {}",
             last_err.expect("the chain always has at least one entry")
@@ -7801,7 +7887,7 @@ async fn execute_command(
     related_tx: &UnboundedSender<RelatedOutcome>,
     langlinks_tx: &UnboundedSender<LangLinksOutcome>,
 ) {
-    use command::{Command, LoginMode, RandomSpec, SaveSpec, TtsSpec};
+    use command::{Command, LoginMode, RandomSpec, SaveSpec, TtsSpec, ZimSpec};
     // PRD FR-DL-6: while a wiki-walk is active and unwon, `:open`/`:random`/
     // `:related` are the "direct open, bypassing links" moves the game
     // restricts — see `game_navigation_blocked`'s doc comment for exactly
@@ -8087,6 +8173,43 @@ async fn execute_command(
         },
         Command::Saved => app.open_saved_picker(),
         Command::FetchQueue => drain_fetch_queue(client, cache, app).await,
+        // PRD FR-OFF-8: `:zim open|close|<title>` and the bare status form.
+        Command::Zim(ZimSpec::Open(path)) => open_zim_archive(app, std::path::Path::new(&path)),
+        Command::Zim(ZimSpec::Close) => {
+            app.notice = Some(if app.zim.take().is_some() {
+                "Closed the ZIM archive".to_string()
+            } else {
+                "No ZIM archive is open".to_string()
+            });
+        }
+        Command::Zim(ZimSpec::Status) => {
+            app.notice = Some(match &app.zim {
+                Some(archive) => format!(
+                    "ZIM: {} — {} articles ({} indexed titles)",
+                    archive.path().display(),
+                    archive.article_count(),
+                    archive.indexed_title_count()
+                ),
+                None => "No ZIM archive is open — :zim open <path>".to_string(),
+            });
+        }
+        Command::Zim(ZimSpec::Lookup(title)) => match try_open_from_zim(app, &title) {
+            Ok(resolved) => {
+                app.notice = Some(format!("Opened \"{resolved}\" from the ZIM archive"));
+            }
+            Err(message) => {
+                let candidates = app
+                    .zim
+                    .as_ref()
+                    .map(|z| z.search_titles(&title, 8))
+                    .unwrap_or_default();
+                app.notice = Some(if candidates.is_empty() {
+                    message
+                } else {
+                    format!("{message} — try: {}", candidates.join(", "))
+                });
+            }
+        },
         // PRD FR-DL-1: same action as the `gh` keybinding.
         Command::Start => app.go_home(),
         // PRD FR-DL-2.

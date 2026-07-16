@@ -231,6 +231,9 @@ pub enum Command {
     RunMacro(String),
     /// `:game ...` (PRD FR-DL-6) — the wiki-walk game; see [`GameSpec`].
     Game(GameSpec),
+    /// `:zim ...` (PRD FR-OFF-8) — the Kiwix ZIM offline read-backend; see
+    /// [`ZimSpec`].
+    Zim(ZimSpec),
     /// `:xyzzy` (PRD FR-DL-8) — the classic. "Nothing happens." unless
     /// `pro = true`, in which case it's treated exactly like any other
     /// unrecognized command (`main::execute_command`'s doc comment explains
@@ -255,6 +258,25 @@ pub enum GameSpec {
     /// `:game share`: (re)shows and clipboard-yanks the current/just-
     /// finished game's shareable result card (`game::share_card`).
     Share,
+}
+
+/// `:zim`'s four forms (PRD FR-OFF-8). Mirrors `:save`'s "the first token
+/// selects a sub-form, anything else is the payload" shape (`SaveSpec`),
+/// except a bare title has no reserved leading keyword to collide with —
+/// only `open`/`close` are reserved, so `:zim Open Society` (a real article
+/// title that happens to start with the word "Open") still parses as a
+/// [`ZimSpec::Lookup`], not a (malformed) `open` with no path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ZimSpec {
+    /// `:zim open <path>` — load a `.zim` file as the offline source.
+    Open(String),
+    /// `:zim close` — unload the current archive.
+    Close,
+    /// bare `:zim` — report whether an archive is loaded (and which).
+    Status,
+    /// `:zim <title>` — look up and open an article from the currently
+    /// loaded archive.
+    Lookup(String),
 }
 
 /// `:tts`/`:speak`'s two forms (PRD FR-PC-2).
@@ -511,7 +533,7 @@ fn validate_set_value(
     }
 }
 
-pub const USAGE: &str = "commands: open <title>, lang [<code>], theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, prefetch-log, interests, not-interested, stats, start, today, random [good], related, talk, info, set theme=<name>|images=on|off|prefetch=on|off|show-cn=on|off|measure=N|ambiguous_width=1|2|reading_wpm=N|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N|justify=on|off|hyphenate=on|off, set-tab measure=N|images=on|off|ambiguous_width=1|2|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N|justify=on|off|hyphenate=on|off (or set-tab key= to reset), config reload, vsplit, only, bilingual, wiki [<name>], set scrollbind, set show-cn, watchlist, notifications, contribs [username], prefs, enable-editing, edit [summary], sync, mirror-watchlist, search-offline, trail [all|days N|export md|dot|mermaid [path]], mksession <name>, session <name>, sessions, tts [stop], speak [stop], run <macro>, game [daily|share|<start> <goal>], xyzzy, help, quit";
+pub const USAGE: &str = "commands: open <title>, lang [<code>], theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, zim [open <path>|close|<title>], prefetch-log, interests, not-interested, stats, start, today, random [good], related, talk, info, set theme=<name>|images=on|off|prefetch=on|off|show-cn=on|off|measure=N|ambiguous_width=1|2|reading_wpm=N|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N|justify=on|off|hyphenate=on|off, set-tab measure=N|images=on|off|ambiguous_width=1|2|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N|justify=on|off|hyphenate=on|off (or set-tab key= to reset), config reload, vsplit, only, bilingual, wiki [<name>], set scrollbind, set show-cn, watchlist, notifications, contribs [username], prefs, enable-editing, edit [summary], sync, mirror-watchlist, search-offline, trail [all|days N|export md|dot|mermaid [path]], mksession <name>, session <name>, sessions, tts [stop], speak [stop], run <macro>, game [daily|share|<start> <goal>], xyzzy, help, quit";
 
 /// Parses one `:` command line. `user_theme_names` are accepted alongside
 /// the six built-ins for `:theme <name>` and `:set theme=<name>` (PRD
@@ -811,6 +833,31 @@ pub fn parse_with_user_themes(input: &str, user_theme_names: &[String]) -> Resul
         }
         "saved" => Ok(Command::Saved),
         "fetch-queue" | "fetchqueue" => Ok(Command::FetchQueue),
+        // PRD FR-OFF-8: `:zim open <path>` loads an archive, `:zim close`
+        // unloads it, bare `:zim` reports what's loaded, and anything else
+        // is a title lookup in the currently loaded archive — same
+        // "reserved first token, else it's the payload" shape as `:trail`
+        // above, except here the payload is a whole-string title rather
+        // than a single further keyword, so only an *exact* `open`/`close`
+        // first token is reserved (see `ZimSpec`'s doc comment for why a
+        // real title starting with "Open"/"Close" — capitalized, as
+        // article titles conventionally are — never collides).
+        "zim" => {
+            if arg.is_empty() {
+                Ok(Command::Zim(ZimSpec::Status))
+            } else {
+                let (sub, rest) = match arg.split_once(char::is_whitespace) {
+                    Some((s, r)) => (s, r.trim()),
+                    None => (arg, ""),
+                };
+                match sub {
+                    "open" if !rest.is_empty() => Ok(Command::Zim(ZimSpec::Open(rest.to_string()))),
+                    "open" => Err("usage: :zim open <path>".to_string()),
+                    "close" if rest.is_empty() => Ok(Command::Zim(ZimSpec::Close)),
+                    _ => Ok(Command::Zim(ZimSpec::Lookup(arg.to_string()))),
+                }
+            }
+        }
         "library" | "lib" => Ok(Command::Library),
         "research" => Ok(Command::Research),
         "toc" => Ok(Command::Toc),
@@ -1756,6 +1803,44 @@ mod tests {
         assert_eq!(parse("saved"), Ok(Command::Saved));
         assert_eq!(parse("fetch-queue"), Ok(Command::FetchQueue));
         assert_eq!(parse("fetchqueue"), Ok(Command::FetchQueue));
+    }
+
+    // ---- PRD FR-OFF-8: `:zim` ------------------------------------------
+
+    #[test]
+    fn bare_zim_reports_status() {
+        assert_eq!(parse("zim"), Ok(Command::Zim(ZimSpec::Status)));
+    }
+
+    #[test]
+    fn zim_open_parses_the_path() {
+        assert_eq!(
+            parse("zim open /path/to/wikipedia.zim"),
+            Ok(Command::Zim(ZimSpec::Open(
+                "/path/to/wikipedia.zim".to_string()
+            )))
+        );
+        assert!(parse("zim open").is_err(), "open with no path is an error");
+    }
+
+    #[test]
+    fn zim_close_parses_with_no_argument() {
+        assert_eq!(parse("zim close"), Ok(Command::Zim(ZimSpec::Close)));
+    }
+
+    #[test]
+    fn zim_with_any_other_argument_is_a_title_lookup() {
+        assert_eq!(
+            parse("zim Alan Turing"),
+            Ok(Command::Zim(ZimSpec::Lookup("Alan Turing".to_string())))
+        );
+        // A real title whose first word happens to be "Open" (capitalized,
+        // as MediaWiki titles conventionally are) is a lookup, not the
+        // reserved `open` subcommand — see `ZimSpec`'s doc comment.
+        assert_eq!(
+            parse("zim Open Society"),
+            Ok(Command::Zim(ZimSpec::Lookup("Open Society".to_string())))
+        );
     }
 
     #[test]

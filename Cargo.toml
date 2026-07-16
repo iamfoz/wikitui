@@ -72,6 +72,25 @@ getrandom = "0.2"
 # hyphenated (see `layout::try_hyphenate`'s scope note).
 hyphenation = { version = "0.8.4", features = ["embed_en-us"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+# PRD FR-OFF-8: the Kiwix ZIM offline read-backend. §6.1's accepted-cost note
+# ("Rust ZIM bindings are immature") is about `libzim` bindings specifically
+# — evaluated and rejected here as `zim-rs`/`zim-sys`, which link the real
+# `libzim` C++ library via `pkg-config` and fail to build in any environment
+# without `libzim-dev` installed (this one included; same shape of failure as
+# the `keychain` feature's `libdbus-1` requirement above, just unconditional
+# since `zim-sys` has no off-by-default gate to hide behind). `zim` (this
+# crate, unrelated to the `zim-rs` family beyond the file format) is a
+# from-scratch pure-Rust reader with no C dependency of its own — it builds
+# clean here — at the cost of pulling in a moderately heavy transitive tree
+# (rayon, indicatif, pbr, num_cpus, clap) that only its own bundled
+# `extract-zim`/`zim-info` CLI binaries actually use; wikitui's own binary
+# never links to those code paths. It targets ZIM major versions 5 and 6
+# (what real Kiwix downloads use) and decodes Zstd/LZMA2/uncompressed
+# clusters; `zim::ZimError::UnsupportedCompression` (`src/zim.rs`) covers the
+# two compression tags (`bzip2`, `zlib`) this crate's own decompressor never
+# implemented, turning what would otherwise be a `todo!()` panic on a rare
+# archive into a clean error.
+zim = "0.4.0"
 # PRD SEC-4: OS keychain token storage, gated behind the off-by-default
 # `keychain` feature above (see it for why). Optional so the default build
 # links no secret-service/D-Bus machinery.

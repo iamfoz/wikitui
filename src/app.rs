@@ -233,6 +233,8 @@ pub enum PeekPopup {
 /// in, ▣ served from the *pinned* saved-pages store. The ▣ glyph is
 /// deliberately distinct from ◐/○ so a pinned saved page (integrity-checked,
 /// never evicted — PRD §5.7) reads as different from a best-effort cache hit.
+/// ◈ (PRD FR-OFF-8) is distinct again: content read straight out of a local
+/// ZIM archive, never fetched or cached at all — see `zim::ZimArchive`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageSource {
     None,
@@ -248,6 +250,10 @@ pub enum PageSource {
     Saved {
         age_secs: u64,
     },
+    /// Served from a currently loaded ZIM archive (PRD FR-OFF-8). No age or
+    /// revid — a ZIM article's only "freshness" is whenever the archive
+    /// itself was built, which this module doesn't attempt to surface.
+    Zim,
 }
 
 /// A background revalidation (PRD FR-OFF-2) found a newer revid and wrote
@@ -293,6 +299,7 @@ impl PageSource {
             Self::Saved { age_secs } => {
                 format!("▣ saved {} ago · ", crate::cache::age_human(*age_secs))
             }
+            Self::Zim => "◈ zim · ".to_string(),
         }
     }
 }
@@ -764,6 +771,12 @@ pub struct App {
     /// The `(lang, title)` the offline card is currently offering to queue or
     /// find in saved pages — `Some` exactly while `mode == Mode::OfflineCard`.
     pub offline_card_target: Option<(String, String)>,
+    /// PRD FR-OFF-8: the currently loaded Kiwix ZIM archive, if any —
+    /// `--zim <path>`/`:zim open <path>` populate it, `:zim close` clears
+    /// it. At most one archive at a time (this chunk doesn't attempt
+    /// multi-archive sessions); `None` is the default, identical-to-before
+    /// behavior every existing call site sees.
+    pub zim: Option<crate::zim::ZimArchive>,
     /// PRD FR-DL-3: per-`(lang, title)` quality-class cache for the session.
     /// The current article's status-bar badge (`current_quality_badge`) and a
     /// batch of search-result rows (`quality_badge_for`) both read from this
@@ -1473,6 +1486,7 @@ impl App {
             saved_prior_mode: Mode::Reading,
             fetch_queue: FetchQueue::load(),
             offline_card_target: None,
+            zim: None,
             quality_cache: HashMap::new(),
             confirmed_redlinks: HashSet::new(),
             checked_redlink_sources: HashSet::new(),
@@ -9879,6 +9893,22 @@ mod tests {
         assert!(offline.starts_with('○'));
         assert_ne!(saved, cached);
         assert_ne!(saved, offline);
+    }
+
+    /// PRD FR-OFF-8's ◈ Zim glyph must likewise be distinct from every
+    /// other source indicator.
+    #[test]
+    fn zim_page_source_glyph_is_distinct_from_every_other_source() {
+        let zim = PageSource::Zim.prefix();
+        assert!(zim.starts_with('◈'), "zim uses ◈: {zim:?}");
+        for other in [
+            PageSource::Live.prefix(),
+            PageSource::Cached { age_secs: 1 }.prefix(),
+            PageSource::Offline { age_secs: 1 }.prefix(),
+            PageSource::Saved { age_secs: 1 }.prefix(),
+        ] {
+            assert_ne!(zim, other);
+        }
     }
 
     /// PRD FR-OFF-5's cost preview: the estimate is count × the tier's
