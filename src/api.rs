@@ -2,6 +2,17 @@
 //! (`{lang}.wikipedia.org`), never `api.wikimedia.org`. Per §6.5 (NF-NET-2)
 //! every request carries a descriptive User-Agent.
 //!
+//! **One stated exception** (PRD FR-DL-3 v2, §6.2 rule 1's own carve-out):
+//! [`WikiClient::fetch_liftwing_quality`] addresses the Lift Wing ML
+//! inference gateway at `api.wikimedia.org`, because the article-quality
+//! model it calls has no per-wiki-hosted equivalent — Lift Wing has only
+//! ever been gateway-hosted. It is opt-in (`liftwing` config, default off)
+//! and its endpoint is config-overridable (§6.2 rule 2) precisely because
+//! the gateway's post-deprecation survival is unverified (SP-4): if it's
+//! gone, this simply degrades to the documented "non-PageAssessments wikis
+//! show no badge" behavior. See that method's own doc comment for the
+//! request/response shape and how unverified it is against a live endpoint.
+//!
 //! The language edition is a per-request parameter rather than client
 //! state, so `:lang de` (FR-CS-2 / FR-ML-2's config) can switch editions
 //! mid-session without rebuilding the HTTP client.
@@ -557,6 +568,72 @@ impl QualityClass {
             Self::Stub => "Stub",
         }
     }
+
+    /// PRD FR-DL-3 v2: maps a Lift Wing `articlequality` score to a
+    /// `QualityClass`. `prediction` is the model's own already-decided top
+    /// class (an argmax over `probability` performed server-side), so this
+    /// simply parses that string with the same [`Self::parse`] the
+    /// `pageassessments` path already uses for its `class` field — the two
+    /// fallback paths converge on one class-name vocabulary. `probability`'s
+    /// per-class map is consulted only when `prediction` is missing or
+    /// unrecognized: an argmax computed locally instead, favoring the
+    /// higher-ranked class (`QualityClass`'s own `Ord`) on an exact tie
+    /// rather than picking arbitrarily. A weighted-average score (rather
+    /// than either argmax) was considered and rejected: it can land on a
+    /// class the distribution never actually favors most (e.g. FA-heavy and
+    /// Stub-heavy mass on either side of B averaging to "B" even when B
+    /// itself has near-zero probability), which reads as a worse-justified
+    /// badge than either directly-reported "most likely" figure.
+    fn from_liftwing_score(score: &LiftWingScore) -> Option<Self> {
+        Self::parse(&score.prediction).or_else(|| {
+            score
+                .probability
+                .iter()
+                .filter_map(|(name, p)| Self::parse(name).map(|class| (class, *p)))
+                .max_by(|(class_a, p_a), (class_b, p_b)| {
+                    p_a.total_cmp(p_b).then(class_a.cmp(class_b))
+                })
+                .map(|(class, _)| class)
+        })
+    }
+}
+
+/// PRD FR-DL-3 v2's Lift Wing `articlequality` predict response. Modeled on
+/// the ORES-legacy-compatible shape Lift Wing kept for backward
+/// compatibility with ORES consumers — `{wiki_db: {scores: {rev_id:
+/// {articlequality: {score: {prediction, probability}}}}}}` — the
+/// best-documented public shape available for this model family. **This is
+/// UNVERIFIED against a live endpoint** (PRD SP-4: the `api.wikimedia.org`
+/// gateway's post-deprecation status, and by extension whether this exact
+/// response shape still holds, is unconfirmed); `liftwing`'s config default
+/// is off for exactly this reason. A response that doesn't parse into this
+/// shape is treated as "no score" (`WikiClient::fetch_liftwing_quality`
+/// returns `Ok(None)`), never a hard error that would take down the whole
+/// article-open path over an optional badge.
+type LiftWingResponse = HashMap<String, LiftWingWikiScores>;
+
+#[derive(Debug, Deserialize, Default)]
+struct LiftWingWikiScores {
+    #[serde(default)]
+    scores: HashMap<String, LiftWingRevScore>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LiftWingRevScore {
+    articlequality: LiftWingModelScore,
+}
+
+#[derive(Debug, Deserialize)]
+struct LiftWingModelScore {
+    score: LiftWingScore,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct LiftWingScore {
+    #[serde(default)]
+    prediction: String,
+    #[serde(default)]
+    probability: HashMap<String, f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1271,6 +1348,58 @@ impl WikiClient {
             }
         }
         Ok(best)
+    }
+
+    /// PRD FR-DL-3 v2 (§6.2 rule 1's stated exception): the Lift Wing
+    /// `articlequality` model, queried when `prop=pageassessments` isn't
+    /// available for the active wiki at all (see `main::enrich_article`'s
+    /// own gate — never called when the wiki *has* PageAssessments, only
+    /// when it doesn't). `liftwing_base_url` is a caller-supplied parameter
+    /// (config-resolved, §6.2 rule 2), not `self.host()`: Lift Wing is
+    /// gateway-hosted, the one endpoint in this whole client that isn't
+    /// per-wiki, so it can't be derived from the active wiki's own template.
+    ///
+    /// Keyed by revision id, not title — the model scores one specific
+    /// revision's text, not "whatever the latest revision happens to be",
+    /// so the caller passes the revid the article view already fetched
+    /// (`Tab::current_revid`) rather than this method spending a second
+    /// "what's the latest revid" round trip to look one up (PRD's "sparing"
+    /// framing for this fallback). `rev_id == 0` (the "unknown/degraded"
+    /// convention `Tab::current_revid` documents) is the caller's problem to
+    /// gate on; this method does not special-case it and will simply ask
+    /// Lift Wing about revision `0`, getting back no score.
+    ///
+    /// Returns `Ok(None)` — not an error — for "no score for this revision"
+    /// and for a response that doesn't parse into the expected shape: an
+    /// optional quality badge going missing must never surface as a fetch
+    /// failure. **UNVERIFIED against a live endpoint** — see
+    /// [`LiftWingResponse`]'s own doc comment for why.
+    pub async fn fetch_liftwing_quality(
+        &self,
+        liftwing_base_url: &str,
+        lang: &str,
+        rev_id: u64,
+    ) -> Result<Option<QualityClass>> {
+        let url = format!("{liftwing_base_url}/models/{lang}wiki-articlequality:predict");
+        let resp = self
+            .http
+            .post(&url)
+            .json(&serde_json::json!({ "rev_id": rev_id, "extended_output": true }))
+            .send()
+            .await
+            .context("requesting Lift Wing article quality")?
+            .error_for_status()
+            .context("Lift Wing article quality request failed")?;
+        let bytes = read_capped(resp, MAX_SEARCH_RESPONSE_BYTES)
+            .await
+            .context("reading Lift Wing response body")?;
+        let parsed: LiftWingResponse =
+            serde_json::from_slice(&bytes).context("parsing Lift Wing response")?;
+        let wiki_key = format!("{lang}wiki");
+        Ok(parsed
+            .get(&wiki_key)
+            .and_then(|w| w.scores.get(&rev_id.to_string()))
+            .and_then(|s| QualityClass::from_liftwing_score(&s.articlequality.score)))
     }
 
     /// PRD FR-PF-3's per-article categories: `prop=categories` for up to 50
@@ -3188,6 +3317,133 @@ mod tests {
             None,
             "no recognized assessment at all must leave the title absent, not a default rank"
         );
+    }
+
+    // ---- Lift Wing (PRD FR-DL-3 v2, §6.2 rule 1's stated exception) -------
+
+    /// The documented request shape: `POST` to `{base}/models/{lang}wiki-
+    /// articlequality:predict` with a JSON body naming the revision — and
+    /// the `prediction` field of a successful response mapped straight to a
+    /// `QualityClass`.
+    #[tokio::test]
+    async fn fetch_liftwing_quality_requests_the_documented_endpoint_shape() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let cap2 = captured.clone();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                *cap2.lock().unwrap() = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let body = br#"{"enwiki":{"scores":{"1001":{"articlequality":{"score":{
+                    "prediction":"GA",
+                    "probability":{"FA":0.1,"GA":0.6,"B":0.2,"C":0.05,"Start":0.03,"Stub":0.02}
+                }}}}}}"#;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+        let client = WikiClient::new("http://unused/{lang}".to_string()).unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let class = client
+            .fetch_liftwing_quality(&base, "en", 1001)
+            .await
+            .unwrap();
+        assert_eq!(class, Some(QualityClass::Ga));
+        let head = captured.lock().unwrap().clone();
+        let request_line = head.lines().next().unwrap_or_default();
+        assert!(
+            request_line.contains("POST /models/enwiki-articlequality:predict"),
+            "{request_line:?}"
+        );
+        assert!(head.contains("\"rev_id\":1001"), "{head:?}");
+    }
+
+    /// A response for a wiki/revid this call didn't ask about (or no score
+    /// at all) is "no badge," not an error — the caller (`enrich_article`)
+    /// must be free to treat a missing Lift Wing score exactly like a wiki
+    /// with no PageAssessments data for a title.
+    #[tokio::test]
+    async fn fetch_liftwing_quality_with_no_matching_score_is_none_not_an_error() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut discard = [0u8; 4096];
+                let _ = stream.read(&mut discard);
+                let body = br#"{"enwiki":{"scores":{}}}"#;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+        let client = WikiClient::new("http://unused/{lang}".to_string()).unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let class = client
+            .fetch_liftwing_quality(&base, "en", 9999)
+            .await
+            .unwrap();
+        assert_eq!(class, None);
+    }
+
+    /// `from_liftwing_score`'s documented fallback: an unrecognized/missing
+    /// `prediction` string still resolves via an argmax over `probability`,
+    /// rather than reporting no badge when the distribution clearly favors
+    /// one recognized class.
+    #[test]
+    fn liftwing_score_falls_back_to_probability_argmax_when_prediction_is_unusable() {
+        let score = LiftWingScore {
+            prediction: String::new(),
+            probability: HashMap::from([
+                ("FA".to_string(), 0.05),
+                ("GA".to_string(), 0.05),
+                ("B".to_string(), 0.75),
+                ("C".to_string(), 0.10),
+                ("Start".to_string(), 0.03),
+                ("Stub".to_string(), 0.02),
+            ]),
+        };
+        assert_eq!(
+            QualityClass::from_liftwing_score(&score),
+            Some(QualityClass::B)
+        );
+    }
+
+    /// `prediction` wins over `probability` even when they'd disagree —
+    /// documented precedence (the model's own reported top class, not a
+    /// locally recomputed one).
+    #[test]
+    fn liftwing_score_prefers_prediction_over_recomputing_from_probability() {
+        let score = LiftWingScore {
+            prediction: "Stub".to_string(),
+            probability: HashMap::from([("FA".to_string(), 0.99), ("Stub".to_string(), 0.01)]),
+        };
+        assert_eq!(
+            QualityClass::from_liftwing_score(&score),
+            Some(QualityClass::Stub)
+        );
+    }
+
+    /// A score with neither a usable `prediction` nor any recognized
+    /// `probability` entry parses to no class at all — a Lift Wing response
+    /// this build can't make sense of is "no badge," never invented.
+    #[test]
+    fn liftwing_score_with_nothing_recognizable_is_none() {
+        let score = LiftWingScore {
+            prediction: "unknown-model-output".to_string(),
+            probability: HashMap::from([("FL".to_string(), 0.9)]),
+        };
+        assert_eq!(QualityClass::from_liftwing_score(&score), None);
     }
 
     /// PRD FR-SR-5's "assessment ≥ GA" filter is exactly `QualityClass`'s

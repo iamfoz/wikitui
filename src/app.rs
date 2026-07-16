@@ -714,13 +714,25 @@ pub struct App {
 
     // -- Trail / wander-graph view (PRD FR-HS-3) ----------------------------
     /// The currently-built trail (`trail::build`), rebuilt fresh every time
-    /// `open_trail` runs — never mutated incrementally, since a trail is a
-    /// point-in-time snapshot of the history table, not a live-updating
-    /// view. Defaults to an empty trail before `:trail` is ever opened.
+    /// `open_trail`/`open_trail_dag` runs — never mutated incrementally,
+    /// since a trail is a point-in-time snapshot of the history table, not a
+    /// live-updating view. Defaults to an empty trail before `:trail` is
+    /// ever opened. `trail.graph` alone is enough to render either layout
+    /// (`trail.tree` for `TrailLayout::Tree`, `trail::dag_from_graph(&trail.
+    /// graph)` computed on demand for `TrailLayout::Dag` — the same "don't
+    /// cache the flattened form" posture `trail::flatten` already has for
+    /// the tree).
     pub trail: crate::trail::Trail,
-    /// Selection cursor into `trail::flatten(&self.trail.tree)`'s line list.
+    /// Which of FR-HS-3's two layouts `:trail`/`:trail dag` last opened
+    /// (PRD: "v1.x ships tree layout; true DAG layout is v2"). Tree is the
+    /// default; `open_trail`/`open_trail_dag` are the only two writers.
+    pub trail_layout: crate::trail::TrailLayout,
+    /// Selection cursor into whichever line list `trail_layout` currently
+    /// renders (`trail::flatten(&self.trail.tree)` for `Tree`,
+    /// `trail::dag_from_graph(&self.trail.graph).nodes` for `Dag`).
     pub trail_selected: usize,
-    /// The mode `open_trail` was entered from, restored on Esc.
+    /// The mode `open_trail`/`open_trail_dag` was entered from, restored on
+    /// Esc.
     pub trail_prior_mode: Mode,
     /// Export-overwrite confirmation for `:trail export`, mirroring
     /// `pending_bookmark_export_overwrite`.
@@ -1164,6 +1176,17 @@ pub struct App {
     /// `apply_config_reload` set this from `[pro]`... — see
     /// `config::ResolvedConfig::pro`'s own doc comment for the exact key.
     pub pro: bool,
+    /// PRD FR-DL-3 v2's `liftwing = true` config: whether `enrich_article`
+    /// even attempts the Lift Wing ML-quality fallback once a wiki's
+    /// `pageassessments` capability is off. Default `false` — see
+    /// `config::ResolvedConfig::liftwing`'s own doc comment for why
+    /// (gateway survival unverified, SP-4).
+    pub liftwing_enabled: bool,
+    /// The Lift Wing gateway endpoint template (§6.2 rule 2), from
+    /// `config::ResolvedConfig::liftwing_base_url` — see that field's doc
+    /// comment. Set at startup and re-applied on `:config reload`
+    /// (`main::apply_config_reload`), same as `liftwing_enabled`.
+    pub liftwing_base_url: String,
 }
 
 /// Which bracket armed FR-DL-4's citation-needed jump chord (`]c`/`[c`) —
@@ -1440,6 +1463,7 @@ impl App {
             history_pick_prior_mode: Mode::Reading,
             session_started_at: crate::history::now_unix(),
             trail: crate::trail::Trail::default(),
+            trail_layout: crate::trail::TrailLayout::default(),
             trail_selected: 0,
             trail_prior_mode: Mode::Reading,
             pending_trail_export_overwrite: None,
@@ -1541,6 +1565,8 @@ impl App {
             game: None,
             achievements_shown: std::collections::HashSet::new(),
             pro: false,
+            liftwing_enabled: false,
+            liftwing_base_url: crate::config::DEFAULT_LIFTWING_BASE_URL.to_string(),
         }
     }
 
@@ -3933,8 +3959,28 @@ impl App {
 
     /// `:trail [all|days N]` (PRD FR-HS-3): builds the wander graph from
     /// whichever visits `scope` selects (default, bare `:trail`: this run's
-    /// own session) and opens the navigable tree view.
+    /// own session) and opens the navigable tree view — always resets
+    /// `trail_layout` to `Tree`, so a stray `:trail` after a `:trail dag`
+    /// session reliably lands back on the default, never leaving the DAG
+    /// layout silently active under the plain command's own status text.
     pub fn open_trail(&mut self, scope: crate::command::TrailScope) {
+        self.trail_layout = crate::trail::TrailLayout::Tree;
+        self.open_trail_common(scope);
+    }
+
+    /// `:trail dag [all|days N]` (PRD FR-HS-3 v2): identical scope handling
+    /// to [`Self::open_trail`], but opens the true-DAG view — a node with
+    /// more than one referrer shows every parent instead of one plus an
+    /// "also from" note.
+    pub fn open_trail_dag(&mut self, scope: crate::command::TrailScope) {
+        self.trail_layout = crate::trail::TrailLayout::Dag;
+        self.open_trail_common(scope);
+    }
+
+    /// Shared build-and-open steps behind [`Self::open_trail`]/
+    /// [`Self::open_trail_dag`] — everything except which `trail_layout`
+    /// the caller already set.
+    fn open_trail_common(&mut self, scope: crate::command::TrailScope) {
         self.trail_prior_mode = self.mode;
         let visits = self.trail_scoped_visits(scope);
         self.trail = crate::trail::build(&visits);
@@ -3955,9 +4001,27 @@ impl App {
         };
     }
 
+    /// The article keys of whichever line list `trail_layout` currently
+    /// renders, in display order — the one thing `cycle_trail`/
+    /// `selected_trail_target` need and the one place they'd otherwise have
+    /// to duplicate the `Tree`/`Dag` branch.
+    fn trail_line_articles(&self) -> Vec<crate::trail::ArticleKey> {
+        match self.trail_layout {
+            crate::trail::TrailLayout::Tree => crate::trail::flatten(&self.trail.tree)
+                .into_iter()
+                .map(|l| l.article)
+                .collect(),
+            crate::trail::TrailLayout::Dag => crate::trail::dag_from_graph(&self.trail.graph)
+                .nodes
+                .into_iter()
+                .map(|n| n.article)
+                .collect(),
+        }
+    }
+
     /// Moves the picker's selection, wrapping — a no-op with nothing shown.
     pub fn cycle_trail(&mut self, forward: bool) {
-        let len = crate::trail::flatten(&self.trail.tree).len();
+        let len = self.trail_line_articles().len();
         if len == 0 {
             return;
         }
@@ -3973,14 +4037,9 @@ impl App {
     /// `App::selected_saved_target`'s "plain data getter, main.rs does the
     /// actual fetch" split).
     pub fn selected_trail_target(&self) -> Option<(String, String, String)> {
-        let lines = crate::trail::flatten(&self.trail.tree);
-        lines.get(self.trail_selected).map(|l| {
-            (
-                l.article.wiki.clone(),
-                l.article.lang.clone(),
-                l.article.title.clone(),
-            )
-        })
+        self.trail_line_articles()
+            .get(self.trail_selected)
+            .map(|a| (a.wiki.clone(), a.lang.clone(), a.title.clone()))
     }
 
     /// `:trail export md|dot|mermaid [path]` (PRD FR-HS-3). Always exports
@@ -9545,6 +9604,108 @@ mod tests {
         app.open_trail(crate::command::TrailScope::Session);
         app.cycle_trail(true);
         assert_eq!(app.trail_selected, 0);
+    }
+
+    // ---- Trail DAG view (PRD FR-HS-3 v2) -----------------------------------
+
+    /// Builds the module doc's own merge scenario purely through the public
+    /// navigation API (`open_document`/`navigate_back_target`/
+    /// `set_document`), the same technique
+    /// `a_branching_trail_shows_two_children_under_the_same_root` already
+    /// uses for a simpler shape: A -> B, back to A, A -> C (so both branches
+    /// exist), then B -> D and, after returning to C, C -> D again — D ends
+    /// up reached from both B and C.
+    fn open_a_merge_trail(app: &mut App) {
+        app.open_document(doc("A"));
+        app.open_document(doc("B")); // A -> B
+        app.open_document(doc("D")); // B -> D (first visit, referrer B)
+        let back_to_b = app.navigate_back_target().expect("B is on the back stack");
+        assert_eq!(back_to_b.title, "B");
+        app.set_document(doc("B"));
+        let back_to_a = app.navigate_back_target().expect("A is on the back stack");
+        assert_eq!(back_to_a.title, "A");
+        app.set_document(doc("A"));
+        app.open_document(doc("C")); // A -> C, the second branch off A
+        app.open_document(doc("D")); // C -> D (second visit, referrer C)
+    }
+
+    #[test]
+    fn open_trail_dag_sets_the_dag_layout_and_open_trail_resets_it_to_tree() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        open_a_merge_trail(&mut app);
+        app.open_trail_dag(crate::command::TrailScope::Session);
+        assert_eq!(app.mode, Mode::Trail);
+        assert_eq!(app.trail_layout, crate::trail::TrailLayout::Dag);
+        app.open_trail(crate::command::TrailScope::Session);
+        assert_eq!(
+            app.trail_layout,
+            crate::trail::TrailLayout::Tree,
+            "plain :trail must always land back on the tree layout"
+        );
+    }
+
+    /// The scenario the DAG view exists for: D was reached from both B and
+    /// C, so `:trail dag` must show D with BOTH as parents — distinct from
+    /// the tree view (already covered by
+    /// `a_multi_parent_node_is_placed_under_its_first_referrer_with_an_
+    /// also_from_note` at the `trail` module level), which keeps only one.
+    #[test]
+    fn trail_dag_shows_a_merge_nodes_full_parent_set() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        open_a_merge_trail(&mut app);
+        app.open_trail_dag(crate::command::TrailScope::Session);
+        let dag = crate::trail::dag_from_graph(&app.trail.graph);
+        let d = dag
+            .nodes
+            .iter()
+            .find(|n| n.article.title == "D")
+            .expect("D must be a DAG node");
+        let mut parent_titles: Vec<&str> = d.parents.iter().map(|p| p.title.as_str()).collect();
+        parent_titles.sort_unstable();
+        assert_eq!(parent_titles, vec!["B", "C"], "D must carry both parents");
+
+        // The tree, over the very same underlying graph, keeps only one.
+        let tree_b = app
+            .trail
+            .tree
+            .roots
+            .iter()
+            .find(|r| r.article.title == "A")
+            .unwrap()
+            .children
+            .iter()
+            .find(|c| c.article.title == "B")
+            .unwrap();
+        assert_eq!(tree_b.children.len(), 1, "D is the tree's child of B only");
+        assert_eq!(tree_b.children[0].also_from, vec![key_of(&app, "C")]);
+    }
+
+    /// `cycle_trail`/`selected_trail_target` must read the DAG's own
+    /// topologically ordered node list while `trail_layout == Dag`, not the
+    /// tree's flattened line list.
+    #[test]
+    fn cycle_trail_and_selected_target_use_the_dag_list_when_dag_layout_is_active() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        open_a_merge_trail(&mut app);
+        app.open_trail_dag(crate::command::TrailScope::Session);
+        let dag = crate::trail::dag_from_graph(&app.trail.graph);
+        assert_eq!(app.trail_selected, 0);
+        for expected in dag.nodes.iter().skip(1) {
+            app.cycle_trail(true);
+            let (_, _, title) = app.selected_trail_target().unwrap();
+            assert_eq!(title, expected.article.title);
+        }
+    }
+
+    /// Small helper: the `ArticleKey` `open_a_merge_trail`'s articles use,
+    /// for asserting against `also_from`/`parents` lists without repeating
+    /// the wiki/lang boilerplate at each call site.
+    fn key_of(app: &App, title: &str) -> crate::trail::ArticleKey {
+        crate::trail::ArticleKey {
+            wiki: String::new(),
+            lang: app.active_tab().lang.clone(),
+            title: title.to_string(),
+        }
     }
 
     /// The session cutoff is a real `>=` filter, not decoration: forcing it

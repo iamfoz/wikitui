@@ -2228,7 +2228,32 @@ fn draw_reading_history_picker(frame: &mut Frame, app: &App, area: Rect) {
     render_selectable_list(frame, list, area, app.history_pick_selected);
 }
 
-/// `:trail`'s wander-graph view (PRD FR-HS-3): the flattened tree
+/// `:trail`'s wander-graph view (PRD FR-HS-3): dispatches on `trail_layout`
+/// (module doc: tree stays the default, `:trail dag` is the v2 opt-in
+/// alternate) — [`draw_trail_tree`] and [`draw_trail_dag`] share everything
+/// else (dwell display, selection highlight, empty-trail message).
+fn draw_trail(frame: &mut Frame, app: &App, area: Rect) {
+    match app.trail_layout {
+        crate::trail::TrailLayout::Tree => draw_trail_tree(frame, app, area),
+        crate::trail::TrailLayout::Dag => draw_trail_dag(frame, app, area),
+    }
+}
+
+/// No-trail-yet placeholder shared by [`draw_trail_tree`]/[`draw_trail_dag`]
+/// — `title` is the layout-specific window title (`TrailLayout::label`).
+fn draw_empty_trail(frame: &mut Frame, app: &App, area: Rect, title: &str) {
+    let paragraph =
+        Paragraph::new("No trail yet — open an article and follow a few links, then :trail again.")
+            .style(colored(app.no_color, app.theme.dim))
+            .block(
+                UiBlock::default()
+                    .borders(Borders::ALL)
+                    .title(format!("{title} — Esc: close")),
+            );
+    frame.render_widget(paragraph, area);
+}
+
+/// The tree layout (PRD FR-HS-3, v1.x default): the flattened tree
 /// (`trail::flatten`), one line per article, connectors drawn via
 /// `trail::connector` (git-log-graph aesthetics — `│`/`├─`/`└─`). Dwell is
 /// shown both as a number (`Alan Turing (4m)`, matching the PRD's own
@@ -2237,19 +2262,10 @@ fn draw_reading_history_picker(frame: &mut Frame, app: &App, area: Rect) {
 /// never a literally resized node. Reuses the shared selectable-list helper
 /// over this tree-flattened line list, the same idiom every other picker in
 /// this module uses.
-fn draw_trail(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_trail_tree(frame: &mut Frame, app: &App, area: Rect) {
     let lines = crate::trail::flatten(&app.trail.tree);
     if lines.is_empty() {
-        let paragraph = Paragraph::new(
-            "No trail yet — open an article and follow a few links, then :trail again.",
-        )
-        .style(colored(app.no_color, app.theme.dim))
-        .block(
-            UiBlock::default()
-                .borders(Borders::ALL)
-                .title("Trail — Esc: close"),
-        );
-        frame.render_widget(paragraph, area);
+        draw_empty_trail(frame, app, area, crate::trail::TrailLayout::Tree.label());
         return;
     }
 
@@ -2295,6 +2311,81 @@ fn draw_trail(frame: &mut Frame, app: &App, area: Rect) {
         "Trail ({} article{}) — Enter: reopen  Esc: close",
         lines.len(),
         if lines.len() == 1 { "" } else { "s" }
+    );
+    let list = List::new(items)
+        .style(base_style(&app.theme, app.no_color))
+        .block(UiBlock::default().borders(Borders::ALL).title(title));
+    render_selectable_list(frame, list, area, app.trail_selected);
+}
+
+/// `:trail dag`'s true-DAG view (PRD FR-HS-3 v2, `trail`'s own "DAG view"
+/// module doc section): the topologically ordered flat list
+/// (`trail::dag_from_graph`), each row's connector (`trail::dag_connector`)
+/// distinguishing a root (no prefix), a single parent (`└─`), and an actual
+/// merge (`┴─`) — but unlike the tree, EVERY parent is also named in full
+/// text (`from: X`/`merged from: X, Y`), never collapsed to one plus an
+/// "also from" note. Otherwise mirrors `draw_trail_tree`'s dwell display and
+/// selection styling exactly.
+fn draw_trail_dag(frame: &mut Frame, app: &App, area: Rect) {
+    let dag = crate::trail::dag_from_graph(&app.trail.graph);
+    if dag.nodes.is_empty() {
+        draw_empty_trail(frame, app, area, crate::trail::TrailLayout::Dag.label());
+        return;
+    }
+
+    let peak = dag
+        .nodes
+        .iter()
+        .map(|n| n.total_dwell_secs)
+        .max()
+        .unwrap_or(0);
+    let items: Vec<ListItem> = dag
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(i, node)| {
+            let mut spans = vec![RSpan::raw(crate::trail::dag_connector(node))];
+            if !node.article.wiki.is_empty() {
+                spans.push(RSpan::styled(
+                    format!("[{}] ", node.article.wiki),
+                    colored(app.no_color, app.theme.dim),
+                ));
+            }
+            spans.push(RSpan::styled(
+                node.article.title.clone(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            let bar = crate::trail::dwell_bar(node.total_dwell_secs, peak, 6);
+            let mut detail = format!(
+                "   ({})",
+                crate::cache::age_human(node.total_dwell_secs.max(0) as u64)
+            );
+            if !bar.is_empty() {
+                detail.push_str(&format!(" {bar}"));
+            }
+            if !node.parents.is_empty() {
+                let names: Vec<&str> = node.parents.iter().map(|a| a.title.as_str()).collect();
+                let label = if node.parents.len() > 1 {
+                    "merged from"
+                } else {
+                    "from"
+                };
+                detail.push_str(&format!("   {label}: {}", names.join(", ")));
+            }
+            spans.push(RSpan::styled(detail, colored(app.no_color, app.theme.dim)));
+            let style = if i == app.trail_selected {
+                colored_bg(app.no_color, app.theme.selected_fg, app.theme.selected_bg)
+            } else {
+                Style::default()
+            };
+            ListItem::new(Line::from(spans)).style(style)
+        })
+        .collect();
+
+    let title = format!(
+        "Trail (DAG, {} article{}) — Enter: reopen  Esc: close",
+        dag.nodes.len(),
+        if dag.nodes.len() == 1 { "" } else { "s" }
     );
     let list = List::new(items)
         .style(base_style(&app.theme, app.no_color))

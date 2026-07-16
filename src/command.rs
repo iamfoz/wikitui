@@ -189,6 +189,12 @@ pub enum Command {
     /// view. Bare `:trail` uses [`TrailScope::Session`] (this run's own
     /// history) — "session-scope is the natural wander graph."
     Trail(TrailScope),
+    /// `:trail dag [all|days N]` (PRD FR-HS-3 v2): the same scope grammar as
+    /// [`Command::Trail`], but opens the true-DAG view
+    /// (`trail::dag_from_graph`) instead of the tree — a node with more than
+    /// one referrer shows every parent, not one plus an "also from" note.
+    /// The tree stays the default; this is the opt-in alternate view.
+    TrailDag(TrailScope),
     /// `:trail export md|dot|mermaid [path]` (PRD FR-HS-3): exports the
     /// trail — always the session scope, regardless of what scope a
     /// currently-open `:trail` view is showing (see `App::export_trail`'s
@@ -564,9 +570,10 @@ pub fn parse_with_user_themes(input: &str, user_theme_names: &[String]) -> Resul
             }
         }
         // `:trail` (PRD FR-HS-3): bare opens the session-scoped tree view;
-        // `all`/`days <N>` widen the scope; `export md|dot|mermaid [path]`
-        // writes it out — same two-level `sub`/`rest` split as `:bookmarks
-        // export`/`:save export`.
+        // `all`/`days <N>` widen the scope; `dag [all|days N]` opens the v2
+        // true-DAG view instead of the tree, over the same scope grammar;
+        // `export md|dot|mermaid [path]` writes it out — same two-level
+        // `sub`/`rest` split as `:bookmarks export`/`:save export`.
         "trail" => {
             let (sub, rest) = match arg.split_once(char::is_whitespace) {
                 Some((s, r)) => (s, r.trim()),
@@ -583,6 +590,36 @@ pub fn parse_with_user_themes(input: &str, user_theme_names: &[String]) -> Resul
                         Ok(0) => Err("trail days must be at least 1".to_string()),
                         Ok(n) => Ok(Command::Trail(TrailScope::Days(n))),
                         Err(_) => Err(format!("trail days must be an integer (got {rest:?})")),
+                    }
+                }
+                // PRD FR-HS-3 v2: `dag` takes the identical scope grammar
+                // `:trail` itself does, one level deeper (`dag`, `dag all`,
+                // `dag days <N>`) — never composed with `export` (a DAG
+                // export doesn't exist; DOT/Mermaid already render the full
+                // graph regardless of which view is on screen).
+                "dag" => {
+                    let (dag_sub, dag_rest) = match rest.split_once(char::is_whitespace) {
+                        Some((s, r)) => (s, r.trim()),
+                        None => (rest, ""),
+                    };
+                    match dag_sub {
+                        "" => Ok(Command::TrailDag(TrailScope::Session)),
+                        "all" => Ok(Command::TrailDag(TrailScope::All)),
+                        "days" => {
+                            if dag_rest.is_empty() {
+                                return Err("usage: :trail dag days <N>".to_string());
+                            }
+                            match dag_rest.parse::<u32>() {
+                                Ok(0) => Err("trail days must be at least 1".to_string()),
+                                Ok(n) => Ok(Command::TrailDag(TrailScope::Days(n))),
+                                Err(_) => {
+                                    Err(format!("trail days must be an integer (got {dag_rest:?})"))
+                                }
+                            }
+                        }
+                        other => Err(format!(
+                            "unknown trail dag subcommand {other:?} — try: trail dag, trail dag all, trail dag days <N>"
+                        )),
                     }
                 }
                 "export" => {
@@ -605,7 +642,7 @@ pub fn parse_with_user_themes(input: &str, user_theme_names: &[String]) -> Resul
                     })
                 }
                 other => Err(format!(
-                    "unknown trail subcommand {other:?} — try: trail, trail all, trail days <N>, trail export md|dot|mermaid [path]"
+                    "unknown trail subcommand {other:?} — try: trail, trail all, trail days <N>, trail dag, trail export md|dot|mermaid [path]"
                 )),
             }
         }
@@ -1824,6 +1861,27 @@ mod tests {
         assert!(parse("trail days 0").is_err(), "0 days is meaningless");
         assert!(parse("trail days soon").is_err());
         assert!(parse("trail frobnicate").is_err());
+    }
+
+    /// PRD FR-HS-3 v2: `:trail dag [all|days N]` mirrors `:trail`'s own
+    /// scope grammar, one level deeper.
+    #[test]
+    fn trail_dag_mirrors_the_scope_grammar_of_plain_trail() {
+        assert_eq!(
+            parse("trail dag"),
+            Ok(Command::TrailDag(TrailScope::Session))
+        );
+        assert_eq!(
+            parse("trail dag all"),
+            Ok(Command::TrailDag(TrailScope::All))
+        );
+        assert_eq!(
+            parse("trail dag days 7"),
+            Ok(Command::TrailDag(TrailScope::Days(7)))
+        );
+        assert!(parse("trail dag days").is_err());
+        assert!(parse("trail dag days 0").is_err());
+        assert!(parse("trail dag frobnicate").is_err());
     }
 
     #[test]

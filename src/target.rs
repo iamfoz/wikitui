@@ -14,6 +14,42 @@
 //! below: "wikt" and "voy" are themselves shaped like plausible (if
 //! nonsensical) language codes per [`is_lang_code`]'s loose ASCII-letters
 //! check, so the interwiki match must run first or it would never fire.
+//!
+//! ## `wiki://`/`wiki:` protocol scheme (PRD FR-CS-7)
+//!
+//! A v2 addition, completing the groundwork `packaging/wikitui.desktop`
+//! shipped (its `x-scheme-handler/wiki` MimeType route): a desktop
+//! environment dispatching a `wiki://` link hands it to `wikitui` as an
+//! ordinary CLI argument (`Exec=wikitui %u`), which lands here exactly like
+//! any other TITLE argument. Grammar:
+//!
+//! - `wiki://{host}/{title}` — `host` resolves exactly like the `https://`
+//!   branch above: `{lang}.wikipedia.org` or one of the four sister-project
+//!   domains, including `.m.` mobile hosts. `{title}` may optionally carry
+//!   the same `wiki/` path segment a real URL does (`wiki://en.wikipedia.org
+//!   /wiki/Alan_Turing`) or omit it (`wiki://en.wikipedia.org/Alan_Turing`)
+//!   — both resolve identically, since there is no real HTTP path to stay
+//!   compatible with, only the convention this scheme borrows from it.
+//! - `wiki:{title}` (no host) — opens `{title}` on the default wiki, the
+//!   same "no language" convention a bare plain-title argument already uses.
+//!   There is no lang-prefix form inside a bare `wiki:` URI (`wiki:de:Alan
+//!   Turing` is one literal title, `"de:Alan Turing"`, not a language
+//!   selector) — a reader who wants a specific language uses the full
+//!   `wiki://{lang}.wikipedia.org/{title}` form instead.
+//!
+//! Checked *before* the interwiki-prefix branch below: "wiki" itself
+//! satisfies [`is_lang_code`]'s loose shape check (it's all lowercase ASCII
+//! letters), so without this branch running first, `wiki:Alan Turing` would
+//! be misparsed as language code "wiki" by the lang-prefix branch further
+//! down — the same ordering hazard "wikt"/"voy" already forced onto the
+//! interwiki-prefix branch, one level earlier.
+//!
+//! An unrecognized host, or a `wiki://`/`wiki:` with nothing left to call a
+//! title, degrades gracefully (PRD's protocol-handler contract has no
+//! "reject the link" option) rather than erroring: the best title-shaped
+//! remainder found is used, falling back to the raw input verbatim as a
+//! last resort — the same "let the API report it missing" posture the
+//! `https://` branch's own unrecognized-URL fallthrough already takes.
 
 use crate::sisters;
 
@@ -99,6 +135,65 @@ fn parse_raw(input: &str) -> Target {
         // A URL we don't understand: fall through and treat the whole
         // string as a title — the API will report it missing, which is a
         // clearer failure than silently mangling it.
+    }
+
+    // `wiki://`/`wiki:` protocol-handler scheme (PRD FR-CS-7) — see the
+    // module doc's own section for the full grammar and why this must run
+    // before the interwiki/lang-prefix branches below.
+    if let Some(rest) = input.strip_prefix("wiki://") {
+        if let Some((host, path)) = rest.split_once('/')
+            && let Some((project, lang)) = match_known_host(host)
+        {
+            let lang = lang.strip_suffix(".m").unwrap_or(lang);
+            // Symmetry with the `https://` branch's own `wiki/`-prefixed
+            // path — accepted here too, but optional, since this scheme has
+            // no real HTTP path to stay compatible with.
+            let path = path.strip_prefix("wiki/").unwrap_or(path);
+            let encoded_title = path.split(['#', '?']).next().unwrap_or(path);
+            let title = urlencoding::decode(encoded_title)
+                .map(|t| t.into_owned())
+                .unwrap_or_else(|_| encoded_title.to_string())
+                .replace('_', " ");
+            if !title.is_empty() && is_lang_code(lang) {
+                return Target {
+                    lang: Some(lang.to_string()),
+                    title,
+                    project: project.map(str::to_string),
+                };
+            }
+        }
+        // An unrecognized host, a non-language-shaped one, or no title left
+        // at all: graceful fallback, not an error (see the module doc) —
+        // recover the last path segment as a plain title on the default
+        // wiki when there is one, else fall back to the raw input verbatim.
+        let recovered = rest.rsplit('/').next().unwrap_or("").replace('_', " ");
+        return Target {
+            lang: None,
+            title: if recovered.is_empty() {
+                input.to_string()
+            } else {
+                recovered
+            },
+            project: None,
+        };
+    }
+    if let Some(rest) = input.strip_prefix("wiki:") {
+        // Bare `wiki:Title` (no host): default wiki + title, same "no
+        // language" convention a plain title argument already carries.
+        let title = urlencoding::decode(rest)
+            .map(|t| t.into_owned())
+            .unwrap_or_else(|_| rest.to_string())
+            .trim()
+            .replace('_', " ");
+        return Target {
+            lang: None,
+            title: if title.is_empty() {
+                input.to_string()
+            } else {
+                title
+            },
+            project: None,
+        };
     }
 
     // Interwiki-prefixed title: "wikt:Word", "voy:Place", "q:Quote",
@@ -271,6 +366,77 @@ mod tests {
             parse("wikt:Alan_Turing"),
             tp(None, "Alan Turing", "wiktionary")
         );
+    }
+
+    // ---- `wiki://`/`wiki:` protocol scheme (PRD FR-CS-7) -------------------
+
+    #[test]
+    fn wiki_scheme_url_resolves_host_and_title_like_https() {
+        assert_eq!(
+            parse("wiki://en.wikipedia.org/Alan_Turing"),
+            t(Some("en"), "Alan Turing")
+        );
+        assert_eq!(
+            parse("wiki://de.wikipedia.org/Kurt_G%C3%B6del"),
+            t(Some("de"), "Kurt Gödel")
+        );
+    }
+
+    #[test]
+    fn wiki_scheme_url_accepts_an_optional_wiki_path_segment() {
+        // Both forms — with and without the real URL's "wiki/" path
+        // segment — resolve identically (module doc: no real HTTP path to
+        // stay compatible with here).
+        assert_eq!(
+            parse("wiki://en.wikipedia.org/wiki/Alan_Turing"),
+            parse("wiki://en.wikipedia.org/Alan_Turing")
+        );
+    }
+
+    #[test]
+    fn wiki_scheme_url_resolves_sister_project_hosts() {
+        assert_eq!(
+            parse("wiki://en.wiktionary.org/computer"),
+            tp(Some("en"), "computer", "wiktionary")
+        );
+    }
+
+    #[test]
+    fn wiki_scheme_url_mobile_host_resolves_to_the_same_wiki() {
+        assert_eq!(
+            parse("wiki://en.m.wikipedia.org/Alan_Turing"),
+            t(Some("en"), "Alan Turing")
+        );
+    }
+
+    #[test]
+    fn bare_wiki_scheme_opens_the_default_wiki() {
+        assert_eq!(parse("wiki:Alan Turing"), t(None, "Alan Turing"));
+        assert_eq!(parse("wiki:Alan_Turing"), t(None, "Alan Turing"));
+    }
+
+    #[test]
+    fn malformed_wiki_scheme_urls_degrade_gracefully_instead_of_erroring() {
+        // An unrecognized host still recovers a title from the path rather
+        // than surfacing an error — the "let the API report it missing"
+        // posture the https:// branch's own fallthrough already takes.
+        let target = parse("wiki://not-a-wiki-host.example/Some_Title");
+        assert_eq!(target.lang, None);
+        assert_eq!(target.title, "Some Title");
+
+        // Nothing at all to recover a title from: falls back to the raw
+        // input rather than panicking or looping.
+        assert_eq!(parse("wiki://").lang, None);
+        assert!(!parse("wiki://").title.is_empty());
+        assert_eq!(parse("wiki:").lang, None);
+        assert!(!parse("wiki:").title.is_empty());
+    }
+
+    #[test]
+    fn bare_wiki_scheme_does_not_chain_a_lang_prefix() {
+        // Module doc: a bare `wiki:` URI has no lang-prefix form of its
+        // own — the whole remainder is one literal title.
+        assert_eq!(parse("wiki:de:Alan Turing"), t(None, "de:Alan Turing"));
     }
 
     #[test]

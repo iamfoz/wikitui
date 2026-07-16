@@ -45,6 +45,19 @@ Random article / quality fixtures (PRD FR-SR-5 / FR-DL-3):
   with no `pageassessments` at all, matching a real unassessed page. Two of
   `RANDOM_TITLES`' six entries reach GA+, so any 10-title `:random good`
   batch (`RANDOM_TITLES`' rotation period is 6) is guaranteed to include one.
+- `POST /service/lw/inference/v1/models/{lang}wiki-articlequality:predict`
+  (PRD FR-DL-3 v2 / §6.2 rule 1's stated Lift Wing exception) — a JSON body
+  naming `rev_id`; a revid in `LIFTWING_SCORES` (`1001`, `Alan_Turing`'s own
+  fixture revid) comes back with a `prediction` plus a probability map
+  weighted toward it, any other revid with an empty `scores` map (no score,
+  matching a real "nothing for this revision" response). `/debug/liftwing-
+  hits` counts how many times this was actually dialed, so a pty test can
+  verify the "pageassessments present → Lift Wing never called" fallback
+  decision on the wire, not just by the badge that does or doesn't appear —
+  reset alongside `REQUEST_LOG` by `/debug/reset`. To exercise the fallback
+  at all, point a `[wiki.<name>]` section's `pageassessments` at `false`
+  (real Wikipedia deployments default it `true` in this build — FR-ML-5) and
+  set `liftwing = true` / `liftwing_base_url` at that same custom wiki.
 
 Math and redlink fixtures (PRD FR-RD-7, FR-DL-5):
 

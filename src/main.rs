@@ -606,6 +606,8 @@ async fn main() -> Result<()> {
         resolved.images.value,
         resolved.include_nonfree.value,
         resolved.pro.value,
+        resolved.liftwing.value,
+        resolved.liftwing_base_url.value.clone(),
         resolved.editing_enabled.value,
         resolved.startpage.value,
         resolved.restore_session.value,
@@ -2271,6 +2273,8 @@ async fn run(
     images_config: Option<bool>,
     include_nonfree: bool,
     pro: bool,
+    liftwing_enabled: bool,
+    liftwing_base_url: String,
     editing_enabled: bool,
     startpage_config: String,
     restore_session_config: bool,
@@ -2374,6 +2378,11 @@ async fn run(
     app.images_override = images_config;
     app.include_nonfree = include_nonfree;
     app.pro = pro;
+    // PRD FR-DL-3 v2: the Lift Wing opt-in + its (config-overridable, §6.2
+    // rule 2) endpoint template — see `App.liftwing_enabled`'s own doc
+    // comment for why this defaults off.
+    app.liftwing_enabled = liftwing_enabled;
+    app.liftwing_base_url = liftwing_base_url;
     // PRD FR-ACC-8: the config half of the editing double opt-in gate.
     app.editing_enabled = editing_enabled;
     // Already validated during resolution (an invalid value fell back to
@@ -3281,6 +3290,8 @@ fn apply_config_reload(app: &mut App) {
     }
     app.include_nonfree = resolved.include_nonfree.value;
     app.pro = resolved.pro.value;
+    app.liftwing_enabled = resolved.liftwing.value;
+    app.liftwing_base_url = resolved.liftwing_base_url.value;
     // PRD FR-ACC-8: a config reload can flip the editing config gate — but a
     // `:enable-editing` opt-in made this session must not be silently undone
     // by a reload of a config file that never set the key, so only take the
@@ -3436,12 +3447,32 @@ async fn enrich_article(client: &WikiClient, app: &mut App, lang: &str, title: &
     // attempted, so `quality_cache` simply never gains an entry for it — the
     // same visible result (no badge) as a wiki that has the extension but no
     // assessment for this one title.
-    if client.capabilities().pageassessments
-        && !app.quality_cache.contains_key(&key)
-        && let Ok(assessments) = client.page_assessments(lang, &[title.to_string()]).await
-        && let Some(class) = assessments.get(title)
-    {
-        app.quality_cache.insert(key.clone(), *class);
+    if client.capabilities().pageassessments {
+        if !app.quality_cache.contains_key(&key)
+            && let Ok(assessments) = client.page_assessments(lang, &[title.to_string()]).await
+            && let Some(class) = assessments.get(title)
+        {
+            app.quality_cache.insert(key.clone(), *class);
+        }
+    } else if app.liftwing_enabled && !app.quality_cache.contains_key(&key) {
+        // PRD FR-DL-3 v2 / §6.2 rule 1's stated exception: a wiki with no
+        // PageAssessments capability falls back to Lift Wing, but only when
+        // the reader opted in (default off — gateway survival unverified,
+        // SP-4). Keyed by the revid the article view already fetched
+        // (`Tab::current_revid`, `0` in degraded mode — never worth asking
+        // Lift Wing about "revision zero"), so this never costs a second
+        // "what's the latest revid" round trip; one call, then cached in
+        // the very same `quality_cache` the pageassessments path populates
+        // (`App::quality_badge_for` doesn't know or care which path filled
+        // it in).
+        let rev_id = app.active_tab().current_revid;
+        if rev_id != 0
+            && let Ok(Some(class)) = client
+                .fetch_liftwing_quality(&app.liftwing_base_url, lang, rev_id)
+                .await
+        {
+            app.quality_cache.insert(key.clone(), class);
+        }
     }
 
     if app.prefetch_active() && !app.checked_redlink_sources.contains(&key) {
@@ -8087,6 +8118,8 @@ async fn execute_command(
         }
         // PRD FR-HS-3: the trail/wander-graph view and its export.
         Command::Trail(scope) => app.open_trail(scope),
+        // PRD FR-HS-3 v2: the true-DAG alternate view, over the same scope.
+        Command::TrailDag(scope) => app.open_trail_dag(scope),
         Command::TrailExport { format, path } => {
             let path = path.map(std::path::PathBuf::from);
             app.export_trail(&format, path.as_deref());
@@ -8808,6 +8841,214 @@ mod tests {
         app.interest_learning = false; // isolates this test from the categories fetch
         enrich_article(&client, &mut app, "en", "Some Article").await;
         assert!(app.quality_cache.is_empty());
+    }
+
+    // ---- Lift Wing fallback wiring (PRD FR-DL-3 v2) ------------------------
+
+    /// Spawns a raw-socket Lift Wing mock that always answers revision 1001
+    /// with `prediction`, counting how many times it was actually connected
+    /// to — reused by every fallback-decision test below, each of which
+    /// needs a different "was Lift Wing dialed at all" assertion (0 calls,
+    /// exactly 1, or exactly 1 across two `enrich_article` invocations).
+    fn spawn_liftwing_mock(
+        prediction: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits2 = hits.clone();
+        std::thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                hits2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let body = format!(
+                    r#"{{"enwiki":{{"scores":{{"1001":{{"articlequality":{{"score":{{"prediction":"{prediction}","probability":{{}}}}}}}}}}}}}}"#
+                );
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body.as_bytes());
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), hits)
+    }
+
+    /// PRD FR-DL-3 v2: a wiki without PageAssessments, `liftwing` enabled,
+    /// falls back to the Lift Wing score — mapped into the very same
+    /// `quality_cache` the pageassessments path fills, so `quality_badge_for`
+    /// can't tell (and doesn't need to) which path answered.
+    #[tokio::test]
+    async fn enrich_article_falls_back_to_liftwing_when_pageassessments_is_unsupported_and_enabled()
+    {
+        let client = test_client_with_capabilities(api::WikiCapabilities {
+            parser: api::ParserMode::Auto,
+            wikifeeds: false,
+            pageviews: false,
+            pageassessments: false,
+        });
+        let (base_url, hits) = spawn_liftwing_mock("GA");
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.interest_learning = false;
+        app.liftwing_enabled = true;
+        app.liftwing_base_url = base_url;
+        app.active_tab_mut().current_revid = 1001;
+        enrich_article(&client, &mut app, "en", "Some Article").await;
+        assert_eq!(
+            app.quality_cache.get(&(
+                "test-wiki".to_string(),
+                "en".to_string(),
+                "Some Article".to_string()
+            )),
+            Some(&api::QualityClass::Ga)
+        );
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// The default: `liftwing` off, a wiki without PageAssessments simply
+    /// shows no badge — no Lift Wing call is even attempted (PRD FR-DL-3's
+    /// "if it dies, non-PageAssessments wikis simply show no badge," true
+    /// unconditionally while the reader hasn't opted in).
+    #[tokio::test]
+    async fn enrich_article_attempts_no_liftwing_call_when_disabled() {
+        let client = test_client_with_capabilities(api::WikiCapabilities {
+            parser: api::ParserMode::Auto,
+            wikifeeds: false,
+            pageviews: false,
+            pageassessments: false,
+        });
+        let (base_url, hits) = spawn_liftwing_mock("GA");
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.interest_learning = false;
+        app.liftwing_enabled = false; // the default
+        app.liftwing_base_url = base_url;
+        app.active_tab_mut().current_revid = 1001;
+        enrich_article(&client, &mut app, "en", "Some Article").await;
+        assert!(app.quality_cache.is_empty());
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "liftwing=false must never dial the gateway at all"
+        );
+    }
+
+    /// PRD FR-DL-3 v2: a wiki that DOES have PageAssessments never falls
+    /// back to Lift Wing, even with `liftwing` enabled — Lift Wing is a
+    /// non-PageAssessments-wiki fallback, not a per-article "unassessed"
+    /// fallback. Verified via the mock's own hit counter, not just by
+    /// reading the branch: if a future change accidentally made both paths
+    /// reachable, this catches it.
+    #[tokio::test]
+    async fn enrich_article_never_calls_liftwing_when_pageassessments_is_supported() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut discard = [0u8; 4096];
+                let _ = stream.read(&mut discard);
+                let body = br#"{"query":{"pages":[
+                    {"title":"Some Article","pageassessments":{"WikiProject Mock":{"class":"FA"}}}
+                ]}}"#;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+        let client = WikiClient::with_wiki(
+            "test-wiki".to_string(),
+            format!("http://127.0.0.1:{port}/{{lang}}"),
+            api::WikiCapabilities {
+                parser: api::ParserMode::Auto,
+                wikifeeds: false,
+                pageviews: false,
+                pageassessments: true,
+            },
+            api::DEFAULT_CONTACT,
+        )
+        .unwrap();
+        let (liftwing_url, liftwing_hits) = spawn_liftwing_mock("Stub");
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.interest_learning = false;
+        app.liftwing_enabled = true;
+        app.liftwing_base_url = liftwing_url;
+        app.active_tab_mut().current_revid = 1001;
+        enrich_article(&client, &mut app, "en", "Some Article").await;
+        assert_eq!(
+            app.quality_cache.get(&(
+                "test-wiki".to_string(),
+                "en".to_string(),
+                "Some Article".to_string()
+            )),
+            Some(&api::QualityClass::Fa),
+            "the real pageassessments class must win"
+        );
+        assert_eq!(
+            liftwing_hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a PageAssessments-capable wiki must never dial Lift Wing"
+        );
+    }
+
+    /// PRD FR-DL-3 v2's "cached, sparing": a second `enrich_article` call for
+    /// the same article costs no second Lift Wing request.
+    #[tokio::test]
+    async fn enrich_article_caches_the_liftwing_score_across_repeated_calls() {
+        let client = test_client_with_capabilities(api::WikiCapabilities {
+            parser: api::ParserMode::Auto,
+            wikifeeds: false,
+            pageviews: false,
+            pageassessments: false,
+        });
+        let (base_url, hits) = spawn_liftwing_mock("B");
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.interest_learning = false;
+        app.liftwing_enabled = true;
+        app.liftwing_base_url = base_url;
+        app.active_tab_mut().current_revid = 1001;
+        enrich_article(&client, &mut app, "en", "Some Article").await;
+        enrich_article(&client, &mut app, "en", "Some Article").await;
+        assert_eq!(
+            app.quality_cache.get(&(
+                "test-wiki".to_string(),
+                "en".to_string(),
+                "Some Article".to_string()
+            )),
+            Some(&api::QualityClass::B)
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the second call must be served from quality_cache, not a second request"
+        );
+    }
+
+    /// PRD `Tab::current_revid`'s `0` degraded-mode convention: Lift Wing
+    /// scores one specific revision, so with no revid known yet there is
+    /// nothing honest to ask it about — the call must not even be attempted.
+    #[tokio::test]
+    async fn enrich_article_skips_liftwing_when_the_revid_is_unknown() {
+        let client = test_client_with_capabilities(api::WikiCapabilities {
+            parser: api::ParserMode::Auto,
+            wikifeeds: false,
+            pageviews: false,
+            pageassessments: false,
+        });
+        let (base_url, hits) = spawn_liftwing_mock("GA");
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.interest_learning = false;
+        app.liftwing_enabled = true;
+        app.liftwing_base_url = base_url;
+        // current_revid defaults to 0 (degraded mode) — left untouched here.
+        enrich_article(&client, &mut app, "en", "Some Article").await;
+        assert!(app.quality_cache.is_empty());
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     /// PRD FR-ML-4/5's `:wiki <name>` switch: a name in the registry

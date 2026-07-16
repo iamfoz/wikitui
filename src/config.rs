@@ -33,6 +33,19 @@ pub const CONFIG_VERSION: u32 = 1;
 /// wiki's base URL (PRD §6.2 rule 1: per-wiki `{lang}.wikipedia.org`).
 pub const DEFAULT_BASE_URL_TEMPLATE: &str = "https://{lang}.wikipedia.org";
 
+/// PRD FR-DL-3 v2 / §6.2 rule 1's one stated exception: Lift Wing is
+/// gateway-hosted, never a per-wiki host, so there is no `{lang}`
+/// substitution here the way `DEFAULT_BASE_URL_TEMPLATE` has one — every
+/// wiki's Lift Wing request goes to this same fixed host, with the wiki
+/// named inside the model id instead (`{lang}wiki-articlequality`, see
+/// `api::WikiClient::fetch_liftwing_quality`). Overridable (§6.2 rule 2) via
+/// `liftwing_base_url` / `WIKITUI_LIFTWING_BASE_URL`, same as
+/// `DEFAULT_BASE_URL_TEMPLATE`/`WIKITUI_BASE_URL` — the seam a mock server
+/// or a future gateway-successor host needs, without a source edit. The real
+/// gateway's post-deprecation survival is unverified (SP-4); `liftwing`
+/// itself defaults off precisely because of that uncertainty.
+pub const DEFAULT_LIFTWING_BASE_URL: &str = "https://api.wikimedia.org/service/lw/inference/v1";
+
 /// The sane bounds for `measure` (FR-RD-9), shared with `:set measure=N`
 /// (FR-PC-4) so the runtime override and the config loader agree.
 pub const MEASURE_MIN: u16 = 40;
@@ -159,6 +172,11 @@ pub struct EnvOverrides {
     /// (`auto`/`truecolor`/`256`/`16`/`mono`) — for testing and user control
     /// over capability degradation, same env-first pattern as `animations`.
     pub color_depth: Option<String>,
+    /// PRD FR-DL-3 v2's Lift Wing gateway endpoint override
+    /// (`WIKITUI_LIFTWING_BASE_URL`), mirroring `base_url`/`WIKITUI_BASE_URL`
+    /// — the mock-server/testing seam for the one endpoint this build
+    /// addresses at `api.wikimedia.org` rather than a per-wiki host.
+    pub liftwing_base_url: Option<String>,
 }
 
 impl EnvOverrides {
@@ -181,6 +199,7 @@ impl EnvOverrides {
             contact: get("WIKITUI_CONTACT"),
             animations: get("WIKITUI_ANIMATIONS"),
             color_depth: get("WIKITUI_COLOR_DEPTH"),
+            liftwing_base_url: get("WIKITUI_LIFTWING_BASE_URL"),
         }
     }
 }
@@ -263,6 +282,22 @@ pub struct ResolvedConfig {
     /// `include_nonfree`/`startpage`), a preference set once, not a CLI/env
     /// concern.
     pub pro: Valued<bool>,
+    /// PRD FR-DL-3 v2: whether the Lift Wing ML quality-score fallback is
+    /// even attempted once `prop=pageassessments` comes back unavailable for
+    /// the active wiki. Default **false** — deliberately conservative: Lift
+    /// Wing is gateway-hosted (`api.wikimedia.org`), the one stated
+    /// exception to §6.2 rule 1, and the gateway's post-deprecation survival
+    /// is unverified (SP-4) — enabling this opts into a network call to a
+    /// host this build cannot promise still answers. File only, like
+    /// `editing_enabled` (a deliberate, set-once safety opt-in, not a
+    /// CLI/env concern).
+    pub liftwing: Valued<bool>,
+    /// PRD §6.2 rule 2's config-overridable endpoint template, applied to
+    /// the one gateway exception above (`DEFAULT_LIFTWING_BASE_URL`);
+    /// overridable via `WIKITUI_LIFTWING_BASE_URL` or this key in the config
+    /// file — the seam a mock server (or a future gateway-successor host)
+    /// needs, without a source edit.
+    pub liftwing_base_url: Valued<String>,
     /// PRD FR-ACC-8's `editing_enabled` (file-only, default `false`): the
     /// config half of the typo-fix editing double opt-in gate. Even when
     /// `true`, editing still requires the separate `editpage` OAuth grant
@@ -757,6 +792,8 @@ pub fn resolve(
         "images",
         "include_nonfree",
         "pro",
+        "liftwing",
+        "liftwing_base_url",
         "editing_enabled",
         "startpage",
         "restore_session",
@@ -859,6 +896,16 @@ pub fn resolve(
     let images = resolve_images(env, &table, &mut issues);
     let include_nonfree = resolve_include_nonfree(&table, &mut issues);
     let pro = resolve_pro(&table, &mut issues);
+    let liftwing = resolve_bool_field("liftwing", None, table.get("liftwing"), false, &mut issues);
+    let liftwing_base_url = resolve_string_field(
+        "liftwing_base_url",
+        None,
+        env.liftwing_base_url.as_deref(),
+        table.get("liftwing_base_url"),
+        DEFAULT_LIFTWING_BASE_URL,
+        |s| Ok(s.to_string()),
+        &mut issues,
+    );
     let editing_enabled = resolve_bool_field(
         "editing_enabled",
         None,
@@ -909,6 +956,8 @@ pub fn resolve(
         images,
         include_nonfree,
         pro,
+        liftwing,
+        liftwing_base_url,
         editing_enabled,
         startpage,
         restore_session,
@@ -3951,6 +4000,57 @@ mod tests {
         );
         assert!(from_file.editing_enabled.value);
         assert_eq!(from_file.editing_enabled.source, Source::File);
+        cleanup(&path);
+    }
+
+    /// PRD FR-DL-3 v2: `liftwing` (file-only, default false) gates the Lift
+    /// Wing ML-quality fallback — conservative default since the gateway's
+    /// post-deprecation survival is unverified (SP-4). Same shape as `pro`/
+    /// `editing_enabled`.
+    #[test]
+    fn liftwing_defaults_false_and_honors_file() {
+        let default = resolve(&CliOverrides::default(), &EnvOverrides::default(), None);
+        assert!(!default.liftwing.value);
+        assert_eq!(default.liftwing.source, Source::Default);
+
+        let path = temp_config("liftwing = true\n");
+        let from_file = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert!(from_file.liftwing.value);
+        assert_eq!(from_file.liftwing.source, Source::File);
+        cleanup(&path);
+    }
+
+    /// PRD §6.2 rule 2: `liftwing_base_url` defaults to the gateway
+    /// (`DEFAULT_LIFTWING_BASE_URL`), overridable by the config file or
+    /// `WIKITUI_LIFTWING_BASE_URL` — the seam a mock server needs, mirroring
+    /// `base_url`/`WIKITUI_BASE_URL`.
+    #[test]
+    fn liftwing_base_url_defaults_to_the_gateway_and_honors_file_and_env() {
+        let default = resolve(&CliOverrides::default(), &EnvOverrides::default(), None);
+        assert_eq!(default.liftwing_base_url.value, DEFAULT_LIFTWING_BASE_URL);
+        assert_eq!(default.liftwing_base_url.source, Source::Default);
+
+        let path = temp_config("liftwing_base_url = \"http://127.0.0.1:9999\"\n");
+        let from_file = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert_eq!(from_file.liftwing_base_url.value, "http://127.0.0.1:9999");
+        assert_eq!(from_file.liftwing_base_url.source, Source::File);
+        cleanup(&path);
+
+        let env = EnvOverrides {
+            liftwing_base_url: Some("http://127.0.0.1:8943".to_string()),
+            ..EnvOverrides::default()
+        };
+        let from_env = resolve(&CliOverrides::default(), &env, Some(&path));
+        assert_eq!(from_env.liftwing_base_url.value, "http://127.0.0.1:8943");
+        assert_eq!(from_env.liftwing_base_url.source, Source::Env);
         cleanup(&path);
     }
 

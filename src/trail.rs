@@ -33,6 +33,37 @@
 //! merge) from producing one; a node caught in such a cycle is promoted to
 //! its own root rather than silently dropped or looped over forever.
 //!
+//! ## DAG view (v2 scope)
+//!
+//! [`dag_from_graph`] is the "true DAG layout" FR-HS-3 explicitly deferred
+//! past the tree above: a node reached from more than one article shows
+//! **every** incoming edge, not one parent plus an "also from" note. It is
+//! an alternate, opt-in view (`:trail dag` / `App::trail_layout`) — the tree
+//! stays the default, unchanged by this section.
+//!
+//! The chosen text-DAG rendering is a **topologically ordered flat list**,
+//! each row explicitly naming all of its parents, rather than a git-log-
+//! graph-style lane/column diagram (`git log --graph`'s own approach:
+//! persistent columns, diagonal `╱`/`╲` crossing lines for merges and
+//! branches). That fuller rendering was considered and set aside: assigning
+//! stable columns to an arbitrary DAG so that crossing lines never
+//! misrepresent an edge is a nontrivial graph-drawing problem in its own
+//! right (git's own implementation runs a dedicated column-allocation pass
+//! over the commit graph), and a wrong-but-plausible-looking crossing line
+//! is a worse failure mode for a small "wander graph" feature than a plainer
+//! rendering that is always unambiguous. The flat list keeps the one
+//! property that actually matters for a DAG *reading order*: every parent
+//! row appears above every one of its children's rows (true topological
+//! order — [`dag_from_graph`]'s own doc comment covers the cycle-safety
+//! fallback for hand-built/adversarial data, mirroring `tree_from_graph`'s).
+//! Connector glyphs are still drawn (`dag_connector`) — reusing the tree's
+//! `│`/`├─`/`└─` family plus a `┴─` "multiple incoming edges join here"
+//! marker for an actual merge — but they decorate each row rather than
+//! encoding real column geometry, and every row's parents are named in full
+//! alongside them regardless (a single-parent row is unambiguous either
+//! way; a multi-parent row is exactly the case a git-log-style diagram would
+//! need columns for, so this spells it out in text instead).
+//!
 //! ## Scope
 //!
 //! [`build`] takes whatever visit slice the caller already selected — this
@@ -275,6 +306,145 @@ fn walk_tree(
         }
     }
     out
+}
+
+/// FR-HS-3's two trail layouts (PRD: "v1.x ships tree layout; true DAG
+/// layout is v2"). `App::trail_layout` picks which one `:trail` shows;
+/// [`TrailGraph`] itself has no opinion and can render either.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TrailLayout {
+    /// The v1.x default (module doc's "Tree-ification"): one parent per
+    /// node, extra referrers noted as "also from."
+    #[default]
+    Tree,
+    /// The v2 true DAG (module doc's "DAG view"): every parent shown.
+    Dag,
+}
+
+impl TrailLayout {
+    /// `:trail`/`:trail dag`'s toggle label, for the view's own title bar.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Tree => "Trail",
+            Self::Dag => "Trail (DAG)",
+        }
+    }
+}
+
+/// One row of the DAG view (module doc's "DAG view"): a node plus **every**
+/// referrer it has been reached from, in first-seen order — unlike
+/// [`TrailNode`], which keeps only `first_referrer` and files the rest under
+/// `also_from`. `parents` is empty exactly when the node is a DAG root (no
+/// in-scope referrer at all), the same condition [`tree_from_graph`] uses to
+/// place a node as a tree root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DagNode {
+    pub article: ArticleKey,
+    pub total_dwell_secs: i64,
+    pub visit_count: usize,
+    pub parents: Vec<ArticleKey>,
+}
+
+/// The DAG view's whole renderable list, already in topological order (see
+/// [`dag_from_graph`]) — every parent row appears before every one of its
+/// children's rows, so a renderer/selector can treat this as one flat,
+/// directly-indexable list exactly like [`flatten`]'s tree-line list.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Dag {
+    pub nodes: Vec<DagNode>,
+}
+
+/// Builds the v2 true-DAG view from `graph` (module doc's "DAG view"): every
+/// node, in topological order, carrying every in-scope referrer as a parent
+/// — nothing collapsed to "also from" the way [`tree_from_graph`] does.
+///
+/// Topological order is produced by repeatedly placing the earliest
+/// (first-visited-order) not-yet-placed node whose parents are all already
+/// placed — under real navigation timestamps `graph.nodes`' own order
+/// already satisfies this on the first pass (module doc's "Cycle safety":
+/// a referrer is necessarily visited, and placed, before its child). A hand-
+/// built/adversarial cycle (nothing stops one, same caveat
+/// `tree_from_graph` documents) is broken the same defensive way: once no
+/// remaining node has all its parents placed, the earliest remaining node is
+/// force-placed anyway rather than looping forever — its still-unplaced
+/// parent(s) simply render *below* it once *they* are placed, the one
+/// honest artifact of breaking a cycle in a linear order.
+pub fn dag_from_graph(graph: &TrailGraph) -> Dag {
+    let by_key: HashMap<&ArticleKey, &TrailNode> =
+        graph.nodes.iter().map(|n| (&n.article, n)).collect();
+
+    // Every in-scope, non-self referrer per node, first-seen order — the
+    // full edge set already carries every referrer pair (module doc's
+    // "Tree-ification"); this simply keeps all of them instead of only the
+    // first. An edge whose `from` isn't itself a node in this graph (a
+    // referrer outside the scope, e.g. a session cutoff — see
+    // `tree_from_graph`'s "root" handling for the identical case) can't be
+    // placed as a row of its own, so it can't be a DAG parent either; the
+    // child simply has one fewer parent, same as it becoming a tree root.
+    let mut parents_of: HashMap<&ArticleKey, Vec<&ArticleKey>> = HashMap::new();
+    let mut parent_seen: HashMap<&ArticleKey, HashSet<&ArticleKey>> = HashMap::new();
+    for e in &graph.edges {
+        if e.from == e.to || !by_key.contains_key(&e.from) {
+            continue;
+        }
+        if parent_seen.entry(&e.to).or_default().insert(&e.from) {
+            parents_of.entry(&e.to).or_default().push(&e.from);
+        }
+    }
+
+    let mut placed: HashSet<&ArticleKey> = HashSet::new();
+    let mut order: Vec<ArticleKey> = Vec::with_capacity(graph.nodes.len());
+    while order.len() < graph.nodes.len() {
+        let ready = graph.nodes.iter().map(|n| &n.article).find(|k| {
+            !placed.contains(*k)
+                && parents_of
+                    .get(*k)
+                    .is_none_or(|ps| ps.iter().all(|p| placed.contains(*p)))
+        });
+        let next = ready.or_else(|| {
+            graph
+                .nodes
+                .iter()
+                .map(|n| &n.article)
+                .find(|k| !placed.contains(*k))
+        });
+        let Some(key) = next else { break };
+        placed.insert(key);
+        order.push(key.clone());
+    }
+
+    let nodes = order
+        .into_iter()
+        .map(|key| {
+            let node = by_key[&key];
+            let parents = parents_of
+                .get(&key)
+                .map(|ps| ps.iter().map(|p| (*p).clone()).collect())
+                .unwrap_or_default();
+            DagNode {
+                article: key,
+                total_dwell_secs: node.total_dwell_secs,
+                visit_count: node.visit_count,
+                parents,
+            }
+        })
+        .collect();
+
+    Dag { nodes }
+}
+
+/// `dag_from_graph`'s row connector (module doc's "DAG view"): reuses the
+/// tree's `│`/`├─`/`└─` glyph family for a root/single-parent row, plus a
+/// `┴─` "multiple incoming edges join here" marker for an actual merge — a
+/// visual nod to `git log --graph`'s own merge glyph, not a literal column
+/// diagram (see the module doc for why this build doesn't attempt one). A
+/// root gets no prefix at all, matching `connector`'s own `depth == 0` rule.
+pub fn dag_connector(node: &DagNode) -> &'static str {
+    match node.parents.len() {
+        0 => "",
+        1 => "\u{2514}\u{2500} ",
+        _ => "\u{2534}\u{2500} ",
+    }
 }
 
 /// The full trail: the graph (nodes + full edge set) and its tree-ified
@@ -740,6 +910,184 @@ mod tests {
     fn empty_trail_has_no_roots() {
         let trail = build(&[]);
         assert!(trail.tree.roots.is_empty());
+    }
+
+    // ---- dag_from_graph: the v2 true-DAG view ------------------------------
+
+    /// The scenario the module doc's "DAG view" section exists for: A→B,
+    /// A→C, B→D, C→D — D has two parents. The tree collapses D under
+    /// whichever referrer it saw first; the DAG must show BOTH.
+    #[test]
+    fn dag_shows_a_merge_nodes_full_parent_set_not_just_the_first() {
+        let visits = vec![
+            visit("", "en", "A", 100, 0, None),
+            visit("", "en", "B", 200, 0, Some(("", "en", "A"))),
+            visit("", "en", "C", 300, 0, Some(("", "en", "A"))),
+            visit("", "en", "D", 400, 0, Some(("", "en", "B"))),
+            visit("", "en", "D", 500, 0, Some(("", "en", "C"))), // second parent
+        ];
+        let graph = build_graph(&visits);
+        let dag = dag_from_graph(&graph);
+        let d = dag
+            .nodes
+            .iter()
+            .find(|n| n.article == key("", "D"))
+            .unwrap();
+        assert_eq!(
+            d.parents,
+            vec![key("", "B"), key("", "C")],
+            "D must carry BOTH incoming edges, first-seen order"
+        );
+        // Distinct from the tree, which keeps only one parent and files the
+        // other under "also from" — this is the whole point of the DAG view.
+        let tree = tree_from_graph(&graph);
+        let a_root = tree
+            .roots
+            .iter()
+            .find(|r| r.article == key("", "A"))
+            .unwrap();
+        // A -> B -> D and A -> C, with D appearing exactly once in the tree
+        // (under B, its first referrer).
+        let b = a_root
+            .children
+            .iter()
+            .find(|c| c.article == key("", "B"))
+            .unwrap();
+        assert_eq!(b.children.len(), 1, "D is the tree's single child of B");
+        assert_eq!(b.children[0].article, key("", "D"));
+        let c = a_root
+            .children
+            .iter()
+            .find(|c| c.article == key("", "C"))
+            .unwrap();
+        assert!(
+            c.children.is_empty(),
+            "the tree must NOT also place D under C"
+        );
+    }
+
+    /// Every parent row must appear above every one of its children's rows
+    /// — the DAG's whole reading-order guarantee (module doc's "DAG view").
+    #[test]
+    fn dag_is_topologically_ordered_parents_before_children() {
+        let visits = vec![
+            visit("", "en", "A", 100, 0, None),
+            visit("", "en", "B", 200, 0, Some(("", "en", "A"))),
+            visit("", "en", "C", 300, 0, Some(("", "en", "A"))),
+            visit("", "en", "D", 400, 0, Some(("", "en", "B"))),
+            visit("", "en", "D", 500, 0, Some(("", "en", "C"))),
+        ];
+        let graph = build_graph(&visits);
+        let dag = dag_from_graph(&graph);
+        let index_of = |title: &str| {
+            dag.nodes
+                .iter()
+                .position(|n| n.article.title == title)
+                .unwrap()
+        };
+        assert!(index_of("A") < index_of("B"));
+        assert!(index_of("A") < index_of("C"));
+        assert!(index_of("B") < index_of("D"));
+        assert!(index_of("C") < index_of("D"));
+    }
+
+    /// A node with no in-scope referrer is a DAG root — empty `parents`,
+    /// same condition `tree_from_graph` uses to place a tree root.
+    #[test]
+    fn dag_roots_have_no_parents() {
+        let visits = vec![
+            visit("", "en", "Alan Turing", 100, 0, None),
+            visit("", "en", "Ada Lovelace", 150, 0, None),
+        ];
+        let graph = build_graph(&visits);
+        let dag = dag_from_graph(&graph);
+        assert!(dag.nodes.iter().all(|n| n.parents.is_empty()));
+        assert_eq!(dag.nodes.len(), 2);
+    }
+
+    /// A referrer outside the scope (module doc's "Tree-ification": e.g. a
+    /// session cutoff) can't be a DAG parent either — same rule
+    /// `tree_from_graph` applies when deciding root vs. child.
+    #[test]
+    fn dag_treats_an_out_of_scope_referrer_as_no_parent() {
+        let visits = vec![visit(
+            "",
+            "en",
+            "Enigma machine",
+            200,
+            0,
+            Some(("", "en", "Alan Turing")), // never itself visited in scope
+        )];
+        let graph = build_graph(&visits);
+        let dag = dag_from_graph(&graph);
+        assert_eq!(dag.nodes.len(), 1);
+        assert!(dag.nodes[0].parents.is_empty());
+    }
+
+    /// A self-referencing visit must not parent a node under itself in the
+    /// DAG either — mirrors `a_self_referencing_visit_does_not_parent_a_node_
+    /// under_itself`'s tree-side assertion.
+    #[test]
+    fn dag_self_reference_does_not_parent_a_node_under_itself() {
+        let visits = vec![visit("", "en", "A", 100, 0, Some(("", "en", "A")))];
+        let graph = build_graph(&visits);
+        let dag = dag_from_graph(&graph);
+        assert_eq!(dag.nodes.len(), 1);
+        assert!(dag.nodes[0].parents.is_empty());
+    }
+
+    /// Adversarial, hand-built cyclic data (impossible from real navigation
+    /// timestamps — module doc's "Cycle safety") must not hang
+    /// `dag_from_graph` and must not silently drop a node.
+    #[test]
+    fn dag_from_graph_does_not_infinite_loop_on_a_referrer_cycle() {
+        let visits = vec![
+            visit("", "en", "A", 100, 0, Some(("", "en", "B"))),
+            visit("", "en", "B", 200, 0, Some(("", "en", "A"))),
+        ];
+        let graph = build_graph(&visits); // must return, not hang
+        let dag = dag_from_graph(&graph); // must return, not hang
+        assert_eq!(dag.nodes.len(), 2, "both nodes survive the cycle");
+        let mut titles: Vec<&str> = dag.nodes.iter().map(|n| n.article.title.as_str()).collect();
+        titles.sort_unstable();
+        assert_eq!(titles, vec!["A", "B"]);
+    }
+
+    #[test]
+    fn dag_from_graph_on_an_empty_graph_is_empty() {
+        let dag = dag_from_graph(&TrailGraph::default());
+        assert!(dag.nodes.is_empty());
+    }
+
+    #[test]
+    fn dag_connector_glyphs_distinguish_root_single_parent_and_merge() {
+        let root = DagNode {
+            article: key("", "A"),
+            total_dwell_secs: 0,
+            visit_count: 1,
+            parents: Vec::new(),
+        };
+        let single = DagNode {
+            article: key("", "B"),
+            total_dwell_secs: 0,
+            visit_count: 1,
+            parents: vec![key("", "A")],
+        };
+        let merge = DagNode {
+            article: key("", "D"),
+            total_dwell_secs: 0,
+            visit_count: 1,
+            parents: vec![key("", "B"), key("", "C")],
+        };
+        assert_eq!(dag_connector(&root), "");
+        assert!(dag_connector(&single).contains('\u{2514}'));
+        assert!(dag_connector(&merge).contains('\u{2534}'));
+        assert_ne!(dag_connector(&single), dag_connector(&merge));
+    }
+
+    #[test]
+    fn trail_layout_defaults_to_tree() {
+        assert_eq!(TrailLayout::default(), TrailLayout::Tree);
     }
 
     // ---- flatten: ordering + connector info --------------------------------

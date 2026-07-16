@@ -838,6 +838,20 @@ ASSESSMENTS = {
     "Enigma machine": "GA",
 }
 
+# PRD FR-DL-3 v2 (§6.2 rule 1's stated Lift Wing exception): the gateway
+# `articlequality` predict endpoint, keyed by revid — `api::WikiClient::
+# fetch_liftwing_quality`'s own doc comment covers why revid, not title (the
+# model scores one specific revision's text). A revid absent from this dict
+# comes back with an empty `scores` map, matching a real "no score for this
+# revision" response — never invented. Counts how many times the endpoint
+# was actually hit (`/debug/liftwing-hits`) so a pty test can verify the
+# "pageassessments present -> Lift Wing never called" fallback decision on
+# the wire, not just by the badge that (or doesn't) show up.
+LIFTWING_SCORES = {
+    1001: "GA",  # Alan_Turing — used by the "wiki without pageassessments" pty fixture
+}
+LIFTWING_HITS = 0
+
 # PRD FR-SR-6 fixture: `morelike:{title}` results, keyed by the display
 # title the Related panel searches for. Shaped like `SEARCH_PAGES` entries
 # (minus size/wordcount/timestamp, which `morelike:` results don't carry any
@@ -1006,6 +1020,7 @@ def make_excerpt(text, query):
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
+        global LIFTWING_HITS
         parsed = urllib.parse.urlparse(self.path)
         parts = parsed.path.split('/')
         params = urllib.parse.parse_qs(parsed.query)
@@ -1032,6 +1047,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if parsed.path == '/debug/media-hits':
             self._send_json({"hits": MEDIA_HITS})
+        elif parsed.path == '/debug/liftwing-hits':
+            self._send_json({"hits": LIFTWING_HITS})
         elif parsed.path == '/debug/requests':
             self._send_json({"requests": REQUEST_LOG})
         elif parsed.path == '/debug/oauth':
@@ -1039,6 +1056,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # refresh actually reached the token endpoint.
             self._send_json({"stats": OAUTH_STATS})
         elif parsed.path == '/debug/reset':
+            LIFTWING_HITS = 0
             REQUEST_LOG.clear()
             # PRD FR-ACC-2/3: restore the account-feature fixtures' mutable
             # state (watched titles, notification read-flags, token epoch) so
@@ -1484,9 +1502,45 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._serve_oauth_token(form)
         elif parsed.path.endswith('/api.php'):
             self._serve_action_api_write(form)
+        elif parsed.path.startswith('/service/lw/inference/v1/models/') and parsed.path.endswith(':predict'):
+            self._serve_liftwing_predict(parsed.path, body)
         else:
             self.send_response(404)
             self.end_headers()
+
+    def _serve_liftwing_predict(self, path, body):
+        # PRD FR-DL-3 v2 / §6.2 rule 1's stated exception: the gateway
+        # `articlequality` predict endpoint — see LIFTWING_SCORES's own
+        # comment for the request/response shape this mirrors (a JSON body
+        # naming `rev_id`, not the form-encoded shape every other write on
+        # this mock uses).
+        global LIFTWING_HITS
+        LIFTWING_HITS += 1
+        # `/models/{lang}wiki-articlequality:predict` — the model segment
+        # names the wiki; the wiki key in the response body is that same
+        # `{lang}wiki` (mirrors the real ORES-legacy-compatible shape
+        # `api::LiftWingResponse` parses).
+        model = path.rsplit('/', 1)[-1].split(':', 1)[0]
+        wiki_db = model[:-len('-articlequality')] if model.endswith('-articlequality') else model
+        try:
+            payload = json.loads(body) if body else {}
+        except ValueError:
+            payload = {}
+        rev_id = payload.get('rev_id')
+        prediction = LIFTWING_SCORES.get(rev_id)
+        scores = {}
+        if prediction is not None:
+            classes = ["FA", "GA", "B", "C", "Start", "Stub"]
+            probability = {c: (0.9 if c == prediction else 0.02) for c in classes}
+            scores[str(rev_id)] = {
+                "articlequality": {
+                    "score": {
+                        "prediction": prediction,
+                        "probability": probability,
+                    },
+                },
+            }
+        self._send_json({wiki_db: {"scores": scores}})
 
     def _serve_action_api_write(self, form):
         # PRD §6.2 rule 8: every write here (`action=watch`/`thank`/

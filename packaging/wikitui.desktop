@@ -6,12 +6,39 @@
 #
 # The MimeType line below declares wikitui as a handler for `wiki://` URIs
 # per PRD FR-CS-7 ("Protocol handler: wiki:// x-scheme-handler via .desktop
-# on Linux"). FR-CS-7 is a v2/P2, best-effort roadmap item (see PRD.md §12,
-# the "Scholar" milestone) — wikitui does NOT parse, register, or handle
-# `wiki://` URIs today. Installing this file alone does not make the
-# protocol handler work; it only tells desktop environments where to route
-# such URIs once (and if) that support ships. Treat this as a placeholder
-# a packager can wire up later, not a working feature.
+# on Linux", v2/P2 — PRD.md §12, the "Scholar" milestone). `wikitui` itself
+# now parses `wiki://`/`wiki:` URIs (`target::parse`, see that module's doc
+# comment for the exact grammar): `Exec=wikitui %u` hands whatever URI a
+# desktop environment dispatches straight through as the ordinary TITLE
+# argument, which is all the CLI side of this feature needs. What this file
+# does NOT do on its own is make the *desktop* route such URIs to wikitui in
+# the first place — that is a one-time, per-machine registration step this
+# file only declares support for, and it remains a packager/user action:
+#
+#   1. Install this file (or an equivalent) somewhere on the desktop's
+#      `.desktop` search path, e.g. `~/.local/share/applications/` for a
+#      per-user install, or the distro's usual system applications
+#      directory for a packaged one.
+#   2. Refresh the desktop database so it notices the new MimeType claim:
+#        update-desktop-database ~/.local/share/applications
+#   3. Register wikitui as the `wiki://` handler explicitly:
+#        xdg-mime default wikitui.desktop x-scheme-handler/wiki
+#      (`xdg-mime query default x-scheme-handler/wiki` confirms it stuck.)
+#
+# `Terminal=true` means the desktop environment opens a terminal emulator to
+# run this — some desktops honor that per-.desktop-entry, others rely on a
+# system-wide "run in terminal" default; if a `wiki://` link opens and
+# immediately closes with nothing visible, that's the desktop's own
+# terminal-launch behavior, not wikitui's — a packager targeting a specific
+# desktop may need to wrap `Exec` in that desktop's preferred terminal
+# invocation instead.
+#
+# macOS has no `.desktop`/`xdg-mime` equivalent; a `wiki://` handler there
+# needs an app-bundle shim (a tiny `.app` wrapper registering the URL scheme
+# via `CFBundleURLTypes` in its `Info.plist` and re-exec'ing this binary in
+# `Terminal.app` or the user's preferred terminal). PRD FR-CS-7 marks that
+# explicitly "best-effort" for v2 — it is documented here, not implemented;
+# no such bundle ships in this repo.
 [Desktop Entry]
 Type=Application
 Name=wikitui
