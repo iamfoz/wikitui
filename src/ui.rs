@@ -3734,14 +3734,31 @@ fn status_bar_text(app: &App, width: u16) -> String {
     }
 }
 
-fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let text = status_bar_text(app, area.width);
+/// Builds the fully-decorated status-bar string: the mode/notice body, the
+/// login+notification and incognito glyphs, and then — as the whole notice
+/// channel's single SEC-1/SEC-2 sink — the sanitizer.
+///
+/// `app.notice` and the breadcrumb/link segments can all carry remote-derived
+/// text (a ZIM title, a server error string, a page title), and `ratatui`
+/// emits a raw ESC/C1/control byte in a `Paragraph` verbatim to the terminal
+/// (PRD §6.6 SEC-1). Sanitizing here, at the one place every status-bar string
+/// is finalized, means no notice source anywhere has to remember to do it, and
+/// the glyphs this function adds are plain text that survives untouched. The
+/// bar is a single row and `ratatui` applies color via `.style`, so a
+/// single-line strip (no legitimate `\n`/`\t` ever belongs here) is correct.
+fn status_bar_line(app: &App, width: u16) -> String {
+    let text = status_bar_text(app, width);
     let text = with_login_glyph(
         text,
         app.logged_in_username(),
         app.notification_badge().as_deref(),
     );
     let text = with_incognito_glyph(text, app.incognito);
+    crate::sanitize::sanitize_single_line(&text).into_owned()
+}
+
+fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
+    let text = status_bar_line(app, area.width);
     let style = if matches!(
         app.mode,
         Mode::Search
@@ -4949,6 +4966,64 @@ mod tests {
             "Alan Turing",
             "no badge is ever shown while logged out"
         );
+    }
+
+    // ---- SEC-1/SEC-2: the status-bar notice channel is sanitized ----------
+
+    /// A notice built from remote text (a ZIM title, a server error) must be
+    /// neutralized at the `status_bar_line` sink before `ratatui` emits it —
+    /// no OSC/CSI/ESC/C1/bidi byte may survive, while the inert payload text
+    /// still shows through.
+    #[test]
+    fn status_bar_line_sanitizes_a_hostile_notice() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.notice =
+            Some("\u{1b}]0;pwned\u{7}open \u{1b}[31mred\u{202e}evil\u{202c} title".to_string());
+        let line = status_bar_line(&app, 100);
+        for c in line.chars() {
+            let u = c as u32;
+            assert!(
+                !((u < 0x20 && c != '\n' && c != '\t')
+                    || u == 0x7F
+                    || (0x80..=0x9F).contains(&u)
+                    || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')),
+                "hostile char U+{u:04X} reached the status bar: {line:?}"
+            );
+        }
+        assert!(
+            line.contains("pwned") && line.contains("evil"),
+            "inert text must survive sanitization: {line:?}"
+        );
+    }
+
+    /// The same, one level higher: the hostile notice must not reach the
+    /// rendered frame buffer either.
+    #[test]
+    fn hostile_notice_does_not_reach_the_rendered_status_bar() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.notice = Some("\u{1b}]0;pwned\u{7}\u{1b}[31mhi\u{202e}bye".to_string());
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        for c in rendered.chars() {
+            let u = c as u32;
+            assert!(
+                !((u < 0x20 && c != '\n' && c != '\t')
+                    || u == 0x7F
+                    || (0x80..=0x9F).contains(&u)
+                    || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')),
+                "hostile char U+{u:04X} reached the rendered status bar"
+            );
+        }
     }
 
     /// The glyph must show up in the actual rendered frame — not just in the

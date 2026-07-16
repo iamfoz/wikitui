@@ -1283,6 +1283,95 @@ mod sanitizer_property {
             assert_laid_lines_clean(&layout.lines, &ctx);
         }
     }
+
+    /// SEC-1 companion to the document test above, for the account/social and
+    /// ZIM surfaces added in later chunks (C2/C3): every hostile fragment,
+    /// embedded in every remote-derived field those `parse_*` functions read,
+    /// must be stripped at the parse boundary before it can reach a `ratatui`
+    /// render site or the persisted store. Uses `serde_json` to build the
+    /// bodies so even the raw-control-byte fragments (NUL, ESC, C1) are encoded
+    /// as valid JSON, exactly as a real server would send them.
+    #[test]
+    fn account_and_zim_fields_never_survive_hostile_input_at_the_parse_boundary() {
+        use crate::account;
+
+        for (i, fragment) in HOSTILE_FRAGMENTS.iter().enumerate() {
+            let payload = match i % 3 {
+                0 => (*fragment).to_string(),
+                1 => format!("normal{fragment}"),
+                _ => format!("{fragment}normal"),
+            };
+            let ctx = format!("fragment {fragment:?}");
+
+            let body = serde_json::json!({
+                "query": { "usercontribs": [
+                    { "title": payload, "timestamp": payload, "comment": payload,
+                      "revid": 1, "sizediff": 0 }
+                ]}
+            })
+            .to_string();
+            let contribs = account::parse_usercontribs(body.as_bytes()).unwrap();
+            assert_span_clean(&contribs[0].title, &format!("{ctx} usercontribs.title"));
+            assert_span_clean(
+                &contribs[0].timestamp,
+                &format!("{ctx} usercontribs.timestamp"),
+            );
+            assert_span_clean(
+                contribs[0].comment.as_deref().unwrap(),
+                &format!("{ctx} usercontribs.comment"),
+            );
+
+            let body = serde_json::json!({
+                "query": { "notifications": { "list": [
+                    { "id": "1", "type": "alert", "text": payload, "read": false,
+                      "timestamp": payload }
+                ]}}
+            })
+            .to_string();
+            let list = account::parse_notif_list(body.as_bytes()).unwrap();
+            assert_span_clean(&list[0].text, &format!("{ctx} notif.text"));
+
+            let body = serde_json::json!({
+                "query": { "watchlist": [
+                    { "title": payload, "user": payload, "timestamp": payload,
+                      "comment": payload, "revid": 1, "old_revid": 0 }
+                ]}
+            })
+            .to_string();
+            let changes = account::parse_watchlist_changes(body.as_bytes()).unwrap();
+            assert_span_clean(&changes[0].title, &format!("{ctx} watchlist.title"));
+            assert_span_clean(&changes[0].user, &format!("{ctx} watchlist.user"));
+            assert_span_clean(&changes[0].timestamp, &format!("{ctx} watchlist.timestamp"));
+            assert_span_clean(
+                changes[0].comment.as_deref().unwrap(),
+                &format!("{ctx} watchlist.comment"),
+            );
+
+            let body = serde_json::json!({ "watchlistraw": [ { "ns": 0, "title": payload } ] })
+                .to_string();
+            let titles = account::parse_watchlistraw(body.as_bytes()).unwrap();
+            assert_span_clean(&titles[0], &format!("{ctx} watchlistraw.title"));
+
+            let body = serde_json::json!({
+                "query": { "userinfo": { "id": 1, "name": "U",
+                    "options": { "skin": payload, "language": payload } } }
+            })
+            .to_string();
+            let prefs = account::parse_userinfo_options(body.as_bytes()).unwrap();
+            assert_span_clean(prefs.skin.as_deref().unwrap(), &format!("{ctx} prefs.skin"));
+            assert_span_clean(
+                prefs.language.as_deref().unwrap(),
+                &format!("{ctx} prefs.language"),
+            );
+
+            let body = serde_json::json!({
+                "readinglists": { "entries": [ { "id": 7, "project": "", "title": payload } ] }
+            })
+            .to_string();
+            let entries = account::parse_readinglist_entries(body.as_bytes());
+            assert_span_clean(&entries[0].title, &format!("{ctx} readinglist.title"));
+        }
+    }
 }
 
 // ===========================================================================

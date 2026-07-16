@@ -44,11 +44,13 @@
 //!   `:zim <title>` (see `main.rs`), and as a fallback `open_title` tries
 //!   after the network and pinned saved pages both come up empty.
 //! - Not attempted: writing ZIM files (never needed — FR-OFF-8 is read-
-//!   only), a picker/browse UI over an archive's full title list (`:zim
-//!   <title>`'s no-match path lists candidates in the status line instead),
-//!   and hardening every possible malformed-file panic in the underlying
-//!   crate (see `checked_entry`/`checked_cluster`'s doc comments for the one
-//!   gap — out-of-range blob indices — this chunk leaves unguarded).
+//!   only) and a picker/browse UI over an archive's full title list (`:zim
+//!   <title>`'s no-match path lists candidates in the status line instead).
+//!   The malformed-file panic surfaces the crate leaves open — out-of-range
+//!   directory, cluster, and blob indices — are all converted to clean
+//!   [`ZimError`]s (`checked_entry`/`checked_cluster`/`checked_blob`), and a
+//!   decompressed blob is size-capped against a decompression bomb; see those
+//!   helpers' doc comments (PRD SEC-1/SEC-3).
 
 use std::collections::HashMap;
 use std::fmt;
@@ -60,6 +62,24 @@ use zim::{DirectoryEntry, MimeType, Namespace, Target, Zim};
 /// posture, applied to a corrupt or cyclic redirect chain rather than HTML
 /// nesting depth). Real archives never chain more than one or two.
 const MAX_REDIRECT_HOPS: u8 = 10;
+
+/// PRD SEC-1: display cap for a title read out of a ZIM directory entry. Titles
+/// from an arbitrary user-supplied `.zim` file are untrusted, and they surface
+/// both as a resolved page title and — via `search_titles` — as status-bar
+/// notice text (`main.rs`'s `:zim`/`--zim` handlers), which `ratatui` emits
+/// verbatim. Same size as `api.rs`/`account.rs`'s single-line title cap.
+const MAX_ZIM_TITLE_CHARS: usize = 512;
+
+/// PRD SEC-3: hard ceiling on one *decompressed* ZIM article blob. A ZIM
+/// article's HTML feeds the same `doc::parse_article_html` pipeline the online
+/// and saved-page paths do, which already truncates its input at
+/// [`crate::doc::MAX_ARTICLE_HTML_BYTES`] — so a blob larger than that is a
+/// corrupt archive or a zstd/lzma decompression bomb, never a real article. It
+/// is rejected in [`checked_blob`] *before* being copied, UTF-8-validated, and
+/// parsed, so the bomb can't drive that whole pipeline. (The `zim` crate
+/// decompresses a full cluster eagerly and exposes no pre-decompression size
+/// hint, so this is the earliest point wikitui's own code can bound it.)
+const MAX_ZIM_BLOB_BYTES: usize = crate::doc::MAX_ARTICLE_HTML_BYTES;
 
 /// Everything that can go wrong opening or reading a ZIM archive — surfaced
 /// verbatim in status-bar notices (`main.rs`'s `:zim`/`--zim` handlers), so
@@ -198,8 +218,8 @@ impl ZimArchive {
                     if let Some(name) = unsupported_compression(&cluster) {
                         return Err(ZimError::UnsupportedCompression(name));
                     }
-                    let blob = cluster.get_blob(blob_idx).map_err(ZimError::Archive)?;
-                    let html = String::from_utf8(blob.to_vec())
+                    let bytes = checked_blob(&cluster, blob_idx, title)?;
+                    let html = String::from_utf8(bytes)
                         .map_err(|_| ZimError::InvalidUtf8(title.to_string()))?;
                     return Ok((display_title(&entry), html));
                 }
@@ -212,6 +232,10 @@ impl ZimArchive {
     /// substring, sorted, deduplicated) — the `:zim <title>` no-exact-match
     /// fallback's candidate list. Title-only, not ranked or fuzzy (see
     /// module doc's scope note).
+    ///
+    /// PRD SEC-1: these candidates become status-bar notice text, but they are
+    /// already clean — every value in `titles` was produced by `display_title`,
+    /// the single sanitize/cap choke point for ZIM titles.
     pub fn search_titles(&self, query: &str, limit: usize) -> Vec<String> {
         let q = query.trim().to_lowercase();
         if q.is_empty() {
@@ -238,15 +262,22 @@ fn normalize_title(title: &str) -> String {
     title.trim().replace(' ', "_").to_lowercase()
 }
 
-/// A directory entry's human-readable title, falling back to its URL when
-/// the title field is empty (the ZIM spec's own documented convention — see
+/// A directory entry's human-readable title, falling back to its URL when the
+/// title field is empty (the ZIM spec's own documented convention — see
 /// `DirectoryEntry::title`'s doc comment in the `zim` crate).
+///
+/// PRD SEC-1: this is the single choke point for every ZIM-derived title. It
+/// sanitizes and length-caps here, so both the resolved title `article_html`/
+/// `main_page_title` return *and* the candidate list `search_titles` reads
+/// back out of `titles` are already clean — `build_title_index` stores exactly
+/// what this returns.
 fn display_title(entry: &DirectoryEntry) -> String {
-    if entry.title.is_empty() {
-        entry.url.clone()
+    let raw = if entry.title.is_empty() {
+        entry.url.as_str()
     } else {
-        entry.title.clone()
-    }
+        entry.title.as_str()
+    };
+    crate::sanitize::sanitize_and_cap_single_line(raw, MAX_ZIM_TITLE_CHARS)
 }
 
 fn is_html_mime(mime: &MimeType) -> bool {
@@ -301,12 +332,10 @@ fn checked_entry(zim: &Zim, idx: u32) -> Result<DirectoryEntry, ZimError> {
 }
 
 /// Same bounds-checking rationale as `checked_entry`, for `get_cluster`'s
-/// direct indexing into the cluster-offset table. This does not (and, given
-/// the crate's API, cannot cheaply) guard the deeper case of an out-of-range
-/// *blob* index within an otherwise-valid cluster — `zim` exposes no
-/// blob-count query before decompression, so a genuinely malformed cluster
-/// can still panic inside `Cluster::get_blob`. Documented, not fixed, in
-/// this chunk.
+/// direct indexing into the cluster-offset table. The deeper case of an
+/// out-of-range *blob* index within an otherwise-valid cluster is handled
+/// separately in [`checked_blob`] (the crate exposes no blob-count query, so
+/// that one can only be guarded by catching the panic, not pre-checking).
 fn checked_cluster(zim: &Zim, idx: u32) -> Result<zim::Cluster<'_>, ZimError> {
     if idx as usize >= zim.header.cluster_count as usize {
         return Err(ZimError::Corrupt(format!(
@@ -315,6 +344,62 @@ fn checked_cluster(zim: &Zim, idx: u32) -> Result<zim::Cluster<'_>, ZimError> {
         )));
     }
     zim.get_cluster(idx).map_err(ZimError::Archive)
+}
+
+/// Serializes the global panic-hook swap in [`checked_blob`] so concurrent ZIM
+/// reads (and parallel tests) can't race on `set_hook`/`take_hook` and leave a
+/// silenced hook installed. The guarded call catches its own panic, so this
+/// lock is never poisoned by one.
+static BLOB_PANIC_HOOK_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Reads one blob out of `cluster`, converting the two remaining ways the
+/// crate's `Cluster::get_blob` can take down the whole TUI into clean
+/// [`ZimError`]s (PRD SEC-3, "harden malformed-file panics"):
+///
+///  - **Out-of-range blob index**: `zim` indexes its internal blob-offset
+///    `Vec` directly and *panics* on a bad index, and exposes no blob-count to
+///    pre-check against — so the call is wrapped in `catch_unwind`. The panic
+///    hook (the crashguard's terminal-restoring one in a real run) is silenced
+///    only for the duration of the guarded call, so a malformed archive
+///    neither crashes the process nor sprays a backtrace across the alternate
+///    screen; it is restored immediately afterward. A caught panic never
+///    escapes past the hook guard, so [`BLOB_PANIC_HOOK_GUARD`] stays healthy.
+///  - **Decompression bomb / oversized blob**: the decompressed length is
+///    checked against [`MAX_ZIM_BLOB_BYTES`] *before* the blob is copied out,
+///    so an over-cap blob is rejected without the extra `to_vec`/UTF-8/parse
+///    work a real article would incur.
+fn checked_blob<'a>(
+    cluster: &'a zim::Cluster<'a>,
+    blob_idx: u32,
+    title: &str,
+) -> Result<Vec<u8>, ZimError> {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    let _serialize = BLOB_PANIC_HOOK_GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let caught = catch_unwind(AssertUnwindSafe(|| -> Result<Vec<u8>, ZimError> {
+        let blob = cluster.get_blob(blob_idx).map_err(ZimError::Archive)?;
+        if blob.len() > MAX_ZIM_BLOB_BYTES {
+            return Err(ZimError::Corrupt(format!(
+                "{title:?}'s decompressed content is {} bytes, over the \
+                 {MAX_ZIM_BLOB_BYTES}-byte article cap (corrupt archive or \
+                 decompression bomb)",
+                blob.len()
+            )));
+        }
+        Ok(blob.to_vec())
+    }));
+    std::panic::set_hook(previous_hook);
+
+    match caught {
+        Ok(result) => result,
+        Err(_) => Err(ZimError::Corrupt(format!(
+            "{title:?} points at an out-of-range blob index in its cluster (malformed archive)"
+        ))),
+    }
 }
 
 /// `zim` 0.4.0's `Cluster::decompress` has an unimplemented `todo!()` panic
@@ -460,20 +545,31 @@ mod tests {
     // ---- Byte-level fixture: a hand-rolled minimal ZIM v5 file, exercised
     // through the real `Zim::new` mmap-and-parse path. ---------------------
 
-    /// One directory entry for [`build_fixture`].
-    enum Entry {
+    /// One directory entry for [`build_fixture`]. Borrows for `'a` so a test
+    /// can pass a large, runtime-built blob (the decompression-bomb fixture)
+    /// as well as the usual `&'static` byte-string literals.
+    enum Entry<'a> {
         /// A real HTML article: gets its own blob in the fixture's one
         /// shared cluster.
         Html {
-            title: &'static str,
-            url: &'static str,
-            html: &'static [u8],
+            title: &'a str,
+            url: &'a str,
+            html: &'a [u8],
+        },
+        /// An HTML dirent whose blob index deliberately points past the end of
+        /// the shared cluster's blob list — no blob is emitted for it. Used to
+        /// exercise `checked_blob`'s out-of-range guard (a malformed archive
+        /// whose directory references a blob that doesn't exist).
+        HtmlBadBlob {
+            title: &'a str,
+            url: &'a str,
+            blob_idx: u32,
         },
         /// A redirect to another entry, addressed by its position in the
         /// `entries` slice passed to `build_fixture`.
         Redirect {
-            title: &'static str,
-            url: &'static str,
+            title: &'a str,
+            url: &'a str,
             target: usize,
         },
     }
@@ -523,7 +619,7 @@ mod tests {
     /// mimetype ("text/html"), one cluster holding every [`Entry::Html`]'s
     /// blob in order.
     fn build_fixture(
-        entries: &[Entry],
+        entries: &[Entry<'_>],
         compression: FixtureCompression,
         main_page: Option<u32>,
     ) -> Vec<u8> {
@@ -539,6 +635,23 @@ mod tests {
                 Entry::Html { title, url, html } => {
                     let blob_idx = blobs.len() as u32;
                     blobs.push(html);
+                    dirents.push(encode_dirent(
+                        0,
+                        b'A',
+                        0u32.to_le_bytes(),
+                        Some(blob_idx.to_le_bytes()),
+                        url,
+                        title,
+                    ));
+                }
+                Entry::HtmlBadBlob {
+                    title,
+                    url,
+                    blob_idx,
+                } => {
+                    // An HTML dirent pointing at cluster 0, blob `blob_idx`, but
+                    // no matching blob is pushed — so a large `blob_idx` indexes
+                    // past the cluster's blob list and the crate would panic.
                     dirents.push(encode_dirent(
                         0,
                         b'A',
@@ -652,7 +765,7 @@ mod tests {
     }
 
     fn write_fixture(
-        entries: &[Entry],
+        entries: &[Entry<'_>],
         compression: FixtureCompression,
         main_page: Option<u32>,
     ) -> std::path::PathBuf {
@@ -867,5 +980,140 @@ mod tests {
         let plain = crate::doc::render_plain(&document, "en");
         assert!(plain.contains("Section"));
         assert!(plain.contains("Body text."));
+    }
+
+    // ---- SEC-1/SEC-3: hostile titles + malformed / bomb clusters -----------
+
+    /// Mirrors `corpus_tests::sanitizer_property::is_forbidden`: no C0 control
+    /// (other than `\n`/`\t`), DEL, C1 control, or bidi override/isolate may
+    /// survive into a title that becomes a `ratatui`-emitted notice.
+    fn assert_no_zim_control(s: &str, ctx: &str) {
+        for c in s.chars() {
+            let u = c as u32;
+            assert!(
+                !((u < 0x20 && c != '\n' && c != '\t')
+                    || u == 0x7F
+                    || (0x80..=0x9F).contains(&u)
+                    || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')),
+                "hostile char U+{u:04X} survived in a ZIM title from {ctx:?}: {s:?}"
+            );
+        }
+    }
+
+    /// ZIM titles carrying OSC/CSI/C1/bidi/DEL bytes (every category except NUL,
+    /// which is the ZIM format's own field terminator and so can never appear
+    /// in a real title) must be neutralized at the `display_title` choke point,
+    /// covering both `main_page_title` and the `search_titles` candidate list.
+    #[test]
+    fn zim_titles_are_sanitized_at_the_display_boundary() {
+        const HOSTILE: &[&str] = &[
+            "\u{1b}]0;pwned\u{7}Article",   // OSC set-title, BEL-terminated
+            "before\u{1b}[31mafter",        // CSI SGR
+            "\u{9b}31mArticle",             // C1 CSI introducer
+            "safe\u{202e}evil\u{202c}road", // RLO bidi override
+            "del\u{7f}Article",             // DEL
+        ];
+        for hostile in HOSTILE {
+            let path = write_fixture(
+                &[Entry::Html {
+                    title: hostile,
+                    url: "Hostile_Article",
+                    html: b"<html><body>x</body></html>",
+                }],
+                FixtureCompression::None,
+                Some(0),
+            );
+            let archive = ZimArchive::open(&path).unwrap();
+            let main = archive.main_page_title().expect("main page title");
+            assert_no_zim_control(&main, hostile);
+            // Searching by the (already-sanitized) title guarantees a match, so
+            // this also exercises the `search_titles` candidate-list output.
+            let hits = archive.search_titles(&main, 10);
+            assert!(!hits.is_empty(), "self-search must match: {main:?}");
+            for hit in &hits {
+                assert_no_zim_control(hit, hostile);
+            }
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// A cluster that decompresses past [`MAX_ZIM_BLOB_BYTES`] must be rejected
+    /// as a clean `ZimError` — never copied, UTF-8-validated, and parsed as if
+    /// it were a real article (SEC-3 decompression bomb).
+    #[test]
+    fn over_cap_decompressed_blob_is_rejected_not_processed() {
+        // Tiny on disk (a run of one byte zstd-compresses to almost nothing),
+        // but decompresses to just over the cap.
+        let bomb = vec![b'A'; MAX_ZIM_BLOB_BYTES + 1_024];
+        let path = write_fixture(
+            &[Entry::Html {
+                title: "Bomb",
+                url: "Bomb",
+                html: &bomb,
+            }],
+            FixtureCompression::Zstd,
+            None,
+        );
+        let archive = ZimArchive::open(&path).unwrap();
+        match archive.article_html("Bomb") {
+            Err(ZimError::Corrupt(msg)) => assert!(msg.contains("cap")),
+            Err(other) => panic!("expected Corrupt over-cap error, got {other}"),
+            Ok((t, html)) => panic!("over-cap blob was accepted: {t:?} ({} bytes)", html.len()),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A directory entry whose blob index points past its cluster's blob list
+    /// (a malformed archive) must surface as a `ZimError`, not the process-
+    /// killing panic the crate's `Cluster::get_blob` raises on that index.
+    #[test]
+    fn out_of_range_blob_index_is_a_clean_error_not_a_panic() {
+        let path = write_fixture(
+            &[
+                Entry::Html {
+                    title: "Good",
+                    url: "Good",
+                    html: b"<html><body>ok</body></html>",
+                },
+                Entry::HtmlBadBlob {
+                    title: "BadBlob",
+                    url: "BadBlob",
+                    blob_idx: 99,
+                },
+            ],
+            FixtureCompression::None,
+            None,
+        );
+        let archive = ZimArchive::open(&path).unwrap();
+        // The guard must not disturb the happy path.
+        assert!(archive.article_html("Good").is_ok());
+        match archive.article_html("BadBlob") {
+            Err(ZimError::Corrupt(_)) => {}
+            Err(other) => panic!("expected Corrupt for out-of-range blob, got {other}"),
+            Ok(_) => panic!("an out-of-range blob index must not resolve to content"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Not a test: writes a hostile-title ZIM to `$WIKITUI_ZIM_FIXTURE_OUT` for
+    /// out-of-process pty verification of the `:zim` notice channel. Ignored by
+    /// default; run with
+    /// `WIKITUI_ZIM_FIXTURE_OUT=/path/hostile.zim cargo test emit_hostile_zim_fixture -- --ignored`.
+    #[test]
+    #[ignore]
+    fn emit_hostile_zim_fixture() {
+        let out = std::env::var("WIKITUI_ZIM_FIXTURE_OUT")
+            .unwrap_or_else(|_| "/tmp/wikitui-hostile.zim".to_string());
+        let bytes = build_fixture(
+            &[Entry::Html {
+                title: "\u{202e}Innocent\u{202c}\u{1b}]0;HIJACK\u{7}Page",
+                url: "Innocent_Page",
+                html: b"<html><body><p>content</p></body></html>",
+            }],
+            FixtureCompression::None,
+            None,
+        );
+        std::fs::write(&out, &bytes).expect("write hostile zim fixture");
+        eprintln!("wrote hostile ZIM fixture to {out}");
     }
 }

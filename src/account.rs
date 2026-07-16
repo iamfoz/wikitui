@@ -44,6 +44,23 @@
 //! posture both argue against inventing a poll interval nothing asked for.
 //! Marking read (`echomarkread`) updates the in-memory badge locally instead
 //! of firing a third network call.
+//!
+//! ## SEC-1: every remote display field is sanitized at this parse boundary
+//!
+//! wikitui talks to arbitrary third-party MediaWiki wikis (FR-ML-4/5), so the
+//! server is fully untrusted, and `ratatui` emits a raw ESC/C1/control byte in
+//! a `Span` verbatim to the terminal (PRD §6.6 SEC-1). The account/social
+//! panes (`ui.rs`'s `draw_watchlist`/`draw_notifications`/`draw_contribs`/
+//! `draw_prefs_overlay`) do no sanitizing of their own, so — exactly like
+//! `api.rs` does for search/typeahead/langlink fields with
+//! `sanitize_search_result` and friends — this module cleans every
+//! remote-derived display field once, right after parsing, in each `parse_*`
+//! function ([`clean_field`]/[`clean_text`]). Doing it here means every
+//! render site downstream receives already-clean, length-capped strings and
+//! no injection can reach the terminal through the account features. The cap
+//! also closes a layout/allocation DoS: these fields (an edit summary, a
+//! notification body) otherwise had no length bound at all, so a multi-MB
+//! value would be carried and laid out in full.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -52,6 +69,30 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::api::WikiClient;
+
+/// SEC-1/SEC-3 cap for a single-line remote account/social field that is a
+/// title, username, timestamp, skin, or language code — sized like `api.rs`'s
+/// own title/search-field handling. Anything longer is either abuse or a
+/// display bug, never legitimate content in one of these slots.
+const MAX_SOCIAL_FIELD_CHARS: usize = 512;
+
+/// SEC-1/SEC-3 cap for the two remote fields that are legitimately longer
+/// prose — an edit summary (`comment`) and a notification body (`text`). Well
+/// above any real value (MediaWiki edit summaries cap at ~1000 bytes) while
+/// still bounding a hostile multi-megabyte payload to a fixed size.
+const MAX_SOCIAL_TEXT_CHARS: usize = 2_048;
+
+/// PRD SEC-1: sanitize (single-line) and length-cap one short remote field —
+/// the account-feature counterpart of `api.rs`'s per-field sanitizers.
+fn clean_field(s: &str) -> String {
+    crate::sanitize::sanitize_and_cap_single_line(s, MAX_SOCIAL_FIELD_CHARS)
+}
+
+/// PRD SEC-1: [`clean_field`] with the larger [`MAX_SOCIAL_TEXT_CHARS`] cap,
+/// for the legitimately-longer `comment`/`text` prose fields.
+fn clean_text(s: &str) -> String {
+    crate::sanitize::sanitize_and_cap_single_line(s, MAX_SOCIAL_TEXT_CHARS)
+}
 
 // ---------------------------------------------------------------------------
 // CSRF / watch tokens (PRD §6.2 rule 8)
@@ -168,7 +209,11 @@ struct WatchlistRawEntry {
 /// "raw watched-pages list").
 pub fn parse_watchlistraw(body: &[u8]) -> Result<Vec<String>, serde_json::Error> {
     let parsed: WatchlistRawResponse = serde_json::from_slice(body)?;
-    Ok(parsed.watchlistraw.into_iter().map(|e| e.title).collect())
+    Ok(parsed
+        .watchlistraw
+        .into_iter()
+        .map(|e| clean_field(&e.title))
+        .collect())
 }
 
 /// One recent edit to a watched page (PRD FR-ACC-2's "what changed"
@@ -203,7 +248,20 @@ struct WatchlistChangesQuery {
 /// Parses `list=watchlist` into the recent-changes list.
 pub fn parse_watchlist_changes(body: &[u8]) -> Result<Vec<WatchlistChange>, serde_json::Error> {
     let parsed: WatchlistChangesResponse = serde_json::from_slice(body)?;
-    Ok(parsed.query.map(|q| q.watchlist).unwrap_or_default())
+    let mut changes = parsed.query.map(|q| q.watchlist).unwrap_or_default();
+    for c in &mut changes {
+        // SEC-1: every field is rendered (`ui.rs::draw_watchlist`) — title and
+        // the `timestamp · user · comment` subline. `timestamp` also feeds the
+        // "since last seen" cutoff, but that comparison is a plain string
+        // compare that stays correct on the cleaned value.
+        c.title = clean_field(&c.title);
+        c.user = clean_field(&c.user);
+        c.timestamp = clean_field(&c.timestamp);
+        if let Some(comment) = c.comment.as_deref() {
+            c.comment = Some(clean_text(comment));
+        }
+    }
+    Ok(changes)
 }
 
 /// The "since last seen" filter (PRD FR-ACC-2): every change whose
@@ -464,10 +522,18 @@ struct NotifListInner {
 /// Parses `meta=notifications&notprop=list`.
 pub fn parse_notif_list(body: &[u8]) -> Result<Vec<Notification>, serde_json::Error> {
     let parsed: NotifListResponse = serde_json::from_slice(body)?;
-    Ok(parsed
+    let mut list = parsed
         .query
         .map(|q| q.notifications.list)
-        .unwrap_or_default())
+        .unwrap_or_default();
+    for n in &mut list {
+        // SEC-1: `text` is rendered as a single line (`ui.rs::
+        // draw_notifications`); `timestamp` is remote too, so it is cleaned
+        // even though this build doesn't currently show it.
+        n.text = clean_text(&n.text);
+        n.timestamp = clean_field(&n.timestamp);
+    }
+    Ok(list)
 }
 
 /// [`NotifCounts`] recomputed purely from a fetched notification list — used
@@ -522,7 +588,19 @@ struct UserContribsQuery {
 /// username per FR-ACC-4).
 pub fn parse_usercontribs(body: &[u8]) -> Result<Vec<Contribution>, serde_json::Error> {
     let parsed: UserContribsResponse = serde_json::from_slice(body)?;
-    Ok(parsed.query.map(|q| q.usercontribs).unwrap_or_default())
+    let mut contribs = parsed.query.map(|q| q.usercontribs).unwrap_or_default();
+    for c in &mut contribs {
+        // SEC-1 — the sharpest case: `:contribs <user>` is public and
+        // unauthenticated (any wiki, any username), so `title`/`comment` come
+        // straight off an untrusted server and are rendered by
+        // `ui.rs::draw_contribs`.
+        c.title = clean_field(&c.title);
+        c.timestamp = clean_field(&c.timestamp);
+        if let Some(comment) = c.comment.as_deref() {
+            c.comment = Some(clean_text(comment));
+        }
+    }
+    Ok(contribs)
 }
 
 // ---------------------------------------------------------------------------
@@ -600,8 +678,18 @@ pub fn parse_userinfo_options(body: &[u8]) -> Result<UserPrefs, serde_json::Erro
     let parsed: UserPrefsResponse = serde_json::from_slice(body)?;
     let info = parsed.query.map(|q| q.userinfo).unwrap_or_default();
     Ok(UserPrefs {
-        skin: info.options.as_ref().and_then(|o| o.skin.clone()),
-        language: info.options.as_ref().and_then(|o| o.language.clone()),
+        // SEC-1: `skin`/`language` are server-controlled strings rendered by
+        // `ui.rs::draw_prefs_overlay`.
+        skin: info
+            .options
+            .as_ref()
+            .and_then(|o| o.skin.as_deref())
+            .map(clean_field),
+        language: info
+            .options
+            .as_ref()
+            .and_then(|o| o.language.as_deref())
+            .map(clean_field),
         email_confirmed: info.emailauthenticated.is_some(),
         editcount: info.editcount,
     })
@@ -790,11 +878,21 @@ pub fn parse_readinglist_entries(body: &[u8]) -> Vec<ReadingListEntry> {
         #[serde(default)]
         entries: Vec<ReadingListEntry>,
     }
-    serde_json::from_slice::<Resp>(body)
+    let mut entries = serde_json::from_slice::<Resp>(body)
         .ok()
         .and_then(|r| r.readinglists)
         .map(|i| i.entries)
-        .unwrap_or_default()
+        .unwrap_or_default();
+    for e in &mut entries {
+        // SEC-1: a pulled entry's `title` becomes both a persisted bookmark/
+        // read-later entry (`main::sync_reading_list`) and rendered text
+        // (`ui.rs`), so it is cleaned before it can reach either the store or
+        // the terminal. `project` is only ever compared for equality against
+        // this session's own (clean) origin, never displayed, so it is left
+        // as-is — a hostile value simply fails to match and is filtered out.
+        e.title = clean_field(&e.title);
+    }
+    entries
 }
 
 /// Parses `command=createentry`'s response into the entry the server just
@@ -812,6 +910,13 @@ pub fn parse_readinglists_createentry(body: &[u8]) -> Option<ReadingListEntry> {
         .ok()
         .and_then(|r| r.readinglists)
         .and_then(|i| i.entry)
+        .map(|mut e| {
+            // SEC-1: same `ReadingListEntry` type as `parse_readinglist_entries`
+            // — cleaned at the parse boundary for defense in depth even though
+            // this build reads back only the server-assigned id from it.
+            e.title = clean_field(&e.title);
+            e
+        })
 }
 
 /// Whether `command=deleteentry` reported success.
@@ -1405,6 +1510,139 @@ mod tests {
     fn parse_usercontribs_of_an_unknown_user_is_an_empty_list() {
         let body = br#"{"query":{"usercontribs":[]}}"#;
         assert_eq!(parse_usercontribs(body).unwrap(), Vec::new());
+    }
+
+    // ---- SEC-1: remote account/social fields are sanitized at parse ---------
+
+    /// `true` for any byte SEC-1 must never let survive to the terminal: a C0
+    /// control other than `\n`/`\t`, DEL, a C1 control, or a bidi override/
+    /// isolate. Mirrors `corpus_tests::sanitizer_property::is_forbidden`.
+    fn has_no_control_bytes(s: &str) -> bool {
+        s.chars().all(|c| {
+            let u = c as u32;
+            !((u < 0x20 && c != '\n' && c != '\t')
+                || u == 0x7F
+                || (0x80..=0x9F).contains(&u)
+                || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'))
+        })
+    }
+
+    #[test]
+    fn parse_usercontribs_strips_hostile_bytes_from_title_and_comment() {
+        // `:contribs <user>` is public/unauthenticated — the sharpest surface.
+        // OSC-0 window-title set, CSI SGR, and an RLO bidi override, all inside
+        // the fields the contributions pane renders verbatim.
+        let body = serde_json::json!({
+            "query": { "usercontribs": [{
+                "title": "Alan\u{1b}]0;pwned\u{7} Turing",
+                "timestamp": "2026-07-15T08:00:00Z",
+                "comment": "fix \u{1b}[31mcite\u{1b}[0m \u{202e}evil\u{202c}",
+                "revid": 5103, "sizediff": 12
+            }]}
+        })
+        .to_string();
+        let contribs = parse_usercontribs(body.as_bytes()).unwrap();
+        let c = &contribs[0];
+        assert!(has_no_control_bytes(&c.title), "title: {:?}", c.title);
+        assert!(c.title.contains("Alan"), "inert text must survive");
+        let comment = c.comment.as_deref().unwrap();
+        assert!(has_no_control_bytes(comment), "comment: {comment:?}");
+        assert!(comment.contains("cite") && comment.contains("evil"));
+        assert_eq!(c.sizediff, 12, "non-text fields are untouched");
+    }
+
+    #[test]
+    fn parse_usercontribs_caps_a_pathological_comment_length() {
+        let huge = "A".repeat(MAX_SOCIAL_TEXT_CHARS + 5_000);
+        let body = format!(
+            "{{\"query\":{{\"usercontribs\":[{{\"title\":\"T\",\
+             \"timestamp\":\"t\",\"comment\":\"{huge}\",\"revid\":1,\"sizediff\":0}}]}}}}"
+        );
+        let contribs = parse_usercontribs(body.as_bytes()).unwrap();
+        let comment = contribs[0].comment.as_deref().unwrap();
+        assert!(
+            comment.chars().count() <= MAX_SOCIAL_TEXT_CHARS + "…[truncated]".chars().count(),
+            "a multi-field comment must be length-capped, got {}",
+            comment.chars().count()
+        );
+        assert!(comment.ends_with("[truncated]"));
+    }
+
+    #[test]
+    fn parse_notif_list_strips_hostile_bytes_from_text() {
+        let body = serde_json::json!({
+            "query": { "notifications": { "list": [{
+                "id": "1", "type": "alert",
+                "text": "\u{1b}]0;hijack\u{7}You were \u{202e}thanked\u{202c}",
+                "read": false, "timestamp": "2026-07-14T09:00:00Z"
+            }]}}
+        })
+        .to_string();
+        let list = parse_notif_list(body.as_bytes()).unwrap();
+        assert!(
+            has_no_control_bytes(&list[0].text),
+            "text: {:?}",
+            list[0].text
+        );
+        assert!(list[0].text.contains("thanked"));
+    }
+
+    #[test]
+    fn parse_watchlist_changes_strips_hostile_bytes_from_every_field() {
+        let body = serde_json::json!({
+            "query": { "watchlist": [{
+                "title": "T\u{1b}[31mitle", "user": "Ba\u{9b}dUser",
+                "timestamp": "2026-07-10\u{7}", "comment": "c\u{202e}omment",
+                "revid": 1, "old_revid": 0
+            }]}
+        })
+        .to_string();
+        let changes = parse_watchlist_changes(body.as_bytes()).unwrap();
+        let c = &changes[0];
+        assert!(has_no_control_bytes(&c.title));
+        assert!(has_no_control_bytes(&c.user));
+        assert!(has_no_control_bytes(&c.timestamp));
+        assert!(has_no_control_bytes(c.comment.as_deref().unwrap()));
+    }
+
+    #[test]
+    fn parse_watchlistraw_strips_hostile_bytes_from_titles() {
+        let body = serde_json::json!({
+            "watchlistraw": [{ "ns": 0, "title": "Ev\u{1b}]0;x\u{7}il" }]
+        })
+        .to_string();
+        let titles = parse_watchlistraw(body.as_bytes()).unwrap();
+        assert!(has_no_control_bytes(&titles[0]), "{:?}", titles[0]);
+    }
+
+    #[test]
+    fn parse_userinfo_options_strips_hostile_bytes_from_skin_and_language() {
+        let body = serde_json::json!({
+            "query": { "userinfo": { "id": 1, "name": "U",
+                "options": { "skin": "vec\u{1b}[31mtor", "language": "e\u{202e}n" } } }
+        })
+        .to_string();
+        let prefs = parse_userinfo_options(body.as_bytes()).unwrap();
+        assert!(has_no_control_bytes(prefs.skin.as_deref().unwrap()));
+        assert!(has_no_control_bytes(prefs.language.as_deref().unwrap()));
+    }
+
+    #[test]
+    fn parse_readinglist_entries_strips_hostile_bytes_from_title() {
+        let body = serde_json::json!({
+            "readinglists": { "entries": [{
+                "id": 7, "project": "http://127.0.0.1:8943",
+                "title": "Al\u{1b}]0;pwned\u{7}an Turing"
+            }]}
+        })
+        .to_string();
+        let entries = parse_readinglist_entries(body.as_bytes());
+        assert!(
+            has_no_control_bytes(&entries[0].title),
+            "{:?}",
+            entries[0].title
+        );
+        assert!(entries[0].title.contains("an Turing"));
     }
 
     // ---- thank ---------------------------------------------------------------

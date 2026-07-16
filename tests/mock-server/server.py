@@ -950,6 +950,20 @@ USER_CONTRIBS = {
             "comment": "add reference", "revid": 4790, "sizediff": 88,
         },
     ],
+    # SEC-1 injection fixture: an untrusted server (any third-party wiki, and
+    # `:contribs` is public/unauthenticated) putting terminal control sequences
+    # in the title/comment fields the contributions pane renders — an OSC-0
+    # window-title hijack, a CSI colour change, and an RLO bidi override. The
+    # client MUST strip all of these at the `account::parse_usercontribs`
+    # boundary; the pty check asserts none of them reach the terminal.
+    "EscapeArtist": [
+        {
+            "title": "Innocent]0;TITLE-HIJACK Page",
+            "timestamp": "2026-07-15T08:00:00Z",
+            "comment": "harmless ]0;pwned edit [31mred[0m ‮evil‬",
+            "revid": 6001, "sizediff": 3,
+        },
+    ],
 }
 
 # Read-only prefs fixture (FR-ACC-7): `meta=userinfo&uiprop=options`. Only
