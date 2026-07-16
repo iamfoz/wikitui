@@ -37,9 +37,14 @@
 //! target has ever been visited (PRD FR-HS-2's persistent visited-link
 //! styling) — one `SELECT` per link per frame would turn scrolling a
 //! link-heavy article into a disk-bound operation. Instead `History` keeps
-//! the full `(lang, title)` visited set in memory (`visited`), loaded once
-//! at open time and kept current by `record_visit`/`clear`, so
-//! `is_visited`/`visited_titles_for_lang` are plain hash lookups.
+//! the full `(wiki, lang, title)` visited set in memory (`visited`), loaded
+//! once at open time and kept current by `record_visit`/`clear`, so
+//! `is_visited`/`visited_titles_for_lang` are plain hash lookups. Keyed on
+//! `(wiki, lang)` rather than `lang` alone (PRD FR-ML-4): a same-titled
+//! article read on one wiki must not paint as visited on a different wiki
+//! that happens to share the title and language, the same cross-wiki
+//! isolation `recent`'s dedup and `positions` already give the rest of
+//! history.
 //!
 //! ## Failure posture
 //!
@@ -121,9 +126,13 @@ pub enum ClearRange {
 
 pub struct History {
     conn: Connection,
-    /// The full `(lang -> {title})` visited set, kept current by every
-    /// mutating method — see the module doc comment's "the visited cache".
-    visited: HashMap<String, HashSet<String>>,
+    /// The full `(wiki -> lang -> {title})` visited set, kept current by
+    /// every mutating method — see the module doc comment's "the visited
+    /// cache". Nested (rather than a `(wiki, lang)` tuple key) so the
+    /// per-draw `visited_titles_for_lang` lookup stays two plain `&str`
+    /// hash lookups with no allocation, the same cost `lang`-only lookups
+    /// had before wiki scoping.
+    visited: HashMap<String, HashMap<String, HashSet<String>>>,
 }
 
 impl History {
@@ -207,6 +216,8 @@ impl History {
             Ok(_) => {
                 let id = self.conn.last_insert_rowid();
                 self.visited
+                    .entry(wiki.to_string())
+                    .or_default()
                     .entry(lang.to_string())
                     .or_default()
                     .insert(title.to_string());
@@ -411,7 +422,7 @@ impl History {
         scored.into_iter().take(limit).map(|(_, v)| v).collect()
     }
 
-    /// Whether `(lang, title)` has ever been visited (PRD FR-HS-2) — an
+    /// Whether `(wiki, lang, title)` has ever been visited (PRD FR-HS-2) — an
     /// in-memory hash lookup, not a query (see the module doc comment's
     /// "the visited cache"). `ui.rs`'s per-draw check goes through
     /// `visited_titles_for_lang` instead (one batch `extend` beats one
@@ -420,18 +431,21 @@ impl History {
     /// documented alternative the brief asked for, the same "not consumed
     /// by anything in this phase" posture `cache.rs`'s `etag` field takes.
     #[allow(dead_code)]
-    pub fn is_visited(&self, lang: &str, title: &str) -> bool {
+    pub fn is_visited(&self, wiki: &str, lang: &str, title: &str) -> bool {
         self.visited
-            .get(lang)
+            .get(wiki)
+            .and_then(|by_lang| by_lang.get(lang))
             .is_some_and(|set| set.contains(title))
     }
 
-    /// Every visited title in `lang`, for `ui.rs` to fold into its
+    /// Every visited title in `(wiki, lang)`, for `ui.rs` to fold into its
     /// per-render visited set in one `extend` call instead of one lookup
-    /// per link. `None` when nothing has ever been visited in that
-    /// language (equivalent to an empty set).
-    pub fn visited_titles_for_lang(&self, lang: &str) -> Option<&HashSet<String>> {
-        self.visited.get(lang)
+    /// per link. `None` when nothing has ever been visited in that wiki's
+    /// edition of that language (equivalent to an empty set) — PRD FR-ML-4:
+    /// a title visited on a *different* wiki must not surface here, or a
+    /// same-titled article there would incorrectly paint as visited too.
+    pub fn visited_titles_for_lang(&self, wiki: &str, lang: &str) -> Option<&HashSet<String>> {
+        self.visited.get(wiki).and_then(|by_lang| by_lang.get(lang))
     }
 
     /// PRD FR-HS-4's `:history clear` / picker `d`: deletes the requested
@@ -495,16 +509,24 @@ fn row_to_visit(row: &rusqlite::Row) -> rusqlite::Result<Visit> {
     })
 }
 
-fn load_visited(conn: &Connection) -> HashMap<String, HashSet<String>> {
-    let mut map: HashMap<String, HashSet<String>> = HashMap::new();
+fn load_visited(conn: &Connection) -> HashMap<String, HashMap<String, HashSet<String>>> {
+    let mut map: HashMap<String, HashMap<String, HashSet<String>>> = HashMap::new();
     let result = (|| -> rusqlite::Result<()> {
-        let mut stmt = conn.prepare("SELECT DISTINCT lang, title FROM visits")?;
+        let mut stmt = conn.prepare("SELECT DISTINCT wiki, lang, title FROM visits")?;
         let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
         })?;
         for row in rows.flatten() {
-            let (lang, title) = row;
-            map.entry(lang).or_default().insert(title);
+            let (wiki, lang, title) = row;
+            map.entry(wiki)
+                .or_default()
+                .entry(lang)
+                .or_default()
+                .insert(title);
         }
         Ok(())
     })();
@@ -883,7 +905,7 @@ mod tests {
     fn in_memory_history_starts_empty_and_never_touches_disk() {
         let history = History::in_memory();
         assert!(history.recent(10).is_empty());
-        assert!(!history.is_visited("en", "Alan Turing"));
+        assert!(!history.is_visited("", "en", "Alan Turing"));
     }
 
     // ---- record + recent (dedup) -------------------------------------------
@@ -1084,12 +1106,49 @@ mod tests {
     #[test]
     fn record_visit_makes_is_visited_true_immediately() {
         let mut history = History::in_memory();
-        assert!(!history.is_visited("en", "Alan Turing"));
+        assert!(!history.is_visited("", "en", "Alan Turing"));
         history.record_visit("", "en", "Alan Turing", None);
-        assert!(history.is_visited("en", "Alan Turing"));
+        assert!(history.is_visited("", "en", "Alan Turing"));
         assert!(
-            !history.is_visited("de", "Alan Turing"),
+            !history.is_visited("", "de", "Alan Turing"),
             "scoped per language"
+        );
+    }
+
+    /// PRD FR-ML-4/FR-HS-2: a title visited on one wiki must not paint a
+    /// same-titled article on a *different* wiki as visited too — the
+    /// visited cache is scoped by wiki, not just language, mirroring the
+    /// isolation `recent`'s dedup and `positions` already give the rest of
+    /// this module (`recent_keeps_a_same_titled_article_on_two_wikis_as_two_rows`,
+    /// `positions_are_isolated_per_wiki`).
+    #[test]
+    fn visited_is_isolated_per_wiki() {
+        let mut history = History::in_memory();
+        history.record_visit("wiktionary", "en", "Mercury", None);
+
+        assert!(
+            history.is_visited("wiktionary", "en", "Mercury"),
+            "visited on the wiki it was actually read on"
+        );
+        assert!(
+            !history.is_visited("", "en", "Mercury"),
+            "a visit on wiktionary must not mark the default wiki's Mercury visited"
+        );
+        assert!(
+            !history.is_visited("wikivoyage", "en", "Mercury"),
+            "nor any other third wiki"
+        );
+
+        assert!(
+            history
+                .visited_titles_for_lang("wiktionary", "en")
+                .is_some_and(|set| set.contains("Mercury"))
+        );
+        assert!(
+            history
+                .visited_titles_for_lang("", "en")
+                .is_none_or(|set| !set.contains("Mercury")),
+            "the default wiki's visited set must not include wiktionary's Mercury"
         );
     }
 
@@ -1101,10 +1160,10 @@ mod tests {
             history.record_visit("", "en", "Alan Turing", None);
         }
         let reopened = History::open_at(&path);
-        assert!(reopened.is_visited("en", "Alan Turing"));
+        assert!(reopened.is_visited("", "en", "Alan Turing"));
         assert!(
             reopened
-                .visited_titles_for_lang("en")
+                .visited_titles_for_lang("", "en")
                 .is_some_and(|set| set.contains("Alan Turing"))
         );
         let _ = std::fs::remove_file(&path);
@@ -1120,7 +1179,7 @@ mod tests {
         let removed = history.clear(ClearRange::All).unwrap();
         assert_eq!(removed, 2);
         assert!(history.recent(10).is_empty());
-        assert!(!history.is_visited("en", "Alan Turing"));
+        assert!(!history.is_visited("", "en", "Alan Turing"));
     }
 
     #[test]
@@ -1142,8 +1201,8 @@ mod tests {
         let recent = history.recent(10);
         let remaining: Vec<&str> = recent.iter().map(|v| v.title.as_str()).collect();
         assert_eq!(remaining, vec!["New Article"]);
-        assert!(!history.is_visited("en", "Old Article"));
-        assert!(history.is_visited("en", "New Article"));
+        assert!(!history.is_visited("", "en", "Old Article"));
+        assert!(history.is_visited("", "en", "New Article"));
     }
 
     #[test]
@@ -1158,8 +1217,8 @@ mod tests {
             })
             .unwrap();
         assert_eq!(removed, 1);
-        assert!(!history.is_visited("en", "Alan Turing"));
-        assert!(history.is_visited("en", "Enigma machine"));
+        assert!(!history.is_visited("", "en", "Alan Turing"));
+        assert!(history.is_visited("", "en", "Enigma machine"));
     }
 
     // ---- retention prune --------------------------------------------------------

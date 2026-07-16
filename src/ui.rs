@@ -37,14 +37,15 @@ fn app_reorder_direction(app: &App, tab: &crate::tab::Tab) -> Option<bidi::Direc
 /// FR-HS-2): this session's own back-stack, forward-stack, and the article
 /// currently on screen — so a page opened this session but not yet
 /// committed to the persistent history (or opened while incognito) still
-/// shows visited — **plus** every `(lang, title)` the persistent,
+/// shows visited — **plus** every `(wiki, lang, title)` the persistent,
 /// cross-session `history::History` store has ever recorded for this tab's
-/// language, so a link stays visited across restarts too. The persistent
-/// half is a single `HashMap` lookup (`History::visited_titles_for_lang`),
-/// not a query — see that method's doc comment for why: this runs once per
-/// draw, but the caller checks membership once per visible link, and a
-/// disk hit per link per frame is exactly what the in-memory cache exists
-/// to avoid.
+/// wiki and language, so a link stays visited across restarts too (and a
+/// same-titled article on a *different* wiki never borrows this tab's
+/// visited styling — PRD FR-ML-4). The persistent half is a single
+/// `HashMap` lookup (`History::visited_titles_for_lang`), not a query — see
+/// that method's doc comment for why: this runs once per draw, but the
+/// caller checks membership once per visible link, and a disk hit per link
+/// per frame is exactly what the in-memory cache exists to avoid.
 fn visited_titles(app: &App) -> HashSet<&str> {
     visited_titles_for(app, app.active_tab())
 }
@@ -58,7 +59,7 @@ fn visited_titles_for<'a>(app: &'a App, tab: &'a crate::tab::Tab) -> HashSet<&'a
     if let Some(doc) = &tab.doc {
         set.insert(doc.title.as_str());
     }
-    if let Some(titles) = app.history.visited_titles_for_lang(&tab.lang) {
+    if let Some(titles) = app.history.visited_titles_for_lang(&tab.wiki, &tab.lang) {
         set.extend(titles.iter().map(String::as_str));
     }
     set

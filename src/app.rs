@@ -7035,6 +7035,50 @@ mod tests {
         assert_eq!(app.active_tab().focused_link, Some(2));
     }
 
+    /// PRD FR-NV-4/FR-RD-6 (this chunk's fix): a reference marker is no
+    /// longer part of `collect_links`'s output at all (wired in through
+    /// `set_document`), so Tab-cycling has nothing non-navigable to land on
+    /// — it skips straight from one real link to the next.
+    #[test]
+    fn cycle_link_only_ever_lands_on_real_links_never_a_reference_marker() {
+        let html = "<html><body>\
+            <p>See <a href=\"./Enigma_machine\">Enigma</a><sup class=\"reference\">\
+            <a href=\"#cite_note-1\">[1]</a></sup> and \
+            <a href=\"./Alan_Turing\">Turing</a><sup class=\"reference\">\
+            <a href=\"#cite_note-2\">[2]</a></sup>.</p>\
+            </body></html>";
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(crate::doc::parse_article_html("T", html));
+
+        assert_eq!(
+            app.active_tab().links.len(),
+            2,
+            "only the two real links, no reference markers: {:?}",
+            app.active_tab().links
+        );
+        assert!(
+            app.active_tab()
+                .links
+                .iter()
+                .all(|l| !l.href.starts_with('#')),
+            "no reference marker belongs in the followable set"
+        );
+
+        for _ in 0..6 {
+            app.cycle_link(true);
+            let href = app
+                .active_tab()
+                .focused_link
+                .and_then(|i| app.active_tab().links.get(i))
+                .map(|l| l.href.as_str())
+                .unwrap_or("");
+            assert!(
+                !href.starts_with('#'),
+                "Tab must never focus a reference marker, got {href:?}"
+            );
+        }
+    }
+
     #[test]
     fn cycle_link_on_linkless_page_leaves_focus_unset() {
         let mut app = App::new("en".to_string(), Theme::terminal(), false);
@@ -7263,7 +7307,21 @@ mod tests {
             </ol></div></body></html>";
         let mut app = App::new("en".to_string(), Theme::terminal(), false);
         app.set_document(crate::doc::parse_article_html("T", html));
-        // Focus the reference marker (the only collected link).
+        // A `#cite_note-*` reference marker is no longer among
+        // `doc::collect_links`'s output (it's a footnote marker, not a
+        // followable link — see `collect_links`'s own doc comment), so
+        // `Tab::install_document` never populates `tab.links` with one and
+        // Tab-focus can no longer reach it. This test's remaining job is the
+        // resolve-and-render machinery `open_peek_at_focus` still owns once
+        // *something* names a reference marker's `(href, text)` — exercised
+        // here by constructing that `LinkRef` directly, the same shape a
+        // future reference-marker-aware trigger would hand it.
+        app.active_tab_mut().links = vec![crate::doc::LinkRef {
+            href: "#cite_note-1".to_string(),
+            text: "[1]".to_string(),
+            internal_title: None,
+            redlink: false,
+        }];
         app.active_tab_mut().focused_link = Some(0);
         let fetch = app.open_peek_at_focus();
         assert!(fetch.is_none(), "a footnote peek never triggers a fetch");

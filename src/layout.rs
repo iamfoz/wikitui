@@ -570,6 +570,17 @@ fn clusters_from_str(s: &str, kind: SpanKind, ambiguous_wide: bool) -> Vec<Clust
 /// numbering must match `doc::collect_links` exactly.
 fn span_kind(style: &SpanStyle, plain_kind: &SpanKind, link_counter: &mut usize) -> SpanKind {
     match style {
+        // A pure same-page fragment anchor (`#cite_note-N`, `#cite_ref-N`, or
+        // any other `#...` href) is a reference/footnote marker, not a
+        // followable link — `doc::collect_links` excludes these from the
+        // link set entirely (they already have footnote-peek via `K`'s
+        // citations data, PRD FR-NV-4), so this must not hand one a
+        // `SpanKind::Link` occurrence number either, or `link_counter` would
+        // run ahead of `collect_links`'s (shorter) list and every later
+        // occurrence index would point at the wrong link. `Dim` matches how
+        // a bare `<sup>` (no nested link) already renders — the visual a
+        // reference marker had before this fix stripped its followability.
+        SpanStyle::Link(href) | SpanStyle::RedLink(href) if href.starts_with('#') => SpanKind::Dim,
         // PRD FR-DL-5: a redlink is still a link for numbering/cycling/hint
         // purposes — it counts here exactly like `Link` (this numbering must
         // match `doc::collect_links`'s order, which also counts both

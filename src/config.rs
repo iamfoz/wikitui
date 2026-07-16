@@ -813,6 +813,9 @@ pub fn resolve(
         "watchlist_mirror_tag",
         "tts_command",
         "command",
+        "auth",
+        "interest_learning",
+        "interest_half_life_days",
     ]
     .into_iter()
     .collect();
@@ -3225,6 +3228,112 @@ mod tests {
         assert_eq!(
             resolved.lang.value, "de",
             "a sibling unknown key must not break valid keys"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn every_real_top_level_section_produces_no_unknown_key_warning() {
+        // One key/section per `known_top_level` entry, each given a value its
+        // own resolver accepts cleanly — this is the regression test for the
+        // bug where `[auth]`, `interest_learning`, and
+        // `interest_half_life_days` were fully parsed by their own resolvers
+        // but missing from `known_top_level`, so a config using them printed
+        // a spurious "unknown config key" warning despite being valid.
+        let path = temp_config(
+            "config_version = 1\n\
+             lang = \"en\"\n\
+             languages = [\"en\", \"de\"]\n\
+             theme = \"dark\"\n\
+             keymap = \"vim\"\n\
+             ambiguous_width = 1\n\
+             measure = 80\n\
+             cite_style = \"apa\"\n\
+             active_wiki = \"wikipedia\"\n\
+             readlater_auto_dequeue = true\n\
+             images = true\n\
+             include_nonfree = false\n\
+             pro = false\n\
+             liftwing = false\n\
+             liftwing_base_url = \"https://example.org\"\n\
+             editing_enabled = false\n\
+             startpage = \"feed\"\n\
+             restore_session = true\n\
+             reading_wpm = 230\n\
+             mouse = true\n\
+             animations = \"full\"\n\
+             auto_theme = false\n\
+             theme_light = \"paper\"\n\
+             theme_dark = \"terminal\"\n\
+             hyperlinks = \"auto\"\n\
+             color_depth = \"auto\"\n\
+             bidi = \"auto\"\n\
+             rtl_reorder = false\n\
+             watchlist_mirror_tag = \"wikitui\"\n\
+             tts_command = \"say\"\n\
+             interest_learning = true\n\
+             interest_half_life_days = 30\n\
+             \n\
+             [cache]\n\
+             max_mb = 100\n\
+             fresh_ttl_hours = 24\n\
+             force_refetch_days = 30\n\
+             \n\
+             [wiki]\n\
+             \n\
+             [history]\n\
+             retention_days = 0\n\
+             \n\
+             [prefetch]\n\
+             enabled = true\n\
+             daily_mb = 20\n\
+             \n\
+             [network]\n\
+             contact = \"test@example.org\"\n\
+             \n\
+             [reading]\n\
+             margin = 2\n\
+             text_align = \"left\"\n\
+             \n\
+             [auth]\n\
+             client_id = \"abc\"\n\
+             \n\
+             [command.morning]\n\
+             run = [\"open-feed\", \"tab-open-random-good\"]\n",
+        );
+        let resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        let unknown_key_warnings: Vec<&String> = resolved
+            .issues
+            .iter()
+            .map(|i| &i.message)
+            .filter(|m| m.contains("unknown config key"))
+            .collect();
+        assert!(
+            unknown_key_warnings.is_empty(),
+            "expected no unknown-key warnings for a config using every real \
+             top-level section, got: {unknown_key_warnings:?}"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_genuinely_unknown_top_level_section_still_warns() {
+        let path = temp_config("[bogus_section]\nkey = 1\n");
+        let resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert!(
+            resolved
+                .issues
+                .iter()
+                .any(|i| i.message.contains("unknown config key 'bogus_section'")),
+            "a top-level section nothing parses should still warn"
         );
         cleanup(&path);
     }

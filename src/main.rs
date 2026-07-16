@@ -2682,6 +2682,19 @@ async fn run(
             apply_config_reload(&mut app);
         }
 
+        // PRD FR-RD-8 / FR-DL-1: kick off fetches for any not-yet-loaded
+        // images the active document references, plus the picture-of-the-day
+        // thumbnail (a no-op when images are off / no graphics protocol / a
+        // text theme; idempotent — each spawns exactly one fetch per source
+        // URL). Moved *before* `draw`/the snapshot just below (rather than
+        // after, where this used to run): a newly-discovered image's
+        // "loading" placeholder now paints in this same frame instead of one
+        // frame late, and — the point that actually matters for the race
+        // below — `image_loading_before_draw` is taken after these two calls
+        // so it already reflects anything they just spawned this turn.
+        request_visible_images(client, &mut app, &image_tx);
+        request_start_page_image(client, &mut app, &image_tx);
+
         // PRD FR-DL-1: snapshotted *before* `draw` rather than re-read fresh
         // for the poll-vs-block decision below — the daily-feed arrival is a
         // background mutex write racing this loop with no channel/notify to
@@ -2700,6 +2713,14 @@ async fn run(
         // until a keypress. Reproduced via pty verification before this
         // comment was written; see the on-this-day/start-page pty script.
         let start_page_still_loading = app.active_tab().doc.is_none() && app.start_page_pending();
+        // The same check-then-act hazard, mirrored for `image_store`: a fresh
+        // post-`draw` read of `any_loading()` would be re-reading state that
+        // could have changed underneath what `draw` actually painted, so the
+        // poll-vs-block decision below uses this pre-`draw` snapshot instead
+        // (taken after the two request-image calls just above, so it already
+        // includes anything they spawned this turn — nothing between here
+        // and `draw` mutates `image_store` further).
+        let image_loading_before_draw = app.image_store.any_loading();
 
         terminal.draw(|f| ui::draw(f, &mut app))?;
 
@@ -2715,16 +2736,6 @@ async fn run(
         // — see `emit_bidi_mode`'s own doc comment. Best-effort, same
         // reasoning as `emit_hyperlinks` just above.
         let _ = emit_bidi_mode(&mut app);
-
-        // PRD FR-RD-8: after each draw, lazily kick off fetches for any
-        // not-yet-loaded images the active document references (a no-op when
-        // images are off / no graphics protocol / a text theme). Idempotent —
-        // it spawns exactly one fetch per source URL.
-        request_visible_images(client, &mut app, &image_tx);
-        // PRD FR-DL-1's picture of the day: the same lazy fetch+decode path,
-        // keyed by the feed's thumbnail URL instead of a document's image
-        // block — see `request_start_page_image`'s doc comment.
-        request_start_page_image(client, &mut app, &image_tx);
 
         // PRD §7 / v0.5's "crash-safe terminal restore": a deliberate,
         // inert-by-default panic trigger for exercising the crash path
@@ -2745,38 +2756,7 @@ async fn run(
         // revalidation/reload notices land without a keypress. Everywhere else
         // — plain Reading mode, nothing in flight — keeps the block-until-input
         // behavior (PRD FR-ACS-2: no gratuitous redraws/CPU use while idle).
-        if app.mode == Mode::Search
-            || app.pending_revalidations > 0
-            || app.any_tab_loading()
-            || app.image_store.any_loading()
-            || app.pending_saves > 0
-            // PRD FR-PF-4: keep the prefetch-log panel refreshing live while
-            // it is open (scoped to that mode only, so idle Reading still
-            // blocks on input — FR-ACS-2).
-            || app.mode == Mode::PrefetchLog
-            // PRD FR-DL-1: the start page's skeleton fills in without a
-            // keypress once the daily feed arrives — scoped to exactly the
-            // "showing the start page and still waiting" window, so idle
-            // Reading with an article open still blocks on input. Uses the
-            // pre-`draw` snapshot above, not a fresh read — see its comment.
-            || start_page_still_loading
-            // PRD FR-SR-6: the Related panel's lazy `morelike:` fetch
-            // completes and redraws without a keypress, mirroring the other
-            // lazy-fetch cases above.
-            || app.related_loading
-            // PRD FR-NV-5: the link-preview popup's lazy summary fetch fills
-            // in without a keypress, same as the Related panel above.
-            || app.summary_loading
-            // PRD FR-ML-1/2: same for any in-flight langlinks fetch — the
-            // picker's own, and the automatic one fired after every fresh
-            // open. Both must gate this condition: without it, the
-            // automatic fetch (which powers the preferred-language hint,
-            // not just the picker) would only ever surface on the reader's
-            // *next* keystroke, since nothing else here is guaranteed to be
-            // true right after opening a plain article with no other
-            // background activity.
-            || app.pending_langlinks > 0
-        {
+        if should_poll_instead_of_block(&app, start_page_still_loading, image_loading_before_draw) {
             let poll_interval = if app.mode == Mode::Search {
                 TYPEAHEAD_POLL
             } else {
@@ -2957,6 +2937,57 @@ fn fire_typeahead(client: &WikiClient, app: &App, tx: &UnboundedSender<Typeahead
             .map_err(|e| e.to_string());
         let _ = tx.send(TypeaheadOutcome { query, result });
     });
+}
+
+/// The `run` loop's poll-vs-block decision (PRD FR-ACS-2): whether something
+/// is happening in the background that should keep the loop on a timer
+/// instead of blocking forever in `event::read()`. `start_page_still_loading`
+/// and `image_loading_before_draw` are taken by value — snapshotted by the
+/// caller *before* `draw` runs, never read fresh from `app` in here — which
+/// is the point: re-reading `app.image_store.any_loading()`/
+/// `app.start_page_pending()` directly in this function would reintroduce
+/// the exact check-then-act hazard B9 fixed (a background state change
+/// between `draw` painting a frame and this decision running could pick the
+/// block-on-`event::read` branch despite `draw` having shown a still-loading
+/// frame, parking the loop until a keypress that may never come). Every
+/// other flag here has no such hazard — each only ever changes via this same
+/// loop's own channel drains, never a background write racing it — so those
+/// are read live from `app` with no snapshot needed.
+fn should_poll_instead_of_block(
+    app: &App,
+    start_page_still_loading: bool,
+    image_loading_before_draw: bool,
+) -> bool {
+    app.mode == Mode::Search
+        || app.pending_revalidations > 0
+        || app.any_tab_loading()
+        || image_loading_before_draw
+        || app.pending_saves > 0
+        // PRD FR-PF-4: keep the prefetch-log panel refreshing live while
+        // it is open (scoped to that mode only, so idle Reading still
+        // blocks on input — FR-ACS-2).
+        || app.mode == Mode::PrefetchLog
+        // PRD FR-DL-1: the start page's skeleton fills in without a
+        // keypress once the daily feed arrives — scoped to exactly the
+        // "showing the start page and still waiting" window, so idle
+        // Reading with an article open still blocks on input.
+        || start_page_still_loading
+        // PRD FR-SR-6: the Related panel's lazy `morelike:` fetch
+        // completes and redraws without a keypress, mirroring the other
+        // lazy-fetch cases above.
+        || app.related_loading
+        // PRD FR-NV-5: the link-preview popup's lazy summary fetch fills
+        // in without a keypress, same as the Related panel above.
+        || app.summary_loading
+        // PRD FR-ML-1/2: same for any in-flight langlinks fetch — the
+        // picker's own, and the automatic one fired after every fresh
+        // open. Both must gate this condition: without it, the
+        // automatic fetch (which powers the preferred-language hint,
+        // not just the picker) would only ever surface on the reader's
+        // *next* keystroke, since nothing else here is guaranteed to be
+        // true right after opening a plain article with no other
+        // background activity.
+        || app.pending_langlinks > 0
 }
 
 /// Spawns the `morelike:{title}` search behind the Related panel (PRD
@@ -3313,9 +3344,19 @@ fn request_start_page_image(
 
 /// `:config reload` and SIGHUP both land here (PRD §6.7): re-resolve
 /// against the exact CLI/env overrides pinned at startup — so they still
-/// outrank the file after a reload — and live-apply theme, measure, and
-/// ambiguous_wide. Network/storage settings (cache size/TTL, base URL) are
-/// documented as restart-only, so `client`/`cache` are deliberately left
+/// outrank the file after a reload — and live-apply theme, measure,
+/// ambiguous_wide, and the `[terminal]`-adjacent settings
+/// (`mouse`/`animations`/`hyperlinks`) that have a live app-side flag to
+/// update. `auto_theme` is deliberately NOT re-queried here: unlike the
+/// others it isn't a stored flag but a one-shot DA1 terminal round trip
+/// (`main::run`'s own `query_terminal_bg` call, gated on raw mode having
+/// just been entered) that only ever picks the *initial* theme before the
+/// event loop starts reading input — re-running it mid-session would mean a
+/// second blocking read of stdin racing the event loop's own, for a query
+/// whose result (a light/dark pick) `set_theme` below already lets an
+/// explicit `theme`/`theme_light`/`theme_dark` edit override anyway — so it's
+/// treated as restart-only, alongside network/storage settings (cache
+/// size/TTL, base URL): `client`/`cache` are likewise deliberately left
 /// untouched here.
 fn apply_config_reload(app: &mut App) {
     let resolved = config::resolve(
@@ -3342,6 +3383,20 @@ fn apply_config_reload(app: &mut App) {
     app.measure = resolved.measure.value;
     app.ambiguous_wide = resolved.ambiguous_wide.value;
     app.reading_wpm = resolved.reading_wpm.value;
+    // PRD FR-NV-9: re-apply `mouse` through the same two-call pattern the
+    // `:set mouse=on|off` command handler uses (real terminal capture +
+    // app-side flag together) so a config edit doesn't leave them disagreeing
+    // with each other the way a flag-only update would.
+    let _ = crashguard::set_mouse_capture(resolved.terminal.mouse.value);
+    app.set_mouse(resolved.terminal.mouse.value);
+    // PRD FR-ACS-4: `animations = full|none` affects rendering every frame
+    // (`no_motion`), so it can and should apply without a restart.
+    app.set_no_motion(resolved.terminal.animations.value == "none");
+    // PRD FR-RD-2 / SEC-2: OSC 8 hyperlink emission mode, same live seam as
+    // `:set hyperlinks=auto|on|off`.
+    if let Some(mode) = HyperlinkMode::parse(&resolved.terminal.hyperlinks.value) {
+        app.set_hyperlinks_mode(mode);
+    }
     // PRD FR-PC-1: reload the `[reading]` spacing/typography defaults too —
     // same live-apply seam as measure/ambiguous_wide just above. A `:set`
     // made this session is not specially preserved here (unlike `images`
@@ -5127,14 +5182,22 @@ async fn handle_key(
                     .get(app.history_pick_selected)
                     .cloned()
                 {
-                    app.lang = visit.lang.clone();
-                    open_title(
+                    // PRD FR-HS-1/FR-ML-4: reopen the visit's OWN recorded
+                    // wiki, never whatever wiki happens to be active right
+                    // now — `open_title`'s "client's active wiki" shortcut is
+                    // wrong here for exactly the reason it's wrong for
+                    // `:trail`'s Enter (see `open_trail_node`'s doc comment);
+                    // a history visit is just as capable of being on a
+                    // different wiki than whatever's current.
+                    app.mode = Mode::Reading;
+                    open_trail_node(
                         client,
                         cache,
                         app,
+                        &visit.wiki,
+                        &visit.lang,
                         &visit.title,
                         revalidate_tx,
-                        langlinks_tx,
                     )
                     .await;
                 }
@@ -9569,6 +9632,210 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PRD FR-HS-1/FR-ML-4 (from C8's own `open_trail_node` fix, mirrored
+    /// here): `Ctrl-h`'s Enter-to-reopen must fetch the *visit's own*
+    /// recorded wiki, never whatever wiki the client happens to be pointed
+    /// at right now. Seeds a visit on `wiktionary` while the app's active
+    /// tab (and the dead-port `test_client`) both sit on the default
+    /// Wikipedia scope, so a wrong "current wiki" implementation would
+    /// either serve the default wiki's L2 cache (empty here, forcing a
+    /// network attempt against the dead port) or simply fail to find the
+    /// cached article — this only passes if the reopen path actually reads
+    /// `visit.wiki`.
+    #[tokio::test]
+    async fn ctrl_h_reopen_targets_the_visits_own_wiki_not_the_active_one() {
+        let client = test_client();
+        let (cache, dir) = temp_cache_dir("history-picker-wiki");
+        cache.put(
+            "wiktionary",
+            "en",
+            "Mercury",
+            "<html><body><p>quicksilver</p></body></html>",
+            42,
+            None,
+        );
+        let (revalidate_tx, _rrx) = mpsc::unbounded_channel::<RevalidationOutcome>();
+        let (open_tx, _orx) = mpsc::unbounded_channel::<TabLoadOutcome>();
+        let (save_tx, _srx) = mpsc::unbounded_channel::<SaveOutcome>();
+        let (related_tx, _rltx) = mpsc::unbounded_channel::<RelatedOutcome>();
+        let (langlinks_tx, _lltx) = mpsc::unbounded_channel::<LangLinksOutcome>();
+        let (summary_tx, _sutx) = mpsc::unbounded_channel::<SummaryOutcome>();
+        let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout())).unwrap();
+
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        // The active tab/wiki is the default (Wikipedia) throughout — the
+        // visit being reopened is the only thing naming `wiktionary`.
+        assert_eq!(app.active_tab().wiki, "");
+        app.mode = Mode::ReadingHistory;
+        app.history_pick_matches = vec![crate::history::Visit {
+            id: 1,
+            wiki: "wiktionary".to_string(),
+            lang: "en".to_string(),
+            title: "Mercury".to_string(),
+            opened_at: 0,
+            dwell_secs: 0,
+            referrer_wiki: None,
+            referrer_lang: None,
+            referrer_title: None,
+        }];
+        app.history_pick_selected = 0;
+
+        handle_key(
+            &client,
+            &cache,
+            &mut app,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            &revalidate_tx,
+            &open_tx,
+            &save_tx,
+            &related_tx,
+            &langlinks_tx,
+            &summary_tx,
+            &mut terminal,
+        )
+        .await;
+
+        assert_eq!(
+            app.active_tab().doc.as_ref().map(|d| d.title.as_str()),
+            Some("Mercury")
+        );
+        assert_eq!(
+            app.active_tab().wiki,
+            "wiktionary",
+            "the tab must be stamped with the VISIT's own wiki, not the \
+             client's active one"
+        );
+        assert_eq!(app.mode, Mode::Reading);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- :config reload / SIGHUP applies terminal-integration settings ----
+
+    /// PRD FR-NV-9 / FR-ACS-4 / FR-RD-2 (this chunk's fix): `apply_config_
+    /// reload` used to re-read theme/measure/reading_wpm/color_depth/user-
+    /// themes but leave `mouse`/`animations`/`hyperlinks` at whatever they
+    /// were at startup — so editing the config file and running `:config
+    /// reload` (or sending SIGHUP) silently ignored those three. This locks
+    /// in that a reload now picks up all three from the file.
+    #[test]
+    fn config_reload_applies_mouse_animations_and_hyperlinks_from_the_file() {
+        let n = std::sync::atomic::AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "wikitui-reload-test-{}-{}.toml",
+            std::process::id(),
+            n.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::write(
+            &path,
+            "mouse = true\nanimations = \"none\"\nhyperlinks = \"on\"\n",
+        )
+        .unwrap();
+
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        // Starting state is every field's own default — the opposite of
+        // what the file above asks for, so a no-op reload would leave this
+        // test's assertions failing.
+        assert!(!app.mouse_enabled);
+        assert!(!app.no_motion);
+        assert_eq!(app.hyperlinks_mode, HyperlinkMode::Auto);
+        app.config_ctx.config_path = Some(path.clone());
+
+        apply_config_reload(&mut app);
+
+        assert!(
+            app.mouse_enabled,
+            "mouse=true from the file must apply live"
+        );
+        assert!(
+            app.no_motion,
+            "animations=none from the file must apply live"
+        );
+        assert_eq!(
+            app.hyperlinks_mode,
+            HyperlinkMode::On,
+            "hyperlinks=on from the file must apply live"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- Image-loading poll-vs-block snapshot (mirrors B9's start-page fix) --
+
+    /// The regression proof for this chunk's TOCTOU fix: `should_poll_
+    /// instead_of_block` must decide on the snapshot it's handed, never on a
+    /// fresh `app.image_store.any_loading()` read of its own — so it keeps
+    /// polling even when the *live* store already looks idle, as long as the
+    /// snapshot (taken before `draw`) said something was loading. Before this
+    /// chunk's fix, the equivalent inline condition read
+    /// `app.image_store.any_loading()` directly, so this exact scenario
+    /// (snapshot says loading, live state already resolved) would have
+    /// returned `false` — picking the block-forever branch despite `draw`
+    /// having just painted a still-loading frame.
+    #[test]
+    fn poll_decision_trusts_the_pre_draw_image_snapshot_over_live_state() {
+        let app = App::new("en".to_string(), Theme::terminal(), false);
+        assert!(
+            !app.image_store.any_loading(),
+            "fixture: nothing is actually loading right now"
+        );
+
+        assert!(
+            should_poll_instead_of_block(&app, false, true),
+            "a `true` snapshot must force polling even though every live \
+             flag (including image_store's own, currently idle) is false"
+        );
+        assert!(
+            !should_poll_instead_of_block(&app, false, false),
+            "with every flag (including both snapshots) false, nothing keeps \
+             the loop from blocking"
+        );
+    }
+
+    /// The event loop's poll-vs-block decision now snapshots
+    /// `image_store.any_loading()` right after `request_visible_images` runs
+    /// and BEFORE `draw` (see the `run` loop's own comment) rather than
+    /// re-reading it fresh afterward — the same time-of-check/time-of-use
+    /// hazard B9 fixed for `start_page_still_loading`. The structural
+    /// guarantee that makes that snapshot safe is that
+    /// `request_visible_images` marks a newly-discovered image as loading
+    /// SYNCHRONOUSLY, before it ever spawns the background fetch — so a
+    /// snapshot taken any time after this call returns (in particular,
+    /// before `draw` — nothing between here and there can resolve or spawn
+    /// another load) can never miss what this call just started. This is the
+    /// half of that invariant that's actually unit-testable outside the live
+    /// event loop.
+    #[tokio::test]
+    async fn request_visible_images_marks_loading_synchronously_so_a_pre_draw_snapshot_cannot_miss_it()
+     {
+        let client = test_client();
+        let mut app = App::new("en".to_string(), Theme::full(), false);
+        app.graphics_env = crate::graphics::GraphicsEnv {
+            colorterm: "truecolor".to_string(),
+            is_tty: true,
+            ..Default::default()
+        };
+        app.open_document(crate::doc::parse_article_html(
+            "Alan Turing",
+            "<html><body><p>x</p><img src=\"https://example.org/turing.jpg\"/></body></html>",
+        ));
+        assert!(
+            !app.image_store.any_loading(),
+            "nothing requested yet — the fixture's image hasn't been discovered"
+        );
+
+        let (image_tx, _rx) = mpsc::unbounded_channel::<ImageOutcome>();
+        request_visible_images(&client, &mut app, &image_tx);
+
+        assert!(
+            app.image_store.any_loading(),
+            "a snapshot taken right after `request_visible_images` returns \
+             (as the event loop's pre-`draw` snapshot now does) must already \
+             see the image it just spawned"
+        );
     }
 
     #[test]
