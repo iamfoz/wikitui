@@ -75,17 +75,11 @@ pub struct SessionState {
 }
 
 /// The real on-disk location (PRD §6.4): `$XDG_STATE_HOME/wikitui/
-/// session.json` — mirrors `history::history_path`'s state-dir resolution
-/// (state dir on Linux/BSD, `<data_dir>/state` fallback on macOS/Windows,
-/// `None` only when no platform directory can be determined at all, e.g. a
-/// sandboxed CI environment with no resolvable home directory).
+/// session.json` — `None` only when no platform directory can be determined
+/// at all, e.g. a sandboxed CI environment with no resolvable home
+/// directory. See `paths::wikitui_state_dir` for the resolution itself.
 pub fn resolve_session_path() -> Option<PathBuf> {
-    let dirs = directories::ProjectDirs::from("", "", "wikitui")?;
-    let dir = dirs
-        .state_dir()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| dirs.data_dir().join("state"));
-    Some(dir.join("session.json"))
+    Some(crate::paths::wikitui_state_dir()?.join("session.json"))
 }
 
 /// Writes `state` to `path` atomically (via the shared
@@ -140,17 +134,11 @@ pub fn is_valid_session_name(name: &str) -> bool {
 
 /// The `sessions/` directory alongside the auto-restore `session.json` —
 /// shared plumbing behind [`resolve_named_session_path`] and
-/// [`list_named_sessions`], mirroring [`resolve_session_path`]'s own
-/// state-dir resolution (so a sandboxed environment with no resolvable
+/// [`list_named_sessions`] (so a sandboxed environment with no resolvable
 /// platform directory degrades to `None` for named sessions exactly the
 /// way it already does for the auto-restore one).
 fn resolve_named_sessions_dir() -> Option<PathBuf> {
-    let dirs = directories::ProjectDirs::from("", "", "wikitui")?;
-    let dir = dirs
-        .state_dir()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| dirs.data_dir().join("state"));
-    Some(dir.join("sessions"))
+    Some(crate::paths::wikitui_state_dir()?.join("sessions"))
 }
 
 /// Where `:mksession <name>` writes and `:session <name>`/`--session <name>`

@@ -503,6 +503,12 @@ pub struct App {
     pub citations: Vec<Citation>,
     pub selected_citation: usize,
     /// The running bibliography, persisted to disk (PRD §6.4 plain files).
+    /// Defaults to an in-memory store for the same reason `history` does
+    /// (that field's doc comment explains why): dozens of tests build an
+    /// `App` via `App::new` and save citations directly, so a real on-disk
+    /// default here would make `cargo test` write into the developer's
+    /// actual data directory on every run. `main::run` swaps in the real
+    /// on-disk store right after construction, same as `history`.
     pub research: ResearchStore,
     /// The library view's selection into `research.citations`.
     pub selected_library: usize,
@@ -640,8 +646,14 @@ pub struct App {
 
     // -- Bookmarks, annotations, read-later (PRD §5.6) --------------------
     /// The saved-bookmarks store (PRD FR-BM-1/7), persisted to disk.
+    /// Defaults to an in-memory store — same "`App::new` empty, `main::run`
+    /// installs the real one" split as `history`/`research` (see `history`'s
+    /// doc comment for why): plenty of tests bookmark a title directly
+    /// through `App::new`, and a real on-disk default would make `cargo
+    /// test` write into the developer's actual data directory.
     pub bookmarks: BookmarkStore,
-    /// The read-later queue (PRD FR-BM-3/7), persisted to disk.
+    /// The read-later queue (PRD FR-BM-3/7), persisted to disk. Same
+    /// in-memory-by-default split as `bookmarks`.
     pub readlater: ReadLaterStore,
     /// The `r`-prefix chord's pending-key latch (`rl` read-later vs `r`'s
     /// own "open Research mode"). See `Mode::Reading`'s `pending_r` arm in
@@ -747,7 +759,10 @@ pub struct App {
 
     // -- Saved pages, bulk save, offline card (PRD §5.7, FR-OFF-4..7) -------
     /// The pinned saved-pages store (PRD FR-OFF-4). Distinct from the
-    /// evictable `PageCache` in `main` — see `saved.rs`.
+    /// evictable `PageCache` in `main` — see `saved.rs`. Defaults to an
+    /// in-memory store, same "`App::new` empty, `main::run` installs the
+    /// real one" split as `history`/`search_index` (see `history`'s doc
+    /// comment for why).
     pub saved: SavedPages,
     /// PRD FR-SR-7's local full-text index over saved + cached pages — see
     /// `offline_search`'s module doc. Defaults to an in-memory store for the
@@ -766,7 +781,9 @@ pub struct App {
     /// The mode `open_saved_picker` was entered from, restored on Esc.
     pub saved_prior_mode: Mode,
     /// The offline fetch queue (PRD FR-OFF-6). Populated by the offline-card's
-    /// `f`, drained by `:fetch-queue`.
+    /// `f`, drained by `:fetch-queue`. Defaults to an in-memory store, same
+    /// "`App::new` empty, `main::run` installs the real one" split as
+    /// `saved`/`history` (see `history`'s doc comment for why).
     pub fetch_queue: FetchQueue,
     /// The `(lang, title)` the offline card is currently offering to queue or
     /// find in saved pages — `Some` exactly while `mode == Mode::OfflineCard`.
@@ -1424,7 +1441,7 @@ impl App {
             last_tab_bar_area: None,
             citations: Vec::new(),
             selected_citation: 0,
-            research: ResearchStore::load(),
+            research: ResearchStore::in_memory(),
             selected_library: 0,
             cite_style: CiteStyle::Apa,
             library_prior_mode: Mode::Reading,
@@ -1456,8 +1473,8 @@ impl App {
             images_override: None,
             include_nonfree: false,
             graphics_env: crate::graphics::GraphicsEnv::default(),
-            bookmarks: BookmarkStore::load(),
-            readlater: ReadLaterStore::load(),
+            bookmarks: BookmarkStore::in_memory(),
+            readlater: ReadLaterStore::in_memory(),
             pending_r: false,
             selected_bookmark: 0,
             bookmark_prior_mode: Mode::Reading,
@@ -1480,11 +1497,11 @@ impl App {
             trail_selected: 0,
             trail_prior_mode: Mode::Reading,
             pending_trail_export_overwrite: None,
-            saved: SavedPages::load(),
+            saved: SavedPages::in_memory(),
             search_index: crate::offline_search::OfflineIndex::in_memory(),
             selected_saved: 0,
             saved_prior_mode: Mode::Reading,
-            fetch_queue: FetchQueue::load(),
+            fetch_queue: FetchQueue::in_memory(),
             offline_card_target: None,
             zim: None,
             quality_cache: HashMap::new(),
@@ -6252,6 +6269,44 @@ mod tests {
             citations: Vec::new(),
             truncated: false,
         }
+    }
+
+    /// H3 (test-isolation / user-data hazard): `App::new` is called from
+    /// roughly 200 call sites in this crate's own test suite. If any of the
+    /// five persisted stores below defaulted to `X::load()` (the real
+    /// on-disk store) rather than `X::in_memory()`, every one of those tests
+    /// would read the developer's actual bookmarks/read-later/research/
+    /// saved/fetch-queue files on `cargo test` — making outcomes depend on
+    /// whatever the developer happens to have saved, and any test that
+    /// triggers a write (several do, e.g. `save_selected_citation_marks_it_
+    /// saved_and_records_the_source_article` before this fix explicitly
+    /// reset `app.research` to guard against exactly this) would corrupt
+    /// that real data. `main::run` — production's one entry point — is the
+    /// only place that installs the real, on-disk stores (see `App.history`'s
+    /// doc comment for the established precedent this mirrors).
+    #[test]
+    fn app_new_defaults_every_persisted_store_to_in_memory() {
+        let app = App::new("en".to_string(), Theme::terminal(), false);
+        assert!(
+            app.research.is_in_memory(),
+            "research must not resolve the real platform data directory"
+        );
+        assert!(
+            app.bookmarks.is_in_memory(),
+            "bookmarks must not resolve the real platform data directory"
+        );
+        assert!(
+            app.readlater.is_in_memory(),
+            "read-later must not resolve the real platform data directory"
+        );
+        assert!(
+            app.saved.is_in_memory(),
+            "saved pages must not resolve the real platform data directory"
+        );
+        assert!(
+            app.fetch_queue.is_in_memory(),
+            "the fetch queue must not resolve the real platform state directory"
+        );
     }
 
     /// The titles on the active tab's back stack, for asserting history

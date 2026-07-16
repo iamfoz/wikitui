@@ -682,19 +682,11 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> rusqlite::Resu
 }
 
 /// The real on-disk location (PRD §6.4): `$XDG_STATE_HOME/wikitui/
-/// history.sqlite`. `ProjectDirs::state_dir()` is `Some` on Linux/BSD
-/// (honoring `$XDG_STATE_HOME`) but `None` on macOS/Windows, where the
-/// `directories` crate has no state-dir concept distinct from the data
-/// dir — falls back to `<data_dir>/state` there, a documented, harmless
-/// subdirectory rather than mixing history.sqlite in with bookmarks.jsonl
-/// et al.
+/// history.sqlite` — a harmless subdirectory rather than mixing
+/// history.sqlite in with bookmarks.jsonl et al. See `paths::
+/// wikitui_state_dir` for the platform resolution itself.
 pub(crate) fn history_path() -> Option<PathBuf> {
-    let dirs = directories::ProjectDirs::from("", "", "wikitui")?;
-    let dir = dirs
-        .state_dir()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| dirs.data_dir().join("state"));
-    Some(dir.join("history.sqlite"))
+    Some(crate::paths::wikitui_state_dir()?.join("history.sqlite"))
 }
 
 /// A history write's own failure is never a crash or a user-facing error

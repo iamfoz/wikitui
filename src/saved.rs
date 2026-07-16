@@ -245,6 +245,14 @@ impl SavedPages {
         self.root.as_ref().map(|r| r.join("saved.jsonl"))
     }
 
+    /// Test-only: see `bookmarks::BookmarkStore::is_in_memory` — lets
+    /// `app.rs`'s H3 regression test confirm `App::new` never resolves the
+    /// real platform data directory.
+    #[cfg(test)]
+    pub(crate) fn is_in_memory(&self) -> bool {
+        self.root.is_none()
+    }
+
     /// The `{wiki}/` path segment for a scope (PRD FR-ML-4), mirroring
     /// `cache::PageCache::scope_dir`: the default (empty) Wikipedia scope
     /// contributes *no* segment, so the resulting path is byte-identical to
@@ -536,7 +544,7 @@ impl SavedPages {
 /// `$XDG_DATA_HOME/wikitui/saved/` (PRD §6.4) — the pinned-store root, deliberately
 /// under the *data* dir, never the cache dir.
 fn saved_root() -> Option<PathBuf> {
-    directories::ProjectDirs::from("", "", "wikitui").map(|d| d.data_dir().join("saved"))
+    Some(crate::paths::wikitui_data_dir()?.join("saved"))
 }
 
 /// sha256 as a lowercase hex string.

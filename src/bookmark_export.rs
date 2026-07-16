@@ -50,8 +50,8 @@ pub fn render(bookmarks: &[Bookmark], format: &str) -> Option<String> {
 /// back to the system temp directory on a platform with no resolvable data
 /// dir — degrading gracefully rather than refusing to export at all.
 pub fn default_export_dir() -> PathBuf {
-    directories::ProjectDirs::from("", "", "wikitui")
-        .map(|d| d.data_dir().join("exports"))
+    crate::paths::wikitui_data_dir()
+        .map(|d| d.join("exports"))
         .unwrap_or_else(std::env::temp_dir)
 }
 

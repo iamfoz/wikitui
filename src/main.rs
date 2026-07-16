@@ -36,6 +36,7 @@ mod macros;
 mod migrate;
 mod netqueue;
 mod offline_search;
+mod paths;
 mod prefetch;
 mod privacy;
 mod random;
@@ -2499,6 +2500,20 @@ async fn run(
     // `history` does (see `App.search_index`'s doc comment); this is the one
     // place production opens the durable one.
     app.search_index = offline_search::OfflineIndex::open();
+    // PRD FR-BM-1/3/7, FR-OFF-4/6: the real, on-disk bookmark, read-later,
+    // research-bibliography, saved-pages, and offline-fetch-queue stores —
+    // `App::new` defaults every one of these to in-memory for the same
+    // reason `history`/`search_index` do (see each field's own doc comment):
+    // dozens of tests build an `App` via `App::new` and bookmark, save a
+    // citation, pin a page, or queue an offline fetch directly, so a real
+    // on-disk default here would make `cargo test` read and write the
+    // developer's actual data and state directories on every run. This is
+    // the one place production installs the durable ones.
+    app.bookmarks = bookmarks::BookmarkStore::load();
+    app.readlater = bookmarks::ReadLaterStore::load();
+    app.research = research::ResearchStore::load();
+    app.saved = saved::SavedPages::load();
+    app.fetch_queue = fetch_queue::FetchQueue::load();
     // PRD FR-PF-3 / FR-PR-2: the local, private interest model — loaded from
     // `$XDG_STATE/wikitui/interest.json` (a fast local read, no network) with
     // the config half-life. Like history, `App::new` defaults to an empty

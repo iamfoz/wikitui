@@ -117,8 +117,7 @@ const PROTECTED_SEGMENT_FRACTION: f64 = 0.8;
 pub fn resolve_pages_dir(dir_override: Option<&Path>) -> Option<PathBuf> {
     match dir_override {
         Some(dir) => Some(dir.join("pages")),
-        None => directories::ProjectDirs::from("", "", "wikitui")
-            .map(|dirs| dirs.cache_dir().join("pages")),
+        None => crate::paths::wikitui_cache_dir().map(|dir| dir.join("pages")),
     }
 }
 

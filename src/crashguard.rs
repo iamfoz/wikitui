@@ -261,13 +261,9 @@ fn format_crash_report(message: &str, location: &str, backtrace: Option<&str>) -
 /// `directories` has no native state-dir concept for (macOS, Windows) — the
 /// data dir's own `state` subdirectory, so a crash report always has
 /// somewhere to land rather than silently failing to write on those
-/// platforms.
+/// platforms. See `paths::wikitui_state_dir` for the resolution itself.
 fn crash_report_dir() -> Option<PathBuf> {
-    let dirs = directories::ProjectDirs::from("", "", "wikitui")?;
-    Some(match dirs.state_dir() {
-        Some(state) => state.to_path_buf(),
-        None => dirs.data_dir().join("state"),
-    })
+    crate::paths::wikitui_state_dir()
 }
 
 /// Writes `contents` to `dir/crash-<unix_time>.txt`, creating `dir` if

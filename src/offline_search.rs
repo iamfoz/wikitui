@@ -380,8 +380,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
 /// The real on-disk location (PRD §6.4): `$XDG_CACHE_HOME/wikitui/
 /// search-index.sqlite` — see the module doc's "Location".
 fn index_path() -> Option<PathBuf> {
-    directories::ProjectDirs::from("", "", "wikitui")
-        .map(|dirs| dirs.cache_dir().join("search-index.sqlite"))
+    Some(crate::paths::wikitui_cache_dir()?.join("search-index.sqlite"))
 }
 
 /// A deterministic rowid for `(wiki, lang, title)`, letting `index`/`remove`

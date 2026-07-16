@@ -583,10 +583,10 @@ struct Migration {
 const MIGRATIONS: &[Migration] = &[];
 
 /// Resolves the config file's location: `--config` (highest), then
-/// `WIKITUI_CONFIG`, then the platform config directory (`directories`
-/// crate, matching `cache.rs`/`research.rs`). `None` only when none of the
-/// above apply and the platform gives no home directory to fall back to —
-/// config loading is then simply skipped, same as a missing file.
+/// `WIKITUI_CONFIG`, then the platform config directory (`paths::
+/// wikitui_config_dir`). `None` only when none of the above apply and the
+/// platform gives no home directory to fall back to — config loading is
+/// then simply skipped, same as a missing file.
 pub fn resolve_config_path(cli_path: Option<PathBuf>, env_var: Option<String>) -> Option<PathBuf> {
     if let Some(p) = cli_path {
         return Some(p);
@@ -594,7 +594,7 @@ pub fn resolve_config_path(cli_path: Option<PathBuf>, env_var: Option<String>) -
     if let Some(p) = env_var {
         return Some(PathBuf::from(p));
     }
-    directories::ProjectDirs::from("", "", "wikitui").map(|d| d.config_dir().join("config.toml"))
+    crate::paths::wikitui_config_dir().map(|d| d.join("config.toml"))
 }
 
 /// PRD FR-CS-8's first-run sentinel: the absence of the config file. `None`

@@ -66,8 +66,8 @@ impl ResearchStore {
     }
 
     /// A store with no on-disk persistence at all: saves only last the
-    /// session. Used by tests elsewhere in the crate that want `App`'s
-    /// citation-saving state machine exercised without touching the real
+    /// session. `App::new`'s own default (see `App.research`'s doc comment)
+    /// so every test that builds an `App` gets this rather than the real
     /// platform data directory, and a natural fit for a future incognito
     /// mode (PRD FR-PR-3) that shouldn't write research state to disk.
     pub fn in_memory() -> Self {
@@ -82,6 +82,16 @@ impl ResearchStore {
             citations: crate::jsonl::load(&path),
             path: Some(path),
         }
+    }
+
+    /// Whether this store has no on-disk backing — i.e. came from
+    /// [`Self::in_memory`] rather than [`Self::load`] finding a real
+    /// directory. Test-only: lets `app.rs`'s H3 regression test confirm
+    /// `App::new` never resolves the real platform data directory without
+    /// exposing the private `path` field itself.
+    #[cfg(test)]
+    pub(crate) fn is_in_memory(&self) -> bool {
+        self.path.is_none()
     }
 
     /// Appends to the in-memory list and, if persistence is available, the
@@ -124,8 +134,7 @@ impl ResearchStore {
 }
 
 fn citations_path() -> Option<PathBuf> {
-    let dirs = directories::ProjectDirs::from("", "", "wikitui")?;
-    Some(dirs.data_dir().join("citations.jsonl"))
+    Some(crate::paths::wikitui_data_dir()?.join("citations.jsonl"))
 }
 
 /// A ready-to-save citation for the Wikipedia article currently being read

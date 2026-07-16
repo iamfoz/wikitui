@@ -383,12 +383,7 @@ pub fn parse_watch_outcome(body: &[u8]) -> Option<WatchOutcome> {
 /// `$XDG_STATE_HOME/wikitui/watchlist.json` — state, not data, since it's a
 /// local bookmark into a server-side feed, not user content of its own.
 pub fn watchlist_state_path() -> Option<PathBuf> {
-    let dirs = directories::ProjectDirs::from("", "", "wikitui")?;
-    let dir = dirs
-        .state_dir()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| dirs.data_dir().join("state"));
-    Some(dir.join("watchlist.json"))
+    Some(crate::paths::wikitui_state_dir()?.join("watchlist.json"))
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -974,12 +969,7 @@ pub struct ReadingListSyncState {
 
 /// `$XDG_STATE_HOME/wikitui/readinglist-sync.json`.
 pub fn readinglist_sync_state_path() -> Option<PathBuf> {
-    let dirs = directories::ProjectDirs::from("", "", "wikitui")?;
-    let dir = dirs
-        .state_dir()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| dirs.data_dir().join("state"));
-    Some(dir.join("readinglist-sync.json"))
+    Some(crate::paths::wikitui_state_dir()?.join("readinglist-sync.json"))
 }
 
 /// Loads the Reading List sync state from `path`. Best-effort like
@@ -1136,12 +1126,7 @@ pub struct WatchMirrorState {
 
 /// `$XDG_STATE_HOME/wikitui/watch-mirror.json`.
 pub fn watch_mirror_state_path() -> Option<PathBuf> {
-    let dirs = directories::ProjectDirs::from("", "", "wikitui")?;
-    let dir = dirs
-        .state_dir()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| dirs.data_dir().join("state"));
-    Some(dir.join("watch-mirror.json"))
+    Some(crate::paths::wikitui_state_dir()?.join("watch-mirror.json"))
 }
 
 /// Loads the watch-mirror state from `path` — best-effort, same degrade-to-

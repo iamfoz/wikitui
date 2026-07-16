@@ -139,6 +139,14 @@ impl BookmarkStore {
         }
     }
 
+    /// Test-only: lets `app.rs`'s H3 regression test confirm `App::new`
+    /// never resolves the real platform data directory, without exposing
+    /// the private `path` field itself (mirrors `ResearchStore::is_in_memory`).
+    #[cfg(test)]
+    pub(crate) fn is_in_memory(&self) -> bool {
+        self.path.is_none()
+    }
+
     pub fn find(&self, wiki: &str, lang: &str, title: &str) -> Option<&Bookmark> {
         self.bookmarks
             .iter()
@@ -352,8 +360,7 @@ impl BookmarkStore {
 }
 
 fn bookmarks_path() -> Option<PathBuf> {
-    let dirs = directories::ProjectDirs::from("", "", "wikitui")?;
-    Some(dirs.data_dir().join("bookmarks.jsonl"))
+    Some(crate::paths::wikitui_data_dir()?.join("bookmarks.jsonl"))
 }
 
 // ---- Read-later store --------------------------------------------------
@@ -383,6 +390,12 @@ impl ReadLaterStore {
             entries: crate::jsonl::load(&path),
             path: Some(path),
         }
+    }
+
+    /// Test-only: see `BookmarkStore::is_in_memory`.
+    #[cfg(test)]
+    pub(crate) fn is_in_memory(&self) -> bool {
+        self.path.is_none()
     }
 
     pub fn contains(&self, wiki: &str, lang: &str, title: &str) -> bool {
@@ -428,8 +441,7 @@ impl ReadLaterStore {
 }
 
 fn readlater_path() -> Option<PathBuf> {
-    let dirs = directories::ProjectDirs::from("", "", "wikitui")?;
-    Some(dirs.data_dir().join("readlater.jsonl"))
+    Some(crate::paths::wikitui_data_dir()?.join("readlater.jsonl"))
 }
 
 // ---- Bookmark picker filter grammar (PRD FR-BM-1) ----------------------

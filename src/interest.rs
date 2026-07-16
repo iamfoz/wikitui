@@ -445,16 +445,9 @@ impl InterestModel {
 
 /// The real on-disk location (PRD §6.4: `$XDG_STATE_HOME/wikitui/interest.json`,
 /// alongside `history.sqlite`). `None` when no platform state directory can be
-/// determined — mirrors `history::history_path` exactly (state dir on
-/// Linux/BSD, `<data_dir>/state` on macOS/Windows where `directories` has no
-/// state-dir concept).
+/// determined. See `paths::wikitui_state_dir` for the resolution itself.
 pub fn interest_path() -> Option<PathBuf> {
-    let dirs = directories::ProjectDirs::from("", "", "wikitui")?;
-    let dir = dirs
-        .state_dir()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| dirs.data_dir().join("state"));
-    Some(dir.join("interest.json"))
+    Some(crate::paths::wikitui_state_dir()?.join("interest.json"))
 }
 
 /// Strip a leading `Category:` (any wiki's canonical namespace form arrives

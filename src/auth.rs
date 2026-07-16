@@ -762,14 +762,10 @@ impl TokenStore for KeyringTokenStore {
 /// git/syncthing sync the `$XDG_DATA_HOME` stores are designed for (§6.4:
 /// data is "git/syncthing-friendly"; tokens are secrets that must stay on one
 /// machine). `None` when no platform state directory resolves (matches
-/// `history_path`'s own silent-degradation contract).
+/// `history_path`'s own silent-degradation contract). See `paths::
+/// wikitui_state_dir` for the resolution itself.
 pub fn auth_path() -> Option<PathBuf> {
-    let dirs = directories::ProjectDirs::from("", "", "wikitui")?;
-    let dir = dirs
-        .state_dir()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| dirs.data_dir().join("state"));
-    Some(dir.join("auth.json"))
+    Some(crate::paths::wikitui_state_dir()?.join("auth.json"))
 }
 
 /// Selects the token store per SEC-4: the OS keychain when the `keychain`

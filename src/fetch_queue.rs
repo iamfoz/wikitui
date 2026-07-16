@@ -101,18 +101,25 @@ impl FetchQueue {
     pub fn snapshot(&self) -> Vec<QueuedFetch> {
         self.entries.clone()
     }
+
+    /// Test-only: see `bookmarks::BookmarkStore::is_in_memory` — lets
+    /// `app.rs`'s H3 regression test confirm `App::new` never resolves the
+    /// real platform state directory.
+    #[cfg(test)]
+    pub(crate) fn is_in_memory(&self) -> bool {
+        self.path.is_none()
+    }
 }
 
 /// `$XDG_STATE_HOME/wikitui/fetch_queue.jsonl` where a state dir exists
-/// (Linux), else the data dir as a fallback (macOS/Windows have no distinct
-/// state dir in the `directories` crate).
+/// (Linux), else `<data_dir>/state` as a fallback (macOS/Windows have no
+/// distinct state dir in the `directories` crate) — see `paths::
+/// wikitui_state_dir`, shared with every other state file (session, history,
+/// auth, interest, watchlist/reading-list-sync/watch-mirror, crash reports)
+/// so this queue can never again land somewhere a `data/state`-walking
+/// backup or `clear-data` sweep would miss it.
 fn queue_path() -> Option<PathBuf> {
-    let dirs = directories::ProjectDirs::from("", "", "wikitui")?;
-    let base = dirs
-        .state_dir()
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(|| dirs.data_dir().to_path_buf());
-    Some(base.join("fetch_queue.jsonl"))
+    Some(crate::paths::wikitui_state_dir()?.join("fetch_queue.jsonl"))
 }
 
 #[cfg(test)]
@@ -169,5 +176,27 @@ mod tests {
         assert_eq!(snap.len(), 2);
         assert_eq!(snap[0].title, "A");
         assert_eq!(snap[1].lang, "de");
+    }
+
+    /// quality-M5's divergence bug: `queue_path` used to fall back to the
+    /// bare data dir instead of `<data_dir>/state` when `directories` has no
+    /// native state-dir concept (macOS/Windows) — a different directory than
+    /// every sibling state file (`session.json`, `history.sqlite`,
+    /// `auth.json`, `interest.json`, `watchlist.json`, …), invisible to a
+    /// `data/state`-walking backup or `clear-data` sweep. Now that
+    /// `queue_path` routes through the same `paths::wikitui_state_dir` every
+    /// sibling does, its parent directory must be exactly that shared
+    /// directory — not merely "a" directory under the data dir.
+    #[test]
+    fn queue_path_parent_is_the_shared_state_dir_not_the_bare_data_dir() {
+        if let (Some(q), Some(state)) = (queue_path(), crate::paths::wikitui_state_dir()) {
+            assert_eq!(
+                q.parent(),
+                Some(state.as_path()),
+                "fetch_queue.jsonl must land directly under the shared state dir"
+            );
+        }
+        // `None` is a legitimate outcome in a sandboxed environment with no
+        // resolvable home directory — never a panic either way.
     }
 }
