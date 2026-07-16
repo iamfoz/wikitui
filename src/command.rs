@@ -239,6 +239,18 @@ pub enum Command {
     /// unrecognized command (`main::execute_command`'s doc comment explains
     /// why that check lives at execution time, not here).
     Xyzzy,
+    /// `:noredirect` (PRD §7 "Redirect") — re-opens the current article's
+    /// *requested* title without following a redirect it turned out to be,
+    /// showing the redirect notice page itself. A no-op (with a notice)
+    /// when the article on screen wasn't reached via a redirect at all —
+    /// see `Tab::redirected_from`.
+    NoRedirect,
+    /// `:report-page` (PRD §7 "Article HTML fails to parse") — writes a
+    /// local repro bundle (raw HTML + title/wiki/lang/revid/wikitui version)
+    /// for the current article and shows the path. Never auto-submitted
+    /// anywhere (FR-PR-1) — purely a file on disk the reader can attach to
+    /// an issue if *they* choose to.
+    ReportPage,
     /// `:q` / `:quit` — exit.
     Quit,
 }
@@ -533,7 +545,7 @@ fn validate_set_value(
     }
 }
 
-pub const USAGE: &str = "commands: open <title>, lang [<code>], theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, zim [open <path>|close|<title>], prefetch-log, interests, not-interested, stats, start, today, random [good], related, talk, info, set theme=<name>|images=on|off|prefetch=on|off|show-cn=on|off|measure=N|ambiguous_width=1|2|reading_wpm=N|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N|justify=on|off|hyphenate=on|off, set-tab measure=N|images=on|off|ambiguous_width=1|2|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N|justify=on|off|hyphenate=on|off (or set-tab key= to reset), config reload, vsplit, only, bilingual, wiki [<name>], set scrollbind, set show-cn, watchlist, notifications, contribs [username], prefs, enable-editing, edit [summary], sync, mirror-watchlist, search-offline, trail [all|days N|export md|dot|mermaid [path]], mksession <name>, session <name>, sessions, tts [stop], speak [stop], run <macro>, game [daily|share|<start> <goal>], xyzzy, help, quit";
+pub const USAGE: &str = "commands: open <title>, lang [<code>], theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, zim [open <path>|close|<title>], prefetch-log, interests, not-interested, stats, start, today, random [good], related, talk, info, set theme=<name>|images=on|off|prefetch=on|off|show-cn=on|off|measure=N|ambiguous_width=1|2|reading_wpm=N|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N|justify=on|off|hyphenate=on|off, set-tab measure=N|images=on|off|ambiguous_width=1|2|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N|justify=on|off|hyphenate=on|off (or set-tab key= to reset), config reload, vsplit, only, bilingual, wiki [<name>], set scrollbind, set show-cn, watchlist, notifications, contribs [username], prefs, enable-editing, edit [summary], sync, mirror-watchlist, search-offline, trail [all|days N|export md|dot|mermaid [path]], mksession <name>, session <name>, sessions, tts [stop], speak [stop], run <macro>, game [daily|share|<start> <goal>], xyzzy, noredirect, report-page, help, quit";
 
 /// Parses one `:` command line. `user_theme_names` are accepted alongside
 /// the six built-ins for `:theme <name>` and `:set theme=<name>` (PRD
@@ -1067,6 +1079,10 @@ pub fn parse_with_user_themes(input: &str, user_theme_names: &[String]) -> Resul
         }
         // PRD FR-DL-8: the classic easter egg.
         "xyzzy" => Ok(Command::Xyzzy),
+        // PRD §7 "Redirect".
+        "noredirect" => Ok(Command::NoRedirect),
+        // PRD §7 "Article HTML fails to parse".
+        "report-page" => Ok(Command::ReportPage),
         "help" | "h" => Ok(Command::Help),
         "q" | "quit" => Ok(Command::Quit),
         "" => Err(USAGE.to_string()),
@@ -1925,6 +1941,18 @@ mod tests {
     #[test]
     fn info_parses_bare() {
         assert_eq!(parse("info"), Ok(Command::Info));
+    }
+
+    // ---- PRD §7: :noredirect / :report-page --------------------------------
+
+    #[test]
+    fn noredirect_parses_bare() {
+        assert_eq!(parse("noredirect"), Ok(Command::NoRedirect));
+    }
+
+    #[test]
+    fn report_page_parses_bare() {
+        assert_eq!(parse("report-page"), Ok(Command::ReportPage));
     }
 
     // ---- PRD FR-HS-3: :trail --------------------------------------------------

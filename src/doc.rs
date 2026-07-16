@@ -284,6 +284,22 @@ pub struct Document {
     /// itself is kept for callers/tests that want to check the condition
     /// without string-matching the banner text.
     pub truncated: bool,
+    /// PRD §7 "Article HTML fails to parse": `true` when the structured
+    /// block walk found nothing at all — markup shaped in a way this
+    /// module's parser doesn't recognize (bare text with no wrapping tag, a
+    /// non-Parsoid response body, …) rather than a legitimately short
+    /// article (even the smallest real stub yields at least one paragraph
+    /// block). `parse_article_html` falls back to a plaintext extract and
+    /// prepends its own banner when this is set — independent of
+    /// `truncated`, which is SEC-3's size/depth-limit signal, not a parse
+    /// failure.
+    pub degraded_parse: bool,
+    /// PRD §7 "Disambiguation page": `true` when Parsoid marked this page's
+    /// HTML with the `mw:PageProp/disambiguation` page-property link —
+    /// detected straight from the article HTML this module already parses,
+    /// no separate pageprops/summary fetch needed. `App`/`main` use this to
+    /// show the candidate-list chooser instead of the ordinary prose view.
+    pub is_disambiguation: bool,
 }
 
 /// One entry from an article's References/bibliography list: the raw
@@ -2174,6 +2190,24 @@ fn cap_html_nesting_depth(html: &str, max_depth: usize) -> (&str, bool) {
 /// reading view and in `--dump` output — no separate UI plumbing needed.
 const TRUNCATED_BANNER: &str = "⚠ Degraded rendering: this article exceeded a PRD SEC-3 parser limit (size or DOM nesting depth) and was truncated. Content beyond that point was not parsed.";
 
+/// PRD §7's "degraded rendering" banner for the *other* trigger — a
+/// structured parse that found nothing at all, not a size/depth limit.
+/// Reuses the same "prepend a bold paragraph block" mechanism as
+/// [`TRUNCATED_BANNER`], with wording specific to this cause so the two
+/// never read as the same problem.
+const DEGRADED_PARSE_BANNER: &str = "⚠ Degraded rendering: this article's HTML did not parse into any structured content; showing a plaintext extract instead. Try :report-page to capture a repro bundle.";
+
+/// PRD §7 "Disambiguation page": Parsoid marks a disambiguation page's own
+/// HTML with this page-property link in `<head>` (the same `mw:PageProp/*`
+/// convention it uses for other page-level flags) — checked directly
+/// against the article HTML `parse_article_html` already fetched, so
+/// detection costs nothing beyond a selector match over a tree that's
+/// already in memory.
+fn detect_disambiguation(parsed: &Html) -> bool {
+    let sel = Selector::parse(r#"link[rel="mw:PageProp/disambiguation"]"#).unwrap();
+    parsed.select(&sel).next().is_some()
+}
+
 pub fn parse_article_html(title: &str, html: &str) -> Document {
     let (html, size_truncated) = cap_html_size(html);
     // Depth guard runs second (SEC-3): a genuinely oversized article is
@@ -2194,11 +2228,38 @@ pub fn parse_article_html(title: &str, html: &str) -> Document {
     walk_blocks(start, &mut blocks, 0, 0);
     let citations = extract_citations(&parsed);
     let display_title = page_display_title(&parsed).unwrap_or_else(|| title.to_string());
+
+    // PRD §7 "Article HTML fails to parse": the structured walk above
+    // recognized nothing — but that alone doesn't distinguish "markup this
+    // parser's block walker doesn't know how to read" (bare text with no
+    // wrapping tag) from "a genuinely, deliberately empty document" (a
+    // `<body></body>` with nothing in it at all, which parsed just fine —
+    // there's simply nothing to show, not a failure). Only degrade when
+    // there is text left on the table: `text_content` finding *something*
+    // the block walk didn't is the actual "parse failed" signal; an empty
+    // extract means there was truly nothing here, which stays a plain,
+    // bannerless empty document exactly as before this fallback existed.
+    let mut degraded_parse = false;
+    if blocks.is_empty() {
+        let text = normalize_ws(&text_content(start));
+        if !text.is_empty() {
+            degraded_parse = true;
+            blocks.push(Block::Paragraph(vec![Span {
+                text,
+                style: SpanStyle::Plain,
+            }]));
+        }
+    }
+
+    let is_disambiguation = detect_disambiguation(&parsed);
+
     let mut document = Document {
         title: display_title,
         blocks,
         citations,
         truncated,
+        degraded_parse,
+        is_disambiguation,
     };
 
     // PRD SEC-1: the single choke point every string this function put into
@@ -2215,8 +2276,76 @@ pub fn parse_article_html(title: &str, html: &str) -> Document {
             }]),
         );
     }
+    if document.degraded_parse {
+        document.blocks.insert(
+            0,
+            Block::Paragraph(vec![Span {
+                text: DEGRADED_PARSE_BANNER.to_string(),
+                style: SpanStyle::Bold,
+            }]),
+        );
+    }
 
     document
+}
+
+/// One candidate row in a disambiguation page's chooser (PRD §7): the link
+/// target plus whatever descriptive text follows it in the same `<li>` — the
+/// fixture shape `<li><a href="./Mercury_(planet)">Mercury</a>, the smallest
+/// planet in the Solar System</li>` splits into target `Mercury (planet)`,
+/// link text `Mercury`, description `the smallest planet in the Solar
+/// System`. Every `Block::ListItem` in the document is scanned (this module
+/// carries no "which `<ul>` do I belong to" id to scope to just one list —
+/// a documented simplification, fine for the single-list shape every real
+/// disambiguation page and this corpus's fixture both have).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisambigCandidate {
+    /// The resolved internal title to open on Enter.
+    pub title: String,
+    /// The link's own anchor text ("Mercury").
+    pub link_text: String,
+    /// Whatever text follows the link in the same list item, with the
+    /// fixture's leading ", " separator trimmed off.
+    pub description: String,
+}
+
+/// Extracts [`DisambigCandidate`] rows from `doc` (PRD §7): a list item
+/// whose first span isn't a followable link (an external/interwiki link, or
+/// plain text) contributes no row — the chooser can only ever offer targets
+/// it can actually open.
+pub fn disambiguation_candidates(doc: &Document) -> Vec<DisambigCandidate> {
+    let mut out = Vec::new();
+    for block in &doc.blocks {
+        let Block::ListItem { spans, .. } = block else {
+            continue;
+        };
+        let mut iter = spans.iter();
+        let Some(first) = iter.next() else {
+            continue;
+        };
+        let href = match &first.style {
+            SpanStyle::Link(href) | SpanStyle::RedLink(href) => href,
+            _ => continue,
+        };
+        let Some(title) = internal_title_from_href(href) else {
+            continue;
+        };
+        let mut description = String::new();
+        for s in iter {
+            description.push_str(&s.text);
+        }
+        let description = description
+            .trim()
+            .trim_start_matches(',')
+            .trim()
+            .to_string();
+        out.push(DisambigCandidate {
+            title,
+            link_text: first.text.clone(),
+            description,
+        });
+    }
+    out
 }
 
 /// PRD SEC-1's single sanitization choke point for this module. Called
@@ -3344,6 +3473,92 @@ mod tests {
     fn html_at_or_under_the_cap_is_not_truncated() {
         let doc = parse_article_html("Test", FIXTURE);
         assert!(!doc.truncated);
+    }
+
+    // ---- PRD §7 "Article HTML fails to parse" -------------------------------
+
+    #[test]
+    fn degenerate_body_falls_back_to_plaintext_with_a_banner() {
+        // Bare text directly under `<body>`, no wrapping tag at all —
+        // `walk_blocks` only ever looks at `Node::Element` children, so this
+        // yields zero structured blocks, the "parse failed" signal.
+        let doc = parse_article_html(
+            "Broken",
+            "<html><head><title>Broken</title></head><body>\
+             Just some plain text with no wrapping tags at all.\
+             </body></html>",
+        );
+        assert!(
+            doc.degraded_parse,
+            "a body with no recognized block-level elements must be flagged"
+        );
+        let has_banner = doc.blocks.first().is_some_and(|b| {
+            matches!(
+                b,
+                Block::Paragraph(spans) if spans.iter().any(|s| s.text.contains("Degraded rendering"))
+            )
+        });
+        assert!(
+            has_banner,
+            "the first block must be the degraded-parse banner"
+        );
+        let has_extract = doc.blocks.iter().any(|b| {
+            matches!(
+                b,
+                Block::Paragraph(spans) if spans.iter().any(|s| s.text.contains("Just some plain text"))
+            )
+        });
+        assert!(
+            has_extract,
+            "the plaintext extract must still reach the reader, banner or not"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_article_is_never_flagged_degraded() {
+        let doc = parse_article_html("Test", FIXTURE);
+        assert!(!doc.degraded_parse);
+    }
+
+    // ---- PRD §7 "Disambiguation page" ---------------------------------------
+
+    const DISAMBIG_HTML: &str = r#"<html><head><title>Mercury (disambiguation)</title>
+<link rel="mw:PageProp/disambiguation"/></head><body>
+<p><b>Mercury</b> may refer to:</p>
+<ul>
+<li><a href="./Mercury_(planet)">Mercury</a>, the smallest planet in the Solar System</li>
+<li><a href="./Mercury_(element)">Mercury</a>, a chemical element</li>
+<li><a href="https://example.com/not-internal">External</a>, not a wiki link</li>
+</ul>
+</body></html>"#;
+
+    #[test]
+    fn a_pageprop_disambiguation_link_flags_the_document() {
+        let doc = parse_article_html("Mercury (disambiguation)", DISAMBIG_HTML);
+        assert!(doc.is_disambiguation);
+    }
+
+    #[test]
+    fn an_ordinary_article_is_never_flagged_disambiguation() {
+        let doc = parse_article_html("Test", FIXTURE);
+        assert!(!doc.is_disambiguation);
+    }
+
+    #[test]
+    fn disambiguation_candidates_extracts_target_text_and_description() {
+        let doc = parse_article_html("Mercury (disambiguation)", DISAMBIG_HTML);
+        let candidates = disambiguation_candidates(&doc);
+        // The external, non-internal link contributes no row — the chooser
+        // can only ever offer targets it can actually open.
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].title, "Mercury (planet)");
+        assert_eq!(candidates[0].link_text, "Mercury");
+        assert_eq!(
+            candidates[0].description,
+            "the smallest planet in the Solar System"
+        );
+        assert_eq!(candidates[1].title, "Mercury (element)");
+        assert_eq!(candidates[1].description, "a chemical element");
     }
 
     /// 10k-deep nested `<div>`s trigger `cap_html_nesting_depth`'s pre-parse

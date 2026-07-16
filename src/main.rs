@@ -108,6 +108,18 @@ const TYPEAHEAD_LIMIT: u32 = 10;
 /// mode with nothing in flight (PRD FR-ACS-2's 0%-idle-CPU property).
 const REVALIDATE_POLL: Duration = Duration::from_millis(100);
 
+/// PRD §7 "429 / maxlag on interactive request": the pause a rate-limited
+/// foreground fetch waits before its first automatic retry when the server
+/// sent no `Retry-After` at all — mirrors NF-NET-4's spirit (honor
+/// `Retry-After` when given, back off sensibly when not) without inventing
+/// a second policy just for the foreground path.
+const DEFAULT_RATE_LIMIT_RETRY: Duration = Duration::from_secs(5);
+
+/// PRD §7: bounded retries — an upstream that stays busy past this many
+/// attempts is given up on gracefully (whatever cache/error `fetch_page`
+/// would otherwise have surfaced), never hammered indefinitely.
+const MAX_FOREGROUND_RETRIES: u32 = 3;
+
 /// One completed (or failed) typeahead request, tagged with the query it
 /// answers so the receiver can drop it if it's gone stale (`app::
 /// typeahead_is_current`) — PRD FR-SR-1's in-flight cancellation.
@@ -815,6 +827,31 @@ struct FetchOutcome {
     /// offline network result (already as current as this session can
     /// make it).
     revalidate: Option<u64>,
+    /// PRD §7 "Redirect": `Some(requested_title)` when the live network
+    /// fetch that produced this outcome followed a redirect —
+    /// `api::FetchedArticle::redirected` threaded through unchanged. `None`
+    /// for a cache hit (redirect-following already happened whenever that
+    /// entry was originally fetched, nothing new to report now) or a fetch
+    /// that simply wasn't a redirect.
+    redirected_from: Option<String>,
+    /// PRD §7 "429 / maxlag on interactive request": `Some(retry_after)`
+    /// when the live network attempt behind this outcome was rate-limited
+    /// but a cached copy was available to serve in the meantime — the one
+    /// case `fetch_page`'s ordinary `Err`-to-cache-fallback swallows the
+    /// classification of *why* the network attempt failed. `None` whenever
+    /// nothing was rate-limited (the overwhelmingly common case) or the
+    /// fetch never touched the network at all (a fresh/background-
+    /// revalidating cache hit).
+    rate_limited: Option<Duration>,
+    /// PRD §7 "Bookmark/saved page whose target moved or was deleted": `true`
+    /// when the live network attempt behind this outcome confirmed the
+    /// article genuinely doesn't exist upstream (`api::ArticleMissing`), not
+    /// just "the network is down right now" — the other classification
+    /// `fetch_page`'s stale-cache fallback would otherwise swallow, same
+    /// reasoning as `rate_limited` just above. `open_title` only acts on
+    /// this when the title is also bookmarked; otherwise it's the same
+    /// ordinary stale-serve every ForceRefetch-and-fail open already was.
+    missing: bool,
 }
 
 /// The cache-aware fetch (PRD FR-OFF-2's serve policy): render whatever
@@ -855,6 +892,9 @@ async fn fetch_page(
                     // canonical is what matched here).
                     resolved_title: title.to_string(),
                     revalidate: None,
+                    redirected_from: None,
+                    rate_limited: None,
+                    missing: false,
                 });
             }
             SwrDecision::RevalidateInBackground => {
@@ -866,6 +906,9 @@ async fn fetch_page(
                     revid: page.revid,
                     resolved_title: title.to_string(),
                     revalidate: Some(page.revid),
+                    redirected_from: None,
+                    rate_limited: None,
+                    missing: false,
                 });
             }
             SwrDecision::ForceRefetch => {
@@ -903,12 +946,20 @@ async fn fetch_page(
             // cache write itself; a parse failure here never blocks the
             // article from opening.
             index_cached_html(search_index, &wiki, lang, &resolved_title, &fetched.html);
+            // PRD §7 "Redirect": the requested string itself is the "Redirected
+            // from X" identity — `resolved_title` (just above) is where it
+            // resolved *to*, already sitting in the rendered document's own
+            // title once this outcome is parsed.
+            let redirected_from = fetched.redirected.then(|| title.to_string());
             Ok(FetchOutcome {
                 html: fetched.html,
                 source: PageSource::Live,
                 revid: fetched.revid,
                 resolved_title,
                 revalidate: None,
+                redirected_from,
+                rate_limited: None,
+                missing: false,
             })
         }
         Err(network_error) => match cached {
@@ -920,6 +971,23 @@ async fn fetch_page(
                 revid: page.revid,
                 resolved_title: title.to_string(),
                 revalidate: None,
+                redirected_from: None,
+                // PRD §7 "429 / maxlag on interactive request": this network
+                // attempt failed, but a cached copy stood in — the ordinary,
+                // silent stale-serve path (PRD FR-OFF-2/NF-NET-8). Surfacing
+                // *why* it failed here, when it was a rate limit specifically,
+                // is what lets `open_title` show the busy toast and schedule
+                // an automatic retry instead of leaving the reader on stale
+                // content with no explanation and no path back to fresh.
+                rate_limited: network_error
+                    .downcast_ref::<api::RateLimited>()
+                    .map(|r| r.retry_after.unwrap_or(DEFAULT_RATE_LIMIT_RETRY)),
+                // PRD §7 "Bookmark/saved page whose target moved or was
+                // deleted": same reasoning as `rate_limited` just above, for
+                // the other classified foreground failure.
+                missing: network_error
+                    .downcast_ref::<api::ArticleMissing>()
+                    .is_some(),
             }),
             None => Err(network_error),
         },
@@ -987,6 +1055,87 @@ fn fire_revalidation(
         });
     });
     true
+}
+
+/// PRD §7 "429 / maxlag on interactive request": schedules a bounded,
+/// non-blocking retry of `(lang, title)` after `retry_after` — honoring the
+/// server's own back-off instead of hammering it — and delivers the
+/// eventual outcome through `App`'s own foreground-retry channel, applied
+/// exactly like a background tab's completed fetch
+/// (`apply_tab_load_outcome`). Runs entirely on a detached task: the render
+/// loop never blocks waiting out `retry_after`, only drains the result once
+/// it lands (`App::pending_foreground_retries` is the poll-loop gate, see
+/// `should_poll_instead_of_block`).
+///
+/// Deliberately does *not* route through the `netqueue` substrate
+/// (`fire_background_load`'s own mechanism): that queue is strictly serial
+/// and priority-ordered against every other background job, which is
+/// exactly wrong for "the reader is watching this specific retry, right
+/// now" — a prefetch job ahead of it in line would delay the very retry the
+/// toast just promised.
+#[allow(clippy::too_many_arguments)]
+fn fire_foreground_retry(
+    app: &mut App,
+    client: &WikiClient,
+    cache: &PageCache,
+    search_index: &offline_search::OfflineIndex,
+    tab_id: TabId,
+    wiki: String,
+    lang: String,
+    title: String,
+    retry_after: Duration,
+) {
+    app.pending_foreground_retries += 1;
+    let tx = app.foreground_retry_tx.clone();
+    let client = client.clone();
+    let cache = cache.clone();
+    let search_index = search_index.clone();
+    tokio::spawn(async move {
+        let mut delay = retry_after;
+        for _ in 0..MAX_FOREGROUND_RETRIES {
+            tokio::time::sleep(delay).await;
+            match fetch_page(&client, &cache, &search_index, &wiki, &lang, &title).await {
+                Ok(outcome) if !matches!(outcome.source, PageSource::Offline { .. }) => {
+                    let _ = tx.send(TabLoadOutcome {
+                        tab_id,
+                        wiki,
+                        lang,
+                        title,
+                        result: Ok(outcome),
+                    });
+                    return;
+                }
+                // Still down (or still rate-limited, served from whatever
+                // cache stood in) — try again unless retries are exhausted,
+                // backing off further since there's no fresher `Retry-After`
+                // to honor past the first one.
+                Ok(_still_offline) => delay *= 2,
+                Err(e) => {
+                    if let Some(rl) = e.downcast_ref::<api::RateLimited>() {
+                        delay = rl.retry_after.unwrap_or(delay * 2);
+                        continue;
+                    }
+                    // A non-rate-limit failure: gracefully give up now, same
+                    // as an ordinary background-load failure would.
+                    let _ = tx.send(TabLoadOutcome {
+                        tab_id,
+                        wiki,
+                        lang,
+                        title,
+                        result: Err(e.to_string()),
+                    });
+                    return;
+                }
+            }
+        }
+        let _ = tx.send(TabLoadOutcome {
+            tab_id,
+            wiki,
+            lang,
+            title,
+            result: Err("Wikipedia is still busy after several retries".to_string()),
+        });
+    });
 }
 
 /// Spawns the fetch for a background tab (PRD FR-TB-3): runs the full
@@ -1840,6 +1989,28 @@ fn apply_tab_load_outcome(
             // it while it loaded), refresh the app-global view state.
             if index == app.active {
                 app.layout = None;
+                // PRD §7 "429 / maxlag on interactive request": a foreground
+                // retry (`fire_foreground_retry`) landing while the offline
+                // card is still showing for this exact tab means there's
+                // fresh content to show now — dismiss the card back to the
+                // reading view (or the disambiguation chooser, mirroring
+                // `set_document`'s own mode decision) instead of leaving a
+                // stale overlay over content that just updated underneath
+                // it. Any other mode the reader has since navigated to (a
+                // picker, a different tab's card) is left alone.
+                if app.mode == Mode::OfflineCard {
+                    app.mode = if app
+                        .active_tab()
+                        .doc
+                        .as_ref()
+                        .is_some_and(|d| d.is_disambiguation)
+                    {
+                        app.disambig_selected = 0;
+                        Mode::Disambig
+                    } else {
+                        Mode::Reading
+                    };
+                }
             }
             if let Some(cached_revid) = fetch.revalidate
                 && fire_revalidation(
@@ -2986,6 +3157,13 @@ async fn run(
             while let Ok(outcome) = open_rx.try_recv() {
                 apply_tab_load_outcome(client, &mut app, outcome, &revalidate_tx);
             }
+            // PRD §7 "429 / maxlag on interactive request": a foreground
+            // retry landed — applied through the exact same install path as
+            // any other completed tab fetch (`apply_tab_load_outcome`).
+            while let Ok(outcome) = app.foreground_retry_rx.try_recv() {
+                app.pending_foreground_retries = app.pending_foreground_retries.saturating_sub(1);
+                apply_tab_load_outcome(client, &mut app, outcome, &revalidate_tx);
+            }
             // PRD FR-RD-8: install decoded inline images; each triggers one
             // relayout so its half-block box appears (`App::deliver_image`).
             while let Ok(outcome) = image_rx.try_recv() {
@@ -3146,6 +3324,13 @@ fn should_poll_instead_of_block(
         // true right after opening a plain article with no other
         // background activity.
         || app.pending_langlinks > 0
+        // PRD §7 "429 / maxlag on interactive request": an automatic
+        // foreground retry is waiting out `Retry-After` on its own detached
+        // task — this keeps the loop waking on a timer so the eventual
+        // success/give-up outcome is drained and applied without the reader
+        // needing to press a key first, same reasoning as
+        // `pending_revalidations` above.
+        || app.pending_foreground_retries > 0
 }
 
 /// Spawns the `morelike:{title}` search behind the Related panel (PRD
@@ -3723,6 +3908,128 @@ async fn toggle_talk_page(
     }
 }
 
+/// PRD §7 "Redirect" row's `:noredirect`: re-fetches the active tab's
+/// *requested* title (`Tab::redirected_from`) without following the
+/// redirect it turned out to be, showing the raw notice page instead of the
+/// resolved target already on screen. A graceful no-op notice — never an
+/// error — when the tab wasn't reached via a redirect at all, which is the
+/// overwhelmingly common case this command is invoked against by mistake.
+async fn open_noredirect(client: &WikiClient, app: &mut App) {
+    let Some(requested) = app.active_tab().redirected_from.clone() else {
+        app.notice = Some("This article wasn't reached via a redirect".to_string());
+        return;
+    };
+    let lang = app.active_tab().lang.clone();
+    match client
+        .fetch_article_html_noredirect(&lang, &requested)
+        .await
+    {
+        Ok(fetched) => {
+            let document = doc::parse_article_html(&requested, &fetched.html);
+            {
+                let tab = app.active_tab_mut();
+                tab.page_source = PageSource::Live;
+                tab.current_revid = fetched.revid;
+            }
+            app.open_document(document);
+            app.notice = Some(format!("Showing the redirect page for \"{requested}\""));
+        }
+        Err(e) => {
+            app.notice = Some(format!("Could not load the redirect page: {e}"));
+        }
+    }
+}
+
+/// PRD §7 "Article HTML fails to parse" row's `:report-page`: writes a local
+/// repro bundle for the current article — title, wiki, lang, revid, the
+/// running wikitui version, and whatever raw HTML this session has cached
+/// for it (best-effort: `cache.peek` can come up empty, e.g. for a page
+/// opened only via `:noredirect`/a ZIM archive that never went through the
+/// ordinary cache write) — and shows the path. Mirrors `crashguard`'s own
+/// "write a local file, print its path, never send it anywhere" contract
+/// (FR-PR-1): captured purely so a reader who hit a rendering bug has
+/// something concrete to attach to an issue *if they choose to*.
+fn write_report_page(cache: &PageCache, app: &mut App) {
+    let Some(doc) = app.active_tab().doc.as_ref() else {
+        app.notice = Some("Open an article first".to_string());
+        return;
+    };
+    let title = doc.title.clone();
+    let tab = app.active_tab();
+    let wiki = tab.wiki.clone();
+    let lang = tab.lang.clone();
+    let revid = tab.current_revid;
+    let html = cache
+        .peek(&wiki, &lang, &title)
+        .map(|c| c.html)
+        .unwrap_or_else(|| "<not available: no cached copy of this page>".to_string());
+    let contents = report_bundle_contents(&title, &wiki, &lang, revid, &html);
+    match write_report_bundle(&contents, &title) {
+        Some(path) => {
+            app.notice = Some(format!("Wrote repro bundle to {}", path.display()));
+        }
+        None => {
+            app.notice = Some(
+                "Could not write a repro bundle: no writable state directory found".to_string(),
+            );
+        }
+    }
+}
+
+/// Builds `:report-page`'s bundle text. Pure (no I/O), so it's directly
+/// testable without touching the filesystem — same split as
+/// `crashguard::format_crash_report`.
+fn report_bundle_contents(title: &str, wiki: &str, lang: &str, revid: u64, html: &str) -> String {
+    format!(
+        "wikitui {} repro bundle\ntitle: {title}\nwiki: {}\nlang: {lang}\nrevid: {revid}\n---- raw html below ----\n{html}\n",
+        env!("CARGO_PKG_VERSION"),
+        if wiki.is_empty() { "wikipedia" } else { wiki },
+    )
+}
+
+/// Filesystem-safe slug for `title`, used in the bundle's filename — same
+/// "keep it readable, replace anything that could confuse a shell or
+/// filesystem" posture as `bookmark_export`'s timestamped export names.
+fn report_bundle_slug(title: &str) -> String {
+    let slug: String = title
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect();
+    if slug.is_empty() {
+        "untitled".to_string()
+    } else {
+        slug
+    }
+}
+
+/// Writes `contents` to `dir/report-<slug>-<unix_time>.txt`, creating `dir`
+/// if needed. Split out from `write_report_bundle` so a test can point it at
+/// a temp directory instead of the real platform state dir — mirrors
+/// `crashguard::write_crash_report_at`'s own split, for the same reason.
+fn write_report_bundle_at(
+    dir: &std::path::Path,
+    contents: &str,
+    slug: &str,
+    unix_time: u64,
+) -> std::io::Result<std::path::PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(format!("report-{slug}-{unix_time}.txt"));
+    std::fs::write(&path, contents)?;
+    Ok(path)
+}
+
+/// Resolves the real platform state directory and writes to it. `None` on
+/// any failure (no writable directory found, or the write itself failed) —
+/// `write_report_page` already handles that case with a fallback notice.
+fn write_report_bundle(contents: &str, title: &str) -> Option<std::path::PathBuf> {
+    let dir = paths::wikitui_state_dir()?;
+    let unix_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    write_report_bundle_at(&dir, contents, &report_bundle_slug(title), unix_time).ok()
+}
+
 /// PRD FR-DL-3/FR-DL-5: after an article installs, opportunistically fetches
 /// its quality-assessment badge and checks its own outgoing links for
 /// redlinks the parse-time `class="new"` signal didn't already catch — both
@@ -3868,6 +4175,54 @@ async fn open_title(
                     tab.current_revid = outcome.revid;
                 }
                 app.open_document(document);
+                // PRD §7 "Redirect": a notice for the reader, plus
+                // remembering the alias actually requested so `:noredirect`
+                // can re-fetch it without following (`Tab::install_document`
+                // already reset this to `None` for the fresh document —
+                // this puts it back only when this particular fetch did
+                // redirect).
+                if let Some(requested) = outcome.redirected_from.clone() {
+                    app.active_tab_mut().redirected_from = Some(requested.clone());
+                    app.notice = Some(format!("Redirected from {requested}"));
+                }
+                // PRD §7 "429 / maxlag on interactive request": a cached copy
+                // stood in for a rate-limited live fetch — toast plus a
+                // bounded, non-blocking automatic retry for fresher content.
+                if let Some(retry_after) = outcome.rate_limited {
+                    app.notice = Some(format!(
+                        "Wikipedia is busy — retrying in {}s",
+                        retry_after.as_secs()
+                    ));
+                    let tab_id = app.active_tab().id;
+                    let wiki = client.wiki_scope();
+                    let search_index = app.search_index.clone();
+                    fire_foreground_retry(
+                        app,
+                        client,
+                        cache,
+                        &search_index,
+                        tab_id,
+                        wiki,
+                        lang.clone(),
+                        title.to_string(),
+                        retry_after,
+                    );
+                }
+                // PRD §7 "Bookmark/saved page whose target moved or was
+                // deleted": the live attempt confirmed the article is
+                // genuinely gone, but a bookmark for it still exists and a
+                // stale cached copy just opened above — offer it with a
+                // graceful notice rather than let it read as an ordinary,
+                // unexplained stale-cache serve.
+                if outcome.missing
+                    && app
+                        .bookmarks
+                        .is_bookmarked(&client.wiki_scope(), lang, title)
+                {
+                    app.notice = Some(format!(
+                        "\"{title}\" may have moved or been deleted — showing the last cached copy"
+                    ));
+                }
                 if let Some(cached_revid) = outcome.revalidate {
                     let tab_id = app.active_tab().id;
                     if fire_revalidation(
@@ -3896,7 +4251,36 @@ async fn open_title(
                 app.loading = false;
                 return;
             }
-            Err(e) => last_err = Some(e),
+            Err(e) => {
+                // PRD §7 "429 / maxlag on interactive request": this
+                // language's attempt was rate-limited (not just "failed") —
+                // toast plus a bounded, non-blocking automatic retry, run
+                // alongside whatever the fallback-chain loop tries next.
+                if let Some(retry_after) = e
+                    .downcast_ref::<api::RateLimited>()
+                    .map(|r| r.retry_after.unwrap_or(DEFAULT_RATE_LIMIT_RETRY))
+                {
+                    app.notice = Some(format!(
+                        "Wikipedia is busy — retrying in {}s",
+                        retry_after.as_secs()
+                    ));
+                    let tab_id = app.active_tab().id;
+                    let wiki = client.wiki_scope();
+                    let search_index = app.search_index.clone();
+                    fire_foreground_retry(
+                        app,
+                        client,
+                        cache,
+                        &search_index,
+                        tab_id,
+                        wiki,
+                        lang.clone(),
+                        title.to_string(),
+                        retry_after,
+                    );
+                }
+                last_err = Some(e);
+            }
         }
     }
     // Every language in the chain came back with nothing.
@@ -3910,6 +4294,44 @@ async fn open_title(
         // before giving up to the offline card, "bridging online + Kiwix
         // worlds" the way §3.3 describes rather than requiring the reader
         // to know in advance which of the two an article lives in.
+    } else if last_err
+        .as_ref()
+        .is_some_and(|e| e.downcast_ref::<api::ArticleMissing>().is_some())
+        && app
+            .bookmarks
+            .is_bookmarked(&client.wiki_scope(), &lang, title)
+    {
+        // PRD §7 "Bookmark/saved page whose target moved or was deleted":
+        // confirmed-missing (not just offline) *and* bookmarked — the
+        // graceful path this row asks for, rather than the generic offline
+        // card. Full title→pageid move-repair (silently re-aliasing a
+        // renamed target) is out of scope for this chunk — deletions are
+        // handled honestly here; a *moved* article still just reports
+        // missing, same as any other 404, and is a documented seam for a
+        // future pageid-tracking pass (bookmarks are stored by title today,
+        // see `bookmarks::Bookmark`).
+        match cache.peek(&client.wiki_scope(), &lang, title) {
+            Some(cached) => {
+                let document = doc::parse_article_html(title, &cached.html);
+                app.open_document(document);
+                {
+                    let tab = app.active_tab_mut();
+                    tab.page_source = PageSource::Offline {
+                        age_secs: cached.age_secs,
+                    };
+                    tab.current_revid = cached.revid;
+                }
+                app.notice = Some(format!(
+                    "\"{title}\" may have moved or been deleted — showing the last cached copy"
+                ));
+            }
+            None => {
+                app.notice = Some(format!(
+                    "\"{title}\" may have moved or been deleted, and no cached copy is available"
+                ));
+                app.show_offline_card(lang, title.to_string());
+            }
+        }
     } else {
         // §7's "Offline, uncached link": the network failed and nothing is
         // cached, in every language tried (and no ZIM archive has it
@@ -5332,6 +5754,29 @@ async fn handle_key(
                     switch_wiki(client, app, &name);
                 }
                 app.mode = Mode::Reading;
+            }
+            KeyCode::Char('?') => {
+                app.prior_mode = app.mode;
+                app.mode = Mode::Help;
+            }
+            _ => {}
+        },
+        // PRD §7 "Disambiguation page": a first-class chooser over the
+        // just-installed document's candidate list, entered automatically by
+        // `App::set_document` instead of the ordinary prose view whenever
+        // `doc::Document::is_disambiguation` is set. `j`/`k` move the
+        // selection, Enter opens the highlighted candidate (a real
+        // navigation, exactly like following any other link), Esc falls
+        // back to Reading to show the raw page — the parsed prose is
+        // already installed in the tab either way.
+        Mode::Disambig => match code {
+            KeyCode::Esc => app.mode = Mode::Reading,
+            KeyCode::Char('j') | KeyCode::Down => app.cycle_disambig(true),
+            KeyCode::Char('k') | KeyCode::Up => app.cycle_disambig(false),
+            KeyCode::Enter => {
+                if let Some(title) = app.disambig_target() {
+                    open_title(client, cache, app, &title, revalidate_tx, langlinks_tx).await;
+                }
             }
             KeyCode::Char('?') => {
                 app.prior_mode = app.mode;
@@ -8825,6 +9270,10 @@ async fn execute_command(
         Command::Xyzzy => {
             app.notice = Some(xyzzy_response(app.pro));
         }
+        // PRD §7 "Redirect".
+        Command::NoRedirect => open_noredirect(client, app).await,
+        // PRD §7 "Article HTML fails to parse".
+        Command::ReportPage => write_report_page(cache, app),
         Command::Quit => app.should_quit = true,
     }
 }
@@ -10508,6 +10957,9 @@ mod tests {
                     revid: 42,
                     resolved_title: "Enigma machine".to_string(),
                     revalidate: None,
+                    redirected_from: None,
+                    rate_limited: None,
+                    missing: false,
                 }),
             },
             &revalidate_tx,
@@ -10517,6 +10969,90 @@ mod tests {
         assert!(!tab.loading, "the background tab is no longer loading");
         assert_eq!(tab.current_revid, 42);
         assert_eq!(tab.doc.as_ref().unwrap().title, "Enigma machine");
+    }
+
+    /// PRD §7 "429 / maxlag on interactive request": a foreground retry
+    /// landing for the active tab while the offline card is still showing
+    /// (this exact tab's failed-then-retried open) must dismiss the card
+    /// back to the reading view — otherwise the stale overlay would sit on
+    /// top of content that just updated underneath it.
+    #[test]
+    fn foreground_retry_landing_on_the_offline_card_dismisses_it_to_reading() {
+        let client = test_client();
+        let (revalidate_tx, _rx) = mpsc::unbounded_channel::<RevalidationOutcome>();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        let id = app.active_tab().id;
+        app.show_offline_card("en".to_string(), "Enigma machine".to_string());
+        assert_eq!(app.mode, Mode::OfflineCard);
+
+        apply_tab_load_outcome(
+            &client,
+            &mut app,
+            TabLoadOutcome {
+                tab_id: id,
+                wiki: String::new(),
+                lang: "en".to_string(),
+                title: "Enigma machine".to_string(),
+                result: Ok(FetchOutcome {
+                    html: "<html><body><p>rotor cipher</p></body></html>".to_string(),
+                    source: PageSource::Live,
+                    revid: 42,
+                    resolved_title: "Enigma machine".to_string(),
+                    revalidate: None,
+                    redirected_from: None,
+                    rate_limited: None,
+                    missing: false,
+                }),
+            },
+            &revalidate_tx,
+        );
+
+        assert_eq!(app.mode, Mode::Reading);
+        assert_eq!(
+            app.active_tab().doc.as_ref().map(|d| d.title.as_str()),
+            Some("Enigma machine")
+        );
+    }
+
+    /// A completion for a tab that ISN'T the active one must never touch
+    /// `app.mode` at all — an offline card (or any other mode) showing for
+    /// whatever the reader is actually looking at stays exactly as it was.
+    #[test]
+    fn foreground_retry_landing_on_a_background_tab_never_touches_the_active_modal() {
+        let client = test_client();
+        let (revalidate_tx, _rx) = mpsc::unbounded_channel::<RevalidationOutcome>();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        let bg_id = app.open_background_tab("Enigma machine".to_string(), "en".to_string());
+        app.show_offline_card("en".to_string(), "Something Else".to_string());
+        assert_eq!(app.mode, Mode::OfflineCard);
+
+        apply_tab_load_outcome(
+            &client,
+            &mut app,
+            TabLoadOutcome {
+                tab_id: bg_id,
+                wiki: String::new(),
+                lang: "en".to_string(),
+                title: "Enigma machine".to_string(),
+                result: Ok(FetchOutcome {
+                    html: "<html><body><p>rotor cipher</p></body></html>".to_string(),
+                    source: PageSource::Live,
+                    revid: 42,
+                    resolved_title: "Enigma machine".to_string(),
+                    revalidate: None,
+                    redirected_from: None,
+                    rate_limited: None,
+                    missing: false,
+                }),
+            },
+            &revalidate_tx,
+        );
+
+        assert_eq!(
+            app.mode,
+            Mode::OfflineCard,
+            "a background tab's completion must never dismiss the active tab's own card"
+        );
     }
 
     #[test]
@@ -10545,6 +11081,9 @@ mod tests {
                     revid: 1,
                     resolved_title: "Enigma machine".to_string(),
                     revalidate: None,
+                    redirected_from: None,
+                    rate_limited: None,
+                    missing: false,
                 }),
             },
             &revalidate_tx,
@@ -10698,6 +11237,9 @@ mod tests {
                     revid: 1001,
                     resolved_title: "Alan Turing".to_string(),
                     revalidate: None,
+                    redirected_from: None,
+                    rate_limited: None,
+                    missing: false,
                 }),
             },
             &revalidate_tx,
@@ -11828,6 +12370,222 @@ mod tests {
             second.source
         );
         assert_eq!(second.revid, first.revid);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PRD §7 "429 / maxlag on interactive request": a stale-cache fallback
+    /// must not silently swallow *why* the live attempt failed when it was a
+    /// rate limit — `open_title` needs `rate_limited` set to show the busy
+    /// toast and schedule an automatic retry, not leave the reader on stale
+    /// content with no explanation.
+    #[tokio::test]
+    async fn fetch_page_surfaces_rate_limited_when_falling_back_to_a_stale_cache() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut discard = [0u8; 8192];
+                let _ = stream.read(&mut discard);
+                let header = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 9\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(header.as_bytes());
+            }
+        });
+        let client = WikiClient::new(format!("http://127.0.0.1:{port}")).unwrap();
+        let dir = temp_state_path("fg-ratelimit").with_extension("cachedir");
+        // `force_refetch_secs = 0`: the entry seeded below is immediately past
+        // the backstop, so `fetch_page` goes to the network anyway (rather
+        // than serving the fresh hit untouched) and hits the 429 above.
+        let cache = PageCache::at(dir.clone(), 10_000_000, 86_400, 0);
+        let index = offline_search::OfflineIndex::in_memory();
+        cache.put(
+            "",
+            "en",
+            "Stale Page",
+            "<html><head><title>Stale Page</title></head><body><p>old</p></body></html>",
+            1,
+            None,
+        );
+
+        let outcome = fetch_page(&client, &cache, &index, "", "en", "Stale Page")
+            .await
+            .unwrap();
+        assert!(matches!(outcome.source, PageSource::Offline { .. }));
+        assert_eq!(
+            outcome.rate_limited,
+            Some(Duration::from_secs(9)),
+            "the stale-cache fallback must surface the classified Retry-After"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- PRD §7 "Article HTML fails to parse": :report-page ----------------
+
+    #[test]
+    fn report_bundle_contents_includes_every_metadata_field_and_the_raw_html() {
+        let contents = report_bundle_contents("Broken Page", "wiktionary", "en", 42, "<p>raw</p>");
+        assert!(contents.contains(env!("CARGO_PKG_VERSION")));
+        assert!(contents.contains("title: Broken Page"));
+        assert!(contents.contains("wiki: wiktionary"));
+        assert!(contents.contains("lang: en"));
+        assert!(contents.contains("revid: 42"));
+        assert!(contents.contains("<p>raw</p>"));
+    }
+
+    #[test]
+    fn report_bundle_contents_names_the_default_wiki_when_the_scope_is_empty() {
+        // `wiki_scope()` is an empty string for the default Wikipedia scope
+        // (PRD FR-ML-4) — the bundle should read as "wikipedia", not a blank.
+        let contents = report_bundle_contents("Title", "", "en", 1, "<p></p>");
+        assert!(contents.contains("wiki: wikipedia"));
+    }
+
+    #[test]
+    fn report_bundle_slug_replaces_non_alphanumeric_characters() {
+        assert_eq!(
+            report_bundle_slug("Mercury (disambiguation)"),
+            "Mercury__disambiguation_"
+        );
+        assert_eq!(report_bundle_slug(""), "untitled");
+    }
+
+    #[test]
+    fn write_report_bundle_at_creates_the_directory_and_file() {
+        let dir = temp_state_path("report-page").with_extension("reportdir");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path =
+            write_report_bundle_at(&dir, "wikitui repro bundle\ntitle: T\n", "T", 1_700_000_001)
+                .expect("write must succeed against a fresh temp dir");
+        assert_eq!(path, dir.join("report-T-1700000001.txt"));
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("title: T"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `:report-page` with no article open at all is a graceful notice, never
+    /// a panic or a bundle written for nothing.
+    #[test]
+    fn write_report_page_notices_when_no_article_is_open() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        let dir = temp_state_path("report-page-empty").with_extension("cachedir");
+        let cache = PageCache::at(dir.clone(), 10_000_000, 86_400, 604_800);
+        write_report_page(&cache, &mut app);
+        assert_eq!(app.notice, Some("Open an article first".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- PRD §7 "Bookmark/saved page whose target moved or was deleted" ----
+
+    /// Serves the real core REST API's genuine-miss 404 shape exactly once
+    /// (`errorKey`, matching `parsoid_404_is_genuine_miss`), so `open_title`
+    /// sees `api::ArticleMissing`, not a generic network error.
+    fn spawn_genuine_miss_404() -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut discard = [0u8; 8192];
+                let _ = stream.read(&mut discard);
+                let body = br#"{"httpCode":404,"httpReason":"Not Found","errorKey":"rest-nonexistent-title"}"#;
+                let header = format!(
+                    "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// A bookmarked title that 404s genuinely, with nothing at all cached for
+    /// it, gets the graceful "may have moved or been deleted" notice — never
+    /// the raw `"Error: no article named ..."` string an ordinary failed
+    /// open shows.
+    #[tokio::test]
+    async fn open_title_notices_a_genuinely_missing_bookmark_with_no_cache_gracefully() {
+        let client = WikiClient::new(spawn_genuine_miss_404()).unwrap();
+        let dir = temp_state_path("bookmark-missing-no-cache").with_extension("cachedir");
+        let cache = PageCache::at(dir.clone(), 10_000_000, 86_400, 604_800);
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.bookmarks
+            .ensure_bookmarked("", "en", "Deleted Article", None);
+        let (revalidate_tx, _rrx) = mpsc::unbounded_channel::<RevalidationOutcome>();
+        let (langlinks_tx, _lltx) = mpsc::unbounded_channel::<LangLinksOutcome>();
+
+        open_title(
+            &client,
+            &cache,
+            &mut app,
+            "Deleted Article",
+            &revalidate_tx,
+            &langlinks_tx,
+        )
+        .await;
+
+        assert_eq!(
+            app.notice,
+            Some(
+                "\"Deleted Article\" may have moved or been deleted, and no cached copy is available"
+                    .to_string()
+            )
+        );
+        assert_eq!(app.mode, Mode::OfflineCard);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same genuinely-missing, bookmarked title — but this time a stale
+    /// cached copy still exists. PRD §7's "last-cached copy offered": the
+    /// article opens from that copy with a graceful notice, not the offline
+    /// card.
+    #[tokio::test]
+    async fn open_title_offers_the_cached_copy_of_a_genuinely_missing_bookmark() {
+        let client = WikiClient::new(spawn_genuine_miss_404()).unwrap();
+        let dir = temp_state_path("bookmark-missing-with-cache").with_extension("cachedir");
+        // `force_refetch_secs = 0`: the entry seeded below is immediately past
+        // the backstop, so `fetch_page` attempts the network (hitting the
+        // genuine-miss 404 above) instead of serving the fresh hit untouched.
+        let cache = PageCache::at(dir.clone(), 10_000_000, 86_400, 0);
+        cache.put(
+            "",
+            "en",
+            "Deleted Article",
+            "<html><head><title>Deleted Article</title></head><body><p>old content</p></body></html>",
+            7,
+            None,
+        );
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.bookmarks
+            .ensure_bookmarked("", "en", "Deleted Article", Some(7));
+        let (revalidate_tx, _rrx) = mpsc::unbounded_channel::<RevalidationOutcome>();
+        let (langlinks_tx, _lltx) = mpsc::unbounded_channel::<LangLinksOutcome>();
+
+        open_title(
+            &client,
+            &cache,
+            &mut app,
+            "Deleted Article",
+            &revalidate_tx,
+            &langlinks_tx,
+        )
+        .await;
+
+        assert_eq!(
+            app.notice,
+            Some(
+                "\"Deleted Article\" may have moved or been deleted — showing the last cached copy"
+                    .to_string()
+            )
+        );
+        assert_eq!(app.mode, Mode::Reading);
+        assert_eq!(
+            app.active_tab().doc.as_ref().map(|d| d.title.as_str()),
+            Some("Deleted Article")
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

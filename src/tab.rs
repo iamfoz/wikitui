@@ -175,6 +175,15 @@ pub struct Tab {
     /// for the currently-installed document (it fires once when the reader
     /// first passes 70% of the article). Reset on each document install.
     pub interest_scroll_signaled: bool,
+    /// PRD §7 "Redirect": `Some(requested_title)` when the currently
+    /// installed document was reached by following a redirect — the alias
+    /// the reader actually asked for (`"UK"`), not the resolved canonical
+    /// title already sitting in `doc.title` (`"United Kingdom"`). `:noredirect`
+    /// reads this to know what to re-fetch without following. Reset to `None`
+    /// by `install_document` on every fresh document; `main::open_title` sets
+    /// it back to `Some` right after, when that particular fetch did redirect
+    /// — the one caller with the fetch-level knowledge this field needs.
+    pub redirected_from: Option<String>,
 }
 
 impl Tab {
@@ -212,6 +221,7 @@ impl Tab {
             visit_started_at: None,
             interest_dwell_signaled: false,
             interest_scroll_signaled: false,
+            redirected_from: None,
         }
     }
 
@@ -261,6 +271,10 @@ impl Tab {
         self.visit_started_at = None;
         self.interest_dwell_signaled = false;
         self.interest_scroll_signaled = false;
+        // PRD §7 "Redirect": a fresh document is, by definition, not (yet)
+        // known to have arrived via a redirect — `main::open_title` sets
+        // this back to `Some` right after, when this particular fetch did.
+        self.redirected_from = None;
         self.clear_find();
     }
 
@@ -291,6 +305,7 @@ impl Tab {
         self.visit_started_at = None;
         self.interest_dwell_signaled = false;
         self.interest_scroll_signaled = false;
+        self.redirected_from = None;
         self.clear_find();
     }
 
@@ -326,6 +341,8 @@ mod tests {
             blocks: Vec::new(),
             citations: Vec::new(),
             truncated: false,
+            degraded_parse: false,
+            is_disambiguation: false,
         }
     }
 

@@ -211,6 +211,16 @@ pub enum Mode {
     /// picker key, and always exports the session scope regardless of what
     /// wider scope this view happens to be showing (see `App::export_trail`).
     Trail,
+    /// PRD §7 "Disambiguation page": entered automatically (`App::
+    /// set_document`) instead of [`Mode::Reading`] whenever the just-installed
+    /// document's `doc::Document::is_disambiguation` is set — a first-class
+    /// chooser over `doc::disambiguation_candidates`, never plain prose.
+    /// `j`/`k` move the selection, Enter opens the highlighted candidate
+    /// (a real navigation, same as any other picker), Esc falls back to
+    /// [`Mode::Reading`] to show the raw page — the parsed prose is already
+    /// installed in the tab either way, so "cancel" and "show the raw page"
+    /// are the same transition.
+    Disambig,
 }
 
 /// The content of the `K` peek popup (PRD FR-NV-4/FR-NV-5). Two visually
@@ -555,6 +565,31 @@ pub struct App {
     /// whenever nothing is in flight. A counter rather than a bool because
     /// rapid navigation can overlap two revalidations (one per article).
     pub pending_revalidations: u32,
+    /// PRD §7 "429 / maxlag on interactive request": how many foreground
+    /// article-open retries (`main::fire_foreground_retry`) are currently
+    /// in flight, mirroring `pending_revalidations`'s "scope the poll
+    /// timeout to this being nonzero" role — the retry itself runs on a
+    /// detached task honoring `Retry-After`, so this only needs to keep the
+    /// main loop waking on a timer instead of blocking on keyboard input
+    /// while the countdown runs.
+    pub pending_foreground_retries: u32,
+    /// PRD §7 "429 / maxlag on interactive request": delivers a foreground
+    /// retry's eventual outcome back into the main loop non-blockingly,
+    /// applied exactly like a background-tab fetch
+    /// (`main::apply_tab_load_outcome`) — the retry never touches this
+    /// `App` directly, only this channel, so it can run fully detached from
+    /// the render loop. Kept on `App` (rather than threaded as a parameter
+    /// through every one of `open_title`'s dozen-plus call chains) since the
+    /// one caller that needs it, `main::open_title`, already has `&mut App`
+    /// in hand.
+    pub foreground_retry_tx: tokio::sync::mpsc::UnboundedSender<crate::TabLoadOutcome>,
+    pub foreground_retry_rx: tokio::sync::mpsc::UnboundedReceiver<crate::TabLoadOutcome>,
+    /// PRD §7 "Disambiguation page": the highlighted row in the chooser
+    /// (`Mode::Disambig`) over `doc::disambiguation_candidates`. Reset to `0`
+    /// whenever `set_document` installs a disambiguation page; not persisted
+    /// (a fresh chooser always starts at the top, same as every other picker
+    /// entered by a document install rather than an explicit open call).
+    pub disambig_selected: usize,
     /// The terminal width the reading view last drew at; layout is built for
     /// this width. Defaults to a sane 80 so line mappings resolve even before
     /// the first draw (e.g. in tests).
@@ -1400,6 +1435,13 @@ impl App {
         // Every session starts with exactly one (empty) tab; the invariant
         // "`tabs` is never empty while running" holds from here.
         let first_tab = Tab::new(0, lang.clone());
+        // PRD §7 "429 / maxlag on interactive request": created here (not in
+        // `main::run`) so the one caller that needs it, `main::open_title`,
+        // can reach it through the `&mut App` it already has — see the
+        // field's own doc comment for why this channel lives on `App`
+        // rather than being threaded as a parameter like every other
+        // background-result channel.
+        let (foreground_retry_tx, foreground_retry_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             mode: Mode::Reading,
             prior_mode: Mode::Reading,
@@ -1468,6 +1510,10 @@ impl App {
             layout_cache: LayoutCache::new(layout::DEFAULT_L1_CAPACITY),
             layout_computations: 0,
             pending_revalidations: 0,
+            pending_foreground_retries: 0,
+            foreground_retry_tx,
+            foreground_retry_rx,
+            disambig_selected: 0,
             layout_width: 80,
             viewport_height: 0,
             measure: 88,
@@ -2830,6 +2876,47 @@ impl App {
             .map(|p| p.name.to_string())
     }
 
+    // -- Disambiguation chooser (PRD §7) -------------------------------------
+
+    /// The active tab's disambiguation candidates, recomputed from its
+    /// document on every call (like `wiki_picker_target`'s static list)
+    /// rather than cached on `App` — the list is only ever read while
+    /// `Mode::Disambig` is showing, and it's cheap to re-derive from
+    /// `doc::disambiguation_candidates` for the short lists a real
+    /// disambiguation page has. Empty for a tab with no document, or one
+    /// whose document isn't a disambiguation page at all.
+    pub fn disambig_candidates(&self) -> Vec<crate::doc::DisambigCandidate> {
+        self.active_tab()
+            .doc
+            .as_ref()
+            .map(crate::doc::disambiguation_candidates)
+            .unwrap_or_default()
+    }
+
+    /// Moves the chooser's selection, wrapping over however many candidates
+    /// this disambiguation page has. A no-op (rather than a panic on a `% 0`)
+    /// when there are none — shouldn't happen for a genuine disambiguation
+    /// page, but a malformed one (no followable links in any list item)
+    /// must still be navigable, not a crash.
+    pub fn cycle_disambig(&mut self, forward: bool) {
+        let len = self.disambig_candidates().len();
+        if len == 0 {
+            return;
+        }
+        self.disambig_selected = if forward {
+            (self.disambig_selected + 1) % len
+        } else {
+            (self.disambig_selected + len - 1) % len
+        };
+    }
+
+    /// Enter's target: the highlighted candidate's resolved internal title.
+    pub fn disambig_target(&self) -> Option<String> {
+        self.disambig_candidates()
+            .get(self.disambig_selected)
+            .map(|c| c.title.clone())
+    }
+
     // -- Splits & bilingual view (PRD FR-TB-4, FR-ML-3) ---------------------
 
     /// PRD FR-TB-4 `:vsplit` / `Ctrl-w v`: split the content area into two
@@ -3644,6 +3731,14 @@ impl App {
         self.citations = citations;
         self.selected_citation = 0;
 
+        // PRD §7 "Disambiguation page": captured before `install_document`
+        // (below) moves `doc` in — this decides the mode switch a few lines
+        // down, the one place every document-install path (fresh
+        // navigation, back/forward, bookmark/read-later/history reopen, the
+        // SWR "r to reload") funnels through, so the chooser shows up no
+        // matter how the disambiguation page was reached.
+        let is_disambiguation = doc.is_disambiguation;
+
         let wiki = self.active_wiki_scope().to_string();
         {
             let tab = self.active_tab_mut();
@@ -3661,7 +3756,12 @@ impl App {
         // raised after the visit is recorded and before the status refresh
         // below, so its toast (a `notice`) is the last word for this open.
         self.check_resume_position(index);
-        self.mode = Mode::Reading;
+        if is_disambiguation {
+            self.disambig_selected = 0;
+            self.mode = Mode::Disambig;
+        } else {
+            self.mode = Mode::Reading;
+        }
         // A new document invalidates the cached layout; it is rebuilt lazily
         // (from L1 if available, else a fresh layout pass) on the next draw
         // or mapping lookup at the current width — see `ensure_layout`.
@@ -6323,6 +6423,8 @@ mod tests {
             blocks: Vec::new(),
             citations: Vec::new(),
             truncated: false,
+            degraded_parse: false,
+            is_disambiguation: false,
         }
     }
 
@@ -10494,6 +10596,8 @@ mod tests {
             blocks: Vec::new(),
             citations: Vec::new(),
             truncated: false,
+            degraded_parse: false,
+            is_disambiguation: false,
         });
         assert_eq!(
             app.current_quality_badge(),

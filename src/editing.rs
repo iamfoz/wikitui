@@ -717,6 +717,8 @@ mod tests {
             ],
             citations: vec![],
             truncated: false,
+            degraded_parse: false,
+            is_disambiguation: false,
         };
         // Link index 0 → first paragraph; index 1 → second paragraph.
         assert_eq!(

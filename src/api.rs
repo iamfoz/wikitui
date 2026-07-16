@@ -269,6 +269,14 @@ struct ActiveWiki {
 #[derive(Clone)]
 pub struct WikiClient {
     http: reqwest::Client,
+    /// PRD §7 "Redirect" row's `:noredirect`: identical to `http` in every
+    /// other respect (same User-Agent, gzip, timeout) except its redirect
+    /// policy is `Policy::none()` — reqwest fixes a client's redirect
+    /// behavior at build time, not per-request, so the one call site that
+    /// needs the raw pre-redirect response (the redirect notice page
+    /// itself) needs its own client rather than an option on `http`'s own
+    /// requests.
+    http_noredirect: reqwest::Client,
     active: std::sync::Arc<std::sync::RwLock<ActiveWiki>>,
 }
 
@@ -699,7 +707,60 @@ pub struct FetchedArticle {
     pub html: String,
     pub revid: u64,
     pub etag: Option<String>,
+    /// PRD §7 "Redirect": `true` when this fetch's final response URL
+    /// differed from the one requested — i.e. the server (or, for Parsoid
+    /// REST, the HTTP client's own default redirect-following) resolved a
+    /// redirect page to its target rather than serving the redirect notice
+    /// itself. `false` for [`WikiClient::fetch_article_html_noredirect`] by
+    /// construction (it never follows one to begin with) and for the legacy
+    /// `action=parse` fallback (documented scope limit: real deployments do
+    /// report a `redirects` array there too, but this module doesn't parse
+    /// it — `fetch_article_html_noredirect` is Parsoid-only, so the legacy
+    /// path never needs to answer "did I redirect?").
+    pub redirected: bool,
 }
+
+/// PRD §7 "429 / maxlag on interactive request": a foreground fetch hit a
+/// rate limit or lag signal. Unlike every other foreground failure (which
+/// stays a plain `anyhow::Error`), this one is a distinct type so callers —
+/// `main::fetch_page`/`open_title` — can `downcast_ref` to tell "Wikipedia
+/// is busy, worth an automatic retry" apart from "this article genuinely
+/// doesn't exist" or "the network is down" without parsing error strings.
+#[derive(Debug)]
+pub struct RateLimited {
+    pub retry_after: Option<Duration>,
+}
+
+impl std::fmt::Display for RateLimited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.retry_after {
+            Some(d) => write!(f, "rate-limited by the wiki; retry after {}s", d.as_secs()),
+            None => write!(f, "rate-limited by the wiki"),
+        }
+    }
+}
+
+impl std::error::Error for RateLimited {}
+
+/// PRD §7 "Bookmark/saved page whose target moved or was deleted": a
+/// foreground fetch confirmed the article genuinely doesn't exist upstream
+/// (Parsoid's own "nonexistent title" 404 shape, not a network failure or an
+/// unsupported-wiki 404) — a distinct type, same reasoning as
+/// [`RateLimited`], so `main::open_title` can tell "this bookmark's target
+/// is gone" apart from "the network is down right now" without string-
+/// matching the error text.
+#[derive(Debug)]
+pub struct ArticleMissing {
+    pub title: String,
+}
+
+impl std::fmt::Display for ArticleMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no article named {:?} on this wiki", self.title)
+    }
+}
+
+impl std::error::Error for ArticleMissing {}
 
 /// Extracts the leading numeric revid from a Parsoid-shaped `ETag`
 /// (`W/"1234567/uuid"`: weak-validator prefix and uuid suffix both
@@ -850,8 +911,16 @@ impl WikiClient {
             .timeout(Duration::from_secs(5))
             .build()
             .context("building HTTP client")?;
+        let http_noredirect = reqwest::Client::builder()
+            .user_agent(build_user_agent(contact))
+            .gzip(true)
+            .timeout(Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .context("building no-redirect HTTP client")?;
         Ok(Self {
             http,
+            http_noredirect,
             active: std::sync::Arc::new(std::sync::RwLock::new(ActiveWiki {
                 name,
                 base_url_template,
@@ -952,7 +1021,10 @@ impl WikiClient {
             match self.fetch_article_html_parsoid(lang, title).await? {
                 ParsoidOutcome::Found(article) => return Ok(article),
                 ParsoidOutcome::Missing => {
-                    bail!("no article named {title:?} on {lang}.wikipedia.org")
+                    return Err(ArticleMissing {
+                        title: title.to_string(),
+                    }
+                    .into());
                 }
                 ParsoidOutcome::Unsupported => {
                     if caps.parser == ParserMode::Parsoid {
@@ -991,6 +1063,21 @@ impl WikiClient {
             .await
             .with_context(|| format!("requesting article HTML for {title:?}"))?;
 
+        // PRD §7 "429 / maxlag on interactive request": checked before the
+        // 404 branch below (429/503 are never MediaWiki's "missing title"
+        // shape) so a foreground caller can distinguish "busy, worth an
+        // automatic retry" from every other outcome via `downcast_ref`,
+        // exactly like the background substrate's `bg_status_failure`
+        // already does for its own callers.
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE
+        {
+            return Err(RateLimited {
+                retry_after: parse_retry_after(resp.headers()),
+            }
+            .into());
+        }
+
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             let body = read_capped(resp, MAX_SEARCH_RESPONSE_BYTES)
                 .await
@@ -1002,6 +1089,14 @@ impl WikiClient {
             });
         }
         let resp = resp.error_for_status().context("fetching article HTML")?;
+        // PRD §7 "Redirect": the real core REST API answers a redirect
+        // source title with a 3xx to its target's own REST URL, which this
+        // client's default redirect policy follows transparently — so by
+        // the time `resp` reaches here, its own `url()` already differs from
+        // what was requested exactly when a redirect was followed. Captured
+        // before the body read below (which doesn't change `resp.url()` but
+        // does consume `resp` itself).
+        let redirected = resp.url().as_str() != url;
         // Captured before the body read below consumes `resp` — PRD
         // FR-OFF-1/Appendix A's revid identity rides the ETag on this same
         // response, so there is no second round trip for it.
@@ -1020,7 +1115,65 @@ impl WikiClient {
             .await
             .context("reading article HTML body")?;
         let html = decode_lossy_utf8(bytes);
-        Ok(ParsoidOutcome::Found(FetchedArticle { html, revid, etag }))
+        Ok(ParsoidOutcome::Found(FetchedArticle {
+            html,
+            revid,
+            etag,
+            redirected,
+        }))
+    }
+
+    /// PRD §7 "Redirect" row's `:noredirect`: fetches `title`'s own Parsoid
+    /// HTML *without* following a redirect it might be — the raw "Redirect
+    /// to: X" notice page, the exact content [`Self::fetch_article_html`]
+    /// transparently hops past via `http_noredirect`'s build-time redirect
+    /// policy (`Policy::none()`). A literal 3xx response therefore reaches
+    /// here directly rather than being auto-followed; reqwest's
+    /// `error_for_status` only ever flags 4xx/5xx, so it's read exactly like
+    /// an ordinary 200 — the redirect notice page's body rides the 3xx
+    /// response the same way a real deployment's redirect page does.
+    /// Parsoid-only (no legacy `action=parse` fallback): `:noredirect` is a
+    /// deliberately rare diagnostic command, not a first-class reading path,
+    /// so FR-ML-5's third-party-wiki degradation isn't worth duplicating
+    /// here.
+    pub async fn fetch_article_html_noredirect(
+        &self,
+        lang: &str,
+        title: &str,
+    ) -> Result<FetchedArticle> {
+        let url = format!(
+            "{}/w/rest.php/v1/page/{}/html",
+            self.host(lang),
+            Self::title_path(title)
+        );
+        let resp = self
+            .http_noredirect
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("requesting non-redirected article HTML for {title:?}"))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            bail!("no article named {title:?} on {lang} wiki");
+        }
+        let resp = resp
+            .error_for_status()
+            .context("fetching non-redirected article HTML")?;
+        let etag = resp
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let revid = etag.as_deref().and_then(parse_revid_from_etag).unwrap_or(0);
+        let bytes = read_capped(resp, crate::doc::MAX_ARTICLE_HTML_BYTES)
+            .await
+            .context("reading non-redirected article HTML body")?;
+        let html = decode_lossy_utf8(bytes);
+        Ok(FetchedArticle {
+            html,
+            revid,
+            etag,
+            redirected: false,
+        })
     }
 
     /// PRD §6.2 rule 3's fallback: legacy `action=parse&prop=text`, the same
@@ -1064,6 +1217,15 @@ impl WikiClient {
             // to title-keyed, always-revalidated storage for this wiki
             // (`FetchedArticle`'s own doc comment covers this fallback).
             etag: None,
+            // PRD §7 "Redirect": `redirects=1` on this request (see
+            // `legacy_parse_url`'s own doc comment) does resolve a redirect
+            // server-side, same as Parsoid's 3xx-follow — but this module
+            // doesn't parse the response's `redirects` array back out, a
+            // documented scope limit (`FetchedArticle::redirected`'s doc
+            // comment): the legacy fallback path is Wikipedia-secondary
+            // (FR-ML-5 third-party wikis), so its own redirect notice never
+            // reaches `main::open_title`'s "Redirected from X" banner today.
+            redirected: false,
         })
     }
 

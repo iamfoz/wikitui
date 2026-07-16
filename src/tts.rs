@@ -237,6 +237,8 @@ mod tests {
             blocks,
             citations: Vec::new(),
             truncated: false,
+            degraded_parse: false,
+            is_disambiguation: false,
         }
     }
 

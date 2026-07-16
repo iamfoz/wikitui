@@ -407,6 +407,42 @@ active_wiki = "legacywiki"
 base_url = "http://127.0.0.1:8943/legacywiki"
 ```
 
+§7 error/empty-state fixtures (the catalog in PRD §7 — disambiguation,
+redirect, rate-limiting, and parse-failure rows):
+
+- `Mercury_(disambiguation)` — carries the real Parsoid page-property
+  marker (`<link rel="mw:PageProp/disambiguation"/>` in `<head>`), the
+  exact signal `doc::detect_disambiguation` checks for straight off the
+  article HTML this client already fetches (no separate pageprops/summary
+  round trip). Its candidate list — `Mercury_(planet)`/`Mercury_(element)` —
+  are both real `PAGES` keys, so the chooser's Enter always resolves.
+- `REDIRECTS` (`"UK" -> "United_Kingdom"`) — `_serve_article` answers a
+  redirect source title with a genuine HTTP 302 whose `Location` points at
+  the target's own REST URL (the real core REST API's documented redirect-
+  following behavior), so `WikiClient::fetch_article_html`'s default client
+  (which never sets a custom redirect policy) transparently lands on the
+  target. The 302's own body is `UK`'s "Redirect to: United Kingdom" notice
+  page (matching `corpus_tests::fixtures::REDIRECT_HTML`'s shape) — a
+  client built with `Policy::none()` (`fetch_article_html_noredirect`,
+  `:noredirect`) never follows the 3xx and reads that body directly instead.
+- `GET /debug/rate-limit?title=&count=&retry_after=` — arms a countdown of
+  429 responses (each carrying `Retry-After: <retry_after>`) for the next
+  `count` requests to `title`'s article HTML, so a pty test can drive the
+  foreground busy-toast + automatic-retry path (PRD §7 "429 / maxlag on
+  interactive request") deterministically instead of needing a real rate
+  limit to fire. `/debug/reset` disarms every title.
+- `Malformed_Showcase` — bare text directly under `<body>` with no
+  wrapping tag at all, so `doc::walk_blocks` (which only ever reads
+  `Node::Element` children) finds zero structured blocks — the "parse
+  failed" signal `doc::parse_article_html` degrades on, falling back to a
+  plaintext extract with its own banner distinct from SEC-3's truncation
+  banner.
+- `GET /debug/delete-page?title=` — removes `title` from `PAGES` outright,
+  so its next fetch is a genuine 404 (the same `errorKey` envelope
+  `_serve_genuine_miss_404` always sends) without touching anything this
+  session already cached or bookmarked for it — the "bookmark target
+  deleted upstream" row's fixture.
+
 ## Extending it
 
 Add new titles to the `PAGES` dict (and, for search coverage, matching

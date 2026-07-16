@@ -23,6 +23,13 @@ REVIDS = {
     # PRD FR-DL-4 pty-verification fixture: two `{{citation needed}}`-family
     # markers.
     "Citation_Needed_Showcase": 1013,
+    # PRD §7 fixtures: disambiguation, redirect, and parse-failure rows.
+    "Mercury_(disambiguation)": 1014,
+    "Mercury_(planet)": 1015,
+    "Mercury_(element)": 1016,
+    "UK": 1017,
+    "United_Kingdom": 1018,
+    "Malformed_Showcase": 1019,
 }
 
 # PRD FR-RD-8 media fixture: build a real, tiny PNG at import time (stdlib
@@ -64,6 +71,15 @@ MEDIA_HITS = 0
 # plain global list is race-free. Exposed at /debug/requests; /debug/reset
 # clears it between phases.
 REQUEST_LOG = []
+
+# PRD §7 "429 / maxlag on interactive request": armed by `/debug/rate-limit
+# ?title=X&count=N&retry_after=S` — the next `N` requests for `X`'s article
+# HTML get a 429 with `Retry-After: S` before falling through to the real
+# response, so a pty test can drive the foreground busy-toast + automatic-
+# retry path deterministically (rather than needing a real, unreliable rate
+# limit to fire). Keyed by title, one countdown at a time per title;
+# `/debug/reset` clears every armed title between phases.
+RATE_LIMIT_ARMED = {}
 
 # Simulates a wiki edit for exactly one fixture, for stale-while-revalidate
 # pty verification: when set to a PAGES key, that title's revid is reported
@@ -461,6 +477,67 @@ PAGES["computer_(word)"] = """<html><head><title>computer (word)</title></head><
     <li><a href="./computing">computing</a></li>
   </ul>
 </body></html>"""
+
+# PRD §7 "Disambiguation page" fixture: the `<link rel="mw:PageProp/
+# disambiguation"/>` head marker is the real Parsoid page-property
+# convention (the same `mw:PageProp/*` family real Parsoid output uses for
+# other page-level flags) — `doc::detect_disambiguation` checks for exactly
+# this, straight off the article HTML already fetched, no extra pageprops/
+# summary round trip. Every candidate link is a real PAGES key below so a
+# pty test's Enter on any chooser row actually resolves.
+PAGES["Mercury_(disambiguation)"] = """<html><head><title>Mercury (disambiguation)</title>
+<link rel="mw:PageProp/disambiguation"/></head><body>
+<p><b>Mercury</b> may refer to:</p>
+<ul>
+<li><a href="./Mercury_(planet)">Mercury</a>, the smallest planet in the Solar System</li>
+<li><a href="./Mercury_(element)">Mercury</a>, a chemical element</li>
+</ul>
+</body></html>"""
+PAGES["Mercury_(planet)"] = """<html><head><title>Mercury (planet)</title></head><body>
+<p>Mercury is the smallest planet in the Solar System and the closest to the Sun.</p>
+</body></html>"""
+PAGES["Mercury_(element)"] = """<html><head><title>Mercury (element)</title></head><body>
+<p>Mercury is a chemical element with symbol Hg, a heavy silvery-white liquid metal.</p>
+</body></html>"""
+
+# PRD §7 "Redirect" fixture. `REDIRECTS` (read by `_serve_article` below)
+# maps a redirect source title to its target: the source's own `PAGES` entry
+# is the real MediaWiki "Redirect to: <target>" notice page's shape (matching
+# `corpus_tests::fixtures::REDIRECT_HTML`) — served with a genuine HTTP 302
+# whose `Location` points at the target's own REST URL (the real core REST
+# API's documented redirect-following behavior) so the default client
+# (`WikiClient::fetch_article_html`, which never sets a custom redirect
+# policy) transparently lands on the target, while a client built with
+# `Policy::none()` (`fetch_article_html_noredirect`, `:noredirect`) instead
+# reads this 302 response directly — its body is the notice page above, so
+# that path still gets meaningful content instead of an empty redirect hop.
+REDIRECTS = {
+    "UK": "United_Kingdom",
+}
+PAGES["UK"] = """<html><head><title>UK</title></head><body>
+<div class="redirectMsg"><p>Redirect to:</p><ul class="redirectText">
+<li><a href="./United_Kingdom">United Kingdom</a></li></ul></div>
+</body></html>"""
+PAGES["United_Kingdom"] = """<html><head><title>United Kingdom</title></head><body>
+<p>The United Kingdom is a country in north-western Europe, off the coast of
+the continental mainland.</p>
+</body></html>"""
+
+# PRD §7 "Article HTML fails to parse" fixture: bare text directly under
+# `<body>` with no wrapping tag at all. `doc::walk_blocks` only ever reads
+# `Node::Element` children, so this yields zero structured blocks — the
+# "parse failed" signal `doc::parse_article_html` degrades on, falling back
+# to a plaintext extract with its own banner (distinct from SEC-3's
+# truncation banner). A genuine Parsoid response is never shaped this way;
+# this stands in for "a response that isn't the expected Parsoid shape at
+# all" (a misconfigured proxy, a captive portal, …).
+PAGES["Malformed_Showcase"] = (
+    "<html><head><title>Malformed Showcase</title></head><body>"
+    "This article's markup is degenerate on purpose: plain text with no "
+    "wrapping paragraph, heading, or list tag at all, so the structured "
+    "block walker recognizes nothing here."
+    "</body></html>"
+)
 
 # PRD FR-ML-1/2 (Appendix A "Langlinks") fixture: `action=query&
 # prop=langlinks&llprop=autonym|langname|url`, keyed by the display title
@@ -1093,7 +1170,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
             for k, v in WIKITEXT_SEED.items():
                 WIKITEXT[k] = v
                 WIKITEXT_REVID[k] = REVIDS.get(k, WIKITEXT_REVID[k])
+            # PRD §7 "429 / maxlag": disarm every rate-limit countdown, same
+            # phase-isolation reasoning as the fixtures just above.
+            RATE_LIMIT_ARMED.clear()
             self._send_json({"ok": True})
+        elif parsed.path == '/debug/rate-limit':
+            # PRD §7 "429 / maxlag on interactive request": arms `count` 429
+            # responses (each carrying `Retry-After: retry_after`) for the
+            # next `count` requests to `title`'s article HTML — see
+            # RATE_LIMIT_ARMED's own comment.
+            title = urllib.parse.unquote(params.get('title', [''])[0]).replace(' ', '_')
+            count = int(params.get('count', ['1'])[0])
+            retry_after = int(params.get('retry_after', ['1'])[0])
+            RATE_LIMIT_ARMED[title] = {"remaining": count, "retry_after": retry_after}
+            self._send_json({"title": title, "count": count, "retry_after": retry_after})
+        elif parsed.path == '/debug/delete-page':
+            # PRD §7 "Bookmark/saved page whose target moved or was
+            # deleted": simulates an upstream deletion — the title is
+            # removed from PAGES (so its next fetch is a genuine 404, the
+            # same `errorKey` shape `_serve_genuine_miss_404` always sends,
+            # never a bare/ambiguous one) without touching whatever this
+            # session already cached or bookmarked for it client-side.
+            title = urllib.parse.unquote(params.get('title', [''])[0]).replace(' ', '_')
+            PAGES.pop(title, None)
+            self._send_json({"deleted": title})
         elif parsed.path == '/debug/edits':
             # PRD FR-ACC-8: every recorded typo-fix edit, so a pty test can
             # confirm the save request shape (summary/minor/baserevid/token)
@@ -1796,6 +1896,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # title, even though the flat PAGES dict does — see LANG_MISSING.
         if lang and title in LANG_MISSING.get(lang, ()):
             self._serve_genuine_miss_404(title)
+            return
+        # PRD §7 "Redirect": a genuine HTTP 302 to the target's own REST URL
+        # (see REDIRECTS's own comment for why the body still carries the
+        # redirect-notice page too, for the `Policy::none()` `:noredirect`
+        # client that never follows it).
+        target = REDIRECTS.get(title)
+        if target is not None:
+            new_parts = list(parts)
+            new_parts[-2] = urllib.parse.quote(target, safe='')
+            location = '/'.join(new_parts)
+            body = current_html(title, PAGES[title]).encode()
+            self.send_response(302)
+            self.send_header('Location', location)
+            self.send_header('Content-Type', 'text/html')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        # PRD §7 "429 / maxlag on interactive request": `/debug/rate-limit`
+        # arms a countdown of 429 responses (with `Retry-After`) for exactly
+        # one title, decremented here on every matching request, so a pty
+        # test can watch the toast fire and then the automatic retry land
+        # once the countdown reaches zero — see RATE_LIMIT_ARMED's own
+        # comment.
+        armed = RATE_LIMIT_ARMED.get(title)
+        if armed is not None and armed["remaining"] > 0:
+            armed["remaining"] -= 1
+            body = b""
+            self.send_response(429)
+            self.send_header('Retry-After', str(armed["retry_after"]))
+            self.send_header('Content-Length', "0")
+            self.end_headers()
             return
         html = PAGES.get(title)
         if html is None:

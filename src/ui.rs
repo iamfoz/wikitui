@@ -578,6 +578,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Mode::WikiPicker => draw_wiki_picker(frame, app, content_area),
         // PRD FR-HS-3's `:trail` wander-graph view.
         Mode::Trail => draw_trail(frame, app, content_area),
+        // PRD §7 "Disambiguation page": a first-class chooser, same
+        // title+description-per-row idiom as `Mode::Related` above.
+        Mode::Disambig => draw_disambig_chooser(frame, app, content_area),
     }
 
     draw_status_bar(frame, app, status_area);
@@ -2906,6 +2909,60 @@ fn draw_related(frame: &mut Frame, app: &App, area: Rect) {
     render_selectable_list(frame, list, area, app.selected_related);
 }
 
+/// PRD §7 "Disambiguation page": a first-class chooser listing the page's
+/// candidate targets with their descriptions — never the ordinary prose
+/// view. Same "bold title line, dim description line" row shape as
+/// `draw_related`, since both are "a link plus a one-line description"
+/// lists; unlike `draw_related` there is no async loading state to show —
+/// the candidates come from the document already installed in the tab, no
+/// network call of their own.
+fn draw_disambig_chooser(frame: &mut Frame, app: &App, area: Rect) {
+    let heading = match &app.active_tab().doc {
+        Some(doc) => format!("Disambiguation: \"{}\"", doc.title),
+        None => "Disambiguation".to_string(),
+    };
+    let candidates = app.disambig_candidates();
+    if candidates.is_empty() {
+        let text = Text::from(vec![
+            Line::from(""),
+            Line::from("No followable candidates on this page — Esc to view it as text."),
+        ]);
+        frame.render_widget(
+            Paragraph::new(text)
+                .style(base_style(&app.theme, app.no_color))
+                .block(UiBlock::default().borders(Borders::ALL).title(heading)),
+            area,
+        );
+        return;
+    }
+    let items: Vec<ListItem> = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let mut lines = vec![Line::from(RSpan::styled(
+                c.link_text.clone(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ))];
+            if !c.description.is_empty() {
+                lines.push(Line::from(RSpan::styled(
+                    c.description.clone(),
+                    colored(app.no_color, app.theme.dim),
+                )));
+            }
+            let style = if i == app.disambig_selected {
+                colored_bg(app.no_color, app.theme.selected_fg, app.theme.selected_bg)
+            } else {
+                Style::default()
+            };
+            ListItem::new(lines).style(style)
+        })
+        .collect();
+    let list = List::new(items)
+        .style(base_style(&app.theme, app.no_color))
+        .block(UiBlock::default().borders(Borders::ALL).title(heading));
+    render_selectable_list(frame, list, area, app.disambig_selected);
+}
+
 /// PRD FR-ACC-2's watchlist pane: two tabs, same layout as `draw_on_this_day`
 /// (a one-row tab strip over a selectable list) — "Watched pages" (the raw
 /// list) and "Recent changes" (the since-last-seen activity feed).
@@ -3652,6 +3709,9 @@ fn status_bar_text(app: &App, width: u16) -> String {
         // `open_trail`/`close_trail` set their own status text (mirrors
         // `Mode::ReadingHistory`/`Mode::SavedPicker` just below).
         Mode::Trail => app.status.clone(),
+        // PRD §7 "Disambiguation page": a static hint, same idiom as
+        // `Mode::WikiPicker` just above — no async state to report.
+        Mode::Disambig => "j/k: move   Enter: open   Esc: view as text".to_string(),
         Mode::ReadingHistory => app.status.clone(),
         Mode::ReadingHistoryFilter => {
             format!("filter: {}   Esc: apply", app.history_pick_filter)
