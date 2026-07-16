@@ -118,6 +118,43 @@ pub enum Action {
     /// PRD FR-ACC-7: open the read-only preferences card.
     PrefsOpen,
     Quit,
+    // -- UX-6 additions: these five already worked as keypresses but had no
+    // registry row, so the palette and the generated `?` cheatsheet — both
+    // built from `COMMANDS`/`READING_HELP_ORDER` — never mentioned them at
+    // all. Registering them doesn't change their existing keybinding (each
+    // one's `main::handle_key` arm is untouched); it only makes them
+    // discoverable the same way every other action already is.
+    /// PRD FR-NV-4/5: `K` peeks the focused link (footnote peek or link
+    /// preview).
+    Peek,
+    /// PRD FR-PR-3: `zz` toggles incognito.
+    IncognitoToggle,
+    /// PRD FR-NV-3: `za` folds/unfolds the section under the cursor.
+    FoldToggle,
+    /// PRD FR-NV-3: `zM` folds every section.
+    FoldAll,
+    /// PRD FR-NV-3: `zR` unfolds every section.
+    UnfoldAll,
+    /// PRD FR-NV-4: `gK` jumps to the References/Notes section.
+    JumpReferences,
+    /// PRD FR-TB-4: `Ctrl-w v` splits the view. Unlike every other action
+    /// here, its binding is a Control-chord *prefix* (`Ctrl-w` arms a latch,
+    /// then `v` resolves it — see `App::pending_ctrl_w`), which the
+    /// single-key/`prefix`-char `Chord` model this registry uses can't name
+    /// directly (`Chord::prefix` is a plain char, never itself a
+    /// Control-chord). So this action is deliberately left keyless in the
+    /// vim table (`label_for` renders "—"), same as any other unbound
+    /// action — its help string spells out the real chord instead.
+    Split,
+    /// PRD FR-PF-4: `:prefetch-log` — no default key, `:`-only until now.
+    PrefetchLogOpen,
+    /// PRD FR-PF-3: `:interests` — no default key, `:`-only until now.
+    InterestsOpen,
+    /// PRD FR-PC-3: `:stats` — no default key, `:`-only until now.
+    StatsOpen,
+    /// PRD FR-TB-5: `:sessions` — lists named sessions; no default key,
+    /// `:`-only until now.
+    SessionsList,
     // -- picker-generic (help only; not palette-invokable) --
     MoveDown,
     MoveUp,
@@ -449,7 +486,14 @@ pub const COMMANDS: &[Meta] = &[
         action: Action::Research,
         name: "research",
         display: "Research mode",
-        help: "cite this page and its sources",
+        // UX-3 fix: `r` reads as a plain one-key action here, but it's
+        // actually a chord's fallback — `main::handle_key` arms `pending_r`
+        // and waits for a second key (`rl` queues for later, Esc cancels,
+        // anything else — including a timed-out non-char key — resolves to
+        // this). Spelling that out in the help text itself (rather than
+        // inventing a "prefix" column just for this one row) is the smaller
+        // of the two fixes UX-3 allows for.
+        help: "cite this page and its sources — r alone (rl instead queues the page for later)",
         contexts: &[KeyContext::Reading],
         in_palette: true,
     },
@@ -635,6 +679,95 @@ pub const COMMANDS: &[Meta] = &[
         display: "Quit",
         help: "quit wikitui (with confirmation)",
         contexts: &[KeyContext::Reading],
+        in_palette: true,
+    },
+    // -- UX-6 additions (see the `Action` variants' own doc comments) --
+    Meta {
+        action: Action::Peek,
+        name: "peek",
+        display: "Peek",
+        help: "preview the focused link or footnote without leaving the page",
+        contexts: &[KeyContext::Reading],
+        in_palette: true,
+    },
+    Meta {
+        action: Action::IncognitoToggle,
+        name: "incognito-toggle",
+        display: "Toggle incognito",
+        help: "no history, no stats, no prefetch while on",
+        contexts: &[KeyContext::Reading],
+        in_palette: true,
+    },
+    Meta {
+        action: Action::FoldToggle,
+        name: "fold-toggle",
+        display: "Fold/unfold section",
+        help: "fold or unfold the section under the cursor",
+        contexts: &[KeyContext::Reading],
+        in_palette: true,
+    },
+    Meta {
+        action: Action::FoldAll,
+        name: "fold-all",
+        display: "Fold all sections",
+        help: "collapse every section",
+        contexts: &[KeyContext::Reading],
+        in_palette: true,
+    },
+    Meta {
+        action: Action::UnfoldAll,
+        name: "unfold-all",
+        display: "Unfold all sections",
+        help: "expand every section",
+        contexts: &[KeyContext::Reading],
+        in_palette: true,
+    },
+    Meta {
+        action: Action::JumpReferences,
+        name: "jump-references",
+        display: "Jump to references",
+        help: "jump to the References/Notes section",
+        contexts: &[KeyContext::Reading],
+        in_palette: true,
+    },
+    Meta {
+        action: Action::Split,
+        name: "split",
+        display: "Split view",
+        help: "split the view (Ctrl-w v; Ctrl-w w switches panes, Ctrl-w c/o/q closes)",
+        contexts: &[KeyContext::Reading],
+        in_palette: true,
+    },
+    Meta {
+        action: Action::PrefetchLogOpen,
+        name: "prefetch-log",
+        display: "Prefetch log",
+        help: "the prefetch transparency/debug panel",
+        contexts: &[KeyContext::Reading, KeyContext::StartPage],
+        in_palette: true,
+    },
+    Meta {
+        action: Action::InterestsOpen,
+        name: "interests",
+        display: "Interests",
+        help: "the local interest-affinity model, in full",
+        contexts: &[KeyContext::Reading, KeyContext::StartPage],
+        in_palette: true,
+    },
+    Meta {
+        action: Action::StatsOpen,
+        name: "stats-open",
+        display: "Reading stats",
+        help: "articles read, time spent, streaks, top topics",
+        contexts: &[KeyContext::Reading, KeyContext::StartPage],
+        in_palette: true,
+    },
+    Meta {
+        action: Action::SessionsList,
+        name: "sessions",
+        display: "Named sessions",
+        help: "list this profile's named sessions (:mksession/:session)",
+        contexts: &[KeyContext::Reading, KeyContext::StartPage],
         in_palette: true,
     },
     // Picker-generic actions: help overlay only, never the palette.
@@ -837,11 +970,15 @@ impl Chord {
             (false, s)
         };
 
-        // A two-character all-lowercase-prefix chord (`gg`, `gt`, `bb`, `rl`)
-        // — only the established latch characters may lead one.
+        // A two-character all-lowercase-prefix chord (`gg`, `gt`, `bb`, `rl`,
+        // `zz`) — only the established latch characters may lead one. `z`
+        // joined this list alongside the UX-6 registry additions for
+        // `zz`/`za`/`zM`/`zR` (previously a `keymap.toml` had no way to name
+        // them at all, since `Chord::parse` is also this grammar's entry
+        // point for user rebindings).
         if !ctrl {
             let chars: Vec<char> = rest.chars().collect();
-            if chars.len() == 2 && matches!(chars[0], 'g' | 'b' | 'r') {
+            if chars.len() == 2 && matches!(chars[0], 'g' | 'b' | 'r' | 'z') {
                 return Some(Chord::prefixed(chars[0], chars[1]));
             }
         }
@@ -973,6 +1110,18 @@ impl Keymap {
         // panel-open convention `gr`/`gR`/`gb` already established, since
         // Appendix B documents no dedicated single-letter open key for it.
         Keymap::bind(b, Reading, Chord::prefixed('g', 'W'), WatchlistOpen);
+        // UX-6: these five already worked as keypresses (`main::handle_key`'s
+        // `K`/`z`-prefix/`g`-prefix arms) but had no registry row at all —
+        // registering their existing bindings here is what makes the palette
+        // and generated `?` cheatsheet finally mention them (see each
+        // `Action` variant's own doc comment). `Action::Split` is the one
+        // exception — see its doc comment for why it stays keyless here.
+        Keymap::bind(b, Reading, Chord::ch('K'), Peek);
+        Keymap::bind(b, Reading, Chord::prefixed('z', 'z'), IncognitoToggle);
+        Keymap::bind(b, Reading, Chord::prefixed('z', 'a'), FoldToggle);
+        Keymap::bind(b, Reading, Chord::prefixed('z', 'M'), FoldAll);
+        Keymap::bind(b, Reading, Chord::prefixed('z', 'R'), UnfoldAll);
+        Keymap::bind(b, Reading, Chord::prefixed('g', 'K'), JumpReferences);
         Keymap::bind(b, Reading, Chord::ch('Q'), Quit);
 
         // Picker-generic navigation.
@@ -1192,18 +1341,25 @@ pub const READING_HELP_ORDER: &[Action] = &[
     Action::LinkHintsBackground,
     Action::FollowLink,
     Action::OpenBackgroundTab,
+    Action::Peek,
     Action::Back,
     Action::Forward,
     Action::BackStackPicker,
+    Action::JumpReferences,
     Action::ReadingHistory,
     Action::NextTab,
     Action::PrevTab,
     Action::TabPicker,
     Action::ReopenClosedTab,
     Action::CloseTab,
+    Action::Split,
     Action::Toc,
+    Action::FoldToggle,
+    Action::FoldAll,
+    Action::UnfoldAll,
     Action::CycleTheme,
     Action::TalkToggle,
+    Action::IncognitoToggle,
     Action::Search,
     Action::FindInPage,
     Action::FindNext,
@@ -1232,6 +1388,10 @@ pub const READING_HELP_ORDER: &[Action] = &[
     Action::NotificationsOpen,
     Action::ContribsOpen,
     Action::PrefsOpen,
+    Action::PrefetchLogOpen,
+    Action::InterestsOpen,
+    Action::StatsOpen,
+    Action::SessionsList,
     Action::Help,
     Action::Quit,
 ];
@@ -1355,6 +1515,33 @@ mod tests {
         assert_eq!(km.resolve(Reading, &Chord::ch('Q')), Some(Quit));
         assert_eq!(km.resolve(Reading, &Chord::ch('i')), Some(Info));
 
+        // UX-6: these five previously worked as keypresses but had no
+        // registry row at all (see each `Action` variant's own doc comment).
+        assert_eq!(km.resolve(Reading, &Chord::ch('K')), Some(Peek));
+        assert_eq!(
+            km.resolve(Reading, &Chord::prefixed('z', 'z')),
+            Some(IncognitoToggle)
+        );
+        assert_eq!(
+            km.resolve(Reading, &Chord::prefixed('z', 'a')),
+            Some(FoldToggle)
+        );
+        assert_eq!(
+            km.resolve(Reading, &Chord::prefixed('z', 'M')),
+            Some(FoldAll)
+        );
+        assert_eq!(
+            km.resolve(Reading, &Chord::prefixed('z', 'R')),
+            Some(UnfoldAll)
+        );
+        assert_eq!(
+            km.resolve(Reading, &Chord::prefixed('g', 'K')),
+            Some(JumpReferences)
+        );
+        // `Split` (Ctrl-w v) is deliberately unbound here — see its own doc
+        // comment for why the Chord model can't name a Control-chord prefix.
+        assert_eq!(km.label_for(Reading, Split), "\u{2014}");
+
         // Global reaches Reading and pickers.
         assert_eq!(km.resolve(Reading, &Chord::ch('?')), Some(Help));
         assert_eq!(km.resolve(Reading, &Chord::ctrl_ch('p')), Some(Palette));
@@ -1376,6 +1563,69 @@ mod tests {
             assert!(names.insert(m.name), "duplicate command name {}", m.name);
             assert!(!m.help.is_empty(), "{} has no help", m.name);
         }
+    }
+
+    /// UX-6: peek/incognito/fold/jump-references/split — and UX-5's
+    /// argument-free `:`-only panels — previously had no registry row at
+    /// all, so neither the palette (FR-CS-1) nor the generated `?`
+    /// cheatsheet (FR-CS-4) ever mentioned them. Registering them (this
+    /// chunk) is what makes both surface them now; this pins that they
+    /// actually do, not just that the `Action` variant compiles.
+    #[test]
+    fn ux6_additions_are_reachable_from_the_palette_and_reading_help() {
+        let km = Keymap::vim();
+        for (query, action) in [
+            ("Peek", Action::Peek),
+            ("Toggle incognito", Action::IncognitoToggle),
+            ("Fold/unfold", Action::FoldToggle),
+            ("Fold all", Action::FoldAll),
+            ("Unfold all", Action::UnfoldAll),
+            ("Jump to references", Action::JumpReferences),
+            ("Split view", Action::Split),
+            ("Prefetch log", Action::PrefetchLogOpen),
+            ("Interests", Action::InterestsOpen),
+            ("Reading stats", Action::StatsOpen),
+            ("Named sessions", Action::SessionsList),
+        ] {
+            let rows = palette_matches(&km, KeyContext::Reading, query);
+            assert!(
+                rows.iter().any(|r| r.action == action),
+                "{query:?} should surface {action:?} in the palette: {rows:?}"
+            );
+        }
+
+        let help = reading_help(&km);
+        assert!(
+            help.iter()
+                .any(|r| r.key == "K" && r.help.contains("preview")),
+            "Peek missing from reading help: {help:?}"
+        );
+        assert!(
+            help.iter().any(|r| r.key == "zz"),
+            "zz (incognito) missing from reading help: {help:?}"
+        );
+        assert!(
+            help.iter().any(|r| r.key == "gK"),
+            "gK (jump references) missing from reading help: {help:?}"
+        );
+        assert!(
+            help.iter()
+                .any(|r| r.help.contains("split") && r.key == "\u{2014}"),
+            "split should appear, keyless, in reading help: {help:?}"
+        );
+    }
+
+    /// UX-3: `r` reads as a plain one-key action in the generated help, but
+    /// it is actually a two-keystroke chord (`main::handle_key`'s
+    /// `pending_r` latch) — the help text itself must say so, since the
+    /// registry's `Chord` model has no distinct "this is a prefix" column.
+    #[test]
+    fn research_help_documents_that_r_is_a_chord_not_a_plain_key() {
+        let help = Action::Research.help();
+        assert!(
+            help.contains("rl"),
+            "Research's help must mention the rl read-later chord: {help:?}"
+        );
     }
 
     /// PRD FR-CS-3: a user keymap.toml adds/overrides bindings via the

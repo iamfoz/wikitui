@@ -1285,7 +1285,7 @@ fn draw_blank_welcome(frame: &mut Frame, app: &App, area: Rect) {
             colored(app.no_color, app.theme.dim),
         )),
         Line::from(""),
-        Line::from("Press / to search Wikipedia, Ctrl-T to cycle themes, ? for help, q to quit."),
+        Line::from("Press / to search Wikipedia, Ctrl-t to cycle themes, ? for help, q to quit."),
     ]);
     frame.render_widget(
         Paragraph::new(welcome).style(base_style(&app.theme, app.no_color)),
@@ -2473,17 +2473,42 @@ fn human_size(bytes: u64) -> String {
 /// its reason string, status (queued/done/failed/skipped-budget/rate-limited),
 /// and bytes. Read-only; a paint function, so it reads snapshots off the
 /// substrate handle rather than mutating anything.
+///
+/// The title+lines are built by [`prefetch_log_content`] and only laid out
+/// (scrolled, bordered) here — see that function's own doc comment for why
+/// the split exists (UX-7: the panel must scroll instead of dismissing on the
+/// very keys meant to scroll it).
 fn draw_prefetch_log(frame: &mut Frame, app: &App, area: Rect) {
+    let (title, lines) = prefetch_log_content(app);
+    let inner_rows = area.height.saturating_sub(2);
+    let max_scroll = (lines.len() as u16).saturating_sub(inner_rows);
+    let offset = app.prefetch_log_scroll.min(max_scroll);
+    let para = Paragraph::new(lines)
+        .style(base_style(&app.theme, app.no_color))
+        .scroll((offset, 0))
+        .block(UiBlock::default().borders(Borders::ALL).title(title));
+    frame.render_widget(para, area);
+}
+
+/// The number of lines the `:prefetch-log` panel currently holds —
+/// `main::handle_key` uses it to clamp the panel's scroll offset the same way
+/// `ui::help_view_len` clamps the `?` overlay's (PRD FR-CS-4 precedent, UX-7).
+pub fn prefetch_log_view_len(app: &App) -> usize {
+    prefetch_log_content(app).1.len()
+}
+
+/// Build the `:prefetch-log` panel's title and body lines — split out of
+/// `draw_prefetch_log` so [`prefetch_log_view_len`] can measure the exact
+/// same content the paint function scrolls through, never a second
+/// hand-maintained line count that could silently drift from it.
+fn prefetch_log_content(app: &App) -> (String, Vec<Line<'static>>) {
     let Some(handle) = app.prefetch.as_ref() else {
-        let para = Paragraph::new("Prefetch substrate is not active in this session.")
-            .style(base_style(&app.theme, app.no_color))
-            .block(
-                UiBlock::default()
-                    .borders(Borders::ALL)
-                    .title("Prefetch log"),
-            );
-        frame.render_widget(para, area);
-        return;
+        return (
+            "Prefetch log".to_string(),
+            vec![Line::from(
+                "Prefetch substrate is not active in this session.",
+            )],
+        );
     };
     let entries = handle.log_recent();
     let budget = handle.budget_snapshot();
@@ -2552,11 +2577,8 @@ fn draw_prefetch_log(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
 
-    let title = format!("Prefetch log ({}) — Esc: close", entries.len());
-    let para = Paragraph::new(lines)
-        .style(base_style(&app.theme, app.no_color))
-        .block(UiBlock::default().borders(Borders::ALL).title(title));
-    frame.render_widget(para, area);
+    let title = format!("Prefetch log ({}) — j/k: scroll  Esc: close", entries.len());
+    (title, lines)
 }
 
 /// PRD FR-PF-3 / FR-PF-4's `:interests` panel — the interest-model inspector.
@@ -2564,7 +2586,32 @@ fn draw_prefetch_log(frame: &mut Frame, app: &App, area: Rect) {
 /// state, the decay half-life, then every tracked topic with its affinity
 /// score (a small bar plus the number), and the current morelike seeds. A
 /// paint function — reads the model, mutates nothing.
+///
+/// Lines are built by [`interests_content`] and only laid out (scrolled,
+/// bordered) here — mirrors `draw_prefetch_log`/`prefetch_log_content`'s
+/// split (UX-7).
 fn draw_interests(frame: &mut Frame, app: &App, area: Rect) {
+    let (title, lines) = interests_content(app);
+    let inner_rows = area.height.saturating_sub(2);
+    let max_scroll = (lines.len() as u16).saturating_sub(inner_rows);
+    let offset = app.interests_scroll.min(max_scroll);
+    let para = Paragraph::new(lines)
+        .style(base_style(&app.theme, app.no_color))
+        .scroll((offset, 0))
+        .block(UiBlock::default().borders(Borders::ALL).title(title));
+    frame.render_widget(para, area);
+}
+
+/// The number of lines the `:interests` panel currently holds — mirrors
+/// `prefetch_log_view_len`'s doc comment (UX-7).
+pub fn interests_view_len(app: &App) -> usize {
+    interests_content(app).1.len()
+}
+
+/// Build the `:interests` panel's title and body lines — split out of
+/// `draw_interests` for the same reason `prefetch_log_content` is split out
+/// of `draw_prefetch_log`.
+fn interests_content(app: &App) -> (String, Vec<Line<'static>>) {
     let model = &app.interest;
     let top = model.top_categories(40);
 
@@ -2647,18 +2694,48 @@ fn draw_interests(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
 
-    let title = format!("Interests ({} topics) — Esc: close", model.len());
-    let para = Paragraph::new(lines)
-        .style(base_style(&app.theme, app.no_color))
-        .block(UiBlock::default().borders(Borders::ALL).title(title));
-    frame.render_widget(para, area);
+    let title = format!(
+        "Interests ({} topics) — j/k: scroll  Esc: close",
+        model.len()
+    );
+    (title, lines)
 }
 
 /// PRD FR-PC-3's `:stats` view — local reading stats: articles read, total
 /// time, streaks, and the interest model's topic distribution. Suppressed by
 /// incognito upstream (incognito never writes history/interest), so it simply
 /// shows whatever non-incognito reading produced. A paint function.
+///
+/// Lines are built by [`stats_content`] and only laid out (scrolled,
+/// bordered) here — mirrors `draw_prefetch_log`/`prefetch_log_content`'s
+/// split (UX-7).
 fn draw_stats(frame: &mut Frame, app: &App, area: Rect) {
+    let lines = stats_content(app);
+    let inner_rows = area.height.saturating_sub(2);
+    let max_scroll = (lines.len() as u16).saturating_sub(inner_rows);
+    let offset = app.stats_scroll.min(max_scroll);
+    let para = Paragraph::new(lines)
+        .style(base_style(&app.theme, app.no_color))
+        .scroll((offset, 0))
+        .block(
+            UiBlock::default()
+                .borders(Borders::ALL)
+                .title("Reading stats — j/k: scroll  Esc: close"),
+        );
+    frame.render_widget(para, area);
+}
+
+/// The number of lines the `:stats` view currently holds — mirrors
+/// `prefetch_log_view_len`'s doc comment (UX-7).
+pub fn stats_view_len(app: &App) -> usize {
+    stats_content(app).len()
+}
+
+/// Build the `:stats` view's body lines — split out of `draw_stats` for the
+/// same reason `prefetch_log_content` is split out of `draw_prefetch_log`.
+/// (No title split needed here — `:stats`'s title is static, unlike the
+/// other two panels' entry/topic counts.)
+fn stats_content(app: &App) -> Vec<Line<'static>> {
     let stats = app.reading_stats();
     let mut lines: Vec<Line> = Vec::new();
 
@@ -2711,14 +2788,7 @@ fn draw_stats(frame: &mut Frame, app: &App, area: Rect) {
         )));
     }
 
-    let para = Paragraph::new(lines)
-        .style(base_style(&app.theme, app.no_color))
-        .block(
-            UiBlock::default()
-                .borders(Borders::ALL)
-                .title("Reading stats — Esc: close"),
-        );
-    frame.render_widget(para, area);
+    lines
 }
 
 /// PRD FR-DL-2's `:today` panel: a one-row strip of type tabs (events/
@@ -3654,6 +3724,16 @@ fn status_bar_text(app: &App, width: u16) -> String {
                 .current_quality_badge()
                 .map(|b| format!("   {b}"))
                 .unwrap_or_default();
+            // PRD FR-BM-1: a small "bookmarked" marker, same low-priority-
+            // suffix treatment as the badge just above — wires
+            // `App::is_active_bookmarked` (`BookmarkStore::is_bookmarked`),
+            // which previously had no UI caller at all (see that method's
+            // own doc comment).
+            let bookmarked = if app.is_active_bookmarked() {
+                "   \u{2605} bookmarked".to_string()
+            } else {
+                String::new()
+            };
             // PRD FR-DL-4: "N uncited claims", the same low-priority-suffix
             // treatment as `hint`/`badge` — shown only while the toggle is
             // on (default off) and only when the page actually has any, so
@@ -3696,10 +3776,25 @@ fn status_bar_text(app: &App, width: u16) -> String {
                     )
                 })
                 .unwrap_or_default();
+            // UX-1 fix: while `pending_cn_bracket` is armed, the very next
+            // keystroke means something other than its ordinary binding
+            // (`c` jumps to the citation-needed marker, anything else falls
+            // through to the deferred table-scroll) — shown here, ahead of
+            // the page's own content, mirroring `game_hud`'s "urgent, shown
+            // first" treatment, so the chord is never a silent trap.
+            let bracket_pending = match app.pending_cn_bracket {
+                Some(app::CnBracket::Next) => {
+                    "[]c: jump to next uncited claim, else: scroll tables]   ".to_string()
+                }
+                Some(app::CnBracket::Prev) => {
+                    "[[c: jump to previous uncited claim, else: scroll tables]   ".to_string()
+                }
+                None => String::new(),
+            };
             let body = match tab.focused_link.and_then(|i| tab.links.get(i)) {
                 Some(link) if link.internal_title.is_some() => {
                     format!(
-                        "{}→ {} ({}/{})   Tab/S-Tab: cycle   Enter: open   H: back   L: forward{hint}{badge}{cn}{rtl}",
+                        "{}→ {} ({}/{})   Tab/S-Tab: cycle   Enter: open   H: back   L: forward{hint}{badge}{bookmarked}{cn}{rtl}",
                         tab.page_source.prefix(),
                         link.text,
                         tab.focused_link.unwrap() + 1,
@@ -3707,7 +3802,7 @@ fn status_bar_text(app: &App, width: u16) -> String {
                     )
                 }
                 Some(link) => format!(
-                    "{}→ {} (external, not yet followable){hint}{badge}{cn}{rtl}",
+                    "{}→ {} (external, not yet followable){hint}{badge}{bookmarked}{cn}{rtl}",
                     tab.page_source.prefix(),
                     link.text
                 ),
@@ -3721,15 +3816,15 @@ fn status_bar_text(app: &App, width: u16) -> String {
                         let prefix = tab.page_source.prefix();
                         let budget = (width as usize).saturating_sub(display_width(&prefix));
                         format!(
-                            "{prefix}{}{hint}{badge}{cn}{rtl}",
+                            "{prefix}{}{hint}{badge}{bookmarked}{cn}{rtl}",
                             build_breadcrumb(&titles, budget)
                         )
                     } else {
-                        format!("{}{hint}{badge}{cn}{rtl}", app.status)
+                        format!("{}{hint}{badge}{bookmarked}{cn}{rtl}", app.status)
                     }
                 }
             };
-            format!("{game_hud}{body}")
+            format!("{game_hud}{bracket_pending}{body}")
         }
     }
 }
@@ -3859,7 +3954,10 @@ fn help_content(app: &App) -> (String, Vec<Line<'static>>) {
             row(":", "command line"),
             row("Ctrl-p", "command palette"),
             row("gr", "random article"),
-            row("Ctrl-T", "cycle color theme"),
+            // UX-13 fix: lowercase to match the registry's own rendering
+            // (`Chord::ctrl_ch('t').label()` = "Ctrl-t") — the mismatched
+            // casing read like a `Ctrl-Shift-t` chord that doesn't exist.
+            row("Ctrl-t", "cycle color theme"),
             row("?", "this help"),
             row("q", "close / quit"),
         ];
@@ -4048,7 +4146,10 @@ fn draw_onboarding(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(""),
         key("/", "search Wikipedia"),
         key("?", "help — every key for the current view"),
-        key("Ctrl-T", "cycle the color theme"),
+        // UX-13 fix: lowercase to match the registry's rendering — see the
+        // start-page help's identical fix just above (`draw_help_overlay`'s
+        // sibling table) for why.
+        key("Ctrl-t", "cycle the color theme"),
         Line::from(""),
         Line::from(RSpan::styled(
             "A config file with commented defaults is being written",
@@ -5243,6 +5344,112 @@ mod tests {
         app.mode = Mode::Hint;
         app.hint_input = "a".to_string();
         assert_eq!(status_bar_text(&app, 80), "hint: a   Esc: cancel");
+    }
+
+    /// FR-BM-1 gap fix: `BookmarkStore::is_bookmarked` had no UI caller at
+    /// all before `App::is_active_bookmarked` — an article being bookmarked
+    /// or not was indistinguishable while reading it (only the one-keypress
+    /// toggle confirmation, and the bookmark picker itself, ever showed the
+    /// state). This pins that the steady-state indicator now shows up, past
+    /// the fresh-toggle notice, and disappears again once un-bookmarked.
+    #[test]
+    fn bookmarked_article_shows_the_steady_state_indicator() {
+        let mut app = app_with_links(false);
+        assert!(!app.is_active_bookmarked());
+        assert!(!status_bar_text(&app, 80).contains("bookmarked"));
+
+        app.toggle_bookmark();
+        assert!(app.is_active_bookmarked());
+        // The fresh-toggle confirmation is itself a `notice` and outranks
+        // everything else in the bar — clearing it exposes the steady-state
+        // line this fix actually adds.
+        app.notice = None;
+        assert!(
+            status_bar_text(&app, 80).contains("bookmarked"),
+            "{}",
+            status_bar_text(&app, 80)
+        );
+
+        app.toggle_bookmark();
+        app.notice = None;
+        assert!(!app.is_active_bookmarked());
+        assert!(!status_bar_text(&app, 80).contains("bookmarked"));
+    }
+
+    /// UX-1's pending-indicator half of the fix: while `pending_cn_bracket`
+    /// is armed, the very next keystroke means something other than its
+    /// ordinary binding (`c` jumps, anything else falls through to the
+    /// deferred table-scroll) — this must never be a silent trap, so it
+    /// shows up in the bar ahead of the page's own content.
+    #[test]
+    fn armed_cn_bracket_shows_a_pending_indicator_in_the_status_bar() {
+        // A document must be open — with none, Reading's "start page" arm
+        // (a distinct branch that never looks at `pending_cn_bracket` at
+        // all) takes over the bar instead.
+        let mut app = app_with_links(false);
+        assert_eq!(app.pending_cn_bracket, None);
+        assert!(!status_bar_text(&app, 80).contains("jump to next"));
+
+        app.pending_cn_bracket = Some(crate::app::CnBracket::Next);
+        assert!(status_bar_text(&app, 80).contains("jump to next uncited claim"));
+
+        app.pending_cn_bracket = Some(crate::app::CnBracket::Prev);
+        assert!(status_bar_text(&app, 80).contains("jump to previous uncited claim"));
+    }
+
+    /// UX-13: the generated cheatsheet renders `Ctrl-t` (lowercase, from
+    /// `registry::Chord::ctrl_ch('t').label()`), but the start-page help and
+    /// onboarding tour hardcoded `Ctrl-T` — a mismatched casing that reads
+    /// like an unrelated `Ctrl-Shift-t` chord. Both must now render the same
+    /// lowercase label the registry does.
+    #[test]
+    fn start_page_help_and_onboarding_render_the_same_lowercase_ctrl_t_as_the_registry() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        assert_eq!(
+            registry::Chord::ctrl_ch('t').label(),
+            "Ctrl-t",
+            "the registry's own rendering — everything else must match it"
+        );
+
+        // Start-page help: `?` pressed from the start page (no document).
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.mode = Mode::Help;
+        app.prior_mode = Mode::Reading;
+        assert!(app.active_tab().doc.is_none());
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(rendered.contains("Ctrl-t"), "{rendered}");
+        assert!(
+            !rendered.contains("Ctrl-T"),
+            "must not regress to the mismatched casing: {rendered}"
+        );
+
+        // Onboarding tour.
+        let mut app2 = App::new("en".to_string(), Theme::terminal(), false);
+        app2.mode = Mode::Onboarding;
+        let mut terminal2 = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal2.draw(|f| draw(f, &mut app2)).unwrap();
+        let rendered2: String = terminal2
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(rendered2.contains("Ctrl-t"), "{rendered2}");
+        assert!(
+            !rendered2.contains("Ctrl-T"),
+            "must not regress to the mismatched casing: {rendered2}"
+        );
     }
 
     /// The notice lifecycle deliverable: set → visible → the next keypress's

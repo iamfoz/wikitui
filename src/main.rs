@@ -4362,6 +4362,7 @@ async fn run_named_macro(
     save_tx: &UnboundedSender<SaveOutcome>,
     related_tx: &UnboundedSender<RelatedOutcome>,
     langlinks_tx: &UnboundedSender<LangLinksOutcome>,
+    summary_tx: &UnboundedSender<SummaryOutcome>,
 ) {
     let mut stack = Vec::new();
     run_macro(
@@ -4375,6 +4376,7 @@ async fn run_named_macro(
         save_tx,
         related_tx,
         langlinks_tx,
+        summary_tx,
         0,
         &mut stack,
     )
@@ -4402,6 +4404,7 @@ async fn run_macro(
     save_tx: &UnboundedSender<SaveOutcome>,
     related_tx: &UnboundedSender<RelatedOutcome>,
     langlinks_tx: &UnboundedSender<LangLinksOutcome>,
+    summary_tx: &UnboundedSender<SummaryOutcome>,
     depth: usize,
     stack: &mut Vec<String>,
 ) {
@@ -4437,6 +4440,7 @@ async fn run_macro(
             save_tx,
             related_tx,
             langlinks_tx,
+            summary_tx,
             depth,
             stack,
         )
@@ -4465,6 +4469,7 @@ async fn run_macro_step(
     save_tx: &UnboundedSender<SaveOutcome>,
     related_tx: &UnboundedSender<RelatedOutcome>,
     langlinks_tx: &UnboundedSender<LangLinksOutcome>,
+    summary_tx: &UnboundedSender<SummaryOutcome>,
     depth: usize,
     stack: &mut Vec<String>,
 ) {
@@ -4495,6 +4500,7 @@ async fn run_macro_step(
             save_tx,
             related_tx,
             langlinks_tx,
+            summary_tx,
             depth + 1,
             stack,
         ))
@@ -4512,6 +4518,7 @@ async fn run_macro_step(
             save_tx,
             related_tx,
             langlinks_tx,
+            summary_tx,
             terminal,
         )
         .await;
@@ -4531,12 +4538,57 @@ async fn run_macro_step(
                 save_tx,
                 related_tx,
                 langlinks_tx,
+                summary_tx,
             ))
             .await;
         }
         Err(message) => {
             app.notice = Some(format!("macro step {step:?} failed: {message}"));
         }
+    }
+}
+
+/// What a keypress means to a read-only inspector panel (`:prefetch-log`/
+/// `:interests`/`:stats` — PRD FR-PF-4/FR-PF-3/FR-PC-3). UX-7: these used to
+/// close on ANY key, so content taller than the viewport had unreachable
+/// overflow (`j` closed the panel instead of scrolling past its own bottom).
+/// This mirrors the `?` help overlay's scroll grammar exactly (j/k/arrows/
+/// Ctrl-d/u/g/G scroll, Esc/q close) — a pure decision, like
+/// `app::resolve_g_prefix`, so the scroll math is testable without a live
+/// terminal; `handle_key`'s three panel arms only apply the answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PanelKeyAction {
+    /// Esc or `q`: close the panel, restoring its prior mode.
+    Close,
+    /// Any scroll key: the new offset, already clamped to `max_scroll`.
+    Scroll(u16),
+    /// Anything else: no-op (unlike the old "any key closes", an unbound key
+    /// here does nothing rather than dismissing the panel).
+    None,
+}
+
+fn resolve_panel_key(
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    current: u16,
+    max_scroll: u16,
+) -> PanelKeyAction {
+    match code {
+        KeyCode::Esc | KeyCode::Char('q') => PanelKeyAction::Close,
+        KeyCode::Char('j') | KeyCode::Down => {
+            PanelKeyAction::Scroll(current.saturating_add(1).min(max_scroll))
+        }
+        KeyCode::Char('k') | KeyCode::Up => PanelKeyAction::Scroll(current.saturating_sub(1)),
+        KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
+            PanelKeyAction::Scroll(current.saturating_add(10).min(max_scroll))
+        }
+        KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+            PanelKeyAction::Scroll(current.saturating_sub(10))
+        }
+        KeyCode::Char(' ') => PanelKeyAction::Scroll(current.saturating_add(10).min(max_scroll)),
+        KeyCode::Char('g') => PanelKeyAction::Scroll(0),
+        KeyCode::Char('G') => PanelKeyAction::Scroll(max_scroll),
+        _ => PanelKeyAction::None,
     }
 }
 
@@ -4628,11 +4680,20 @@ async fn handle_key(
     // PRD FR-CS-1: Ctrl-p opens the command palette from the reading view.
     // Additive — Ctrl-p was previously unbound there; the text-input modes
     // (Search's own Ctrl-p moves the suggestion) are deliberately excluded.
+    // UX-8 fix: `pending_ctrl_w`/`pending_cn_bracket` are latches exactly like
+    // `pending_g`/`pending_b`/`pending_r`/`pending_z` — they too must gate
+    // Ctrl-p and the override layer below, or `Ctrl-w` then `Ctrl-p` opens
+    // the palette with the window-command chord still armed, and the key
+    // after the palette closes (Esc-ing it, say) gets silently eaten by
+    // `pending_ctrl_w`'s resolution arm instead of doing what it looks like
+    // it does.
     if palette_allowed(app.mode)
         && !app.pending_g
         && !app.pending_b
         && !app.pending_r
         && !app.pending_z
+        && !app.pending_ctrl_w
+        && app.pending_cn_bracket.is_none()
         && code == KeyCode::Char('p')
         && modifiers.contains(KeyModifiers::CONTROL)
     {
@@ -4646,12 +4707,16 @@ async fn handle_key(
     // `None` for every default binding and this is a no-op — `handle_key`'s
     // existing dispatch and behavior are untouched. Only a rebinding surfaces
     // here. Scoped to the reading view (where `dispatch_action` is well
-    // defined) and to single keys — the g/b/r/z chord latches are resolved
-    // below, so we skip while one is pending.
+    // defined) and to single keys — the g/b/r/z/Ctrl-w/cn-bracket chord
+    // latches are resolved below, so we skip while one is pending (UX-8: see
+    // the Ctrl-p guard just above for why `pending_ctrl_w`/
+    // `pending_cn_bracket` belong in this list too).
     if !app.pending_g
         && !app.pending_b
         && !app.pending_r
         && !app.pending_z
+        && !app.pending_ctrl_w
+        && app.pending_cn_bracket.is_none()
         && let Some(ctx) = override_context(app)
         && let Some(chord) = registry::Chord::from_key(code, modifiers)
         && let Some(action) = app.keymap.runtime_action(ctx, &chord)
@@ -4666,6 +4731,7 @@ async fn handle_key(
             save_tx,
             related_tx,
             langlinks_tx,
+            summary_tx,
             terminal,
         )
         .await;
@@ -4730,6 +4796,7 @@ async fn handle_key(
                         save_tx,
                         related_tx,
                         langlinks_tx,
+                        summary_tx,
                         terminal,
                     )
                     .await;
@@ -4755,12 +4822,47 @@ async fn handle_key(
             app.mode = Mode::Reading;
             finish_onboarding(app);
         }
-        // PRD FR-PF-4: the prefetch-log panel is read-only — any key closes it.
-        Mode::PrefetchLog => app.close_prefetch_log(),
-        // PRD FR-PF-3 / FR-PC-3: the interest and stats panels are read-only
-        // inspectors — any key closes them, same as the prefetch log.
-        Mode::Interests => app.close_interests(),
-        Mode::Stats => app.close_stats(),
+        // PRD FR-PF-4: the prefetch-log panel — scrollable (UX-7, see
+        // `resolve_panel_key`'s doc comment for why "any key closes it" was
+        // wrong for content taller than the viewport).
+        Mode::PrefetchLog => {
+            let visible = terminal
+                .size()
+                .map(|s| s.height.saturating_sub(4))
+                .unwrap_or(20);
+            let max_scroll = (ui::prefetch_log_view_len(app) as u16).saturating_sub(visible);
+            match resolve_panel_key(code, modifiers, app.prefetch_log_scroll, max_scroll) {
+                PanelKeyAction::Close => app.close_prefetch_log(),
+                PanelKeyAction::Scroll(v) => app.prefetch_log_scroll = v,
+                PanelKeyAction::None => {}
+            }
+        }
+        // PRD FR-PF-3 / FR-PC-3: the interest and stats panels — same
+        // scrollable treatment as the prefetch log just above (UX-7).
+        Mode::Interests => {
+            let visible = terminal
+                .size()
+                .map(|s| s.height.saturating_sub(4))
+                .unwrap_or(20);
+            let max_scroll = (ui::interests_view_len(app) as u16).saturating_sub(visible);
+            match resolve_panel_key(code, modifiers, app.interests_scroll, max_scroll) {
+                PanelKeyAction::Close => app.close_interests(),
+                PanelKeyAction::Scroll(v) => app.interests_scroll = v,
+                PanelKeyAction::None => {}
+            }
+        }
+        Mode::Stats => {
+            let visible = terminal
+                .size()
+                .map(|s| s.height.saturating_sub(4))
+                .unwrap_or(20);
+            let max_scroll = (ui::stats_view_len(app) as u16).saturating_sub(visible);
+            match resolve_panel_key(code, modifiers, app.stats_scroll, max_scroll) {
+                PanelKeyAction::Close => app.close_stats(),
+                PanelKeyAction::Scroll(v) => app.stats_scroll = v,
+                PanelKeyAction::None => {}
+            }
+        }
         // PRD Appendix B's search keybindings: Enter opens the highlighted
         // typeahead suggestion directly (FR-SR-1); Tab runs a full-text
         // search of the typed query instead (FR-SR-2's mode toggle) — the
@@ -4854,6 +4956,7 @@ async fn handle_key(
                             save_tx,
                             related_tx,
                             langlinks_tx,
+                            summary_tx,
                         )
                         .await
                     }
@@ -4883,6 +4986,7 @@ async fn handle_key(
                                 save_tx,
                                 related_tx,
                                 langlinks_tx,
+                                summary_tx,
                             )
                             .await;
                         } else {
@@ -5782,6 +5886,14 @@ async fn handle_key(
             // rather than reprocessing it as its own binding.
             if app.pending_r {
                 app.pending_r = false;
+                // PRD Appendix B "Esc cancels" (UX-4 fix): only an explicit
+                // char resolves the chord (`resolve_r_prefix`'s `l`->
+                // read-later, anything else -> Research). A non-char second
+                // key (Esc, Enter, an arrow, ...) has no place in that
+                // grammar, so it now just cancels the latch silently instead
+                // of falling back to "open Research anyway" — `r` then Esc
+                // used to open Research regardless, which reads as `Esc`
+                // failing to back out of anything.
                 if let KeyCode::Char(c) = code {
                     match app::resolve_r_prefix(c) {
                         app::RPrefixAction::ReadLater => {
@@ -5795,10 +5907,6 @@ async fn handle_key(
                             }
                         }
                     }
-                } else if app.active_tab().doc.is_some() {
-                    app.mode = Mode::Research;
-                } else {
-                    app.status = "Open an article first".to_string();
                 }
                 return;
             }
@@ -5890,15 +5998,20 @@ async fn handle_key(
                 KeyCode::Char(' ') => app.scroll_by(15),
                 // PRD FR-DL-4: `]c`/`[c` jump to the next/previous
                 // citation-needed marker — armed only while `show_cn` is on
-                // (see `App::pending_cn_bracket`'s doc comment for why the
-                // bare keys' table-scroll meaning is completely untouched
-                // while the feature is off, its default). Resolved on the
-                // *next* keypress, mirroring `pending_r`'s "the prefix key
-                // has a standalone meaning" latch shape just below.
-                KeyCode::Char(']') if app.show_cn => {
+                // AND the document actually has a marker to jump to (UX-1
+                // fix: arming it unconditionally on `show_cn` alone meant
+                // `]`/`[` silently ate the *next* keystroke on every page,
+                // even ones with zero citation-needed markers, where the
+                // chord could never do anything). See
+                // `App::pending_cn_bracket`'s doc comment for why the bare
+                // keys' table-scroll meaning is completely untouched while
+                // the feature is off, its default. Resolved on the *next*
+                // keypress, mirroring `pending_r`'s "the prefix key has a
+                // standalone meaning" latch shape just below.
+                KeyCode::Char(']') if app.show_cn && app.doc_has_citation_needed() => {
                     app.pending_cn_bracket = Some(app::CnBracket::Next);
                 }
-                KeyCode::Char('[') if app.show_cn => {
+                KeyCode::Char('[') if app.show_cn && app.doc_has_citation_needed() => {
                     app.pending_cn_bracket = Some(app::CnBracket::Prev);
                 }
                 // PRD FR-RD-4's horizontal table scroll: `[`/`]` shift the
@@ -6001,25 +6114,34 @@ async fn handle_key(
                         }
                     }
                 }
+                // UX-2 fix: these end-of-history messages are one-keypress
+                // feedback, but a fresh document focuses link 0 (see
+                // `App::set_document`), and the focused-link line shadows
+                // `app.status` — so on nearly every real article, this
+                // message was computed and then silently never drawn.
+                // `app.notice` outranks the focused-link line unconditionally
+                // (`ui::status_bar_text`'s early check), which is exactly the
+                // fix the successful-yank case below also needed.
                 KeyCode::Char('H') => {
                     if let Some(entry) = app.navigate_back_target() {
                         open_history_entry(client, cache, app, entry, revalidate_tx).await;
                     } else {
-                        app.status = "No earlier page in history".to_string();
+                        app.notice = Some("No earlier page in history".to_string());
                     }
                 }
                 KeyCode::Char('L') => {
                     if let Some(entry) = app.navigate_forward_target() {
                         open_history_entry(client, cache, app, entry, revalidate_tx).await;
                     } else {
-                        app.status = "No later page in history".to_string();
+                        app.notice = Some("No later page in history".to_string());
                     }
                 }
                 // `u` reopens the last closed tab (PRD FR-TB-1). Distinct from
-                // Ctrl-u (half-page up), which is a guarded arm above.
+                // Ctrl-u (half-page up), which is a guarded arm above. UX-2:
+                // `notice`, not `status` — see the `H`/`L` comment above.
                 KeyCode::Char('u') => {
                     if !app.reopen_closed_tab() {
-                        app.status = "No recently closed tabs to reopen".to_string();
+                        app.notice = Some("No recently closed tabs to reopen".to_string());
                     }
                 }
                 // Ctrl-t cycles the theme (PRD FR-TH-2): bare `T` moved to
@@ -6031,9 +6153,10 @@ async fn handle_key(
                     app.cycle_theme()
                 }
                 KeyCode::Char('t') if app.active_tab().doc.is_none() => app.reroll_til(),
+                // UX-2: `notice`, not `status` — see the `H`/`L` comment above.
                 KeyCode::Char('t') => {
                     if app.active_tab().sections.is_empty() {
-                        app.status = "No sections on this page".to_string();
+                        app.notice = Some("No sections on this page".to_string());
                     } else {
                         app.mode = Mode::Toc;
                     }
@@ -6050,24 +6173,31 @@ async fn handle_key(
                     app.mode = Mode::Command;
                     app.command_input.clear();
                 }
+                // UX-2 fix: `y`/`Y`'s whole point is a one-keypress
+                // confirmation of what got copied — routed through `notice`
+                // (not `status`) so it survives the focused-link line, which
+                // a fresh document's default focus (link 0) put in front of
+                // `status` on nearly every real yank. This was the exact gap
+                // the B-status fix's `app.notice` routing (external-link/
+                // redlink feedback) left unclosed.
                 KeyCode::Char('y') => {
                     if let Some(url) = app.yank_url() {
-                        app.status = match yank_to_clipboard(&url) {
+                        app.notice = Some(match yank_to_clipboard(&url) {
                             Ok(()) => format!("Yanked {url}"),
                             Err(e) => format!("Yank failed: {e}"),
-                        };
+                        });
                     } else {
-                        app.status = "Open an article first".to_string();
+                        app.notice = Some("Open an article first".to_string());
                     }
                 }
                 KeyCode::Char('Y') => {
                     if let Some(link) = app.yank_markdown() {
-                        app.status = match yank_to_clipboard(&link) {
+                        app.notice = Some(match yank_to_clipboard(&link) {
                             Ok(()) => format!("Yanked {link}"),
                             Err(e) => format!("Yank failed: {e}"),
-                        };
+                        });
                     } else {
-                        app.status = "Open an article first".to_string();
+                        app.notice = Some("Open an article first".to_string());
                     }
                 }
                 // PRD FR-OFF-2's "r to reload", Research mode's `r`
@@ -6107,16 +6237,19 @@ async fn handle_key(
                     app.mode = Mode::Find;
                     app.clear_find();
                 }
+                // UX-2: `notice`, not `status` — see the `H`/`L` comment above.
                 KeyCode::Char('n') => {
                     if app.active_tab().find_matches.is_empty() {
-                        app.status = "No active search — Ctrl-f to find in this page".to_string();
+                        app.notice =
+                            Some("No active search — Ctrl-f to find in this page".to_string());
                     } else {
                         app.find_next();
                     }
                 }
                 KeyCode::Char('N') => {
                     if app.active_tab().find_matches.is_empty() {
-                        app.status = "No active search — Ctrl-f to find in this page".to_string();
+                        app.notice =
+                            Some("No active search — Ctrl-f to find in this page".to_string());
                     } else {
                         app.find_prev();
                     }
@@ -6154,6 +6287,12 @@ async fn handle_key(
                     app.pending_b = false;
                     app.pending_r = false;
                     app.pending_z = false;
+                    // UX-8 fix: Esc is documented to cancel every pending
+                    // latch — these two were left out, so `Ctrl-w`/an armed
+                    // `]`/`[` chord followed by Esc left the latch armed to
+                    // silently consume whatever key came next.
+                    app.pending_ctrl_w = false;
+                    app.pending_cn_bracket = None;
                     app.clear_find();
                 }
                 _ => {}
@@ -6172,6 +6311,17 @@ async fn handle_key(
     }
     if !matches!(code, KeyCode::Char('z')) {
         app.pending_z = false;
+    }
+    // UX-8 fix: the same cross-mode safety net as the four latches just
+    // above — without it, a `Ctrl-w`/armed-bracket latch that survives past
+    // this keypress (e.g. because it was left dangling by a mode switch that
+    // never reached `Mode::Reading`'s own resolution arm) would stay armed
+    // indefinitely and consume some future, unrelated keystroke instead.
+    if !matches!(code, KeyCode::Char('w') if modifiers.contains(KeyModifiers::CONTROL)) {
+        app.pending_ctrl_w = false;
+    }
+    if !matches!(code, KeyCode::Char(']') | KeyCode::Char('[')) {
+        app.pending_cn_bracket = None;
     }
 }
 
@@ -6580,6 +6730,7 @@ async fn dispatch_action(
     save_tx: &UnboundedSender<SaveOutcome>,
     related_tx: &UnboundedSender<RelatedOutcome>,
     langlinks_tx: &UnboundedSender<LangLinksOutcome>,
+    summary_tx: &UnboundedSender<SummaryOutcome>,
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
 ) {
     use registry::Action;
@@ -6649,18 +6800,20 @@ async fn dispatch_action(
                 None => app.status = "No internal link focused to open in a tab".to_string(),
             }
         }
+        // UX-2 fix: `notice`, not `status` — mirrors the hardcoded `H`/`L`
+        // arms this dispatches identically to (see their own comment).
         Action::Back => {
             if let Some(entry) = app.navigate_back_target() {
                 open_history_entry(client, cache, app, entry, revalidate_tx).await;
             } else {
-                app.status = "No earlier page in history".to_string();
+                app.notice = Some("No earlier page in history".to_string());
             }
         }
         Action::Forward => {
             if let Some(entry) = app.navigate_forward_target() {
                 open_history_entry(client, cache, app, entry, revalidate_tx).await;
             } else {
-                app.status = "No later page in history".to_string();
+                app.notice = Some("No later page in history".to_string());
             }
         }
         Action::BackStackPicker => {
@@ -6678,9 +6831,10 @@ async fn dispatch_action(
             app.selected_tab_pick = app.active;
             app.mode = Mode::TabPicker;
         }
+        // UX-2 fix: `notice`, not `status` — mirrors the hardcoded `u` arm.
         Action::ReopenClosedTab => {
             if !app.reopen_closed_tab() {
-                app.status = "No recently closed tabs to reopen".to_string();
+                app.notice = Some("No recently closed tabs to reopen".to_string());
             }
         }
         Action::CloseTab => {
@@ -6688,9 +6842,10 @@ async fn dispatch_action(
                 app.should_quit = true;
             }
         }
+        // UX-2 fix: `notice`, not `status` — mirrors the hardcoded `t` arm.
         Action::Toc => {
             if app.active_tab().sections.is_empty() {
-                app.status = "No sections on this page".to_string();
+                app.notice = Some("No sections on this page".to_string());
             } else {
                 app.mode = Mode::Toc;
             }
@@ -6716,24 +6871,28 @@ async fn dispatch_action(
             app.mode = Mode::Help;
         }
         Action::Palette => app.open_palette(),
+        // UX-2 fix: `notice`, not `status` — mirrors the hardcoded `y`/`Y`
+        // arms (see their own comment for why this was the actual bug: a
+        // successful yank gave zero feedback on any page with a focused
+        // link, which is nearly every page).
         Action::YankUrl => {
             if let Some(url) = app.yank_url() {
-                app.status = match yank_to_clipboard(&url) {
+                app.notice = Some(match yank_to_clipboard(&url) {
                     Ok(()) => format!("Yanked {url}"),
                     Err(e) => format!("Yank failed: {e}"),
-                };
+                });
             } else {
-                app.status = "Open an article first".to_string();
+                app.notice = Some("Open an article first".to_string());
             }
         }
         Action::YankMarkdown => {
             if let Some(link) = app.yank_markdown() {
-                app.status = match yank_to_clipboard(&link) {
+                app.notice = Some(match yank_to_clipboard(&link) {
                     Ok(()) => format!("Yanked {link}"),
                     Err(e) => format!("Yank failed: {e}"),
-                };
+                });
             } else {
-                app.status = "Open an article first".to_string();
+                app.notice = Some("Open an article first".to_string());
             }
         }
         Action::ReadLater => enqueue_read_later(client, cache, app).await,
@@ -6752,16 +6911,17 @@ async fn dispatch_action(
             app.mode = Mode::Find;
             app.clear_find();
         }
+        // UX-2 fix: `notice`, not `status` — mirrors the hardcoded `n`/`N` arms.
         Action::FindNext => {
             if app.active_tab().find_matches.is_empty() {
-                app.status = "No active search — Ctrl-f to find in this page".to_string();
+                app.notice = Some("No active search — Ctrl-f to find in this page".to_string());
             } else {
                 app.find_next();
             }
         }
         Action::FindPrev => {
             if app.active_tab().find_matches.is_empty() {
-                app.status = "No active search — Ctrl-f to find in this page".to_string();
+                app.notice = Some("No active search — Ctrl-f to find in this page".to_string());
             } else {
                 app.find_prev();
             }
@@ -6800,6 +6960,42 @@ async fn dispatch_action(
             app.pending_quit_confirm = true;
             app.notice = Some("really quit? (y/n)".to_string());
         }
+        // -- UX-6 additions: identical behavior to their existing keypress,
+        // now also reachable from the palette (and listed in `?` help) —
+        // see each `registry::Action` variant's own doc comment.
+        Action::Peek => {
+            if let Some((lang, title)) = app.open_peek_at_focus() {
+                fire_summary(client, &lang, &title, summary_tx);
+            }
+        }
+        Action::IncognitoToggle => {
+            app.incognito = !app.incognito;
+            cache.set_incognito(app.incognito);
+            app.notice = Some(if app.incognito {
+                "incognito: on — no history, no stats, no prefetch \
+                 (explicit saves still persist, with a warning)"
+                    .to_string()
+            } else {
+                "incognito: off".to_string()
+            });
+        }
+        Action::FoldToggle => app.toggle_fold_at_cursor(),
+        Action::FoldAll => app.fold_all(),
+        Action::UnfoldAll => app.unfold_all(),
+        Action::JumpReferences => app.jump_to_references(),
+        Action::Split => match app.open_split(app.last_content_area.width) {
+            Ok(()) => {
+                app.notice = Some(
+                    "split — Ctrl-w w switches panes, :set scrollbind syncs, :only closes"
+                        .to_string(),
+                )
+            }
+            Err(reason) => app.notice = Some(reason),
+        },
+        Action::PrefetchLogOpen => app.open_prefetch_log(),
+        Action::InterestsOpen => app.open_interests(),
+        Action::StatsOpen => app.open_stats(),
+        Action::SessionsList => cmd_list_sessions(app),
         // Picker-generic actions are handled inline by each picker's own arm;
         // they are never routed here (not palette-exposed, and the override
         // layer is scoped to the reading view).
@@ -8178,6 +8374,7 @@ async fn execute_command(
     save_tx: &UnboundedSender<SaveOutcome>,
     related_tx: &UnboundedSender<RelatedOutcome>,
     langlinks_tx: &UnboundedSender<LangLinksOutcome>,
+    summary_tx: &UnboundedSender<SummaryOutcome>,
 ) {
     use command::{Command, LoginMode, RandomSpec, SaveSpec, TtsSpec, ZimSpec};
     // PRD FR-DL-6: while a wiki-walk is active and unwon, `:open`/`:random`/
@@ -8610,6 +8807,7 @@ async fn execute_command(
                 save_tx,
                 related_tx,
                 langlinks_tx,
+                summary_tx,
             )
             .await
         }
@@ -9073,6 +9271,778 @@ mod tests {
             .decode(payload)
             .unwrap();
         assert_eq!(decoded, b"Alan Turing");
+    }
+
+    // ---- UX-COHERENCE: status-bar feedback, latch handling, panel --------
+    // ---- scrolling, and command discoverability ---------------------------
+    //
+    // Shared plumbing for the tests below that drive real `handle_key`
+    // calls: a dead client, a temp-dir cache, one-shot channels for every
+    // outcome type (all unused here — none of these keypresses ever reach
+    // `tokio::spawn`), and a `Terminal` that's never drawn to (only a few
+    // arms call `.size()` on it). Constructing it from real stdout mirrors
+    // `ctrl_h_reopen_targets_the_visits_own_wiki_not_the_active_one`'s own
+    // precedent for calling `handle_key` directly from this test module.
+    #[allow(clippy::type_complexity)]
+    fn ux_test_harness(
+        tag: &str,
+    ) -> (
+        WikiClient,
+        PageCache,
+        std::path::PathBuf,
+        UnboundedSender<RevalidationOutcome>,
+        UnboundedSender<TabLoadOutcome>,
+        UnboundedSender<SaveOutcome>,
+        UnboundedSender<RelatedOutcome>,
+        UnboundedSender<LangLinksOutcome>,
+        UnboundedSender<SummaryOutcome>,
+        Terminal<CrosstermBackend<Stdout>>,
+    ) {
+        let client = test_client();
+        let (cache, dir) = temp_cache_dir(tag);
+        let (revalidate_tx, _) = mpsc::unbounded_channel();
+        let (open_tx, _) = mpsc::unbounded_channel();
+        let (save_tx, _) = mpsc::unbounded_channel();
+        let (related_tx, _) = mpsc::unbounded_channel();
+        let (langlinks_tx, _) = mpsc::unbounded_channel();
+        let (summary_tx, _) = mpsc::unbounded_channel();
+        let terminal = Terminal::new(CrosstermBackend::new(io::stdout())).unwrap();
+        (
+            client,
+            cache,
+            dir,
+            revalidate_tx,
+            open_tx,
+            save_tx,
+            related_tx,
+            langlinks_tx,
+            summary_tx,
+            terminal,
+        )
+    }
+
+    /// A document with exactly one internal link, focused by default (see
+    /// `App::set_document`'s "a fresh document focuses link 0" behavior) —
+    /// the exact precondition that made these Reading-action messages
+    /// invisible: `ui::status_bar_text`'s focused-link line shadows
+    /// `app.status`, but not `app.notice` (UX-2's fix).
+    fn app_with_focused_internal_link() -> App {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(crate::doc::parse_article_html(
+            "Test Article",
+            r#"<html><body><p>See <a href="./Internal_Target">Alpha</a>.</p></body></html>"#,
+        ));
+        assert_eq!(
+            app.active_tab().focused_link,
+            Some(0),
+            "fixture precondition: a fresh document with a link focuses it"
+        );
+        app
+    }
+
+    /// Renders the current frame into an off-screen buffer and returns every
+    /// cell's symbol concatenated — needed since `ui::status_bar_text` is
+    /// private to that module; this reads the actual painted frame instead.
+    fn render_frame(app: &mut App) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    /// UX-2: `y`/`Y`/`H`/`L`/`u`/`n`/`N`/`t`'s one-keypress feedback used to
+    /// write `app.status`, which `ui::status_bar_text`'s Reading arm only
+    /// shows when *no* link is focused — nearly never true, since a fresh
+    /// document focuses link 0. Routed through `app.notice` instead (which
+    /// outranks the focused-link line unconditionally), matching the earlier
+    /// B-status fix for external-link/redlink feedback.
+    #[tokio::test]
+    async fn reading_action_feedback_routes_through_notice_past_the_focused_link_line() {
+        let (
+            client,
+            cache,
+            dir,
+            revalidate_tx,
+            open_tx,
+            save_tx,
+            related_tx,
+            langlinks_tx,
+            summary_tx,
+            mut terminal,
+        ) = ux_test_harness("ux2-notice-routing");
+
+        let mut app = app_with_focused_internal_link();
+        // Precondition: with no notice yet, the rich focused-link line owns
+        // the bar — this is the exact shadowing UX-2 fixes around.
+        assert!(render_frame(&mut app).contains("Tab/S-Tab: cycle"));
+
+        macro_rules! press {
+            ($code:expr) => {
+                handle_key(
+                    &client,
+                    &cache,
+                    &mut app,
+                    $code,
+                    KeyModifiers::NONE,
+                    &revalidate_tx,
+                    &open_tx,
+                    &save_tx,
+                    &related_tx,
+                    &langlinks_tx,
+                    &summary_tx,
+                    &mut terminal,
+                )
+                .await
+            };
+        }
+
+        // A successful yank must be visible, not silently swallowed by the
+        // focused-link line (previously: zero feedback on any real page).
+        press!(KeyCode::Char('y'));
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|n| n.starts_with("Yanked")),
+            "{:?}",
+            app.notice
+        );
+        let rendered = render_frame(&mut app);
+        assert!(rendered.contains("Yanked"), "{rendered}");
+        assert!(
+            !rendered.contains("Tab/S-Tab: cycle"),
+            "the notice must replace the focused-link line, not sit behind it: {rendered}"
+        );
+
+        press!(KeyCode::Char('Y'));
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|n| n.starts_with("Yanked")),
+            "{:?}",
+            app.notice
+        );
+
+        // `H`/`L`: a fresh tab has no back/forward history yet.
+        press!(KeyCode::Char('H'));
+        assert_eq!(app.notice.as_deref(), Some("No earlier page in history"));
+        assert!(render_frame(&mut app).contains("No earlier page in history"));
+
+        press!(KeyCode::Char('L'));
+        assert_eq!(app.notice.as_deref(), Some("No later page in history"));
+
+        // `u`: nothing has been closed yet.
+        press!(KeyCode::Char('u'));
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("No recently closed tabs to reopen")
+        );
+
+        // `n`/`N`: no active in-page search.
+        press!(KeyCode::Char('n'));
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("No active search — Ctrl-f to find in this page")
+        );
+        press!(KeyCode::Char('N'));
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("No active search — Ctrl-f to find in this page")
+        );
+
+        // `t`: the fixture document has no headings.
+        press!(KeyCode::Char('t'));
+        assert_eq!(app.notice.as_deref(), Some("No sections on this page"));
+        assert_eq!(
+            app.mode,
+            Mode::Reading,
+            "no sections on the page means there is no TOC to open"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// UX-1 fix: with `show_cn` on but the document carrying zero
+    /// citation-needed markers, `[`/`]` must scroll tables immediately (the
+    /// jump chord could never do anything there) rather than arm
+    /// `pending_cn_bracket` and silently eat the reader's very next
+    /// keystroke.
+    #[tokio::test]
+    async fn bracket_key_scrolls_tables_immediately_when_the_page_has_no_citation_needed_markers() {
+        let (
+            client,
+            cache,
+            dir,
+            revalidate_tx,
+            open_tx,
+            save_tx,
+            related_tx,
+            langlinks_tx,
+            summary_tx,
+            mut terminal,
+        ) = ux_test_harness("ux1-no-markers");
+
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.show_cn = true;
+        let mut html = String::from("<html><body><table class=\"wikitable\"><tbody><tr>");
+        for c in 0..5 {
+            html.push_str(&format!("<td>c{c}</td>"));
+        }
+        html.push_str("</tr></tbody></table></body></html>");
+        app.set_document(crate::doc::parse_article_html("No markers", &html));
+        assert_eq!(
+            crate::doc::count_citation_needed(app.active_tab().doc.as_ref().unwrap()),
+            0,
+            "fixture precondition: no citation-needed markers"
+        );
+        assert_eq!(app.active_tab().table_col_offset, 0);
+
+        handle_key(
+            &client,
+            &cache,
+            &mut app,
+            KeyCode::Char(']'),
+            KeyModifiers::NONE,
+            &revalidate_tx,
+            &open_tx,
+            &save_tx,
+            &related_tx,
+            &langlinks_tx,
+            &summary_tx,
+            &mut terminal,
+        )
+        .await;
+
+        assert!(
+            app.pending_cn_bracket.is_none(),
+            "no markers to jump to: the chord must never arm"
+        );
+        assert_eq!(
+            app.active_tab().table_col_offset,
+            1,
+            "the bare `]` must still scroll the table immediately"
+        );
+
+        // And the very next keystroke must be its own, ordinary binding —
+        // not swallowed as a deferred chord resolution.
+        let scroll_before = app.active_tab().scroll;
+        handle_key(
+            &client,
+            &cache,
+            &mut app,
+            KeyCode::Char('j'),
+            KeyModifiers::NONE,
+            &revalidate_tx,
+            &open_tx,
+            &save_tx,
+            &related_tx,
+            &langlinks_tx,
+            &summary_tx,
+            &mut terminal,
+        )
+        .await;
+        assert!(
+            app.active_tab().scroll >= scroll_before,
+            "the key after `]` must scroll normally, not get eaten by a stale latch"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// UX-1: with `show_cn` on AND the page carrying at least one
+    /// citation-needed marker, the jump chord is still fully reachable — `]`
+    /// arms the latch, `c` resolves it to the jump (not the deferred
+    /// table-scroll).
+    #[tokio::test]
+    async fn bracket_key_arms_and_the_jump_still_works_when_markers_are_present() {
+        let (
+            client,
+            cache,
+            dir,
+            revalidate_tx,
+            open_tx,
+            save_tx,
+            related_tx,
+            langlinks_tx,
+            summary_tx,
+            mut terminal,
+        ) = ux_test_harness("ux1-with-markers");
+
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.show_cn = true;
+        app.layout_width = 80;
+        app.viewport_height = 24;
+        let html = "<html><body><p>A claim<sup class=\"noprint\" typeof=\"mw:Transclusion\" \
+             data-mw='{&quot;parts&quot;:[{&quot;template&quot;:{&quot;target&quot;:\
+             {&quot;wt&quot;:&quot;Citation needed&quot;},&quot;params&quot;:{}}}]}'>\
+             [<i><a href=\"./Wikipedia:Citation_needed\">citation needed</a></i>]</sup>.</p>\
+             <p>Padding text so the marker isn't already at the top of the \
+             viewport, giving the jump somewhere real to move the scroll \
+             to.</p></body></html>";
+        app.set_document(crate::doc::parse_article_html("Has markers", html));
+        assert!(
+            app.doc_has_citation_needed(),
+            "fixture precondition: at least one marker"
+        );
+
+        handle_key(
+            &client,
+            &cache,
+            &mut app,
+            KeyCode::Char(']'),
+            KeyModifiers::NONE,
+            &revalidate_tx,
+            &open_tx,
+            &save_tx,
+            &related_tx,
+            &langlinks_tx,
+            &summary_tx,
+            &mut terminal,
+        )
+        .await;
+        assert_eq!(app.pending_cn_bracket, Some(app::CnBracket::Next));
+
+        handle_key(
+            &client,
+            &cache,
+            &mut app,
+            KeyCode::Char('c'),
+            KeyModifiers::NONE,
+            &revalidate_tx,
+            &open_tx,
+            &save_tx,
+            &related_tx,
+            &langlinks_tx,
+            &summary_tx,
+            &mut terminal,
+        )
+        .await;
+        assert!(
+            app.pending_cn_bracket.is_none(),
+            "the second key must resolve (and clear) the latch"
+        );
+        assert!(
+            !app.notice
+                .as_deref()
+                .is_some_and(|n| n.contains("No citation-needed")),
+            "a real marker exists, so the jump must actually find it: {:?}",
+            app.notice
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// UX-4: `r` then Esc must cancel the latch, not fall through to
+    /// opening Research — Esc backing out of a chord must never instead
+    /// open a mode.
+    #[tokio::test]
+    async fn pending_r_then_esc_cancels_instead_of_opening_research() {
+        let (
+            client,
+            cache,
+            dir,
+            revalidate_tx,
+            open_tx,
+            save_tx,
+            related_tx,
+            langlinks_tx,
+            summary_tx,
+            mut terminal,
+        ) = ux_test_harness("ux4-pending-r-esc");
+
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(crate::doc::parse_article_html(
+            "Test",
+            "<html><body><p>Some text.</p></body></html>",
+        ));
+
+        handle_key(
+            &client,
+            &cache,
+            &mut app,
+            KeyCode::Char('r'),
+            KeyModifiers::NONE,
+            &revalidate_tx,
+            &open_tx,
+            &save_tx,
+            &related_tx,
+            &langlinks_tx,
+            &summary_tx,
+            &mut terminal,
+        )
+        .await;
+        assert!(app.pending_r, "r arms the latch");
+
+        handle_key(
+            &client,
+            &cache,
+            &mut app,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+            &revalidate_tx,
+            &open_tx,
+            &save_tx,
+            &related_tx,
+            &langlinks_tx,
+            &summary_tx,
+            &mut terminal,
+        )
+        .await;
+        assert!(!app.pending_r, "Esc must clear the latch");
+        assert_eq!(
+            app.mode,
+            Mode::Reading,
+            "Esc cancels — it must never open Research"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// UX-8: `Ctrl-w` then `Ctrl-p` must not open the palette with the
+    /// window-command latch still armed — the palette-open guard now checks
+    /// `pending_ctrl_w` (and `pending_cn_bracket`) alongside the pre-existing
+    /// g/b/r/z checks.
+    #[tokio::test]
+    async fn ctrl_w_then_ctrl_p_does_not_open_the_palette_with_the_latch_still_armed() {
+        let (
+            client,
+            cache,
+            dir,
+            revalidate_tx,
+            open_tx,
+            save_tx,
+            related_tx,
+            langlinks_tx,
+            summary_tx,
+            mut terminal,
+        ) = ux_test_harness("ux8-ctrlw-ctrlp");
+
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+
+        handle_key(
+            &client,
+            &cache,
+            &mut app,
+            KeyCode::Char('w'),
+            KeyModifiers::CONTROL,
+            &revalidate_tx,
+            &open_tx,
+            &save_tx,
+            &related_tx,
+            &langlinks_tx,
+            &summary_tx,
+            &mut terminal,
+        )
+        .await;
+        assert!(app.pending_ctrl_w, "Ctrl-w arms the window-command latch");
+
+        handle_key(
+            &client,
+            &cache,
+            &mut app,
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL,
+            &revalidate_tx,
+            &open_tx,
+            &save_tx,
+            &related_tx,
+            &langlinks_tx,
+            &summary_tx,
+            &mut terminal,
+        )
+        .await;
+        assert_eq!(
+            app.mode,
+            Mode::Reading,
+            "the palette must not open while a window-command chord is pending"
+        );
+        assert!(
+            !app.pending_ctrl_w,
+            "falling through to Mode::Reading's own resolution must still \
+             resolve (and clear) the latch, even though `p` isn't a \
+             recognized second key"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// UX-8: even outside `Mode::Reading` — where `pending_ctrl_w`'s own
+    /// early-return resolution never runs at all — the bottom-of-
+    /// `handle_key` safety net must still clear a dangling latch, so it can
+    /// never survive to silently consume some unrelated future keystroke.
+    #[tokio::test]
+    async fn dangling_latches_are_cleared_by_the_cross_mode_safety_net() {
+        let (
+            client,
+            cache,
+            dir,
+            revalidate_tx,
+            open_tx,
+            save_tx,
+            related_tx,
+            langlinks_tx,
+            summary_tx,
+            mut terminal,
+        ) = ux_test_harness("ux8-cross-mode-net");
+
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.mode = Mode::Palette;
+        app.pending_ctrl_w = true;
+        app.pending_cn_bracket = Some(app::CnBracket::Next);
+
+        // Palette's own ordinary Esc handling closes the palette — nothing
+        // about that arm even looks at these two fields.
+        handle_key(
+            &client,
+            &cache,
+            &mut app,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+            &revalidate_tx,
+            &open_tx,
+            &save_tx,
+            &related_tx,
+            &langlinks_tx,
+            &summary_tx,
+            &mut terminal,
+        )
+        .await;
+
+        assert!(
+            !app.pending_ctrl_w,
+            "the cross-mode safety net must clear a dangling Ctrl-w latch"
+        );
+        assert!(
+            app.pending_cn_bracket.is_none(),
+            "the cross-mode safety net must clear a dangling cn-bracket latch"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// UX-7: `resolve_panel_key`'s pure scroll decision — the read-only
+    /// inspector panels (`:prefetch-log`/`:interests`/`:stats`) used to
+    /// close on ANY key; this mirrors the `?` help overlay's own scroll
+    /// grammar exactly (j/k/arrows/Ctrl-d-u/g-G scroll, Esc/q close).
+    #[test]
+    fn resolve_panel_key_scrolls_and_clamps_and_closes_on_esc_or_q() {
+        assert_eq!(
+            resolve_panel_key(KeyCode::Char('j'), KeyModifiers::NONE, 0, 10),
+            PanelKeyAction::Scroll(1)
+        );
+        assert_eq!(
+            resolve_panel_key(KeyCode::Down, KeyModifiers::NONE, 9, 10),
+            PanelKeyAction::Scroll(10),
+            "clamped to max_scroll"
+        );
+        assert_eq!(
+            resolve_panel_key(KeyCode::Char('k'), KeyModifiers::NONE, 0, 10),
+            PanelKeyAction::Scroll(0),
+            "saturating, never underflows"
+        );
+        assert_eq!(
+            resolve_panel_key(KeyCode::Char('d'), KeyModifiers::CONTROL, 0, 10),
+            PanelKeyAction::Scroll(10)
+        );
+        assert_eq!(
+            resolve_panel_key(KeyCode::Char('u'), KeyModifiers::CONTROL, 5, 10),
+            PanelKeyAction::Scroll(0)
+        );
+        assert_eq!(
+            resolve_panel_key(KeyCode::Char('g'), KeyModifiers::NONE, 7, 10),
+            PanelKeyAction::Scroll(0)
+        );
+        assert_eq!(
+            resolve_panel_key(KeyCode::Char('G'), KeyModifiers::NONE, 0, 10),
+            PanelKeyAction::Scroll(10)
+        );
+        assert_eq!(
+            resolve_panel_key(KeyCode::Esc, KeyModifiers::NONE, 3, 10),
+            PanelKeyAction::Close
+        );
+        assert_eq!(
+            resolve_panel_key(KeyCode::Char('q'), KeyModifiers::NONE, 3, 10),
+            PanelKeyAction::Close
+        );
+        assert_eq!(
+            resolve_panel_key(KeyCode::Char('x'), KeyModifiers::NONE, 3, 10),
+            PanelKeyAction::None,
+            "an unbound key is a no-op now, not a dismiss"
+        );
+    }
+
+    /// UX-7: with `app.prefetch` unset (as in every test/no-substrate
+    /// session) the panel's content is shorter than any real viewport, so
+    /// `max_scroll` is 0 — but the regression this locks in is that `j` no
+    /// longer CLOSES the panel just because there's nothing to scroll to
+    /// (previously "any key closes it" would have reverted to `prior_mode`
+    /// right here); Esc must still close it.
+    #[tokio::test]
+    async fn prefetch_log_panel_no_longer_closes_on_j_but_esc_still_closes_it() {
+        let (
+            client,
+            cache,
+            dir,
+            revalidate_tx,
+            open_tx,
+            save_tx,
+            related_tx,
+            langlinks_tx,
+            summary_tx,
+            mut terminal,
+        ) = ux_test_harness("ux7-prefetch-log");
+
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.open_prefetch_log();
+        assert_eq!(app.mode, Mode::PrefetchLog);
+        assert_eq!(app.prefetch_log_scroll, 0);
+
+        handle_key(
+            &client,
+            &cache,
+            &mut app,
+            KeyCode::Char('j'),
+            KeyModifiers::NONE,
+            &revalidate_tx,
+            &open_tx,
+            &save_tx,
+            &related_tx,
+            &langlinks_tx,
+            &summary_tx,
+            &mut terminal,
+        )
+        .await;
+        assert_eq!(
+            app.mode,
+            Mode::PrefetchLog,
+            "j must scroll (or no-op at the bottom), never close the panel"
+        );
+
+        handle_key(
+            &client,
+            &cache,
+            &mut app,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+            &revalidate_tx,
+            &open_tx,
+            &save_tx,
+            &related_tx,
+            &langlinks_tx,
+            &summary_tx,
+            &mut terminal,
+        )
+        .await;
+        assert_eq!(app.mode, Mode::Reading, "Esc still closes the panel");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same fix for the other two read-only panels (UX-7) — briefer
+    /// since the mechanism (`resolve_panel_key`) is identical and already
+    /// proven above; this only pins that `Mode::Interests`/`Mode::Stats`
+    /// actually route through it too.
+    #[tokio::test]
+    async fn interests_and_stats_panels_no_longer_close_on_any_key_but_esc_still_closes_them() {
+        let (
+            client,
+            cache,
+            dir,
+            revalidate_tx,
+            open_tx,
+            save_tx,
+            related_tx,
+            langlinks_tx,
+            summary_tx,
+            mut terminal,
+        ) = ux_test_harness("ux7-interests-stats");
+
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+
+        app.open_interests();
+        assert_eq!(app.mode, Mode::Interests);
+        handle_key(
+            &client,
+            &cache,
+            &mut app,
+            KeyCode::Char('j'),
+            KeyModifiers::NONE,
+            &revalidate_tx,
+            &open_tx,
+            &save_tx,
+            &related_tx,
+            &langlinks_tx,
+            &summary_tx,
+            &mut terminal,
+        )
+        .await;
+        assert_eq!(
+            app.mode,
+            Mode::Interests,
+            "j must not close the interests panel"
+        );
+        handle_key(
+            &client,
+            &cache,
+            &mut app,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+            &revalidate_tx,
+            &open_tx,
+            &save_tx,
+            &related_tx,
+            &langlinks_tx,
+            &summary_tx,
+            &mut terminal,
+        )
+        .await;
+        assert_eq!(
+            app.mode,
+            Mode::Reading,
+            "Esc still closes the interests panel"
+        );
+
+        app.open_stats();
+        assert_eq!(app.mode, Mode::Stats);
+        handle_key(
+            &client,
+            &cache,
+            &mut app,
+            KeyCode::Char('k'),
+            KeyModifiers::NONE,
+            &revalidate_tx,
+            &open_tx,
+            &save_tx,
+            &related_tx,
+            &langlinks_tx,
+            &summary_tx,
+            &mut terminal,
+        )
+        .await;
+        assert_eq!(app.mode, Mode::Stats, "k must not close the stats panel");
+        handle_key(
+            &client,
+            &cache,
+            &mut app,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+            &revalidate_tx,
+            &open_tx,
+            &save_tx,
+            &related_tx,
+            &langlinks_tx,
+            &summary_tx,
+            &mut terminal,
+        )
+        .await;
+        assert_eq!(app.mode, Mode::Reading, "Esc still closes the stats panel");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- PRD FR-DL-6: wiki-walk navigation guard (`game_navigation_blocked`) --

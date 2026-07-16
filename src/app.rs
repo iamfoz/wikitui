@@ -845,6 +845,11 @@ pub struct App {
     pub prefetch: Option<crate::netqueue::SubstrateHandle>,
     /// The mode `open_prefetch_log` was entered from, restored on close.
     pub prefetch_prior_mode: Mode,
+    /// The `:prefetch-log` panel's scroll offset (PRD FR-CS-4-style fix, UX-7):
+    /// read-only inspector panels must scroll their overflow like the `?` help
+    /// overlay does, rather than dismiss on the very key that was meant to
+    /// scroll them. Reset to 0 on every `open_prefetch_log`.
+    pub prefetch_log_scroll: u16,
 
     // -- Interest model + reading stats (PRD FR-PF-3, FR-PC-3, FR-PR-2) -----
     /// The local, private interest-affinity model (`interest::InterestModel`).
@@ -863,8 +868,14 @@ pub struct App {
     pub interest_path: Option<std::path::PathBuf>,
     /// The mode `open_interests` was entered from, restored on close.
     pub interest_prior_mode: Mode,
+    /// The `:interests` panel's scroll offset — see `prefetch_log_scroll`'s
+    /// doc comment for why this exists (UX-7). Reset to 0 on `open_interests`.
+    pub interests_scroll: u16,
     /// The mode `open_stats` was entered from, restored on close.
     pub stats_prior_mode: Mode,
+    /// The `:stats` view's scroll offset — see `prefetch_log_scroll`'s doc
+    /// comment for why this exists (UX-7). Reset to 0 on `open_stats`.
+    pub stats_scroll: u16,
 
     // -- Start page, on-this-day panel, TIL widget (PRD FR-DL-1,2,7) -------
     /// The daily Wikifeeds cache, shared with the background substrate's
@@ -1519,11 +1530,14 @@ impl App {
             pending_saved_export_overwrite: None,
             prefetch: None,
             prefetch_prior_mode: Mode::Reading,
+            prefetch_log_scroll: 0,
             interest: crate::interest::InterestModel::default(),
             interest_learning: true,
             interest_path: None,
             interest_prior_mode: Mode::Reading,
+            interests_scroll: 0,
             stats_prior_mode: Mode::Reading,
+            stats_scroll: 0,
             feed_cache: None,
             startpage_config: StartPageConfig::default(),
             start_selected: 0,
@@ -1668,7 +1682,8 @@ impl App {
     pub fn open_prefetch_log(&mut self) {
         self.prefetch_prior_mode = self.mode;
         self.mode = Mode::PrefetchLog;
-        self.status = "Prefetch log — Esc to close".to_string();
+        self.prefetch_log_scroll = 0;
+        self.status = "Prefetch log — j/k: scroll  Esc: close".to_string();
     }
 
     /// Close the prefetch-log panel, restoring the prior mode.
@@ -1846,7 +1861,8 @@ impl App {
     pub fn open_interests(&mut self) {
         self.interest_prior_mode = self.mode;
         self.mode = Mode::Interests;
-        self.status = "Interest model — Esc to close".to_string();
+        self.interests_scroll = 0;
+        self.status = "Interest model — j/k: scroll  Esc: close".to_string();
     }
 
     /// Close the interests panel, restoring the prior mode.
@@ -1859,7 +1875,8 @@ impl App {
     pub fn open_stats(&mut self) {
         self.stats_prior_mode = self.mode;
         self.mode = Mode::Stats;
-        self.status = "Reading stats — Esc to close".to_string();
+        self.stats_scroll = 0;
+        self.status = "Reading stats — j/k: scroll  Esc: close".to_string();
     }
 
     /// Close the stats view, restoring the prior mode.
@@ -3802,6 +3819,19 @@ impl App {
     pub fn set_show_cn(&mut self, on: bool) {
         self.show_cn = on;
         self.notice = Some(format!("show-cn={}", if on { "on" } else { "off" }));
+    }
+
+    /// Whether the active tab's document carries at least one
+    /// citation-needed marker (PRD FR-DL-4). `main::handle_key`'s `]`/`[`
+    /// arms only arm `pending_cn_bracket` while this is true (UX-1 fix): with
+    /// `show_cn` on but a page with no markers at all, the jump chord could
+    /// never do anything, so arming it just to eat the reader's very next
+    /// keystroke for nothing was a pure regression, not a real feature.
+    pub fn doc_has_citation_needed(&self) -> bool {
+        self.active_tab()
+            .doc
+            .as_ref()
+            .is_some_and(|d| crate::doc::count_citation_needed(d) > 0)
     }
 
     /// Flushes accumulated dwell time for `tabs[index]`'s current visit
@@ -5814,6 +5844,25 @@ impl App {
         let title = tab.doc.as_ref()?.title.as_str();
         // The badge for the open article lives in that tab's own wiki scope.
         self.quality_badge_for(&tab.wiki, title)
+    }
+
+    /// Whether the article on screen is bookmarked (PRD FR-BM-1): wires
+    /// `BookmarkStore::is_bookmarked`, which previously had no caller outside
+    /// its own tests — the store tracked bookmarks correctly, but nothing in
+    /// the UI ever asked it whether the *current* article was one, so a
+    /// bookmarked page and an unbookmarked page were indistinguishable while
+    /// reading (only `m`'s one-keypress toggle confirmation, and the
+    /// bookmark picker itself, ever showed the state). Scoped by wiki (PRD
+    /// FR-ML-4), same as every other bookmark lookup — a same-titled article
+    /// on another wiki never borrows this one's bookmark.
+    pub fn is_active_bookmarked(&self) -> bool {
+        let tab = self.active_tab();
+        match &tab.doc {
+            Some(doc) => self
+                .bookmarks
+                .is_bookmarked(&tab.wiki, &tab.lang, &doc.title),
+            None => false,
+        }
     }
 
     /// `title`'s quality badge from the session cache, in `wiki`'s scope for
