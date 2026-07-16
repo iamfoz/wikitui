@@ -88,46 +88,15 @@ pub fn resolve_session_path() -> Option<PathBuf> {
     Some(dir.join("session.json"))
 }
 
-/// Writes `state` to `path` via a unique temp file, fsynced, then
-/// atomically renamed over the original — mirrors `jsonl::atomic_rewrite`'s
-/// durability contract (see that function's doc comment): a crash or power
-/// loss mid-write can never leave `path` holding a truncated or mixed file,
-/// only ever the previous save or the complete new one. Best-effort like
-/// every other store in this codebase: the caller (`App::persist_session`)
-/// discards the `Result`, since a failed session save must never interrupt
-/// reading.
+/// Writes `state` to `path` atomically (via the shared
+/// [`crate::atomicio::write_atomic`] helper): a crash or power loss mid-write
+/// can never leave `path` holding a truncated or mixed file, only ever the
+/// previous save or the complete new one. Best-effort like every other store
+/// in this codebase: the caller (`App::persist_session`) discards the
+/// `Result`, since a failed session save must never interrupt reading.
 pub fn save(state: &SessionState, path: &Path) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let json = serde_json::to_string_pretty(state).map_err(std::io::Error::other)?;
-    // Unique per call (not just per process), same reasoning as
-    // `jsonl::atomic_rewrite`: concurrent saves (a second wikitui instance,
-    // or two rapid saves racing a slow disk) must never clobber each
-    // other's temp file between write and rename.
-    static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let unique = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let base = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("session.json");
-    let tmp = path.with_file_name(format!(".{base}.{}.{unique}.tmp", std::process::id()));
-    {
-        use std::io::Write;
-        let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(json.as_bytes())?;
-        file.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)?;
-    // Best-effort directory sync so the rename itself is durable; opening a
-    // directory for sync only works on Unix, and its failure shouldn't fail
-    // the (already-visible) rename.
-    if let Some(parent) = path.parent()
-        && let Ok(dir) = std::fs::File::open(parent)
-    {
-        let _ = dir.sync_all();
-    }
-    Ok(())
+    crate::atomicio::write_atomic(path, json.as_bytes())
 }
 
 /// Loads a previously-saved session. A missing file, an unreadable file, or

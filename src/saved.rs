@@ -335,7 +335,12 @@ impl SavedPages {
             }
             let compressed = zstd::stream::encode_all(html.as_bytes(), ZSTD_LEVEL)
                 .map_err(std::io::Error::other)?;
-            std::fs::write(&content_abs, &compressed)?;
+            // Atomic write (CORR-M6): a crash/power-loss mid-write must never
+            // leave a truncated blob — the pinned copy is the integrity-checked
+            // tier, so a partial write would fail `verify` and destroy the good
+            // prior copy. temp+fsync+rename means the reader sees either the
+            // old complete blob or the new complete one, never a torn hybrid.
+            crate::atomicio::write_atomic(&content_abs, &compressed)?;
 
             if !thumbs.is_empty() {
                 let thumb_dir = root.join(Self::thumb_dir_rel(wiki, lang, title));
@@ -393,11 +398,16 @@ impl SavedPages {
         {
             self.records[pos] = record.clone();
             if let Some(index) = self.index_path() {
-                let _ = crate::jsonl::rewrite_matching::<SavedRecord, _>(
+                // Propagate the index rewrite error (CORR-L4): swallowing it
+                // (the old `let _ =`) would leave the stale index row pointing
+                // at the just-overwritten blob — verify=Corrupt, get=None —
+                // while `save` falsely returned Ok. `?`, matching the append
+                // path below.
+                crate::jsonl::rewrite_matching::<SavedRecord, _>(
                     &index,
                     |r| r.wiki == wiki && r.lang == lang && r.title == title,
                     Some(&record),
-                );
+                )?;
             }
         } else {
             self.records.push(record.clone());
@@ -502,10 +512,10 @@ impl SavedPages {
             .iter()
             .position(|r| r.wiki == wiki && r.lang == lang && r.title == title)?;
         let removed = self.records.remove(pos);
-        if let Some(root) = &self.root {
-            let _ = std::fs::remove_file(root.join(&removed.content_file));
-            let _ = std::fs::remove_dir_all(root.join(Self::thumb_dir_rel(wiki, lang, title)));
-        }
+        // Rewrite the index FIRST (CORR-M6), then best-effort delete the blob
+        // and thumbnails: a crash landing between the two leaves at worst an
+        // orphaned blob (the index no longer names it), never a Corrupt index
+        // row pointing at content we already deleted.
         let persisted = match self.index_path() {
             Some(index) => crate::jsonl::rewrite_matching::<SavedRecord, _>(
                 &index,
@@ -515,6 +525,10 @@ impl SavedPages {
             .map(|_| ()),
             None => Ok(()),
         };
+        if let Some(root) = &self.root {
+            let _ = std::fs::remove_file(root.join(&removed.content_file));
+            let _ = std::fs::remove_dir_all(root.join(Self::thumb_dir_rel(wiki, lang, title)));
+        }
         Some((removed, persisted))
     }
 }
@@ -828,6 +842,113 @@ mod tests {
         assert!(store.get("", "en", "Nope").is_none());
         let mem = SavedPages::in_memory();
         assert!(mem.get("", "en", "Nope").is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// CORR-L4: a failed index rewrite must surface, not be swallowed. Replace
+    /// the index file with a directory so the replace path's fresh
+    /// `read_to_string` fails with a non-NotFound error; `save` must return
+    /// `Err`, never a false `Ok` that claims the pin succeeded.
+    #[test]
+    fn save_propagates_an_index_rewrite_error_rather_than_returning_ok() {
+        let (mut store, root) = temp_store();
+        store
+            .save(
+                "",
+                "en",
+                "Turing",
+                1,
+                Tier::T0,
+                "<p>v1</p>",
+                &[],
+                vec![],
+                "",
+            )
+            .unwrap();
+
+        // The record stays in memory, so the re-save takes the *replace* path;
+        // a directory where the index file was makes its index write fail.
+        let index = root.join("saved.jsonl");
+        std::fs::remove_file(&index).unwrap();
+        std::fs::create_dir(&index).unwrap();
+
+        let result = store.save(
+            "",
+            "en",
+            "Turing",
+            2,
+            Tier::T0,
+            "<p>v2</p>",
+            &[],
+            vec![],
+            "",
+        );
+        assert!(
+            result.is_err(),
+            "a failed index rewrite must not return Ok — the caller must learn the pin didn't stick"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// CORR-M6: the pinned blob is written via the atomic temp+rename helper,
+    /// so a partial/torn write can never corrupt the prior copy. A completed
+    /// save leaves the blob verifiable and no stray `.tmp` artifact beside it.
+    #[test]
+    fn save_writes_the_blob_atomically_leaving_no_partial_temp() {
+        let (mut store, root) = temp_store();
+        let rec = store
+            .save(
+                "",
+                "en",
+                "Turing",
+                1,
+                Tier::T0,
+                "<p>pinned</p>",
+                &[],
+                vec![],
+                "",
+            )
+            .unwrap();
+        assert_eq!(
+            store.verify("", "en", "Turing"),
+            Integrity::Ok,
+            "the blob must be written in full, never truncated"
+        );
+        let content_dir = root.join(&rec.content_file).parent().unwrap().to_path_buf();
+        let stray = std::fs::read_dir(&content_dir)
+            .unwrap()
+            .any(|e| e.unwrap().file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(
+            !stray,
+            "the atomic blob write must leave no partial temp file behind"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// CORR-M6: `remove` rewrites the index before deleting the blob, so no
+    /// Corrupt index row is ever stranded pointing at a missing blob. After a
+    /// remove, reloading from disk shows no record at all — and hence nothing
+    /// `verify_all` can report as corrupt.
+    #[test]
+    fn remove_leaves_no_dangling_corrupt_index_row() {
+        let (mut store, root) = temp_store();
+        store
+            .save("", "en", "Turing", 1, Tier::T0, "<p>x</p>", &[], vec![], "")
+            .unwrap();
+        let (_, persisted) = store.remove("", "en", "Turing").unwrap();
+        assert!(persisted.is_ok());
+
+        let reloaded = SavedPages::at(root.clone());
+        assert!(
+            reloaded.list().is_empty(),
+            "the index row must be gone, leaving no row to point at a deleted blob"
+        );
+        assert!(
+            reloaded
+                .verify_all()
+                .iter()
+                .all(|(_, _, _, v)| *v == Integrity::Ok)
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

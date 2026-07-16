@@ -397,14 +397,14 @@ pub fn load_last_seen(path: &Path) -> Option<String> {
 /// "losing one write is preferable to interrupting reading" posture) —
 /// worst case the next open re-shows a change already seen, never a crash.
 pub fn save_last_seen(path: &Path, last_seen: &str) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let json = serde_json::to_string(&WatchlistState {
         last_seen: Some(last_seen.to_string()),
     })
     .map_err(std::io::Error::other)?;
-    std::fs::write(path, json)
+    // Atomic write (quality-M4): a torn watchlist-state write could leave a
+    // truncated file that loads as "never seen anything", re-surfacing changes
+    // the reader already acknowledged.
+    crate::atomicio::write_atomic(path, json.as_bytes())
 }
 
 /// The newest `timestamp` across `changes`, or `None` for an empty feed —
@@ -986,11 +986,11 @@ pub fn save_readinglist_sync_state(
     path: &Path,
     state: &ReadingListSyncState,
 ) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let json = serde_json::to_string(state).map_err(std::io::Error::other)?;
-    std::fs::write(path, json)
+    // Atomic write (quality-M4): a torn reading-list sync-state write is
+    // especially costly — a truncated snapshot makes the next reconcile
+    // resurrect entries the reader deleted or re-churn already-synced ones.
+    crate::atomicio::write_atomic(path, json.as_bytes())
 }
 
 /// The three actions one Reading List two-way reconcile decides on (PRD
@@ -1141,11 +1141,10 @@ pub fn load_watch_mirror_state(path: &Path) -> WatchMirrorState {
 /// Persists the watch-mirror state to `path` — best-effort, same posture as
 /// [`save_readinglist_sync_state`].
 pub fn save_watch_mirror_state(path: &Path, state: &WatchMirrorState) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let json = serde_json::to_string(state).map_err(std::io::Error::other)?;
-    std::fs::write(path, json)
+    // Atomic write (quality-M4): same posture as `save_readinglist_sync_state`
+    // — a torn watch-mirror snapshot must not corrupt the mirror's view.
+    crate::atomicio::write_atomic(path, json.as_bytes())
 }
 
 /// What one watch-mirror application needs to do (PRD FR-BM-6): titles to

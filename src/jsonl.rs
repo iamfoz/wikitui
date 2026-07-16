@@ -39,6 +39,14 @@ pub fn load<T: DeserializeOwned>(path: &Path) -> Vec<T> {
 /// reads the file first, so it can't race with a concurrent reader/writer
 /// on the read half — only `rewrite_matching`'s delete/replace path needs
 /// the fresh-read-then-atomic-rename dance.
+///
+/// The line *and* its trailing newline are built into one buffer and emitted
+/// in a single `write_all` (CORR-M8): `writeln!` would emit the body and the
+/// `\n` as two separate `write` calls, so two `O_APPEND` writers racing on the
+/// same file could interleave into `line_Aline_B\n\n` — one corrupt line plus
+/// a blank, both then silently dropped by `load`'s `filter_map(ok)`, losing
+/// *both* records. A single small `write_all` to an `O_APPEND` file is atomic
+/// with respect to other appenders, so each record lands as one intact line.
 pub fn append<T: Serialize>(path: &Path, record: &T) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -47,8 +55,9 @@ pub fn append<T: Serialize>(path: &Path, record: &T) -> std::io::Result<()> {
         .create(true)
         .append(true)
         .open(path)?;
-    let line = serde_json::to_string(record).map_err(std::io::Error::other)?;
-    writeln!(file, "{line}")
+    let mut line = serde_json::to_string(record).map_err(std::io::Error::other)?;
+    line.push('\n');
+    file.write_all(line.as_bytes())
 }
 
 /// Rewrites the first line in `path` that parses to a `T` for which
@@ -111,61 +120,85 @@ where
     Ok(true)
 }
 
-/// Writes `lines` (already newline-free) to `path` via a unique temp file,
-/// fsynced, then atomically renamed over the original — the durability half
-/// of `rewrite_matching`, split out because it has no need for the generic
-/// parse/predicate machinery above.
+/// Writes `lines` (already newline-free) to `path` atomically — the
+/// durability half of `rewrite_matching`, now a thin adapter over the shared
+/// [`crate::atomicio::write_atomic`] helper (which owns the unique-temp +
+/// fsync + rename + directory-fsync dance every store in the codebase relies
+/// on). Split out from the generic parse/predicate machinery above because it
+/// only needs the joined bytes.
 fn atomic_rewrite(path: &Path, lines: &[String]) -> std::io::Result<()> {
     let mut out = lines.join("\n");
     if !out.is_empty() {
         out.push('\n');
     }
-    // The temp name must be unique per *call*, not just per process: two
-    // concurrent rewrites (different threads, or different stores sharing a
-    // directory) would otherwise clobber each other's temp file between
-    // write and rename.
-    static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let unique = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let base = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("wikitui-store.jsonl");
-    let tmp = path.with_file_name(format!(".{base}.{}.{unique}.tmp", std::process::id()));
-    {
-        let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(out.as_bytes())?;
-        file.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)?;
-    // Best-effort directory sync so the rename itself is durable; opening a
-    // directory for sync only works on Unix, and its failure shouldn't fail
-    // the (already-visible) rename.
-    if let Some(parent) = path.parent()
-        && let Ok(dir) = std::fs::File::open(parent)
-    {
-        let _ = dir.sync_all();
-    }
-    Ok(())
+    crate::atomicio::write_atomic(path, out.as_bytes())
 }
 
-/// Rewrites the *entire* file to `records`, in the given order — unlike
-/// `rewrite_matching`'s single-line replace/delete, every record is
-/// re-serialized from scratch, so a line this build couldn't parse does NOT
-/// survive a whole-file reorder the way it survives `rewrite_matching` (there
-/// is nothing to preserve byte-for-byte once every record has already been
-/// read into memory and it wasn't one of them). Used by `bookmarks::
-/// BookmarkStore::reorder` (PRD FR-BM-5's "server wins on order" conflict
-/// policy) — the one caller whose contract is "line order is itself
-/// meaningful data," not just "one line's content changed."
-pub fn rewrite_all<T: Serialize>(path: &Path, records: &[T]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+/// Reorders — in place, preserving every non-participating line
+/// byte-for-byte — only the lines of `path` that parse to a `T` for which
+/// `is_match` returns true, according to `reorder`. Unlike a whole-file
+/// rewrite from the caller's in-memory snapshot (which re-serializes every
+/// record from scratch and so silently drops any line that snapshot never held
+/// — an unparseable line, another wiki/lang's record, or a concurrent append
+/// by a second running instance), this reads the file *fresh* like
+/// [`rewrite_matching`] and only touches the
+/// matching records' *slots*: it collects the matching records in file order,
+/// hands them to `reorder` (which must return the same records permuted, never
+/// adding or dropping any), and writes them back into exactly the positions
+/// they occupied, leaving every other line — matching or not, parseable or
+/// not — untouched. This is what lets `BookmarkStore::reorder` re-rank one
+/// `(wiki, lang)`'s bookmarks without erasing an unparseable line, another
+/// language's bookmark, or one a second instance appended since load (CORR-M2).
+///
+/// Returns whether any matching record was found (and hence a rewrite
+/// attempted). A `reorder` that returns a different number of records than it
+/// was handed is a caller bug that would misalign the slots, so it is rejected
+/// without writing (the file is left exactly as-is) rather than stranding an
+/// empty slot and losing a line.
+pub fn reorder_matching<T, M, R>(path: &Path, is_match: M, reorder: R) -> std::io::Result<bool>
+where
+    T: Serialize + DeserializeOwned,
+    M: Fn(&T) -> bool,
+    R: FnOnce(Vec<T>) -> Vec<T>,
+{
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+
+    // `slots` are the indices in `out` a matching record occupies (a `None`
+    // placeholder to be filled by the reordered set); every other line is kept
+    // verbatim as `Some(raw)` at its original position.
+    let mut out: Vec<Option<String>> = Vec::new();
+    let mut slots: Vec<usize> = Vec::new();
+    let mut matching: Vec<T> = Vec::new();
+    for line in content.lines() {
+        if let Ok(parsed) = serde_json::from_str::<T>(line)
+            && is_match(&parsed)
+        {
+            slots.push(out.len());
+            matching.push(parsed);
+            out.push(None);
+        } else {
+            out.push(Some(line.to_string()));
+        }
     }
-    let lines: Vec<String> = records
-        .iter()
-        .map(|r| serde_json::to_string(r).map_err(std::io::Error::other))
-        .collect::<std::io::Result<Vec<_>>>()?;
-    atomic_rewrite(path, &lines)
+    if matching.is_empty() {
+        return Ok(false);
+    }
+
+    let reordered = reorder(matching);
+    if reordered.len() != slots.len() {
+        return Ok(false);
+    }
+    for (&slot, record) in slots.iter().zip(reordered.iter()) {
+        out[slot] = Some(serde_json::to_string(record).map_err(std::io::Error::other)?);
+    }
+
+    let lines: Vec<String> = out.into_iter().flatten().collect();
+    atomic_rewrite(path, &lines)?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -367,79 +400,6 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_all_replaces_the_whole_file_in_the_given_order() {
-        let path = temp_path("rewrite-all");
-        append(
-            &path,
-            &Rec {
-                id: 1,
-                text: "a".into(),
-            },
-        )
-        .unwrap();
-        append(
-            &path,
-            &Rec {
-                id: 2,
-                text: "b".into(),
-            },
-        )
-        .unwrap();
-        append(
-            &path,
-            &Rec {
-                id: 3,
-                text: "c".into(),
-            },
-        )
-        .unwrap();
-
-        // Reordered AND missing id 2 — a whole-file rewrite, not an edit.
-        let reordered = vec![
-            Rec {
-                id: 3,
-                text: "c".into(),
-            },
-            Rec {
-                id: 1,
-                text: "a".into(),
-            },
-        ];
-        rewrite_all(&path, &reordered).unwrap();
-
-        let loaded: Vec<Rec> = load(&path);
-        assert_eq!(loaded, reordered);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn rewrite_all_on_a_fresh_path_creates_the_file_and_parent_dir() {
-        let dir = std::env::temp_dir().join(format!(
-            "wikitui-test-jsonl-rewrite-all-fresh-{}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        let path = dir.join("nested").join("store.jsonl");
-        rewrite_all(
-            &path,
-            &[Rec {
-                id: 1,
-                text: "x".into(),
-            }],
-        )
-        .unwrap();
-        let loaded: Vec<Rec> = load(&path);
-        assert_eq!(
-            loaded,
-            vec![Rec {
-                id: 1,
-                text: "x".into()
-            }]
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn rewrite_matching_only_touches_the_first_match() {
         let path = temp_path("firstonly");
         append(
@@ -462,6 +422,123 @@ mod tests {
         rewrite_matching::<Rec, _>(&path, |r| r.id == 1, None).unwrap();
         let loaded: Vec<Rec> = load(&path);
         assert_eq!(loaded.len(), 1, "only the first matching line is removed");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// CORR-M8: each `append` emits its record and newline in one `write_all`,
+    /// so two `O_APPEND` writers can't interleave a half-line. With the old
+    /// `writeln!` (body and `\n` as separate writes) a race produced a
+    /// concatenated, unparseable line plus a blank — `load` would drop both,
+    /// and the count would fall short of what was appended.
+    #[test]
+    fn concurrent_appends_never_interleave_into_lost_lines() {
+        let path = temp_path("concurrent-append");
+        let threads: u32 = 8;
+        let per_thread: u32 = 200;
+        let mut handles = Vec::new();
+        for t in 0..threads {
+            let path = path.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..per_thread {
+                    append(
+                        &path,
+                        &Rec {
+                            id: t * per_thread + i,
+                            text: "x".repeat(40),
+                        },
+                    )
+                    .unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let loaded: Vec<Rec> = load(&path);
+        assert_eq!(
+            loaded.len(),
+            (threads * per_thread) as usize,
+            "every concurrently-appended record must survive as one intact line"
+        );
+        let mut ids: Vec<u32> = loaded.iter().map(|r| r.id).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            (0..threads * per_thread).collect::<Vec<_>>(),
+            "no record was interleaved into an unparseable line"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// CORR-M2's primitive: `reorder_matching` reorders only the matching
+    /// records' slots and preserves every other line byte-for-byte — a
+    /// parseable-but-non-matching record, an unparseable line, and a record a
+    /// second instance appended after this store loaded all survive, where
+    /// `rewrite_all` from a stale snapshot would have erased them.
+    #[test]
+    fn reorder_matching_reorders_only_matching_slots_preserving_everything_else() {
+        let path = temp_path("reorder-matching");
+        append(
+            &path,
+            &Rec {
+                id: 1,
+                text: "a".into(),
+            },
+        )
+        .unwrap();
+        append(
+            &path,
+            &Rec {
+                id: 99,
+                text: "other".into(),
+            },
+        )
+        .unwrap();
+        append(
+            &path,
+            &Rec {
+                id: 2,
+                text: "b".into(),
+            },
+        )
+        .unwrap();
+        let mut raw = std::fs::read_to_string(&path).unwrap();
+        raw.push_str("{\"truncated\":\n");
+        std::fs::write(&path, raw).unwrap();
+        // A concurrent append after the (hypothetical) in-memory snapshot —
+        // this is the record a `rewrite_all` from stale memory would drop.
+        append(
+            &path,
+            &Rec {
+                id: 3,
+                text: "c".into(),
+            },
+        )
+        .unwrap();
+
+        let found = reorder_matching::<Rec, _, _>(
+            &path,
+            |r| r.id != 99,
+            |mut recs: Vec<Rec>| {
+                recs.reverse();
+                recs
+            },
+        )
+        .unwrap();
+        assert!(found);
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("{\"truncated\":"),
+            "the unparseable line must survive byte-for-byte"
+        );
+        let loaded: Vec<Rec> = load(&path);
+        assert_eq!(
+            loaded.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![3, 99, 2, 1],
+            "matching records reverse within their slots; id 99 keeps its slot"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

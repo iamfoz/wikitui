@@ -244,10 +244,17 @@ impl BookmarkStore {
     /// panicking on it) keeps its prior relative position among them,
     /// sorted after every title `order` does rank.
     ///
-    /// Unlike every other mutator in this store, this rewrites the *whole*
-    /// file in one shot (`jsonl::rewrite_all`) rather than one line — line
-    /// order becomes meaningful data here, a step beyond FR-BM-7's baseline
-    /// append-only/single-line-edit contract.
+    /// Unlike every other mutator in this store, line *order* is meaningful
+    /// data here, a step beyond FR-BM-7's baseline append-only/single-line-edit
+    /// contract. It is nonetheless persisted through the same fresh-read,
+    /// preserve-everything-else discipline (CORR-M2): `jsonl::reorder_matching`
+    /// re-reads the file, reorders only this `(lang)`'s own parseable records
+    /// among the slots they occupy, and leaves every other line — another
+    /// language's bookmark, an unparseable line, a bookmark a second running
+    /// instance appended since this store loaded — byte-for-byte in place.
+    /// (The earlier `jsonl::rewrite_all` from the in-memory snapshot erased all
+    /// three, since the snapshot had already dropped unparseable lines at load
+    /// and never saw the concurrent append.)
     pub fn reorder(&mut self, lang: &str, order: &[String]) -> std::io::Result<()> {
         let slots: Vec<usize> = self
             .bookmarks
@@ -272,7 +279,24 @@ impl BookmarkStore {
             self.bookmarks[slot] = bookmark;
         }
         if let Some(path) = &self.path {
-            crate::jsonl::rewrite_all(path, &self.bookmarks)?;
+            let lang = lang.to_string();
+            let order = order.to_vec();
+            crate::jsonl::reorder_matching::<Bookmark, _, _>(
+                path,
+                move |b| b.lang == lang,
+                move |mut matching: Vec<Bookmark>| {
+                    // Stable sort by rank in `order`; ties (and titles `order`
+                    // never mentions, ranked `usize::MAX`) keep their prior
+                    // relative file order — matching the in-memory reorder above.
+                    matching.sort_by_key(|b| {
+                        order
+                            .iter()
+                            .position(|t| t == &b.title)
+                            .unwrap_or(usize::MAX)
+                    });
+                    matching
+                },
+            )?;
         }
         Ok(())
     }
@@ -660,6 +684,75 @@ mod tests {
         // "Berlin" (de) keeps its original position rather than being pulled
         // to the front or back by the `en` reorder.
         assert_eq!(titles, vec!["Berlin", "Enigma machine", "Alan Turing"]);
+    }
+
+    /// CORR-M2: `reorder` must persist through a fresh read that preserves
+    /// every line it doesn't own. A second instance's concurrent append, an
+    /// unparseable line, and another language's bookmark all survive an `en`
+    /// reorder — where the old `rewrite_all` from the stale in-memory snapshot
+    /// erased all three.
+    #[test]
+    fn reorder_preserves_concurrent_append_unparseable_and_other_lang_lines() {
+        let path = temp_path("bookmarks-reorder-concurrent");
+        let mut store = BookmarkStore::load_from(path.clone());
+        store.toggle("en", "X", None);
+        store.toggle("en", "Y", None);
+
+        // A second instance appends a third `en` bookmark and a `de` bookmark
+        // after this store loaded, plus a hand-corrupted line — none of which
+        // this store's in-memory snapshot knows about.
+        let concurrent_z = Bookmark {
+            title: "Z".to_string(),
+            lang: "en".to_string(),
+            revid_at_bookmark: None,
+            section_anchor: None,
+            created_at: now_ts(),
+            updated_at: now_ts(),
+            tags: Vec::new(),
+            note: None,
+        };
+        crate::jsonl::append(&path, &concurrent_z).unwrap();
+        let mut raw = std::fs::read_to_string(&path).unwrap();
+        raw.push_str("{\"a corrupt bookmark line\":\n");
+        std::fs::write(&path, raw).unwrap();
+        let concurrent_de = Bookmark {
+            title: "Berlin".to_string(),
+            lang: "de".to_string(),
+            ..concurrent_z.clone()
+        };
+        crate::jsonl::append(&path, &concurrent_de).unwrap();
+
+        store
+            .reorder("en", &["Y".to_string(), "X".to_string()])
+            .unwrap();
+
+        let reloaded = BookmarkStore::load_from(path.clone());
+        let titles: Vec<&str> = reloaded
+            .bookmarks
+            .iter()
+            .map(|b| b.title.as_str())
+            .collect();
+        assert!(
+            titles.contains(&"Z"),
+            "the concurrently-appended en bookmark must survive the reorder"
+        );
+        assert!(
+            titles.contains(&"Berlin"),
+            "another language's bookmark must survive the reorder"
+        );
+        let pos = |t: &str| titles.iter().position(|x| *x == t).unwrap();
+        assert!(pos("Y") < pos("X"), "Y ranks before X per the new order");
+        assert!(
+            pos("X") < pos("Z"),
+            "the unranked concurrent append stays last among en"
+        );
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("a corrupt bookmark line"),
+            "an unparseable line must survive byte-for-byte"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

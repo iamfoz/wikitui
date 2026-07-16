@@ -430,16 +430,16 @@ impl InterestModel {
         model
     }
 
-    /// Serialize to pretty-printed JSON at `path`, creating parent directories.
-    /// Best-effort: a write failure returns `Err` for the caller to log, never
-    /// panics (mirrors `history`'s swallow-to-a-log-line posture).
+    /// Serialize to pretty-printed JSON at `path`, atomically (via the shared
+    /// [`crate::atomicio::write_atomic`] helper, quality-M4), so a crash
+    /// mid-write can never leave a truncated `interest.json` that loads as an
+    /// empty model and silently discards the reader's accumulated interest
+    /// scores. Best-effort: a write failure returns `Err` for the caller to
+    /// log, never panics (mirrors `history`'s swallow-to-a-log-line posture).
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(path, json)
+        crate::atomicio::write_atomic(path, json.as_bytes())
     }
 }
 

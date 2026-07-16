@@ -2,6 +2,7 @@ mod account;
 mod achievements;
 mod api;
 mod app;
+mod atomicio;
 mod attribution;
 mod auth;
 mod autotheme;
@@ -8764,7 +8765,11 @@ fn run_reindex(resolved: &config::ResolvedConfig) -> i32 {
         }
     }
     for (wiki, lang, title) in cache.list_entries() {
-        if let Some(page) = cache.get(&wiki, &lang, &title) {
+        // `peek`, not `get`: rebuilding the index reads every cached entry, and
+        // `get`'s read-side touch would promote each to Protected and flatten
+        // its mtime, defeating SLRU/recency (CORR-M8). A reindex must observe
+        // the cache, not disturb its eviction state.
+        if let Some(page) = cache.peek(&wiki, &lang, &title) {
             let document = doc::parse_article_html(&title, &page.html);
             let plain = doc::render_plain(&document, &lang);
             docs.push((wiki, lang, title, offline_search::Kind::Cached, plain));

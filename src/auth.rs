@@ -675,27 +675,20 @@ impl TokenStore for FileTokenStore {
     }
 }
 
-/// Writes `bytes` to `path` with `0600` permissions on unix, creating or
-/// truncating. On unix the mode is set *before* the content is written (via
-/// `OpenOptions::mode`) so the tokens are never briefly world-readable
-/// between create and chmod. Non-unix falls back to a plain write (the
-/// keychain is the real store there anyway).
+/// Writes `bytes` to `path` with `0600` permissions on unix, atomically. On
+/// unix this goes through [`crate::atomicio::write_atomic_mode`]: the tokens
+/// are written to a temp file created at `0600` and then renamed over `path`,
+/// so they are never present on disk at a laxer mode for even an instant
+/// (CORR-L6). The earlier approach set the mode only on *create* and chmod'd a
+/// pre-existing file *after* writing — a window in which a rewritten
+/// `auth.json` sat at its old (possibly `0644`) mode holding fresh tokens. The
+/// rename also makes the rewrite crash-atomic, so a mid-write crash can never
+/// truncate the token file and log the reader out. Non-unix falls back to a
+/// plain write (the keychain is the real store there anyway).
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        use std::os::unix::fs::PermissionsExt as _;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        f.write_all(bytes)?;
-        // An existing file keeps its old mode through `open`; force it.
-        let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(path, perms)?;
-        f.flush()
+        crate::atomicio::write_atomic_mode(path, bytes, 0o600)
     }
     #[cfg(not(unix))]
     {
@@ -1233,6 +1226,38 @@ mod tests {
         store.save(&sample_tokens()).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "auth.json must be owner-only, got {mode:o}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CORR-L6: rewriting `auth.json` over a pre-existing world-readable file
+    /// must end at `0600` — and, structurally, the tokens only ever reach the
+    /// real path via a rename of a temp created at `0600`, so they are never
+    /// present at the laxer mode mid-write.
+    #[cfg(unix)]
+    #[test]
+    fn rewriting_over_a_pre_existing_0644_file_ends_at_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = temp_path("perms-rewrite");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auth.json");
+        // The exact starting state the old create-mode + late-chmod approach
+        // left fresh tokens momentarily exposed in.
+        std::fs::write(&path, b"stale world-readable tokens").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let store = FileTokenStore::new(path.clone());
+        store.save(&sample_tokens()).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a rewritten auth.json must be 0600, never left at 0644, got {mode:o}"
+        );
+        assert_eq!(
+            store.load().unwrap(),
+            Some(sample_tokens()),
+            "the atomic rename must have replaced the file with the new tokens"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

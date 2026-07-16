@@ -546,8 +546,22 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     if version >= SCHEMA_VERSION {
         return Ok(()); // already current — no redundant DDL on every launch
     }
+    // Each step runs its DDL *and* its `user_version` bump inside ONE
+    // transaction (CORR-M8). SQLite's DDL and the `user_version` header write
+    // are both transactional, so a crash mid-migration rolls the step back
+    // wholesale — the version never advances past a step that didn't fully
+    // apply, and the step simply re-runs from a clean state next launch. This
+    // closes the old failure mode where each `execute_batch` auto-committed
+    // per statement with the version bump last: a crash after the DDL but
+    // before the bump left the schema half-changed *and* eligible to re-run
+    // the DDL, wedging on e.g. a duplicate-column error forever. The `IF NOT
+    // EXISTS` guards below (and the explicit `column_exists` check in v4, which
+    // `ADD COLUMN` has no `IF NOT EXISTS` form for) additionally make each step
+    // idempotent, so even a database left half-migrated by the *old* code
+    // recovers rather than wedges.
     if version < 1 {
-        conn.execute_batch(
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS visits (
                 id INTEGER PRIMARY KEY,
                 lang TEXT NOT NULL,
@@ -561,6 +575,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             CREATE INDEX IF NOT EXISTS idx_visits_opened_at ON visits(opened_at);
             PRAGMA user_version = 1;",
         )?;
+        tx.commit()?;
     }
     if version < 2 {
         // PRD FR-NV-8 reading-position memory: one row per article, replaced on
@@ -569,7 +584,8 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         // is the section heading the saved scroll sat in (the revid-mismatch
         // fallback target). Sharing history.sqlite means `clear-data --history`
         // (a whole-file delete) already covers positions.
-        conn.execute_batch(
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS positions (
                 lang TEXT NOT NULL,
                 title TEXT NOT NULL,
@@ -582,6 +598,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             );
             PRAGMA user_version = 2;",
         )?;
+        tx.commit()?;
     }
     if version < 3 {
         // PRD FR-ML-4: reading-position memory gains a wiki dimension so a
@@ -591,9 +608,11 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         // is the default Wikipedia scope (the only wiki before this), copied
         // over with `wiki = ''` — no position is lost. `IF NOT EXISTS`/the
         // idempotent copy make a fresh database (which just created the v2
-        // shape above) migrate forward cleanly too.
-        conn.execute_batch(
-            "CREATE TABLE positions_v3 (
+        // shape above) migrate forward cleanly too, and the transaction makes
+        // the rebuild all-or-nothing so a crash never strands `positions_v3`.
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS positions_v3 (
                 wiki TEXT NOT NULL DEFAULT '',
                 lang TEXT NOT NULL,
                 title TEXT NOT NULL,
@@ -610,6 +629,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             ALTER TABLE positions_v3 RENAME TO positions;
             PRAGMA user_version = 3;",
         )?;
+        tx.commit()?;
     }
     if version < 4 {
         // PRD FR-ML-4/FR-HS-3: `visits` gains the same wiki dimension
@@ -620,13 +640,38 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         // `referrer_wiki` — a pre-v4 visit's referrer is still known by
         // lang/title, just not by wiki, so it isn't lost, only less precise
         // (`trail.rs` treats a `None` referrer_wiki as the default wiki).
-        conn.execute_batch(
-            "ALTER TABLE visits ADD COLUMN wiki TEXT NOT NULL DEFAULT '';
-            ALTER TABLE visits ADD COLUMN referrer_wiki TEXT;
-            PRAGMA user_version = 4;",
-        )?;
+        // `ADD COLUMN` has no `IF NOT EXISTS`, so each is guarded by an
+        // explicit column check: a database whose columns were added by an
+        // interrupted pre-transaction migration (but whose version never
+        // reached 4) re-runs cleanly instead of erroring on a duplicate column.
+        let tx = conn.unchecked_transaction()?;
+        if !column_exists(&tx, "visits", "wiki")? {
+            tx.execute_batch("ALTER TABLE visits ADD COLUMN wiki TEXT NOT NULL DEFAULT '';")?;
+        }
+        if !column_exists(&tx, "visits", "referrer_wiki")? {
+            tx.execute_batch("ALTER TABLE visits ADD COLUMN referrer_wiki TEXT;")?;
+        }
+        tx.execute_batch("PRAGMA user_version = 4;")?;
+        tx.commit()?;
     }
     Ok(())
+}
+
+/// Whether `table` already has a column named `column` — the idempotency guard
+/// for `ADD COLUMN` migration steps, which SQLite offers no `IF NOT EXISTS`
+/// form for. `table` is always a compile-time-constant identifier here (never
+/// reader input), so interpolating it into the `PRAGMA` is safe. A missing
+/// table simply yields no rows (hence `false`), never an error.
+fn column_exists(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The real on-disk location (PRD §6.4): `$XDG_STATE_HOME/wikitui/
@@ -881,6 +926,77 @@ mod tests {
             enigma.referrer_wiki, None,
             "a pre-v4 referrer has no recorded wiki — not lost, just less precise"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// CORR-M8: a v4 migration interrupted after its `ADD COLUMN`s ran but
+    /// before the `user_version` bump committed (the half-state the old
+    /// per-statement-autocommit code could leave on a crash) must re-run
+    /// cleanly. Simulate it by hand-adding the v4 columns while leaving the
+    /// version at 3; opening must finish the bump to 4 rather than wedge
+    /// forever on a "duplicate column name" error.
+    #[test]
+    fn an_interrupted_v4_migration_re_runs_idempotently_without_wedging() {
+        let path = temp_path();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE visits (
+                    id INTEGER PRIMARY KEY,
+                    lang TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    opened_at INTEGER NOT NULL,
+                    dwell_secs INTEGER NOT NULL DEFAULT 0,
+                    referrer_lang TEXT,
+                    referrer_title TEXT
+                );
+                CREATE TABLE positions (
+                    wiki TEXT NOT NULL DEFAULT '',
+                    lang TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    revid INTEGER NOT NULL DEFAULT 0,
+                    scroll INTEGER NOT NULL DEFAULT 0,
+                    folds TEXT NOT NULL DEFAULT '',
+                    anchor TEXT,
+                    updated_at INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (wiki, lang, title)
+                );
+                INSERT INTO visits (lang, title, opened_at) VALUES ('en', 'Alan Turing', 100);
+                -- The v4 DDL ran, but the version bump did not (the crash window).
+                ALTER TABLE visits ADD COLUMN wiki TEXT NOT NULL DEFAULT '';
+                ALTER TABLE visits ADD COLUMN referrer_wiki TEXT;
+                PRAGMA user_version = 3;",
+            )
+            .unwrap();
+        }
+
+        // Re-running migrate must finish the bump to 4, not error on the
+        // already-present columns.
+        let history = History::open_at(&path);
+        let version: i64 = history
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            version, SCHEMA_VERSION,
+            "the interrupted migration must complete rather than wedge at v3"
+        );
+
+        // The pre-existing visit survives, readable via the v4 wiki column.
+        let visits = history.all_visits();
+        assert_eq!(visits.len(), 1);
+        assert_eq!(
+            visits[0].wiki, "",
+            "the backfilled visit reads as the default wiki"
+        );
+
+        // A second open stays a clean no-op.
+        let reopened = History::open_at(&path);
+        let again: i64 = reopened
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(again, SCHEMA_VERSION);
         let _ = std::fs::remove_file(&path);
     }
 

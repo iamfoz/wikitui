@@ -398,30 +398,38 @@ impl PageCache {
             .or_else(|| self.migrate_legacy_entry(wiki, lang, title))
     }
 
-    fn get_current_format(&self, wiki: &str, lang: &str, title: &str) -> Option<CachedPage> {
+    /// The side-effect-free read shared by [`Self::get`] and [`Self::peek`]:
+    /// resolves the current-format index entry, reads and decompresses its
+    /// blob, and returns both (with the two on-disk paths) touching nothing.
+    /// Whether the read-side LRU/SLRU touch is then applied is the caller's
+    /// choice — `get` applies it, `peek` doesn't.
+    fn read_current_format(
+        &self,
+        wiki: &str,
+        lang: &str,
+        title: &str,
+    ) -> Option<(PathBuf, PathBuf, IndexEntry, String)> {
         let index_path = self.index_path(wiki, lang, title)?;
         let text = std::fs::read_to_string(&index_path).ok()?;
-        let mut entry: IndexEntry = serde_json::from_str(&text).ok()?;
+        let entry: IndexEntry = serde_json::from_str(&text).ok()?;
         let blob_path = self.blob_path(wiki, lang, title, entry.revid)?;
         let compressed = std::fs::read(&blob_path).ok()?;
         let html_bytes = zstd::stream::decode_all(compressed.as_slice()).ok()?;
         let html = String::from_utf8(html_bytes).ok()?;
+        Some((index_path, blob_path, entry, html))
+    }
 
+    fn get_current_format(&self, wiki: &str, lang: &str, title: &str) -> Option<CachedPage> {
+        let (index_path, blob_path, entry, html) = self.read_current_format(wiki, lang, title)?;
+
+        // Read-side LRU/SLRU touch — the whole reason `get` differs from
+        // `peek`. mtime is the recency signal; the hit bump (via `touch_hit`,
+        // which re-reads fresh so a concurrent `put_at` isn't clobbered) is
+        // the SLRU promotion signal. Best-effort — a failure just means this
+        // read went uncounted, never a miss or a panic.
         touch_mtime(&index_path);
         touch_mtime(&blob_path);
-
-        // PRD FR-OFF-3 v1.0 SLRU: this read is this entry's Nth ever; the
-        // *second* read (not the first, which is merely "opened once, same
-        // as any binge read") promotes it out of the probationary segment.
-        // Best-effort rewrite — a failure here just means this read didn't
-        // get counted, never a cache miss or a panic.
-        entry.hits = entry.hits.saturating_add(1);
-        if entry.segment == Segment::Probationary && entry.hits >= 2 {
-            entry.segment = Segment::Protected;
-        }
-        if let Ok(json) = serde_json::to_string(&entry) {
-            let _ = std::fs::write(&index_path, json);
-        }
+        self.touch_hit(&index_path);
 
         let age_secs = now_unix().saturating_sub(entry.fetched_at);
         Some(CachedPage {
@@ -430,6 +438,56 @@ impl PageCache {
             revid: entry.revid,
             etag: entry.etag,
         })
+    }
+
+    /// A side-effect-free cache read (PRD FR-SR-7's reindex): identical
+    /// content to [`Self::get`] for a current-format entry, but touches
+    /// nothing — no mtime, no hit count, no SLRU promotion — and never
+    /// migrates a legacy flat file. `reindex` bulk-reads *every* cached entry
+    /// to rebuild the offline search index; routing that through `get` would
+    /// promote every one-open article to `Protected` and flatten every
+    /// entry's mtime to "now", defeating exactly the SLRU/recency ordering
+    /// eviction depends on (CORR-M8). An indexer sees the same bytes a reader
+    /// would, without disturbing the reader's eviction state.
+    pub fn peek(&self, wiki: &str, lang: &str, title: &str) -> Option<CachedPage> {
+        let (_, _, entry, html) = self.read_current_format(wiki, lang, title)?;
+        let age_secs = now_unix().saturating_sub(entry.fetched_at);
+        Some(CachedPage {
+            html,
+            age_secs,
+            revid: entry.revid,
+            etag: entry.etag,
+        })
+    }
+
+    /// Applies the read-side SLRU hit bump to the entry at `index_path`,
+    /// re-reading it *fresh* immediately before the atomic write-back rather
+    /// than mutating the copy `get` already read. This is the title index's
+    /// concurrency contract (CORR-M8): `put_at` is the authoritative writer of
+    /// the content pointer (revid/fetched_at/etag), and a background
+    /// revalidation may advance it between `get`'s read and this touch;
+    /// starting from the freshest on-disk entry means the hit bump layers onto
+    /// whatever `put_at` most recently wrote instead of resurrecting the stale
+    /// revid `get` happened to read. The write goes through the atomic helper,
+    /// so a reader never observes a torn index. Best-effort — an unreadable or
+    /// corrupt index just means this read went uncounted, never a panic.
+    fn touch_hit(&self, index_path: &Path) {
+        let Ok(text) = std::fs::read_to_string(index_path) else {
+            return;
+        };
+        let Ok(mut entry) = serde_json::from_str::<IndexEntry>(&text) else {
+            return;
+        };
+        // PRD FR-OFF-3 v1.0 SLRU: the *second* read (not the first, merely
+        // "opened once, same as any binge read") promotes an entry out of the
+        // probationary segment.
+        entry.hits = entry.hits.saturating_add(1);
+        if entry.segment == Segment::Probationary && entry.hits >= 2 {
+            entry.segment = Segment::Protected;
+        }
+        if let Ok(json) = serde_json::to_string(&entry) {
+            let _ = crate::atomicio::write_atomic(index_path, json.as_bytes());
+        }
     }
 
     fn migrate_legacy_entry(&self, wiki: &str, lang: &str, title: &str) -> Option<CachedPage> {
@@ -448,8 +506,14 @@ impl PageCache {
         // Fold it into the new format at its original fetched_at (an
         // honest age, not a falsely-fresh "just fetched now") before ever
         // returning success, then remove the old file — the "read once,
-        // then rewritten" migration this module documents.
-        self.put_at(wiki, lang, title, html, 0, None, fetched_at);
+        // then rewritten" migration this module documents. Tagged
+        // *non*-incognito unconditionally (CORR-M1): a pre-upgrade flat file
+        // predates incognito entirely, so folding it in during an incognito
+        // session must not mark this pre-existing content for the session-end
+        // wipe — that would delete a warmed cache entry the reader never chose
+        // to make private, and `migrate` also deletes the legacy source, so
+        // the loss would be permanent.
+        self.put_tagged(wiki, lang, title, html, 0, None, fetched_at, false);
         let _ = std::fs::remove_file(&old_path);
 
         let age_secs = now_unix().saturating_sub(fetched_at);
@@ -494,6 +558,40 @@ impl PageCache {
         etag: Option<&str>,
         fetched_at: u64,
     ) {
+        // A brand-new entry written during this session takes this session's
+        // incognito state; a re-put of an existing entry carries the existing
+        // flag forward instead (see `put_tagged`).
+        self.put_tagged(
+            wiki,
+            lang,
+            title,
+            html,
+            revid,
+            etag,
+            fetched_at,
+            self.is_incognito(),
+        );
+    }
+
+    // Wiki + lang + title + html + revid + etag + fetched_at + the brand-new
+    // entry's incognito tag: two dimensions past clippy's ceiling for the same
+    // reason `put_at` is one past it. `new_entry_incognito` is only consulted
+    // when there is no existing index entry to carry a flag forward from —
+    // `migrate_legacy_entry` passes `false` so a pre-upgrade file it folds in
+    // is never marked private, while the normal `put_at` passes this session's
+    // state.
+    #[allow(clippy::too_many_arguments)]
+    fn put_tagged(
+        &self,
+        wiki: &str,
+        lang: &str,
+        title: &str,
+        html: &str,
+        revid: u64,
+        etag: Option<&str>,
+        fetched_at: u64,
+        new_entry_incognito: bool,
+    ) {
         // PRD FR-PR-3's single gate: every cache write consults it too, not
         // just history/prefetch — `Write::Cache` always resolves to `Allow`
         // (see `privacy`'s module doc comment for why a cache write is never
@@ -528,25 +626,31 @@ impl PageCache {
             }
         }
 
-        // PRD FR-OFF-3 v1.0 SLRU: a `put` for a title already in the index
-        // (a revalidation-driven refetch, a ForceRefetch reopen) rewrites
-        // this same JSON file — carry its existing `hits`/`segment` forward
-        // rather than defaulting back to `Probationary`, or every content
-        // refresh would silently strip a reader's established favorite of
-        // its eviction protection. A brand-new title has nothing to carry
-        // forward, so it starts at the same `Probationary`/`0` default a
-        // fresh entry always has.
-        let (hits, segment) = std::fs::read_to_string(&index_path)
+        // PRD FR-OFF-3 v1.0 SLRU + FR-PR-3 incognito: a `put` for a title
+        // already in the index (a revalidation-driven refetch, a ForceRefetch
+        // reopen, a legacy migration) rewrites this same JSON file — carry its
+        // existing `hits`/`segment` *and* `incognito` flag forward rather than
+        // re-deriving them from this session. Re-deriving `hits`/`segment`
+        // would strip a favorite of its eviction protection on every refresh;
+        // re-deriving `incognito` from *this* session (CORR-M1) would tag a
+        // pre-existing, non-incognito entry for the session-end wipe merely
+        // because it was re-put while incognito — deleting content the reader
+        // never chose to make private. Only a brand-new title, with nothing on
+        // disk to carry forward, takes the `Probationary`/`0` default and
+        // `new_entry_incognito`.
+        let (hits, segment, incognito) = match std::fs::read_to_string(&index_path)
             .ok()
             .and_then(|text| serde_json::from_str::<IndexEntry>(&text).ok())
-            .map(|existing| (existing.hits, existing.segment))
-            .unwrap_or_default();
+        {
+            Some(existing) => (existing.hits, existing.segment, existing.incognito),
+            None => (0, Segment::default(), new_entry_incognito),
+        };
 
         let entry = IndexEntry {
             revid,
             fetched_at,
             etag: etag.map(str::to_string),
-            incognito: self.is_incognito(),
+            incognito,
             wiki: wiki.to_string(),
             lang: lang.to_string(),
             title: title.to_string(),
@@ -556,10 +660,10 @@ impl PageCache {
         let Ok(json) = serde_json::to_string(&entry) else {
             return;
         };
-        if let Some(parent) = index_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if std::fs::write(&index_path, json).is_err() {
+        // Atomic write (CORR-M8): a torn index write could otherwise leave a
+        // half-written JSON a reader parses as a miss, or clobber a
+        // concurrently-written fresher entry with a truncated one.
+        if crate::atomicio::write_atomic(&index_path, json.as_bytes()).is_err() {
             return;
         }
         self.evict_to_cap();
@@ -583,7 +687,7 @@ impl PageCache {
         };
         entry.fetched_at = now_unix();
         if let Ok(json) = serde_json::to_string(&entry) {
-            let _ = std::fs::write(&index_path, json);
+            let _ = crate::atomicio::write_atomic(&index_path, json.as_bytes());
         }
         if let Some(blob_path) = self.blob_path(wiki, lang, title, entry.revid) {
             touch_mtime(&blob_path);
@@ -1748,6 +1852,92 @@ mod tests {
         let report = cache.wipe_incognito_entries();
         assert_eq!(report.entries, 0);
         assert!(cache.get("", "en", "Turing").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CORR-M1: re-putting a pre-existing *non*-incognito entry during a later
+    /// incognito session (a revalidation-driven refetch, a ForceRefetch
+    /// reopen) must carry its existing `incognito = false` forward, not
+    /// re-derive `true` from this session — otherwise the session-end wipe
+    /// would delete a cache entry the reader never chose to make private.
+    #[test]
+    fn re_putting_a_pre_incognito_entry_during_incognito_does_not_retag_or_wipe_it() {
+        let (cache, dir) = temp_cache(DEFAULT_MAX_BYTES);
+        cache.put("", "en", "Turing", "content", 1, None); // written non-incognito
+        cache.set_incognito(true);
+        // A refetch of the same title (new revid) re-puts the index entry.
+        cache.put("", "en", "Turing", "content v2", 2, None);
+
+        let report = cache.wipe_incognito_entries();
+        assert_eq!(
+            report.entries, 0,
+            "a pre-existing non-incognito entry must stay non-incognito across an incognito re-put"
+        );
+        assert!(
+            cache.get("", "en", "Turing").is_some(),
+            "and must survive the session-end wipe"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CORR-M1, the migration path: `migrate_legacy_entry` folds a pre-upgrade
+    /// flat file into the new format (then deletes the source). Doing so during
+    /// an incognito session must not tag the migrated entry incognito — the
+    /// legacy file predates incognito, and because migration removes it, a wipe
+    /// would be permanent loss of content the reader never made private.
+    #[test]
+    fn migrating_a_legacy_entry_during_incognito_does_not_tag_it_incognito() {
+        let (cache, dir) = temp_cache(DEFAULT_MAX_BYTES);
+        write_legacy_entry(&dir, "en", "Turing", now_unix(), "<html>legacy</html>");
+        cache.set_incognito(true);
+        // Opening it migrates it into the new format under incognito.
+        assert_eq!(
+            cache.get("", "en", "Turing").unwrap().html,
+            "<html>legacy</html>"
+        );
+
+        let report = cache.wipe_incognito_entries();
+        assert_eq!(
+            report.entries, 0,
+            "a migrated pre-upgrade entry must never be tagged incognito"
+        );
+        assert!(
+            cache.get("", "en", "Turing").is_some(),
+            "and must survive the wipe — the legacy source is already gone, so loss would be permanent"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CORR-M8: `peek` (the reindex read path) serves the same content as
+    /// `get` but touches nothing — no hit bump, no SLRU promotion, no mtime
+    /// reset — so a full-cache reindex can't flatten the recency/segment state
+    /// eviction depends on.
+    #[test]
+    fn peek_reads_content_without_touching_hits_segment_or_mtime() {
+        let (cache, dir) = temp_cache(DEFAULT_MAX_BYTES);
+        cache.put("", "en", "Turing", "content", 1, None);
+        let index_path = dir.join("page").join("en").join("Turing.json");
+        let before_mtime = std::fs::metadata(&index_path).unwrap().modified().unwrap();
+        let before: IndexEntry =
+            serde_json::from_str(&std::fs::read_to_string(&index_path).unwrap()).unwrap();
+
+        // Bulk-peek a few times (what reindex does over every cached entry).
+        for _ in 0..3 {
+            assert_eq!(cache.peek("", "en", "Turing").unwrap().html, "content");
+        }
+
+        let after: IndexEntry =
+            serde_json::from_str(&std::fs::read_to_string(&index_path).unwrap()).unwrap();
+        assert_eq!(after.hits, before.hits, "peek must not bump the hit count");
+        assert_eq!(
+            after.segment, before.segment,
+            "peek must not promote the segment"
+        );
+        let after_mtime = std::fs::metadata(&index_path).unwrap().modified().unwrap();
+        assert_eq!(
+            after_mtime, before_mtime,
+            "peek must not reset the index mtime"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
