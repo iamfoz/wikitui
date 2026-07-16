@@ -365,6 +365,28 @@ impl CircuitBreaker {
         self.opened_at = None;
     }
 
+    /// CORR-M4: a completed request that neither succeeded nor was a
+    /// 429/5xx (`Outcome::Failed` — a plain network/parse error) still
+    /// resets the consecutive streak, per this type's own doc comment ("a
+    /// success **or any completed request that wasn't a 429/5xx** resets the
+    /// consecutive count"). Distinct from [`Self::on_success`] because it
+    /// did not actually succeed — it only touches `consecutive`, not
+    /// `opened_at`. That never differs observably from calling
+    /// `on_success` here: a job only ever runs once `is_open` has already
+    /// gone false (an open breaker blocks execution entirely — see the
+    /// worker's requeue-and-sleep path), so any `opened_at` still set at
+    /// this point is already stale, from a cooldown that has already
+    /// elapsed. Without this reset, an interleaved sequence like
+    /// `ServerError, ServerError, Failed, ServerError` tripped a
+    /// threshold-3 breaker on the 4th call despite never seeing 3
+    /// *consecutive* 429/5xx — and a post-cooldown probe that came back
+    /// `Failed` left `consecutive` sitting at/over threshold, so the very
+    /// next single 5xx re-opened the breaker instantly instead of needing
+    /// `threshold` fresh consecutive ones.
+    pub fn on_soft_failure(&mut self) {
+        self.consecutive = 0;
+    }
+
     pub fn on_failure(&mut self, now: u64) {
         self.consecutive = self.consecutive.saturating_add(1);
         if self.consecutive >= self.threshold {
@@ -429,6 +451,18 @@ impl ForegroundGate {
             }
         }
     }
+
+    /// A non-blocking peek at whether foreground is idle right now. The
+    /// worker uses this immediately after popping a job (CORR-M3): if
+    /// foreground is active, the job must go back to the front of its lane
+    /// *before* parking on [`Self::wait_until_idle`], not sit held in a local
+    /// variable while parked — otherwise a higher-priority job enqueued
+    /// during the wait (e.g. a revalidation arriving while a prefetch is
+    /// parked waiting out the gate) would be skipped over by the
+    /// already-in-hand lower-priority one the instant the gate clears.
+    fn is_idle(&self) -> bool {
+        *self.tx.borrow() == 0
+    }
 }
 
 /// Held for the duration of a foreground request; decrements the gate on drop,
@@ -471,8 +505,10 @@ pub struct MorelikeSeed {
 }
 
 /// A unit of background work. Priority is derived from the variant:
-/// `Revalidate` is revalidation priority (outranks all prefetch), everything
-/// else is prefetch priority. `RankLinks`/`Featured` are *seed* jobs — one
+/// `Revalidate` and `LoadTab` are revalidation priority (outrank all
+/// prefetch, and are exempt from the prefetch byte/request budget — see
+/// `LoadTab`'s own doc comment for why), everything else is prefetch
+/// priority. `RankLinks`/`Featured` are *seed* jobs — one
 /// batched metadata request each (NEVER per-article fanout, §6.2 rule 7) whose
 /// result enqueues the actual `PrefetchArticle` bodies.
 #[derive(Debug, Clone)]
@@ -484,6 +520,27 @@ pub enum Job {
         lang: String,
         title: String,
         cached_revid: u64,
+    },
+    /// FR-TB-3 background-tab load (quality-M1), migrated onto the
+    /// substrate from a raw, per-call-site `tokio::spawn` with no
+    /// coordination at all (session restore was the worst case, looping
+    /// over every saved tab and firing all of them at once). Revalidation
+    /// priority, not prefetch: the reader explicitly asked to open this
+    /// article, just not in the foreground tab, so dropping it for
+    /// exhausted *speculative* prefetch budget would defeat the feature —
+    /// it is exempt from the budget the same way `Revalidate` is, but still
+    /// gated, serialized, and breaker-governed like everything else here.
+    /// The dedup key is scoped to `tab_id` (unlike every other job kind,
+    /// which keys on `(lang, title)` alone): two *different* tabs loading
+    /// the same article must never coalesce into one job, since only one
+    /// `tab_id` — and so only one tab — would ever see the completion,
+    /// leaving the other stuck showing its "…" placeholder forever. Only a
+    /// genuine duplicate fire for the same tab coalesces.
+    LoadTab {
+        tab_id: u64,
+        wiki: String,
+        lang: String,
+        title: String,
     },
     /// FR-PF-1/FR-PF-2 fetch one article body into L2 with its reason string.
     PrefetchArticle {
@@ -521,12 +578,18 @@ pub enum Job {
 
 impl Job {
     fn is_prefetch(&self) -> bool {
-        !matches!(self, Job::Revalidate { .. })
+        !matches!(self, Job::Revalidate { .. } | Job::LoadTab { .. })
     }
 
     fn dedup_key(&self) -> String {
         match self {
             Job::Revalidate { lang, title, .. } => format!("rv:{lang}:{title}"),
+            Job::LoadTab {
+                tab_id,
+                lang,
+                title,
+                ..
+            } => format!("tl:{tab_id}:{lang}:{title}"),
             Job::PrefetchArticle { lang, title, .. } => format!("pf:{lang}:{title}"),
             Job::RankLinks {
                 lang,
@@ -677,15 +740,35 @@ impl Queue {
 
     fn enqueue(&mut self, job: Job) -> bool {
         let key = job.dedup_key();
-        if !self.inflight.insert(key) {
+        if !self.reserve(key) {
             return false;
         }
+        self.push_reserved(job);
+        true
+    }
+
+    /// The dedup half of `enqueue`, split out (CORR-L7) so a caller can defer
+    /// a side effect that must only happen for a job that's actually going to
+    /// be queued — e.g. the `:prefetch-log` "Queued" row, which must not be
+    /// created for a job `enqueue` is about to drop as a coalesced duplicate.
+    /// Reserves `key`; the job itself is queued separately via
+    /// [`Self::push_reserved`] once the caller's side effect (if any) is
+    /// done.
+    fn reserve(&mut self, key: String) -> bool {
+        self.inflight.insert(key)
+    }
+
+    /// Push a job whose dedup key is already reserved (via [`Self::reserve`])
+    /// onto its priority lane. Never call this without a preceding
+    /// successful `reserve` for the same job's key — `enqueue` above is the
+    /// combined, safe-by-construction version for callers with no side
+    /// effect to gate.
+    fn push_reserved(&mut self, job: Job) {
         if job.is_prefetch() {
             self.prefetch.push_back(job);
         } else {
             self.revalidation.push_back(job);
         }
-        true
     }
 
     /// Revalidation outranks prefetch; FIFO within a priority.
@@ -812,12 +895,44 @@ impl SubstrateHandle {
         added
     }
 
+    /// Enqueue a background-tab load (PRD FR-TB-3, quality-M1). Never gated
+    /// by the FR-PF-6 kill switch, same as `enqueue_revalidation` above and
+    /// for the same reason: that switch means "stop speculating", not "stop
+    /// doing what the reader explicitly asked for". Returns whether it was
+    /// newly queued — see `Job::LoadTab`'s doc comment for why coalescing is
+    /// scoped to one tab rather than `(lang, title)` the way every other job
+    /// kind's dedup is.
+    pub fn enqueue_load_tab(&self, tab_id: u64, wiki: String, lang: String, title: String) -> bool {
+        let job = Job::LoadTab {
+            tab_id,
+            wiki,
+            lang,
+            title,
+        };
+        let added = self.inner.queue.lock().unwrap().enqueue(job);
+        if added {
+            self.inner.notify.notify_one();
+        }
+        added
+    }
+
     /// Enqueue a prefetch-priority job (article body or a seed). A no-op when
     /// the kill switch is off (FR-PF-6). For `PrefetchArticle`, a `Queued` log
     /// row is created here and the job's `log_id` is filled in — logging is
     /// centralized at the queue, not scattered through the executor.
+    ///
+    /// CORR-L7: the dedup reservation happens *first*; the log row is only
+    /// created once reservation confirms this job is genuinely going to be
+    /// queued, not for one `enqueue` is about to drop as a coalesced
+    /// duplicate (single-flight, NF-NET-5) — a previous version logged
+    /// unconditionally before checking, leaving a phantom `Queued` row in
+    /// `:prefetch-log` that would never resolve.
     pub fn enqueue_prefetch(&self, mut job: Job) -> bool {
         if !self.is_enabled() {
+            return false;
+        }
+        let key = job.dedup_key();
+        if !self.inner.queue.lock().unwrap().reserve(key) {
             return false;
         }
         if let Job::PrefetchArticle {
@@ -835,11 +950,9 @@ impl SubstrateHandle {
                 .push_queued(title.clone(), reason.clone());
             *log_id = id;
         }
-        let added = self.inner.queue.lock().unwrap().enqueue(job);
-        if added {
-            self.inner.notify.notify_one();
-        }
-        added
+        self.inner.queue.lock().unwrap().push_reserved(job);
+        self.inner.notify.notify_one();
+        true
     }
 
     /// Convenience for a ranked article body (FR-PF-1/2). Test-only: production
@@ -901,8 +1014,20 @@ impl SubstrateHandle {
             };
 
             // NF-NET-1: never start a background request while foreground is
-            // in flight.
-            self.inner.gate.wait_until_idle().await;
+            // in flight. CORR-M3: popping the job *before* this check (as a
+            // previous version of this loop did, holding it in `job` across
+            // the wait below) let it jump the queue — a prefetch popped here
+            // would run ahead of a revalidation enqueued while parked, since
+            // parking with the job already in hand never re-consults
+            // priority. Requeuing to the front and re-selecting after the
+            // wait (mirroring the breaker's own requeue-and-reselect just
+            // below) fixes that: whichever job is highest-priority when the
+            // gate actually clears is the one that runs.
+            if !self.inner.gate.is_idle() {
+                self.inner.queue.lock().unwrap().requeue_front(job);
+                self.inner.gate.wait_until_idle().await;
+                continue;
+            }
 
             let now = clock.now_secs();
 
@@ -1010,7 +1135,11 @@ impl SubstrateHandle {
                 }
                 Outcome::Failed => {
                     // Plain network error: backoff, but do not trip the breaker
-                    // (that is reserved for 429/5xx, NF-NET-4).
+                    // (that is reserved for 429/5xx, NF-NET-4). CORR-M4: it
+                    // still resets the consecutive 429/5xx streak (see
+                    // `CircuitBreaker::on_soft_failure`'s doc comment) — this
+                    // outcome is not itself a breaker-relevant failure.
+                    self.inner.breaker.lock().unwrap().on_soft_failure();
                     sleep_for = Some(backoff.delay(fail_attempt));
                     fail_attempt = fail_attempt.saturating_add(1);
                     if let Some(id) = log_id {
@@ -1080,6 +1209,46 @@ mod tests {
         assert!(q.pop().is_none());
     }
 
+    /// quality-M1: `LoadTab` (the migrated background-tab-load job) shares
+    /// `Revalidate`'s priority lane and budget exemption, but its dedup key
+    /// is scoped to `tab_id` — two different tabs loading the same article
+    /// must both get their own job (and so their own completion), while a
+    /// genuine duplicate fire for one tab still coalesces.
+    #[test]
+    fn load_tab_jobs_are_revalidation_priority_and_dedup_scoped_per_tab() {
+        let mut q = Queue::new();
+        assert!(q.enqueue(Job::PrefetchArticle {
+            lang: "en".into(),
+            title: "A".into(),
+            reason: "r".into(),
+            log_id: 0,
+        }));
+        assert!(q.enqueue(Job::LoadTab {
+            tab_id: 1,
+            wiki: "wikipedia".into(),
+            lang: "en".into(),
+            title: "B".into(),
+        }));
+        // LoadTab outranks the earlier-enqueued prefetch, same as Revalidate.
+        assert!(matches!(q.pop(), Some(Job::LoadTab { .. })));
+        assert!(matches!(q.pop(), Some(Job::PrefetchArticle { .. })));
+        assert!(q.pop().is_none());
+
+        let mut q2 = Queue::new();
+        let load = |tab_id: u64| Job::LoadTab {
+            tab_id,
+            wiki: "wikipedia".into(),
+            lang: "en".into(),
+            title: "Same Article".into(),
+        };
+        assert!(q2.enqueue(load(1)));
+        assert!(
+            q2.enqueue(load(2)),
+            "a different tab_id must not coalesce with tab 1's in-flight load"
+        );
+        assert!(!q2.enqueue(load(1)), "same-tab duplicate still coalesces");
+    }
+
     #[test]
     fn queue_dedups_identical_jobs_until_completed() {
         let mut q = Queue::new();
@@ -1096,6 +1265,27 @@ mod tests {
         assert!(!q.enqueue(job()), "still coalesces mid-flight");
         q.complete(&popped.dedup_key());
         assert!(q.enqueue(job()), "re-queueable once completed");
+    }
+
+    /// CORR-L7 regression: a coalesced duplicate prefetch must not leave a
+    /// phantom "Queued" row in `:prefetch-log` that never resolves. Before
+    /// the fix, `enqueue_prefetch` created the log row unconditionally
+    /// *before* the single-flight dedup check, so the second (dropped) call
+    /// still logged its own row alongside the first.
+    #[test]
+    fn enqueue_prefetch_does_not_log_a_coalesced_duplicate() {
+        let handle = SubstrateHandle::new_with_clock(test_config(), TestClock::new(0));
+        assert!(handle.enqueue_prefetch_article("en".into(), "Dup".into(), "r".into()));
+        assert!(
+            !handle.enqueue_prefetch_article("en".into(), "Dup".into(), "r2".into()),
+            "duplicate coalesces (NF-NET-5)"
+        );
+        let log = handle.log_recent();
+        assert_eq!(
+            log.len(),
+            1,
+            "the coalesced duplicate must not leave a second, never-resolving Queued row"
+        );
     }
 
     #[test]
@@ -1149,6 +1339,38 @@ mod tests {
         assert!(
             !cb.is_open(0),
             "success reset the count so 2 more don't trip"
+        );
+    }
+
+    /// CORR-M4 regression: `Outcome::Failed` (a plain network/parse error,
+    /// not a 429/5xx) must reset the consecutive streak exactly like a
+    /// success does, or an interleaved sequence of failures that never sees
+    /// 3 *consecutive* 429/5xx still trips the breaker. Before the fix,
+    /// `on_soft_failure` didn't exist and nothing was called for `Failed` at
+    /// all, so `ServerError, ServerError, Failed, ServerError` left
+    /// `consecutive` at 3 (2, 2, 3) and opened the breaker on the 4th call.
+    #[test]
+    fn breaker_soft_failure_resets_the_streak_so_only_genuinely_consecutive_hard_failures_trip_it()
+    {
+        let mut cb = CircuitBreaker::new(3, 300);
+        cb.on_failure(0); // consecutive: 1
+        cb.on_failure(0); // consecutive: 2
+        cb.on_soft_failure(); // a `Failed` outcome: consecutive back to 0
+        cb.on_failure(0); // consecutive: 1
+        assert!(
+            !cb.is_open(0),
+            "the soft failure reset the streak; only 1 consecutive 5xx since"
+        );
+
+        // Unchanged: 3 genuinely consecutive hard failures (no soft failure
+        // breaking the streak) still trip a threshold-3 breaker.
+        let mut cb2 = CircuitBreaker::new(3, 300);
+        cb2.on_failure(0);
+        cb2.on_failure(0);
+        cb2.on_failure(0);
+        assert!(
+            cb2.is_open(0),
+            "3 genuinely consecutive hard failures still trip it"
         );
     }
 
@@ -1240,6 +1462,41 @@ mod tests {
         assert_eq!(max.load(Ordering::SeqCst), 1, "never two in flight");
     }
 
+    /// quality-M1: background-tab loads routed onto the substrate get every
+    /// property the old raw `tokio::spawn` per call site had none of —
+    /// serialized (never more than one in flight, unlike N concurrent raw
+    /// spawns from e.g. session restore's loop) and gated behind foreground
+    /// (a background-tab load never starts while the reader's own fetch is
+    /// in flight).
+    #[tokio::test(start_paused = true)]
+    async fn worker_serializes_load_tab_jobs_and_yields_to_foreground() {
+        let handle = SubstrateHandle::new_with_clock(test_config(), TestClock::new(0));
+        let exec = FakeExecutor::new(Outcome::Done { bytes: 0 });
+        let max = exec.max_concurrent.clone();
+        let calls = exec.calls.clone();
+
+        let guard = handle.foreground_guard();
+        tokio::spawn(handle.clone().run(exec));
+        for i in 0..4 {
+            handle.enqueue_load_tab(i, "wikipedia".into(), "en".into(), format!("T{i}"));
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            0,
+            "blocked while foreground is active"
+        );
+
+        drop(guard);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(calls.lock().unwrap().len(), 4, "all four eventually ran");
+        assert_eq!(
+            max.load(Ordering::SeqCst),
+            1,
+            "never two in flight -- serialized, not concurrent raw spawns"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn worker_yields_to_foreground_then_resumes() {
         let handle = SubstrateHandle::new_with_clock(test_config(), TestClock::new(0));
@@ -1282,6 +1539,48 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let order = calls.lock().unwrap().clone();
         assert_eq!(order, vec!["rv:en:R".to_string(), "pf:en:P".to_string()]);
+    }
+
+    /// CORR-M3 regression, distinct from `worker_runs_revalidation_before_
+    /// prefetch` above: that test enqueues *both* jobs before the worker's
+    /// first `pop`, so `pop`'s own priority ordering alone explains its
+    /// (already-passing) result — it never exercises the gate-wait requeue
+    /// path. Here only the prefetch is queued at pop time (the revalidation
+    /// lane is empty), so the worker pops the prefetch, finds foreground
+    /// active, and must park; the revalidation is enqueued *while it's
+    /// parked*. Before the fix, the popped prefetch sat in a local variable
+    /// across that wait and ran first the instant foreground cleared,
+    /// regardless of what arrived in the meantime.
+    #[tokio::test(start_paused = true)]
+    async fn worker_requeues_a_popped_job_when_a_higher_priority_one_arrives_during_the_gate_wait()
+    {
+        let handle = SubstrateHandle::new_with_clock(test_config(), TestClock::new(0));
+        let exec = FakeExecutor::new(Outcome::Done { bytes: 1 });
+        let calls = exec.calls.clone();
+
+        let guard = handle.foreground_guard();
+        tokio::spawn(handle.clone().run(exec));
+        handle.enqueue_prefetch_article("en".into(), "P".into(), "r".into());
+        // Give the worker a chance to pop P and park on the (still-active)
+        // foreground gate before anything else is queued.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            0,
+            "still blocked on the gate, nothing has run yet"
+        );
+
+        handle.enqueue_revalidation(1, "en".into(), "R".into(), 7);
+        drop(guard);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let order = calls.lock().unwrap().clone();
+        assert_eq!(
+            order,
+            vec!["rv:en:R".to_string(), "pf:en:P".to_string()],
+            "the revalidation enqueued during the gate wait must still run \
+             first, even though the prefetch was popped first (CORR-M3)"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1372,6 +1671,71 @@ mod tests {
         // Two 5xx trip the breaker (threshold 2); the rest are suspended
         // during the (very long) cooldown.
         assert_eq!(calls.lock().unwrap().len(), 2, "suspended after k failures");
+    }
+
+    /// CORR-M4 regression at the worker level: `ServerError, ServerError,
+    /// Failed, ServerError` must NOT trip a threshold-3 breaker, because the
+    /// `Failed` outcome (a plain network/parse error) resets the consecutive
+    /// streak — the fourth job never sees 3 *consecutive* 429/5xx behind it.
+    /// Before the fix, the breaker didn't react to `Failed` at all, so the
+    /// streak went 1, 2, (unchanged) 2, 3 and the fourth job's `ServerError`
+    /// tripped it, suspending the (nonexistent) fifth job under a long
+    /// cooldown. All four running to completion here is the observable
+    /// signal that the breaker never opened.
+    #[tokio::test(start_paused = true)]
+    async fn worker_breaker_is_not_tripped_by_a_soft_failure_between_hard_failures() {
+        struct Scripted {
+            i: Arc<AtomicUsize>,
+        }
+        impl Executor for Scripted {
+            fn execute(&self, _job: Job) -> impl Future<Output = ExecResult> + Send {
+                let i = self.i.clone();
+                async move {
+                    let idx = i.fetch_add(1, Ordering::SeqCst);
+                    // A 5th job is what actually distinguishes the fix: with
+                    // only 4 jobs queued, whether the breaker opens on the
+                    // 4th's outcome is unobservable (there's nothing left to
+                    // block). Job 5 only runs if the breaker is still closed
+                    // once job 4 completes.
+                    let outcome = match idx {
+                        0 | 1 => Outcome::ServerError,
+                        2 => Outcome::Failed,
+                        3 => Outcome::ServerError,
+                        _ => Outcome::Done { bytes: 0 },
+                    };
+                    ExecResult {
+                        outcome,
+                        follow_ups: Vec::new(),
+                    }
+                }
+            }
+        }
+        let cfg = SubstrateConfig {
+            breaker_threshold: 3,
+            breaker_cooldown_secs: 3600,
+            ..test_config()
+        };
+        let handle = SubstrateHandle::new_with_clock(cfg, TestClock::new(0));
+        let i = Arc::new(AtomicUsize::new(0));
+        let exec = Scripted { i: i.clone() };
+
+        let guard = handle.foreground_guard();
+        tokio::spawn(handle.clone().run(exec));
+        for n in 0..5 {
+            handle.enqueue_prefetch_article("en".into(), format!("S{n}"), "r".into());
+        }
+        drop(guard);
+
+        // Generous: covers the worst-case sum of the exponential backoff
+        // delays between the four non-success outcomes.
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        assert_eq!(
+            i.load(Ordering::SeqCst),
+            5,
+            "all five must run; the Failed outcome (job 3) reset the \
+             consecutive streak so job 4's ServerError alone never opens a \
+             threshold-3 breaker, and job 5 must not be suspended (CORR-M4)"
+        );
     }
 
     #[tokio::test(start_paused = true)]

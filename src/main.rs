@@ -1002,12 +1002,29 @@ fn fire_background_load(
     client: &WikiClient,
     cache: &PageCache,
     search_index: &offline_search::OfflineIndex,
+    prefetch: Option<&netqueue::SubstrateHandle>,
     tab_id: TabId,
     wiki: String,
     lang: String,
     title: String,
     tx: &UnboundedSender<TabLoadOutcome>,
 ) {
+    // quality-M1 migrated this onto the substrate (PRD §5.8, NF-NET-1/4/5/7):
+    // every call site here used to be its own raw, uncoordinated
+    // `tokio::spawn` — no foreground gate, no single-flight dedup, no
+    // circuit breaker, no serialization against whatever else the
+    // background worker was doing. Session restore's loop over every saved
+    // tab was the worst offender, firing all of them at once. The worker
+    // runs the job through `execute_load_tab`, which calls the exact same
+    // `fetch_page` this used to call directly and still delivers a
+    // `TabLoadOutcome` over `tx` — callers and `apply_tab_load_outcome` are
+    // unchanged.
+    if let Some(handle) = prefetch {
+        handle.enqueue_load_tab(tab_id, wiki, lang, title);
+        return;
+    }
+    // Fallback for any path with no substrate installed (unit tests,
+    // `--dump`): the original ad hoc spawn, so behavior there is unchanged.
     let client = client.clone();
     let cache = cache.clone();
     let search_index = search_index.clone();
@@ -1066,6 +1083,12 @@ struct BgExecutor {
     cache: PageCache,
     search_index: offline_search::OfflineIndex,
     revalidate_tx: UnboundedSender<RevalidationOutcome>,
+    /// quality-M1: background-tab loads (`Job::LoadTab`) migrated onto the
+    /// substrate deliver their result over the exact same channel
+    /// `fire_background_load`'s old raw spawn used, so `apply_tab_load_
+    /// outcome`'s tab-id routing (and a closed tab's completion dropping
+    /// gracefully) is unchanged.
+    open_tx: UnboundedSender<TabLoadOutcome>,
     feed_cache: Arc<std::sync::Mutex<prefetch::FeedCache>>,
     weights: netqueue::RankWeights,
     top_n: usize,
@@ -1080,6 +1103,7 @@ impl netqueue::Executor for BgExecutor {
         let cache = self.cache.clone();
         let search_index = self.search_index.clone();
         let tx = self.revalidate_tx.clone();
+        let open_tx = self.open_tx.clone();
         let feed_cache = self.feed_cache.clone();
         let weights = self.weights;
         let top_n = self.top_n;
@@ -1091,6 +1115,24 @@ impl netqueue::Executor for BgExecutor {
                     title,
                     cached_revid,
                 } => execute_revalidation(&client, &tx, tab_id, lang, title, cached_revid).await,
+                netqueue::Job::LoadTab {
+                    tab_id,
+                    wiki,
+                    lang,
+                    title,
+                } => {
+                    execute_load_tab(
+                        &client,
+                        &cache,
+                        &search_index,
+                        &open_tx,
+                        tab_id,
+                        wiki,
+                        lang,
+                        title,
+                    )
+                    .await
+                }
                 netqueue::Job::PrefetchArticle { lang, title, .. } => {
                     execute_prefetch_article(&client, &cache, &search_index, &lang, &title).await
                 }
@@ -1491,6 +1533,59 @@ async fn execute_revalidation(
                 follow_ups: none,
             }
         }
+    }
+}
+
+/// FR-TB-3 background-tab load on the substrate (quality-M1): every call
+/// site (`fire_background_load`) used to be its own raw, uncoordinated
+/// `tokio::spawn`; this is the executor half that runs once the substrate
+/// has cleared the job (gate/serial/breaker — see `Job::LoadTab`'s doc
+/// comment for why it's exempt from the *budget*). Reuses the exact same
+/// cache-aware `fetch_page` the old ad hoc spawn called and delivers the
+/// same `TabLoadOutcome` over `open_tx` — only *when* and *how many at once*
+/// changed, not what a background tab load actually does or how its result
+/// looks to `apply_tab_load_outcome`.
+///
+/// `fetch_page` is the foreground-style fetch (`open_title` uses the same
+/// one) rather than the classified `_bg` API methods `execute_revalidation`/
+/// `execute_prefetch_article` call, so its error is a plain `anyhow::Error`
+/// with no 429/5xx classification available. A failure here is
+/// conservatively always `Outcome::Failed` (backoff, no breaker trip) —
+/// including `fetch_page`'s own "network attempt failed but a stale cached
+/// copy was served anyway" case (`PageSource::Offline`), which still counts
+/// as a failed live attempt for backoff bookkeeping even though the tab
+/// itself still gets content to show.
+// Same shape/reasoning as `fire_background_load`'s own
+// `#[allow(clippy::too_many_arguments)]`: one dimension past the ceiling,
+// each already a minimal, self-explanatory parameter.
+#[allow(clippy::too_many_arguments)]
+async fn execute_load_tab(
+    client: &WikiClient,
+    cache: &PageCache,
+    search_index: &offline_search::OfflineIndex,
+    open_tx: &UnboundedSender<TabLoadOutcome>,
+    tab_id: TabId,
+    wiki: String,
+    lang: String,
+    title: String,
+) -> netqueue::ExecResult {
+    let fetched = fetch_page(client, cache, search_index, &wiki, &lang, &title).await;
+    let outcome = match &fetched {
+        Ok(o) if !matches!(o.source, PageSource::Offline { .. }) => {
+            netqueue::Outcome::Done { bytes: 0 }
+        }
+        _ => netqueue::Outcome::Failed,
+    };
+    let _ = open_tx.send(TabLoadOutcome {
+        tab_id,
+        wiki,
+        lang,
+        title,
+        result: fetched.map_err(|e| e.to_string()),
+    });
+    netqueue::ExecResult {
+        outcome,
+        follow_ups: Vec::new(),
     }
 }
 
@@ -2604,8 +2699,13 @@ async fn run(
     // PRD §5.8 / NF-NET-1: the one background substrate. A single serial
     // worker drains its priority queue; revalidation (FR-OFF-2) is migrated
     // onto it here so there is one coherent background story with prefetch
-    // (FR-PF-1/2). Background-tab loads, saved-page fetches, and read-later
-    // warming remain ad-hoc spawns for now — documented follow-up.
+    // (FR-PF-1/2). Background-tab loads (FR-TB-3: session restore,
+    // Ctrl-Enter, the `F` hint, and the registry's `OpenBackgroundTab`
+    // action) are migrated too (quality-M1) — `fire_background_load` routes
+    // through `app.prefetch` (this handle) once it exists below, falling
+    // back to its original ad hoc spawn only where no substrate is
+    // installed (tests, `--dump`). Saved-page fetches (`:save`) remain an
+    // ad-hoc spawn for now — documented follow-up.
     let substrate = netqueue::SubstrateHandle::new(prefetch_config);
     substrate.set_enabled(prefetch_enabled);
     app.prefetch = Some(substrate.clone());
@@ -2619,6 +2719,7 @@ async fn run(
         cache: cache.clone(),
         search_index: app.search_index.clone(),
         revalidate_tx: revalidate_tx.clone(),
+        open_tx: open_tx.clone(),
         feed_cache,
         weights: substrate.weights(),
         top_n: substrate.top_n(),
@@ -3352,7 +3453,16 @@ fn request_visible_images(client: &WikiClient, app: &mut App, tx: &UnboundedSend
         app.image_store.mark_loading(src.clone());
         let client = client.clone();
         let tx = tx.clone();
+        // quality-M2: bounds how many of these run at once (see
+        // `image::IMAGE_FETCH_CONCURRENCY`) — acquired *inside* the spawned
+        // task, after `mark_loading` already ran synchronously above, so
+        // waiting for a free slot only delays the network request, never
+        // this frame's "loading" placeholder.
+        let limiter = app.image_fetch_limiter.clone();
         tokio::spawn(async move {
+            let Ok(_permit) = limiter.acquire_owned().await else {
+                return;
+            };
             let decoded = match client.fetch_image(&src).await {
                 Ok(bytes) => crate::image::decode_image(&bytes),
                 Err(_) => None,
@@ -3390,7 +3500,13 @@ fn request_start_page_image(
     app.image_store.mark_loading(src.clone());
     let client = client.clone();
     let tx = tx.clone();
+    // quality-M2: shares `request_visible_images`'s fetch-concurrency cap
+    // (same pipeline, same budget — see `image::new_fetch_limiter`).
+    let limiter = app.image_fetch_limiter.clone();
     tokio::spawn(async move {
+        let Ok(_permit) = limiter.acquire_owned().await else {
+            return;
+        };
         let decoded = match client.fetch_image(&src).await {
             Ok(bytes) => crate::image::decode_image(&bytes),
             Err(_) => None,
@@ -3974,7 +4090,13 @@ async fn open_trail_node(
 /// background opens use (`fire_background_load`/`apply_tab_load_outcome`),
 /// so restore never blocks startup on the network — each tab shows its
 /// target title + "…" in the tab bar until its fetch (cache-first, so
-/// usually instant) lands, exactly like any other background tab. Scroll and
+/// usually instant) lands, exactly like any other background tab. Looping
+/// over every saved tab here used to mean N concurrent, uncoordinated
+/// fetches all firing at once (each its own raw `tokio::spawn`); now that
+/// `fire_background_load` enqueues onto the substrate (quality-M1), restore
+/// with many tabs drains through the same single serial worker as
+/// everything else, still cache-first so a warm cache makes this
+/// indistinguishable from the old eager behavior in practice. Scroll and
 /// fold state can't be applied until that fetch installs a document
 /// (`Tab::install_document` always resets both) — `apply_tab_load_outcome`
 /// applies them from `app.pending_session_restore` the moment each tab's
@@ -4031,6 +4153,7 @@ fn restore_session_tabs(
                 client,
                 cache,
                 &app.search_index,
+                app.prefetch.as_ref(),
                 tab_id,
                 saved.wiki.clone(),
                 saved.lang.clone(),
@@ -4854,6 +4977,7 @@ async fn handle_key(
                                 client,
                                 cache,
                                 &app.search_index,
+                                app.prefetch.as_ref(),
                                 id,
                                 client.wiki_scope(),
                                 lang,
@@ -5799,10 +5923,13 @@ async fn handle_key(
                 }
                 KeyCode::Char('F') => app.enter_hint_mode(true),
                 // PRD FR-TB-3: Ctrl-Enter opens the focused internal link in a
-                // BACKGROUND tab — the fetch fires immediately via the tab-load
-                // channel and focus does NOT move. (Budget-aware prefetch
-                // scheduling for these is a later chunk; for now it fetches
-                // eagerly.) Checked before the plain-Enter arm below.
+                // BACKGROUND tab — focus does NOT move. `fire_background_load`
+                // enqueues it onto the substrate (quality-M1), so it is
+                // gated behind any foreground fetch, serialized against
+                // whatever else is background-loading, and single-flight
+                // deduped, same as revalidation/prefetch — it is exempt from
+                // the *prefetch* budget (see `netqueue::Job::LoadTab`'s doc
+                // comment). Checked before the plain-Enter arm below.
                 // PRD FR-DL-1: Enter on the start page opens the focused
                 // item (TFA/most-read/news/on-this-day/TIL) in this tab —
                 // Ctrl-Enter's "open in background tab" has no start-page
@@ -5833,6 +5960,7 @@ async fn handle_key(
                                 client,
                                 cache,
                                 &app.search_index,
+                                app.prefetch.as_ref(),
                                 id,
                                 client.wiki_scope(),
                                 lang,
@@ -6509,6 +6637,7 @@ async fn dispatch_action(
                         client,
                         cache,
                         &app.search_index,
+                        app.prefetch.as_ref(),
                         id,
                         client.wiki_scope(),
                         lang,
@@ -9453,6 +9582,43 @@ mod tests {
         assert_eq!(app.tabs.len(), 1, "no tab was resurrected");
     }
 
+    /// quality-M1 regression: before this fix, `fire_background_load`
+    /// unconditionally spawned its own raw `tokio::spawn` — no gate, no
+    /// dedup, no breaker, no serialization against anything else the
+    /// background worker was doing. With a substrate handle installed (as
+    /// `main::run` always installs one), it must enqueue a `Job::LoadTab`
+    /// there instead, observable synchronously via `pending()`/
+    /// `any_inflight()` without needing a runtime to drive anything.
+    #[test]
+    fn fire_background_load_enqueues_onto_the_substrate_when_one_is_installed() {
+        let client = test_client();
+        let cache = PageCache::disabled();
+        let search_index = offline_search::OfflineIndex::in_memory();
+        let handle = netqueue::SubstrateHandle::new(netqueue::SubstrateConfig::default());
+        let (tx, _rx) = mpsc::unbounded_channel::<TabLoadOutcome>();
+
+        assert_eq!(handle.pending(), 0);
+        assert!(!handle.any_inflight());
+        fire_background_load(
+            &client,
+            &cache,
+            &search_index,
+            Some(&handle),
+            7,
+            "wikipedia".to_string(),
+            "en".to_string(),
+            "Enigma machine".to_string(),
+            &tx,
+        );
+        assert_eq!(
+            handle.pending(),
+            1,
+            "must land on the substrate's queue, not a bare tokio::spawn with \
+             nothing to observe synchronously"
+        );
+        assert!(handle.any_inflight());
+    }
+
     // ---- Session auto-restore (PRD FR-TB-5) --------------------------------
 
     fn sample_session_state() -> session::SessionState {
@@ -9942,6 +10108,87 @@ mod tests {
             "a snapshot taken right after `request_visible_images` returns \
              (as the event loop's pre-`draw` snapshot now does) must already \
              see the image it just spawned"
+        );
+    }
+
+    /// quality-M2 regression: before this fix, `request_visible_images`
+    /// spawned one uncoordinated `tokio::spawn` per not-yet-loaded image with
+    /// no cap at all, so a media-heavy article could fire every image fetch
+    /// at once. A tiny raw-socket server (the same test-only pattern
+    /// `api.rs`'s own tests use) tracks how many client connections are open
+    /// simultaneously; each held open just long enough for others to overlap
+    /// with it proves whether the fan-out is actually bounded.
+    #[tokio::test]
+    async fn request_visible_images_bounds_concurrent_fetches() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const IMAGE_COUNT: usize = 6;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let concurrent = Arc::new(AtomicUsize::new(0));
+        let max_concurrent = Arc::new(AtomicUsize::new(0));
+        {
+            let concurrent = concurrent.clone();
+            let max_concurrent = max_concurrent.clone();
+            std::thread::spawn(move || {
+                for _ in 0..IMAGE_COUNT {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        break;
+                    };
+                    let concurrent = concurrent.clone();
+                    let max_concurrent = max_concurrent.clone();
+                    std::thread::spawn(move || {
+                        let n = concurrent.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_concurrent.fetch_max(n, Ordering::SeqCst);
+                        let mut discard = [0u8; 4096];
+                        let _ = stream.read(&mut discard);
+                        // Held open long enough for other concurrent
+                        // connections to overlap with this one before any of
+                        // them respond.
+                        std::thread::sleep(Duration::from_millis(150));
+                        let body = b"x";
+                        let header = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(header.as_bytes());
+                        let _ = stream.write_all(body);
+                        concurrent.fetch_sub(1, Ordering::SeqCst);
+                    });
+                }
+            });
+        }
+
+        let client = test_client();
+        let mut app = App::new("en".to_string(), Theme::full(), false);
+        app.graphics_env = crate::graphics::GraphicsEnv {
+            colorterm: "truecolor".to_string(),
+            is_tty: true,
+            ..Default::default()
+        };
+        let imgs: String = (0..IMAGE_COUNT)
+            .map(|i| format!("<img src=\"http://127.0.0.1:{port}/img{i}.png\"/>"))
+            .collect();
+        app.open_document(crate::doc::parse_article_html(
+            "Test",
+            &format!("<html><body><p>x</p>{imgs}</body></html>"),
+        ));
+
+        let (image_tx, _rx) = mpsc::unbounded_channel::<ImageOutcome>();
+        request_visible_images(&client, &mut app, &image_tx);
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let max = max_concurrent.load(Ordering::SeqCst);
+        assert!(
+            max <= crate::image::IMAGE_FETCH_CONCURRENCY,
+            "at most {} inline-image fetches may run at once, saw {max}",
+            crate::image::IMAGE_FETCH_CONCURRENCY
+        );
+        assert!(
+            max < IMAGE_COUNT,
+            "the fan-out must be bounded below the {IMAGE_COUNT} requested images, saw {max}"
         );
     }
 

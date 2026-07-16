@@ -16,11 +16,34 @@
 //! theme background at paint time, so the store stays theme-independent.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 /// Hard cap on a decoded image's dimensions (PRD SEC-3 spirit: bound the work
 /// a hostile/oversized asset can cause). Thumbnails are far smaller; anything
 /// past this is rejected to alt text rather than decoded.
 const MAX_IMAGE_DIM: u32 = 4096;
+
+/// quality-M2: caps how many inline/POTD image fetches run at once. Before
+/// this bound, `main::request_visible_images` spawned one uncoordinated
+/// `tokio::spawn` per not-yet-loaded image with nothing gating how many ran
+/// concurrently — a media-heavy article could burst dozens of simultaneous
+/// requests at once, competing with whatever else the client was doing. 3 is
+/// generous enough that a screenful of images still appears quickly while
+/// never approaching a fan-out that saturates the connection.
+pub const IMAGE_FETCH_CONCURRENCY: usize = 3;
+
+/// One shared limiter for every inline/POTD image fetch a session spawns
+/// (`main::request_visible_images` and `main::request_start_page_image` both
+/// acquire a permit before calling `WikiClient::fetch_image` — see the
+/// latter's doc comment for why they share one pipeline, and so one budget).
+/// A permit is only acquired *inside* the spawned task, after
+/// `ImageStore::mark_loading` has already run synchronously in the caller —
+/// waiting for a free slot delays the network request itself, never the
+/// "loading" placeholder the reader sees this frame.
+pub fn new_fetch_limiter() -> Arc<Semaphore> {
+    Arc::new(Semaphore::new(IMAGE_FETCH_CONCURRENCY))
+}
 
 /// A decoded raster image: tightly-packed RGBA8, `width * height * 4` bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]

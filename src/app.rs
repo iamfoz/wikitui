@@ -626,6 +626,11 @@ pub struct App {
     /// populated by async fetch/decode (never blocking the UI). Read by
     /// `ensure_layout` (to reserve boxes) and paint (to fill them).
     pub image_store: crate::image::ImageStore,
+    /// quality-M2: bounds how many inline/POTD image fetches run at once
+    /// (`main::request_visible_images`/`request_start_page_image`) — see
+    /// `image::new_fetch_limiter`'s doc comment. One per `App` so every image
+    /// fetch this session spawns shares the same cap.
+    pub image_fetch_limiter: std::sync::Arc<tokio::sync::Semaphore>,
     /// Bumped whenever inline-image state changes (a decode lands, `:set
     /// images` flips, a theme change flips `images`). Feeds `LayoutOptions`
     /// so a change forces exactly one relayout and no pre-decode cached
@@ -1469,6 +1474,7 @@ impl App {
             hint_background: false,
             config_ctx: ConfigContext::default(),
             image_store: crate::image::ImageStore::new(),
+            image_fetch_limiter: crate::image::new_fetch_limiter(),
             image_epoch: 0,
             images_override: None,
             include_nonfree: false,
