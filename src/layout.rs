@@ -2237,11 +2237,23 @@ pub fn fold_body_counts(body: &[Block]) -> (usize, usize) {
 /// the block kinds those two functions descend into). Used to advance the
 /// occurrence counter across a folded block without laying it out, so a visible
 /// link after the fold keeps the same global index the unfolded layout gave it.
+///
+/// The `#`-fragment exclusion is load-bearing and must mirror `span_kind`/
+/// `doc::collect_links` exactly: a pure same-page fragment anchor
+/// (`#cite_note-N`, a reference marker) is *not* handed a `SpanKind::Link`
+/// occurrence by `span_kind`, so folding a section whose body holds one must
+/// not advance `link_counter` for it either. Counting it here would push every
+/// real link after the fold to a phantom index that `link_lines`/`link_visible`
+/// never fill, silently hiding an on-screen link from Tab-cycling (the very
+/// desync the ordering invariant forbids).
 fn block_link_count(block: &Block) -> usize {
     let count = |spans: &[crate::doc::Span]| {
         spans
             .iter()
-            .filter(|s| matches!(s.style, SpanStyle::Link(_) | SpanStyle::RedLink(_)))
+            .filter(|s| match &s.style {
+                SpanStyle::Link(href) | SpanStyle::RedLink(href) => !href.starts_with('#'),
+                _ => false,
+            })
             .count()
     };
     match block {
@@ -3429,6 +3441,59 @@ mod tests {
             .collect();
         emitted.dedup();
         assert_eq!(emitted, vec![0, 2]);
+    }
+
+    /// Lead link, an `h2 History` whose body carries a Cite-extension
+    /// reference marker (`<sup class="reference"><a href="#cite_note-1">[1]
+    /// </a></sup>`), then an `h2 Legacy` with a second link. The marker is a
+    /// same-page fragment anchor — excluded from `collect_links` and given no
+    /// `SpanKind::Link` occurrence — so folding History must NOT advance the
+    /// link counter for it.
+    const FOLD_CITE_FIXTURE: &str = r##"
+    <html><head><title>Cite Fold</title></head><body>
+      <p>Lead with a <a href="./Lead_Link">lead link</a> here.</p>
+      <h2>History</h2>
+      <p>A claim<sup class="reference"><a href="#cite_note-1">[1]</a></sup> in history.</p>
+      <h2>Legacy</h2>
+      <p>Legacy paragraph with a <a href="./Legacy_Link">legacy link</a>.</p>
+    </body></html>
+    "##;
+
+    #[test]
+    fn folding_a_section_with_a_citation_marker_keeps_link_numbering_aligned() {
+        let doc = parse_article_html("Cite Fold", FOLD_CITE_FIXTURE);
+        let links = collect_links(&doc);
+        // Two followable links; the `#cite_note-1` marker is not one of them.
+        assert_eq!(links.len(), 2);
+        let history = heading_block(&doc, "History");
+        let folded =
+            layout_document_with_images(&doc, 80, LayoutOptions::default(), &NoImages, &[history]);
+        // The folded citation marker must not inflate the per-occurrence
+        // vectors past `collect_links`'s length — before the `block_link_count`
+        // fix these were length 3 (a phantom trailing entry) and desynced from
+        // `collect_links`.
+        assert_eq!(folded.link_lines.len(), links.len());
+        assert_eq!(folded.link_visible.len(), links.len());
+        assert_eq!(folded.link_cols.len(), links.len());
+        // Both real links stay visible — the Legacy link after the fold is not
+        // pushed onto a phantom index and silently hidden.
+        assert!(folded.link_visible[0], "the lead link stays visible");
+        assert!(
+            folded.link_visible[1],
+            "the Legacy link after the fold stays visible"
+        );
+        // The Legacy link still emits its span at occurrence 1, not 2.
+        let mut emitted: Vec<usize> = folded
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .filter_map(|s| match s.kind {
+                SpanKind::Link(occ) => Some(occ),
+                _ => None,
+            })
+            .collect();
+        emitted.dedup();
+        assert_eq!(emitted, vec![0, 1]);
     }
 
     #[test]

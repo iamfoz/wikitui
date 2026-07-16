@@ -383,6 +383,51 @@ pub fn collect_links(doc: &Document) -> Vec<LinkRef> {
     links
 }
 
+/// A same-page fragment-anchor marker (`href` starting with `#`) encountered
+/// while reading, in document order — the exact complement of `collect_links`
+/// over the same block kinds. Predominantly Cite-extension reference markers
+/// (`<sup class="reference"><a href="#cite_note-1">[1]</a></sup>`). `block` is
+/// the `doc.blocks` index the marker lives in, which the width-aware layout
+/// maps to a laid-out line (`layout::Layout::block_lines`).
+#[derive(Debug, Clone)]
+pub struct ReferenceMarker {
+    pub href: String,
+    pub text: String,
+    pub block: usize,
+}
+
+/// Collects every same-page fragment-anchor marker (`#…` href) in the blocks
+/// that render one, in reading order, tagged with its block index — the set
+/// `collect_links` deliberately excludes (see its doc comment). Kept as a list
+/// distinct from the followable `LinkRef`s so `K`'s footnote peek (PRD
+/// FR-NV-4) can target the reference nearest the reading position *without*
+/// ever making a marker a Tab-followable link.
+pub fn collect_reference_markers(doc: &Document) -> Vec<ReferenceMarker> {
+    let mut markers = Vec::new();
+    for (i, block) in doc.blocks.iter().enumerate() {
+        let spans = match block {
+            Block::Paragraph(spans) | Block::Blockquote(spans) => spans,
+            Block::ListItem { spans, .. } => spans,
+            _ => continue,
+        };
+        for s in spans {
+            let href = match &s.style {
+                SpanStyle::Link(href) | SpanStyle::RedLink(href) => href,
+                _ => continue,
+            };
+            if !href.starts_with('#') {
+                continue;
+            }
+            markers.push(ReferenceMarker {
+                href: href.clone(),
+                text: s.text.clone(),
+                block: i,
+            });
+        }
+    }
+    markers
+}
+
 /// A heading in the reading view, identified by the index of its block in
 /// `doc.blocks` — the target of the table-of-contents jump (PRD FR-NV-2). The
 /// laid-out line it maps to is resolved by `layout::Layout::block_lines`, so

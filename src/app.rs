@@ -4649,65 +4649,160 @@ impl App {
     /// isn't cached yet (the caller fires it off the event loop), else `None`
     /// (a footnote, an already-cached preview, or nothing focusable to peek).
     pub fn open_peek_at_focus(&mut self) -> Option<(String, String)> {
+        self.ensure_layout();
         let link = self
             .active_tab()
             .focused_link
             .and_then(|i| self.active_tab().links.get(i))
             .cloned();
-        let Some(link) = link else {
-            self.status = "No link focused to peek — Tab to focus one".to_string();
-            return None;
-        };
-        // FR-NV-4 footnote peek: a reference marker resolves locally.
-        if is_reference_marker(&link.href) {
-            let citation = self
-                .active_tab()
-                .doc
-                .as_ref()
-                .and_then(|d| resolve_reference(&d.citations, &link.href, &link.text).cloned());
-            match citation {
-                Some(c) => {
-                    self.peek_prior_mode = self.mode;
-                    self.peek = Some(PeekPopup::Footnote {
-                        marker: link.text.clone(),
-                        text: c.text,
-                    });
-                    self.mode = Mode::Peek;
-                    self.status = "Reference — Ctrl-o/Esc: close".to_string();
-                }
-                None => self.status = "Reference not found".to_string(),
+        if let Some(link) = &link {
+            // A directly-installed reference `LinkRef` still peeks as a
+            // footnote. Markers are otherwise absent from `links` (0b86bf0),
+            // so this arises only when a caller sets one deliberately; the
+            // live `K`-on-a-`[n]` route is the scroll-proximity path below.
+            if is_reference_marker(&link.href) {
+                let (href, text) = (link.href.clone(), link.text.clone());
+                self.open_footnote_peek(&href, &text);
+                return None;
             }
+            // FR-NV-5 link preview wins when the focused link is one the reader
+            // has settled on — an internal link actually on screen (Tab-cycling
+            // scrolls its target into view). A focused link scrolled out of the
+            // viewport is no longer what `K` is "on", so it yields to the
+            // footnote-peek path; `focused_link_in_view` keeps the historical
+            // behavior before the first draw sets a real viewport height.
+            if link.internal_title.is_some() && self.focused_link_in_view() {
+                return self.open_link_preview(link.internal_title.clone().unwrap());
+            }
+        }
+        // FR-NV-4 footnote peek (restored): peek the reference marker nearest
+        // the reading position. Reference markers are not followable links and
+        // can't be Tab-focused, so this proximity route is how `K` reaches a
+        // `[n]` marker once folding/cycling has stopped landing on them.
+        if self.peek_reference_near_scroll() {
             return None;
         }
-        // FR-NV-5 link preview: an internal link's summary.
-        match link.internal_title {
-            Some(title) => {
-                let lang = self.lang.clone();
+        // No reference near the cursor: fall back to previewing a focused
+        // internal link even off-screen, so `K` is never a silent no-op when a
+        // link is focused.
+        if let Some(link) = link {
+            if let Some(title) = link.internal_title {
+                return self.open_link_preview(title);
+            }
+            self.status = "External link — nothing to preview".to_string();
+        } else {
+            self.status =
+                "Nothing to peek here — Tab to a link or scroll to a reference".to_string();
+        }
+        None
+    }
+
+    /// FR-NV-5 link preview: open the peek popup for an internal link `title`
+    /// on the active tab's wiki. Returns the `(lang, title)` the caller must
+    /// fetch a summary for when it isn't cached yet, else `None` (already
+    /// cached — the popup renders immediately).
+    fn open_link_preview(&mut self, title: String) -> Option<(String, String)> {
+        let lang = self.lang.clone();
+        self.peek_prior_mode = self.mode;
+        self.peek = Some(PeekPopup::LinkPreview {
+            lang: lang.clone(),
+            title: title.clone(),
+        });
+        self.mode = Mode::Peek;
+        if self.summary_cache.contains_key(&(
+            self.active_tab().wiki.clone(),
+            lang.clone(),
+            title.clone(),
+        )) {
+            self.summary_loading = false;
+            self.status = "Link preview — Ctrl-o/Esc: close   Enter: open".to_string();
+            None
+        } else {
+            self.summary_loading = true;
+            self.status = "Loading preview…".to_string();
+            Some((lang, title))
+        }
+    }
+
+    /// FR-NV-4 footnote peek: resolve a reference marker `(href, text)` to its
+    /// citation and open the peek popup — locally, from the parsed citations,
+    /// never a network call. A graceful "reference not found" status when it
+    /// doesn't resolve. Shared by the focused-marker path and the
+    /// scroll-proximity path so the footnote peek is spelled exactly once.
+    fn open_footnote_peek(&mut self, href: &str, text: &str) {
+        let citation = self
+            .active_tab()
+            .doc
+            .as_ref()
+            .and_then(|d| resolve_reference(&d.citations, href, text).cloned());
+        match citation {
+            Some(c) => {
                 self.peek_prior_mode = self.mode;
-                self.peek = Some(PeekPopup::LinkPreview {
-                    lang: lang.clone(),
-                    title: title.clone(),
+                self.peek = Some(PeekPopup::Footnote {
+                    marker: text.to_string(),
+                    text: c.text,
                 });
                 self.mode = Mode::Peek;
-                if self.summary_cache.contains_key(&(
-                    self.active_tab().wiki.clone(),
-                    lang.clone(),
-                    title.clone(),
-                )) {
-                    self.summary_loading = false;
-                    self.status = "Link preview — Ctrl-o/Esc: close   Enter: open".to_string();
-                    None
-                } else {
-                    self.summary_loading = true;
-                    self.status = "Loading preview…".to_string();
-                    Some((lang, title))
-                }
+                self.status = "Reference — Ctrl-o/Esc: close".to_string();
             }
-            None => {
-                self.status = "External link — nothing to preview".to_string();
-                None
-            }
+            None => self.status = "Reference not found".to_string(),
         }
+    }
+
+    /// FR-NV-4 (restored): open the footnote peek for the reference marker
+    /// nearest the current reading position, resolved locally with no network.
+    /// Reference markers are deliberately not followable links (0b86bf0), so
+    /// they can't be Tab-focused — this proximity search over the tab's
+    /// `reference_markers` (mapped to lines via `Layout::block_lines`) is the
+    /// live route to a `[n]` marker's text. Returns whether a marker was found
+    /// (so the caller can fall back when the page has none).
+    fn peek_reference_near_scroll(&mut self) -> bool {
+        self.ensure_layout();
+        let scroll = self.active_tab().scroll as usize;
+        let Some(block_lines) = self.layout.as_ref().map(|l| l.block_lines.clone()) else {
+            return false;
+        };
+        let nearest = self
+            .active_tab()
+            .reference_markers
+            .iter()
+            .filter(|m| is_reference_marker(&m.href))
+            .map(|m| {
+                let line = block_lines.get(m.block).copied().unwrap_or(0);
+                (line.abs_diff(scroll), line, m.href.clone(), m.text.clone())
+            })
+            .min_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let Some((_, _, href, text)) = nearest else {
+            return false;
+        };
+        self.open_footnote_peek(&href, &text);
+        true
+    }
+
+    /// Whether the active tab's focused link is currently within the drawn
+    /// viewport — the signal `K` uses to decide a focused internal link is the
+    /// reader's deliberate preview target (FR-NV-5) rather than one they have
+    /// scrolled past. `true` when no link is focused-and-visible is `false`;
+    /// `true` when there is no viewport height yet (before the first draw / in
+    /// unit tests) so the historical "the focused link is the peek target"
+    /// behavior stands with nothing to test against.
+    fn focused_link_in_view(&self) -> bool {
+        let Some(occ) = self.active_tab().focused_link else {
+            return false;
+        };
+        let vh = self.viewport_height;
+        if vh == 0 {
+            return true;
+        }
+        let Some(layout) = self.layout.as_ref() else {
+            return true;
+        };
+        if !layout.link_visible.get(occ).copied().unwrap_or(false) {
+            return false;
+        }
+        let line = layout.link_lines.get(occ).copied().unwrap_or(0) as u16;
+        let scroll = self.active_tab().scroll;
+        line >= scroll && line < scroll.saturating_add(vh)
     }
 
     /// Close the peek popup (`Ctrl-o`/`Esc`), restoring the prior mode.
@@ -7232,6 +7327,43 @@ mod tests {
         assert!(seen.contains(&0) && seen.contains(&2));
     }
 
+    #[test]
+    fn cycle_link_reaches_a_link_after_a_folded_section_with_a_citation_marker() {
+        // A folded section whose body holds a `#cite_note` reference marker
+        // must not desync link numbering: the marker is excluded from
+        // `collect_links` and gets no `SpanKind::Link` occurrence, so folding
+        // it must not advance the counter past the real link that follows. If
+        // it did (the `block_link_count` bug), that link would inherit a
+        // phantom index its `link_visible` slot never sets, and Tab-cycling
+        // would silently skip it.
+        let html = "<html><body><p>lead <a href=\"./Lead\">lead link</a></p>\
+            <h2>History</h2>\
+            <p>a claim<sup class=\"reference\"><a href=\"#cite_note-1\">[1]</a></sup> here</p>\
+            <h2>Legacy</h2><p>a <a href=\"./Leg\">legacy link</a></p></body></html>";
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(crate::doc::parse_article_html("T", html));
+        app.layout_width = 80;
+        app.viewport_height = 20;
+        // Two followable links; the citation marker is not one.
+        assert_eq!(app.active_tab().links.len(), 2);
+        let hist_block = app.active_tab().sections[0].block;
+        app.active_tab_mut().folded_blocks.insert(hist_block);
+        app.ensure_layout();
+        // The visibility vector stays link-length, not inflated by the marker.
+        assert_eq!(app.layout.as_ref().unwrap().link_visible.len(), 2);
+        app.active_tab_mut().focused_link = None;
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            app.cycle_link(true);
+            seen.push(app.active_tab().focused_link.unwrap());
+        }
+        assert!(seen.contains(&0), "the lead link is reachable: {seen:?}");
+        assert!(
+            seen.contains(&1),
+            "the link after the fold is reachable, not skipped: {seen:?}"
+        );
+    }
+
     // ---- PRD FR-NV-4 footnote peek + gK -----------------------------------
 
     fn cite(id: &str, text: &str) -> Citation {
@@ -7335,6 +7467,115 @@ mod tests {
         app.close_peek();
         assert_eq!(app.mode, Mode::Reading);
         assert!(app.peek.is_none());
+    }
+
+    #[test]
+    fn k_peeks_the_nearest_reference_marker_without_a_focused_link() {
+        // A `[1]` marker in the body and a matching References section. The
+        // marker is not a followable link (0b86bf0) and cannot be Tab-focused,
+        // so `K` must reach it by reading-position proximity — the footnote
+        // peek path that regressed to dead code when markers left `links`.
+        let html = "<html><body>\
+            <p>Lead with a <a href=\"./Enigma\">real link</a>.</p>\
+            <p>A claim<sup class=\"reference\"><a href=\"#cite_note-1\">[1]</a></sup> here.</p>\
+            <h2>References</h2>\
+            <div class=\"mw-references-wrap\"><ol class=\"references\">\
+            <li id=\"cite_note-1\"><span class=\"reference-text\">Hodges, Andrew. The Enigma.</span></li>\
+            </ol></div></body></html>";
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(crate::doc::parse_article_html("T", html));
+        app.layout_width = 80;
+        app.viewport_height = 20;
+
+        // 0b86bf0 intact: the marker is not in the followable link set.
+        assert!(
+            app.active_tab()
+                .links
+                .iter()
+                .all(|l| !l.href.starts_with('#')),
+            "reference markers stay out of the followable link set"
+        );
+        // But it is tracked for footnote peek.
+        assert!(
+            app.active_tab()
+                .reference_markers
+                .iter()
+                .any(|m| m.href == "#cite_note-1"),
+            "the marker is tracked as a reference marker"
+        );
+
+        // Tab-focus never lands on a marker: cycling only reaches the one real
+        // link, whose href is not a `#`-anchor.
+        app.active_tab_mut().focused_link = None;
+        app.cycle_link(true);
+        let focused = app
+            .active_tab()
+            .focused_link
+            .expect("a real link is focusable");
+        assert!(
+            !is_reference_marker(&app.active_tab().links[focused].href),
+            "Tab focus never lands on a reference marker"
+        );
+
+        // Put the reading position on the marker's paragraph, with no link
+        // focused, and peek: the footnote branch fires again (was unreachable).
+        app.ensure_layout();
+        let marker_block = app.active_tab().reference_markers[0].block;
+        let line = app.layout.as_ref().unwrap().block_lines[marker_block];
+        app.active_tab_mut().scroll = line as u16;
+        app.active_tab_mut().focused_link = None;
+
+        let fetch = app.open_peek_at_focus();
+        assert!(fetch.is_none(), "a footnote peek never triggers a fetch");
+        assert_eq!(app.mode, Mode::Peek, "the footnote peek is reachable again");
+        match &app.peek {
+            Some(PeekPopup::Footnote { marker, text }) => {
+                assert_eq!(marker, "[1]");
+                assert!(text.contains("Hodges"), "resolved locally: {text:?}");
+            }
+            other => panic!("expected a footnote peek, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn k_prefers_a_nearby_reference_over_an_offscreen_focused_link() {
+        // The focused link is at the top; the reader has scrolled down to a
+        // citation. `K` peeks the reference in view, not the link scrolled off
+        // above it (FR-NV-4 over a stale FR-NV-5 focus).
+        let html = "<html><body>\
+            <p>Lead with a <a href=\"./Enigma\">real link</a>.</p>\
+            <p>one</p><p>two</p><p>three</p><p>four</p><p>five</p>\
+            <p>A claim<sup class=\"reference\"><a href=\"#cite_note-1\">[1]</a></sup> here.</p>\
+            <h2>References</h2>\
+            <div class=\"mw-references-wrap\"><ol class=\"references\">\
+            <li id=\"cite_note-1\"><span class=\"reference-text\">Hodges, Andrew. The Enigma.</span></li>\
+            </ol></div></body></html>";
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(crate::doc::parse_article_html("T", html));
+        app.layout_width = 80;
+        app.viewport_height = 3;
+        app.ensure_layout();
+        // The first link is focused (install default) but scrolled out of view.
+        assert_eq!(app.active_tab().focused_link, Some(0));
+        let marker_block = app.active_tab().reference_markers[0].block;
+        let line = app.layout.as_ref().unwrap().block_lines[marker_block];
+        assert!(
+            line as u16 > app.viewport_height,
+            "the marker is below the top link"
+        );
+        app.active_tab_mut().scroll = line as u16;
+
+        let fetch = app.open_peek_at_focus();
+        assert!(fetch.is_none(), "the footnote peek makes no fetch");
+        match &app.peek {
+            Some(PeekPopup::Footnote { text, .. }) => {
+                assert!(
+                    text.contains("Hodges"),
+                    "peeked the nearby reference: {text:?}"
+                );
+            }
+            other => panic!("expected a footnote peek, got {other:?}"),
+        }
     }
 
     // ---- PRD FR-NV-5 link preview -----------------------------------------

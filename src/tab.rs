@@ -14,7 +14,10 @@
 use serde::{Deserialize, Serialize};
 
 use crate::app::PendingReload;
-use crate::doc::{Document, LinkRef, SectionRef, collect_links, section_outline};
+use crate::doc::{
+    Document, LinkRef, ReferenceMarker, SectionRef, collect_links, collect_reference_markers,
+    section_outline,
+};
 use crate::layout;
 
 /// A stable, monotonically-assigned per-tab identity (PRD FR-TB-3). Background
@@ -97,6 +100,13 @@ pub struct Tab {
     pub wiki: String,
     pub doc: Option<Document>,
     pub links: Vec<LinkRef>,
+    /// PRD FR-NV-4: the article's same-page reference markers (`[n]` →
+    /// `#cite_note-…`), in document order — the set `collect_links` excludes
+    /// from `links` (0b86bf0) so they are never Tab-followable. Kept
+    /// separately so `K` can peek the reference nearest the reading position
+    /// (`App::open_peek_at_focus`) without a marker ever becoming a focusable
+    /// link. Recomputed on every document install, cleared on blank.
+    pub reference_markers: Vec<ReferenceMarker>,
     pub focused_link: Option<usize>,
     pub sections: Vec<SectionRef>,
     pub selected_section: usize,
@@ -178,6 +188,7 @@ impl Tab {
             wiki: String::new(),
             doc: None,
             links: Vec::new(),
+            reference_markers: Vec::new(),
             focused_link: None,
             sections: Vec::new(),
             selected_section: 0,
@@ -224,6 +235,7 @@ impl Tab {
     /// *non-active* tab when a background fetch completes.
     pub fn install_document(&mut self, doc: Document) {
         self.links = collect_links(&doc);
+        self.reference_markers = collect_reference_markers(&doc);
         self.focused_link = if self.links.is_empty() { None } else { Some(0) };
         self.sections = section_outline(&doc);
         self.selected_section = 0;
@@ -262,6 +274,7 @@ impl Tab {
     pub fn clear_to_blank(&mut self) {
         self.doc = None;
         self.links.clear();
+        self.reference_markers.clear();
         self.focused_link = None;
         self.sections.clear();
         self.selected_section = 0;
