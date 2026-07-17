@@ -490,7 +490,18 @@ impl History {
         if max_age_days == 0 {
             return;
         }
-        let cutoff = now_unix() - (max_age_days as i64) * 86_400;
+        // CORR-L5: `max_age_days` is user config (`config::resolve`'s
+        // validation only rejects negative TOML values, not absurdly large
+        // ones), so an unclamped `as i64` cast or `* 86_400` multiply can
+        // wrap negative or overflow-panic in a debug build. A negative
+        // wrapped value here would turn into a far-future cutoff that
+        // deletes *all* history instead of nothing. `try_from` + saturating
+        // arithmetic means the worst an absurd value can do is saturate the
+        // cutoff to `i64::MIN` — i.e. prune nothing, the same as too-small a
+        // retention window pruning everything is never silently inverted.
+        let days = i64::try_from(max_age_days).unwrap_or(i64::MAX);
+        let age_secs = days.saturating_mul(86_400);
+        let cutoff = now_unix().saturating_sub(age_secs);
         if let Err(e) = self.clear(ClearRange::Before(cutoff)) {
             log_write_failure("retention_prune", &e);
         }
@@ -1381,6 +1392,27 @@ mod tests {
             .unwrap();
         history.retention_prune(0);
         assert_eq!(history.recent(10).len(), 1, "0 days means keep forever");
+    }
+
+    /// CORR-L5: before this fix, an absurd `retention_days` (bigger than
+    /// `i64::MAX`) wrapped negative through the bare `as i64` cast, and the
+    /// subsequent `* 86_400` could overflow-panic in a debug build — or, if
+    /// it didn't panic, the wrapped-negative value produced a far-future
+    /// cutoff that deleted *all* history instead of the intended "keep
+    /// (almost) forever". Saturating arithmetic must instead prune nothing.
+    #[test]
+    fn retention_prune_with_an_absurd_retention_days_does_not_delete_everything() {
+        let mut history = History::in_memory();
+        history.record_visit("", "en", "Just Visited", None);
+        assert_eq!(history.recent(10).len(), 1);
+
+        history.retention_prune(u64::MAX);
+
+        assert_eq!(
+            history.recent(10).len(),
+            1,
+            "an absurd retention window must not wipe out history that's seconds old"
+        );
     }
 
     #[test]

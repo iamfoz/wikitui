@@ -520,10 +520,13 @@ impl SavedPages {
             .iter()
             .position(|r| r.wiki == wiki && r.lang == lang && r.title == title)?;
         let removed = self.records.remove(pos);
-        // Rewrite the index FIRST (CORR-M6), then best-effort delete the blob
-        // and thumbnails: a crash landing between the two leaves at worst an
-        // orphaned blob (the index no longer names it), never a Corrupt index
-        // row pointing at content we already deleted.
+        // Rewrite the index FIRST (CORR-M6), then delete the blob and
+        // thumbnails *only if that succeeded* (re-review residual): gating
+        // the blob delete on the rewrite's own `Ok` means a rewrite failure
+        // (disk full, permissions, ...) leaves the still-listed record's
+        // content in place — the index and the blob it names either both
+        // move together or neither does, never a `verify => Corrupt` row
+        // stranded pointing at content we deleted anyway.
         let persisted = match self.index_path() {
             Some(index) => crate::jsonl::rewrite_matching::<SavedRecord, _>(
                 &index,
@@ -533,7 +536,9 @@ impl SavedPages {
             .map(|_| ()),
             None => Ok(()),
         };
-        if let Some(root) = &self.root {
+        if persisted.is_ok()
+            && let Some(root) = &self.root
+        {
             let _ = std::fs::remove_file(root.join(&removed.content_file));
             let _ = std::fs::remove_dir_all(root.join(Self::thumb_dir_rel(wiki, lang, title)));
         }
@@ -957,6 +962,42 @@ mod tests {
                 .iter()
                 .all(|(_, _, _, v)| *v == Integrity::Ok)
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Re-review residual (Wave-1): before this fix, the blob delete ran
+    /// unconditionally even when the index rewrite came back `Err` — the
+    /// comment already claimed "rewrite first, then delete" but nothing
+    /// actually gated the second step on the first one's outcome. Forcing
+    /// the rewrite to fail (the index path replaced with a directory, so
+    /// `rewrite_matching`'s `read_to_string` errors instead of treating it
+    /// as merely absent) must now leave the blob on disk.
+    #[test]
+    fn remove_keeps_the_blob_when_the_index_rewrite_fails() {
+        let (mut store, root) = temp_store();
+        let record = store
+            .save("", "en", "Turing", 1, Tier::T0, "<p>x</p>", &[], vec![], "")
+            .unwrap();
+        let content_abs = root.join(&record.content_file);
+        assert!(content_abs.exists(), "save must have written the blob");
+
+        // Force the index rewrite to fail: replace the index file with a
+        // directory, so the rewrite's `read_to_string` errors out instead of
+        // silently treating a missing file as "nothing to rewrite".
+        let index = root.join("saved.jsonl");
+        std::fs::remove_file(&index).unwrap();
+        std::fs::create_dir_all(&index).unwrap();
+
+        let (_, persisted) = store.remove("", "en", "Turing").unwrap();
+        assert!(
+            persisted.is_err(),
+            "the forced rewrite failure must surface"
+        );
+        assert!(
+            content_abs.exists(),
+            "a failed index rewrite must not delete the blob — no dangling Corrupt row"
+        );
+
         let _ = std::fs::remove_dir_all(&root);
     }
 

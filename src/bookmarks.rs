@@ -423,17 +423,34 @@ impl ReadLaterStore {
     /// Removes the entry at `index` — used both by the picker's `d` and by
     /// "opening a read-later entry auto-dequeues it" (PRD FR-BM-3, config
     /// `readlater_auto_dequeue`). Same safe-delete contract as
-    /// `BookmarkStore::remove`.
+    /// `BookmarkStore::remove`: matched by `(wiki, lang, title)` identity —
+    /// the queue's own key (`contains`/`enqueue`'s dedup) — rather than
+    /// full-record equality (CORR-L3), so a line whose non-identity field
+    /// drifted on disk (e.g. a future priority edit) still gets found and
+    /// deleted instead of surviving to resurrect the "removed" entry on the
+    /// next launch. `rewrite_matching`'s `found` flag becomes the `Err` case
+    /// below rather than being silently discarded: once matched by identity,
+    /// `found == false` only happens if the line was never on disk to begin
+    /// with (removed out-of-band), which is worth surfacing rather than
+    /// reporting as an indistinguishable success.
     pub fn remove(&mut self, index: usize) -> Option<(ReadLaterEntry, std::io::Result<()>)> {
         if index >= self.entries.len() {
             return None;
         }
         let removed = self.entries.remove(index);
         let persisted = match &self.path {
-            Some(path) => {
-                crate::jsonl::rewrite_matching::<ReadLaterEntry, _>(path, |e| *e == removed, None)
-                    .map(|_| ())
-            }
+            Some(path) => match crate::jsonl::rewrite_matching::<ReadLaterEntry, _>(
+                path,
+                |e| e.wiki == removed.wiki && e.lang == removed.lang && e.title == removed.title,
+                None,
+            ) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "read-later entry was already absent from the on-disk queue",
+                )),
+                Err(e) => Err(e),
+            },
             None => Ok(()),
         };
         Some((removed, persisted))
@@ -968,6 +985,40 @@ mod tests {
         let parsed: ReadLaterEntry = serde_json::from_str(old).expect("old format must parse");
         assert_eq!(parsed.wiki, "");
         assert_eq!(parsed.priority, 0);
+    }
+
+    /// CORR-L3: before this fix, `remove` matched the on-disk line by full
+    /// struct equality, so a line that drifted in any non-identity field
+    /// (here, `priority`) silently failed to match — `rewrite_matching`
+    /// found nothing, the file was left untouched, and the dequeued entry
+    /// would resurrect on the next launch even though `Ok(())` reported
+    /// success. Matching on `(wiki, lang, title)` identity fixes it.
+    #[test]
+    fn remove_deletes_the_disk_line_even_if_a_non_identity_field_drifted() {
+        let path = temp_path("readlater-drift");
+        let mut store = ReadLaterStore::load_from(path.clone());
+        store.enqueue(entry("Drifted"));
+
+        // Simulate the on-disk line no longer matching the in-memory entry
+        // exactly (e.g. a future priority-editing feature bumped it).
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let drifted = raw.replace("\"priority\":0", "\"priority\":5");
+        assert_ne!(raw, drifted, "the fixture must actually drift a field");
+        std::fs::write(&path, drifted).unwrap();
+
+        let (removed, persisted) = store.remove(0).unwrap();
+        assert_eq!(removed.title, "Drifted");
+        assert!(
+            persisted.is_ok(),
+            "identity match must still find and delete the drifted line"
+        );
+
+        let reloaded = ReadLaterStore::load_from(path.clone());
+        assert!(
+            reloaded.entries.is_empty(),
+            "the drifted line must actually be gone on disk, not resurrect on reload"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

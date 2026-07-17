@@ -1000,7 +1000,7 @@ fn draw_reading(frame: &mut Frame, app: &mut App, area: Rect) {
         let total_lines = app
             .layout
             .as_ref()
-            .map(|l| l.lines.len() as u16)
+            .map(|l| app::line_to_scroll(l.lines.len()))
             .unwrap_or(0);
         let max_scroll = total_lines.saturating_sub(visible_height);
         {
@@ -1156,7 +1156,10 @@ fn draw_split(frame: &mut Frame, app: &mut App, area: Rect) {
     // Clamp each pane's scroll to its own laid-out length; record max_scroll so
     // scroll-sync and the scroll keys stay in bounds per pane.
     for (idx, layout) in [(left_idx, &left_layout), (right_idx, &right_layout)] {
-        let total = layout.as_ref().map(|l| l.lines.len() as u16).unwrap_or(0);
+        let total = layout
+            .as_ref()
+            .map(|l| app::line_to_scroll(l.lines.len()))
+            .unwrap_or(0);
         let max_scroll = total.saturating_sub(content_h.max(1));
         let t = &mut app.tabs[idx];
         t.max_scroll = max_scroll;

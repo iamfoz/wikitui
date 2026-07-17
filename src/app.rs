@@ -449,9 +449,10 @@ pub struct App {
     pub lang: String,
     /// PRD FR-ML-4/5: the registry name of the wiki `client`'s host template
     /// currently addresses (`"wikipedia"`, a sister project, or a custom
-    /// `[wiki.<name>]` name) — mirrors `client.active_wiki_name()`, kept on
-    /// `App` too so status-bar/picker/`:wiki` code that only has `&App` (no
-    /// `&WikiClient`) doesn't need one threaded in just to read it.
+    /// `[wiki.<name>]` name) — mirrors the name `WikiClient::switch_wiki` set
+    /// on the shared client state, kept on `App` too so status-bar/picker/
+    /// `:wiki` code that only has `&App` (no `&WikiClient`) doesn't need one
+    /// threaded in just to read it.
     pub active_wiki_name: String,
     /// PRD FR-ML-4/5's `:wiki <name>` switch targets, resolved once at
     /// startup (`config::ResolvedWikiRegistry`) and converted to the
@@ -3162,7 +3163,16 @@ impl App {
         if !split.bilingual
             && let Some(idx) = self.tab_index_by_id(other_id)
         {
-            self.tabs.remove(idx);
+            // CORR-L1: a plain `:vsplit`'s duplicate pane may have been
+            // navigated to a distinct article since the split opened, so it
+            // gets the same teardown as any other tab close — dwell flush,
+            // FR-NV-8 reading-position save, close-undo snapshot (`u` still
+            // reopens it) — rather than a bare `Vec::remove` that silently
+            // discards all three.
+            self.flush_tab_dwell(idx);
+            self.save_reading_position(idx);
+            let tab = self.tabs.remove(idx);
+            self.push_closed(tab);
         }
         if let Some(idx) = self.tab_index_by_id(focused_id) {
             self.active = idx;
@@ -4088,17 +4098,17 @@ impl App {
             lines
                 .iter()
                 .copied()
-                .find(|&l| l as u16 > current)
+                .find(|&l| line_to_scroll(l) > current)
                 .unwrap_or(lines[0])
         } else {
             lines
                 .iter()
                 .copied()
                 .rev()
-                .find(|&l| (l as u16) < current)
+                .find(|&l| line_to_scroll(l) < current)
                 .unwrap_or(*lines.last().expect("checked non-empty above"))
         };
-        let scroll = self.center_scroll(target as u16);
+        let scroll = self.center_scroll(line_to_scroll(target));
         self.active_tab_mut().scroll = scroll;
     }
 
@@ -4756,7 +4766,7 @@ impl App {
         };
         if let Some(line) = line {
             let max = self.active_tab().max_scroll;
-            self.active_tab_mut().scroll = (line as u16).min(max);
+            self.active_tab_mut().scroll = line_to_scroll(line).min(max);
         }
         self.mode = Mode::Reading;
     }
@@ -5069,7 +5079,7 @@ impl App {
         let total = self
             .layout
             .as_ref()
-            .map(|l| l.lines.len() as u16)
+            .map(|l| line_to_scroll(l.lines.len()))
             .unwrap_or(0);
         total.saturating_sub(self.viewport_height)
     }
@@ -6683,6 +6693,20 @@ fn wrap_move(current: usize, len: usize, delta: i32) -> usize {
     let len = len as i32;
     let cur = (current as i32).rem_euclid(len);
     (cur + delta).rem_euclid(len) as usize
+}
+
+/// CORR-L2: a laid-out line index (`usize`) → the `u16` scroll unit,
+/// saturating rather than wrapping. A pathological article can lay out to
+/// tens of thousands more lines than `u16::MAX`; a bare `as u16` wraps that
+/// back around to a small number, stranding `computed_max_scroll` (or a
+/// jump target) far short of where it should land instead of at the
+/// furthest position the `u16` scroll field can actually represent.
+/// `pub(crate)` — `ui.rs`'s draw-time `max_scroll` computation (the single-
+/// and split-pane paths) is the same conversion at the site that actually
+/// governs scroll for the reading view, so it shares this rather than
+/// duplicating (or re-breaking) the saturating cast.
+pub(crate) fn line_to_scroll(n: usize) -> u16 {
+    u16::try_from(n).unwrap_or(u16::MAX)
 }
 
 /// PRD FR-ML-1's picker ordering: rows whose code appears in `preferred`
@@ -9789,6 +9813,35 @@ mod tests {
         assert_eq!(app.active_tab().find_matches.len(), 1);
     }
 
+    /// CORR-L2: a laid-out line count beyond `u16::MAX` must saturate
+    /// `computed_max_scroll`, not wrap around to a small number that would
+    /// strand the reachable bottom of the article far short of its real end.
+    #[test]
+    fn computed_max_scroll_saturates_instead_of_wrapping_on_a_huge_layout() {
+        use crate::layout::{LaidLine, Layout, LayoutOptions};
+
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(doc("Huge"));
+        app.viewport_height = 20;
+        app.layout = Some(Layout {
+            width: 80,
+            options: LayoutOptions::default(),
+            lines: vec![LaidLine { spans: Vec::new() }; 70_000],
+            block_lines: vec![0],
+            link_lines: vec![],
+            link_visible: vec![],
+            link_cols: vec![],
+            continuation: vec![true; 70_000],
+            folds: vec![],
+        });
+
+        assert_eq!(
+            app.computed_max_scroll(),
+            u16::MAX - 20,
+            "70,000 laid-out lines must saturate to u16::MAX, not wrap to a tiny number"
+        );
+    }
+
     /// Smart-case (FR-NV-6a) reaches all the way through `App::update_find`,
     /// not just the lower-level `layout::find_matches` it delegates to.
     #[test]
@@ -11946,6 +11999,46 @@ mod tests {
             app.active_tab().id,
             right_id,
             "the pane you were focused on is the one that stays"
+        );
+    }
+
+    /// CORR-L1: before this fix, `close_split` dropped the non-focused
+    /// pane's tab via a bare `Vec::remove`, bypassing `close_tab`'s
+    /// teardown — a `:vsplit` duplicate navigated to a different article
+    /// lost its FR-NV-8 reading position and was gone for good (no `u`
+    /// reopen) on `:only`/`Ctrl-w c`.
+    #[test]
+    fn closing_the_split_saves_the_dropped_panes_position_and_allows_undo() {
+        let mut app = split_app();
+        app.open_split(100).unwrap();
+
+        // Navigate the right (duplicate) pane to a distinct article and
+        // leave it scrolled partway down — no longer a throwaway duplicate.
+        app.focus_split_other();
+        app.open_document(doc("Other Article"));
+        app.active_tab_mut().scroll = 9;
+        let other_id = app.tabs[app.active].id;
+
+        // Refocus the left pane — `:only` now discards the *other* (right)
+        // pane: the one just navigated away from being a duplicate.
+        app.focus_split_pane(0);
+        assert!(app.close_split());
+        assert_eq!(app.tabs.len(), 1, "the right pane's tab is gone");
+
+        let saved = app
+            .history
+            .position("", "en", "Other Article")
+            .expect("FR-NV-8: the discarded pane's reading position was saved");
+        assert_eq!(saved.scroll, 9);
+
+        assert!(
+            app.reopen_closed_tab(),
+            "u must still reopen the discarded pane"
+        );
+        assert_eq!(app.tabs.len(), 2);
+        assert!(
+            app.tabs.iter().any(|t| t.id == other_id),
+            "the reopened tab is the same one that was closed"
         );
     }
 

@@ -5758,7 +5758,7 @@ async fn handle_key(
             _ => {}
         },
         Mode::Results => match code {
-            KeyCode::Esc => {
+            KeyCode::Esc | KeyCode::Char('q') => {
                 app.mode = Mode::Search;
             }
             KeyCode::Char('j') | KeyCode::Down => {
@@ -5823,7 +5823,7 @@ async fn handle_key(
         // PRD FR-SR-6's Related panel: a selectable `morelike:` list, same
         // j/k/Enter/Esc grammar as every other picker in this match.
         Mode::Related => match code {
-            KeyCode::Esc => app.close_related(),
+            KeyCode::Esc | KeyCode::Char('q') => app.close_related(),
             KeyCode::Char('j') | KeyCode::Down => app.related_move(1),
             KeyCode::Char('k') | KeyCode::Up => app.related_move(-1),
             KeyCode::Enter => {
@@ -5841,7 +5841,7 @@ async fn handle_key(
         // article's langlinks, same j/k/Enter/Esc grammar as every other
         // picker in this match; `/` enters the live fuzzy filter.
         Mode::LangPicker => match code {
-            KeyCode::Esc => app.close_lang_picker(),
+            KeyCode::Esc | KeyCode::Char('q') => app.close_lang_picker(),
             KeyCode::Char('j') | KeyCode::Down => app.cycle_lang(true),
             KeyCode::Char('k') | KeyCode::Up => app.cycle_lang(false),
             KeyCode::Char('/') => app.mode = Mode::LangFilter,
@@ -5885,7 +5885,7 @@ async fn handle_key(
             _ => {}
         },
         Mode::Toc => match code {
-            KeyCode::Esc => app.mode = Mode::Reading,
+            KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Reading,
             KeyCode::Char('j') | KeyCode::Down => {
                 let len = app.active_tab().sections.len();
                 if len > 0 {
@@ -5961,7 +5961,7 @@ async fn handle_key(
         // PRD FR-TB-1's `bb` tab picker: a selectable list of open tabs.
         // Enter switches, `d` closes the highlighted tab, Esc cancels.
         Mode::TabPicker => match code {
-            KeyCode::Esc => app.mode = Mode::Reading,
+            KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Reading,
             KeyCode::Char('j') | KeyCode::Down => {
                 if !app.tabs.is_empty() {
                     app.selected_tab_pick = (app.selected_tab_pick + 1).min(app.tabs.len() - 1);
@@ -5992,7 +5992,7 @@ async fn handle_key(
         // PRD FR-NV-7's `gb` back-stack picker: the active tab's history
         // trail. Enter jumps to that entry (browser-style), Esc cancels.
         Mode::HistoryPicker => match code {
-            KeyCode::Esc => app.mode = Mode::Reading,
+            KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Reading,
             KeyCode::Char('j') | KeyCode::Down => {
                 let len = app.active_tab().back_stack.len();
                 if len > 0 {
@@ -6019,7 +6019,7 @@ async fn handle_key(
         // projects. Enter switches (same state change `:wiki <name>` makes),
         // Esc cancels. No fetch to kick off — the list never changes.
         Mode::WikiPicker => match code {
-            KeyCode::Esc => app.mode = Mode::Reading,
+            KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Reading,
             KeyCode::Char('j') | KeyCode::Down => app.cycle_wiki_pick(true),
             KeyCode::Char('k') | KeyCode::Up => app.cycle_wiki_pick(false),
             KeyCode::Enter => {
@@ -6043,7 +6043,7 @@ async fn handle_key(
         // back to Reading to show the raw page — the parsed prose is
         // already installed in the tab either way.
         Mode::Disambig => match code {
-            KeyCode::Esc => app.mode = Mode::Reading,
+            KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Reading,
             KeyCode::Char('j') | KeyCode::Down => app.cycle_disambig(true),
             KeyCode::Char('k') | KeyCode::Up => app.cycle_disambig(false),
             KeyCode::Enter => {
@@ -6063,7 +6063,7 @@ async fn handle_key(
         // node is never assumed to be on the app's *currently active* wiki),
         // Esc closes.
         Mode::Trail => match code {
-            KeyCode::Esc => app.close_trail(),
+            KeyCode::Esc | KeyCode::Char('q') => app.close_trail(),
             KeyCode::Char('j') | KeyCode::Down => app.cycle_trail(true),
             KeyCode::Char('k') | KeyCode::Up => app.cycle_trail(false),
             KeyCode::Enter => {
@@ -6083,7 +6083,7 @@ async fn handle_key(
         // tag editor (`Mode::BookmarkTagEdit`), `d` deletes, Enter opens in
         // this tab (consistent with Results/history — no new-tab surprise).
         Mode::BookmarkPicker => match code {
-            KeyCode::Esc => app.close_bookmark_picker(),
+            KeyCode::Esc | KeyCode::Char('q') => app.close_bookmark_picker(),
             KeyCode::Char('j') | KeyCode::Down => app.cycle_bookmark(true),
             KeyCode::Char('k') | KeyCode::Up => app.cycle_bookmark(false),
             KeyCode::Char('/') => app.mode = Mode::BookmarkFilter,
@@ -6145,7 +6145,7 @@ async fn handle_key(
         // `readlater_auto_dequeue` — removes the entry; `d` removes without
         // opening.
         Mode::ReadLaterPicker => match code {
-            KeyCode::Esc => app.close_readlater_picker(),
+            KeyCode::Esc | KeyCode::Char('q') => app.close_readlater_picker(),
             KeyCode::Char('j') | KeyCode::Down => app.cycle_readlater(true),
             KeyCode::Char('k') | KeyCode::Up => app.cycle_readlater(false),
             KeyCode::Char('d') => app.remove_selected_readlater(),
@@ -6174,7 +6174,7 @@ async fn handle_key(
         // `d` deletes that article's whole history, Enter opens in this tab
         // (consistent with every other picker — no new-tab surprise).
         Mode::ReadingHistory => match code {
-            KeyCode::Esc => app.close_reading_history_picker(),
+            KeyCode::Esc | KeyCode::Char('q') => app.close_reading_history_picker(),
             KeyCode::Char('j') | KeyCode::Down => app.cycle_history_pick(true),
             KeyCode::Char('k') | KeyCode::Up => app.cycle_history_pick(false),
             KeyCode::Char('/') => app.mode = Mode::ReadingHistoryFilter,
@@ -6233,7 +6233,7 @@ async fn handle_key(
         // PRD §5.7 / FR-OFF-4's saved-pages browser: Enter offline-serves the
         // pinned copy (▣), `d` un-pins, Esc closes.
         Mode::SavedPicker => match code {
-            KeyCode::Esc => app.close_saved_picker(),
+            KeyCode::Esc | KeyCode::Char('q') => app.close_saved_picker(),
             KeyCode::Char('j') | KeyCode::Down => app.cycle_saved(true),
             KeyCode::Char('k') | KeyCode::Up => app.cycle_saved(false),
             KeyCode::Char('d') => app.delete_selected_saved(),
@@ -6260,7 +6260,7 @@ async fn handle_key(
                 app.close_offline_card();
                 app.open_saved_picker();
             }
-            KeyCode::Esc => app.close_offline_card(),
+            KeyCode::Esc | KeyCode::Char('q') => app.close_offline_card(),
             _ => {}
         },
         // PRD FR-DL-5 / §7's "Redlink followed" card: `s` searches for a
@@ -6282,14 +6282,14 @@ async fn handle_key(
                     });
                 }
             }
-            KeyCode::Esc => app.close_redlink_card(),
+            KeyCode::Esc | KeyCode::Char('q') => app.close_redlink_card(),
             _ => {}
         },
         // PRD FR-NV-4/5's `K` peek popup: `Ctrl-o` (Appendix B "returns") and
         // Esc close it; Enter follows the previewed internal link in this tab.
         Mode::Peek => match code {
             KeyCode::Char('o') if modifiers.contains(KeyModifiers::CONTROL) => app.close_peek(),
-            KeyCode::Esc => app.close_peek(),
+            KeyCode::Esc | KeyCode::Char('q') => app.close_peek(),
             KeyCode::Enter => {
                 if let Some((lang, title)) = app.peek_open_target() {
                     app.close_peek();
@@ -6313,7 +6313,7 @@ async fn handle_key(
         // horizontally) switch type, Enter opens the focused entry's linked
         // article.
         Mode::OnThisDay => match code {
-            KeyCode::Esc => app.close_on_this_day(),
+            KeyCode::Esc | KeyCode::Char('q') => app.close_on_this_day(),
             KeyCode::Char('j') | KeyCode::Down => app.otd_move(1),
             KeyCode::Char('k') | KeyCode::Up => app.otd_move(-1),
             KeyCode::Tab | KeyCode::Char('l') | KeyCode::Right => app.otd_next_tab(),
@@ -6333,14 +6333,14 @@ async fn handle_key(
         },
         // PRD §10 / Appendix B's `:info` overlay: read-only, Esc dismisses.
         Mode::Info => {
-            if code == KeyCode::Esc {
+            if matches!(code, KeyCode::Esc | KeyCode::Char('q')) {
                 app.close_info();
             }
         }
         // PRD FR-ACC-2's watchlist pane: same two-tab navigation shape as
         // `Mode::OnThisDay` above (j/k move, Tab/h/l switch tab, Enter opens).
         Mode::Watchlist => match code {
-            KeyCode::Esc => app.close_watchlist(),
+            KeyCode::Esc | KeyCode::Char('q') => app.close_watchlist(),
             KeyCode::Char('j') | KeyCode::Down => app.watchlist_move(1),
             KeyCode::Char('k') | KeyCode::Up => app.watchlist_move(-1),
             KeyCode::Tab | KeyCode::Char('l') | KeyCode::Right => app.watchlist_next_tab(),
@@ -6364,7 +6364,7 @@ async fn handle_key(
         // mode makes — a fresh network round trip only for the write itself,
         // never a re-poll of the count, per `account.rs`'s poll-cadence doc).
         Mode::Notifications => match code {
-            KeyCode::Esc => app.close_notifications(),
+            KeyCode::Esc | KeyCode::Char('q') => app.close_notifications(),
             KeyCode::Char('j') | KeyCode::Down => app.notif_move(1),
             KeyCode::Char('k') | KeyCode::Up => app.notif_move(-1),
             KeyCode::Tab | KeyCode::Char('l') | KeyCode::Right => app.notif_next_tab(),
@@ -6380,7 +6380,7 @@ async fn handle_key(
         // PRD FR-ACC-4/6's contributions view: Enter opens the edited
         // article, `t` thanks the focused edit (logged in only).
         Mode::Contribs => match code {
-            KeyCode::Esc => app.close_contribs(),
+            KeyCode::Esc | KeyCode::Char('q') => app.close_contribs(),
             KeyCode::Char('j') | KeyCode::Down => app.contribs_move(1),
             KeyCode::Char('k') | KeyCode::Up => app.contribs_move(-1),
             KeyCode::Enter => {
@@ -6401,7 +6401,7 @@ async fn handle_key(
         // PRD FR-ACC-7's read-only prefs card: same overlay idiom as
         // `Mode::Info` above.
         Mode::Prefs => {
-            if code == KeyCode::Esc {
+            if matches!(code, KeyCode::Esc | KeyCode::Char('q')) {
                 app.close_prefs();
             }
         }
@@ -10786,6 +10786,92 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// UX-10: `q` was a silent no-op in every list-style picker (only Esc
+    /// closed them, unlike `Mode::Help`/the scrollable panels, which already
+    /// took `q` — see `resolve_panel_key`). Every picker now accepts `q` as
+    /// an Esc alias; this pins a representative sample across both closing
+    /// idioms (a bare `app.mode = Mode::Reading` and a dedicated
+    /// `close_*_picker` method).
+    #[tokio::test]
+    async fn q_closes_pickers_the_same_way_esc_does() {
+        let (
+            client,
+            cache,
+            dir,
+            revalidate_tx,
+            open_tx,
+            save_tx,
+            related_tx,
+            langlinks_tx,
+            summary_tx,
+            mut terminal,
+        ) = ux_test_harness("ux10-q-closes-pickers");
+
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(crate::doc::parse_article_html(
+            "Test",
+            "<html><body><p>Some text.</p></body></html>",
+        ));
+
+        for mode in [
+            Mode::TabPicker,
+            Mode::WikiPicker,
+            Mode::Disambig,
+            Mode::Toc,
+            Mode::Related,
+        ] {
+            app.mode = mode;
+            handle_key(
+                &client,
+                &cache,
+                &mut app,
+                KeyCode::Char('q'),
+                KeyModifiers::NONE,
+                &revalidate_tx,
+                &open_tx,
+                &save_tx,
+                &related_tx,
+                &langlinks_tx,
+                &summary_tx,
+                &mut terminal,
+            )
+            .await;
+            assert_eq!(
+                app.mode,
+                Mode::Reading,
+                "q must close {mode:?} exactly like Esc does"
+            );
+        }
+
+        // The `close_*_picker`-style modes go through their own prior-mode
+        // restore rather than a bare assignment — same behavior, different
+        // code path, both must honor `q`.
+        app.bookmark_prior_mode = Mode::Reading;
+        app.mode = Mode::BookmarkPicker;
+        handle_key(
+            &client,
+            &cache,
+            &mut app,
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+            &revalidate_tx,
+            &open_tx,
+            &save_tx,
+            &related_tx,
+            &langlinks_tx,
+            &summary_tx,
+            &mut terminal,
+        )
+        .await;
+        assert_eq!(
+            app.mode,
+            Mode::Reading,
+            "q must close the bookmark picker exactly like Esc does"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// UX-8: `Ctrl-w` then `Ctrl-p` must not open the palette with the
     /// window-command latch still armed — the palette-open guard now checks
     /// `pending_ctrl_w` (and `pending_cn_bracket`) alongside the pre-existing
@@ -11525,7 +11611,7 @@ mod tests {
 
     /// PRD FR-ML-4/5's `:wiki <name>` switch: a name in the registry
     /// repoints both `app.active_wiki_name` and the shared client state
-    /// (`WikiClient::active_wiki_name`/`host`) at once.
+    /// (`WikiClient::host`/capabilities) at once.
     #[test]
     fn switch_wiki_updates_app_and_client_for_a_known_name() {
         let client = WikiClient::new(config::DEFAULT_BASE_URL_TEMPLATE.to_string()).unwrap();
@@ -11545,7 +11631,6 @@ mod tests {
 
         assert!(switch_wiki(&client, &mut app, "archwiki"));
         assert_eq!(app.active_wiki_name, "archwiki");
-        assert_eq!(client.active_wiki_name(), "archwiki");
         assert_eq!(client.wiki_origin("en"), "https://wiki.archlinux.org");
         assert_eq!(client.capabilities().parser, api::ParserMode::Legacy);
         assert!(app.notice.as_deref().unwrap().contains("archwiki"));
@@ -11560,7 +11645,7 @@ mod tests {
         let mut app = App::new("en".to_string(), Theme::terminal(), false);
         assert!(!switch_wiki(&client, &mut app, "not-configured"));
         assert_eq!(app.active_wiki_name, "wikipedia");
-        assert_eq!(client.active_wiki_name(), "wikipedia");
+        assert_eq!(client.wiki_origin("en"), "https://en.wikipedia.org");
         assert!(
             app.notice
                 .as_deref()

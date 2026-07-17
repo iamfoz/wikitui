@@ -908,19 +908,21 @@ impl WikiClient {
     /// included) that only ever addressed Wikipedia keeps that unconditional
     /// behavior; a real per-wiki matrix comes from [`Self::with_wiki`].
     /// Production (`main::run`) always has a config-resolved matrix in hand
-    /// and calls [`Self::with_wiki`] directly, so this simpler constructor is
-    /// test-support surface today — kept public rather than `#[cfg(test)]`
-    /// since it's a legitimate, documented API a caller with no capability
-    /// data of its own can still reach for.
-    #[allow(dead_code)]
+    /// and calls [`Self::with_wiki`] directly, so this simpler constructor
+    /// only ever fires from this crate's own tests — `wikitui` ships no
+    /// `src/lib.rs`, so there is no external caller that could reach for it
+    /// either. `#[cfg(test)]`, not `pub` + `#[allow(dead_code)]`: a
+    /// dead-code allowance that never actually applies outside test builds
+    /// would just be silently ignored, not a real guard.
+    #[cfg(test)]
     pub fn new(base_url_template: String) -> Result<Self> {
         Self::with_contact(base_url_template, DEFAULT_CONTACT)
     }
 
     /// Like [`new`](Self::new) but with a configured contact channel for the
     /// User-Agent (PRD NF-NET-2 / §6.2 rule 2's config-overridable
-    /// networking) — same test-support scope as `new`.
-    #[allow(dead_code)]
+    /// networking) — same test-only scope as `new`.
+    #[cfg(test)]
     pub fn with_contact(base_url_template: String, contact: &str) -> Result<Self> {
         Self::with_wiki(
             "wikipedia".to_string(),
@@ -986,21 +988,6 @@ impl WikiClient {
             base_url_template,
             capabilities,
         };
-    }
-
-    /// The registry name of the wiki this client currently addresses
-    /// (`"wikipedia"`, `"wiktionary"`, or a custom `[wiki.<name>]` name).
-    /// `App::active_wiki_name` mirrors this for code that only has `&App`
-    /// (every current caller); kept as a client accessor too since it's the
-    /// authoritative value `switch_wiki` actually set, exercised directly by
-    /// this module's own tests.
-    #[allow(dead_code)]
-    pub fn active_wiki_name(&self) -> String {
-        self.active
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .name
-            .clone()
     }
 
     /// The wiki-scope key for the wiki this client currently addresses — see
@@ -3172,7 +3159,7 @@ mod tests {
     fn switch_wiki_repoints_every_clone() {
         let client = WikiClient::new("https://{lang}.wikipedia.org".to_string()).unwrap();
         let clone = client.clone();
-        assert_eq!(client.active_wiki_name(), "wikipedia");
+        assert_eq!(client.host("en"), "https://en.wikipedia.org");
         assert!(client.capabilities().wikifeeds);
 
         client.switch_wiki(
@@ -3186,7 +3173,6 @@ mod tests {
             },
         );
 
-        assert_eq!(clone.active_wiki_name(), "wiktionary");
         assert_eq!(clone.host("en"), "https://en.wiktionary.org");
         assert!(!clone.capabilities().wikifeeds);
     }

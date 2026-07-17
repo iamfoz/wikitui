@@ -455,7 +455,11 @@ pub const COMMANDS: &[Meta] = &[
         name: "command-palette",
         display: "Command palette",
         help: "fuzzy-find any command",
-        contexts: &[KeyContext::Global],
+        // UX-14: `main::palette_allowed` only opens the palette from
+        // Reading (text-input modes have their own Ctrl-p, and the latches
+        // documented there must gate it too) — `Global` here overclaimed
+        // reach the runtime never honors.
+        contexts: &[KeyContext::Reading],
         in_palette: false,
     },
     Meta {
