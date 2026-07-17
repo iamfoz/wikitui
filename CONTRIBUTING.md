@@ -16,7 +16,18 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 All four must be clean before a change lands. There's no `clippy.toml` or
-lint-allowlist — the crate is warning-free and stays that way.
+lint-allowlist — the crate is warning-free and stays that way. The
+off-by-default `math-layout` feature (see `Cargo.toml`) needs the same two
+gates run again with it enabled, since it changes what `layout.rs` compiles:
+
+```sh
+cargo test --features math-layout
+cargo clippy --all-targets --features math-layout -- -D warnings
+```
+
+`.github/workflows/ci.yml` runs this exact battery (both feature configs)
+plus `cargo deny check` on every push and pull request, so a change that's
+clean locally is clean there too.
 
 ### The mock MediaWiki server
 
@@ -117,10 +128,14 @@ instead of screen-scraping live Wikipedia in tests.
 ## Dependency license audit
 
 wikitui is AGPL-3.0-only (see `LICENSE`); every dependency it links needs a
-license compatible with that. This is a manual pass over `Cargo.toml`'s
-direct dependencies (no `cargo deny`/`cargo license` run here — do that
-too, before a release, if either is available), read straight from each
-crate's own `Cargo.toml` `license` field:
+license compatible with that. `deny.toml` at the repo root is the automated
+version of this check (`cargo deny check`, run in CI on every push/PR —
+see `.github/workflows/ci.yml`); its own comments explain every allowed
+license and every documented advisory exception. What follows here is the
+original manual pass over `Cargo.toml`'s *direct* dependencies only, read
+straight from each crate's own `Cargo.toml` `license` field — kept because
+it's a faster human-readable check of the top-level list than reading the
+full resolved graph:
 
 | Crate | License |
 |---|---|

@@ -1,6 +1,19 @@
 [package]
 name = "wikitui"
-version = "0.1.0"
+# 0.1.0 was a placeholder left over from the project's very first commit;
+# every §12 milestone from v0.5 "Reader" through v1.0 "Librarian" and most
+# of v1.x/v2 (accounts, splits/bilingual, offline search, TTS, reading
+# stats, experimental RTL, the UI-localization string-table seam) is
+# implemented and tested, so 0.1.0 badly understated the shipped scope.
+# 0.9.0 is the honest label for where this actually sits: feature-complete
+# against nearly the whole PRD, but pre-1.0 because §6.8's performance
+# targets are unvalidated on real hardware (see README's Performance
+# section), packaging (Homebrew/AUR/nixpkgs/release binaries) isn't
+# published, and this is the first commit to add CI at all — none of
+# which should be true of a real "1.0". Not "2.0": that would claim the
+# full v2 milestone (full bidi, real UI translations, wiki:// OS
+# auto-registration) is done, which it isn't.
+version = "0.9.0"
 edition = "2024"
 description = "An unofficial, keyboard-first terminal (TUI) client for Wikipedia and Wikimedia sister projects"
 # The LICENSE file in this repo is the unmodified AGPL-3.0 text with no

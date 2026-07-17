@@ -34,6 +34,10 @@ its contributors for charting this space first.
   and link-preview popups, quality badges, and redlink handling.
 - **Tabs**: buffer-style tabs with per-tab history, background tab opens,
   and session auto-restore across restarts.
+- **Splits & bilingual mode**: `:vsplit` for two independently-scrolled
+  panes on the same tab set, `:set scrollbind` to lock their scroll
+  together, and `:bilingual` to open the current article's other-language
+  edition (via langlinks) side by side for comparison reading.
 - **Library**: bookmarks with tags and annotations, a read-later queue,
   saved (pinned) offline pages with bulk save, and bibliography export in
   APA/Harvard/MLA/Chicago style.
@@ -44,13 +48,36 @@ its contributors for charting this space first.
   app feels faster than the website without hiding what it fetched or why.
 - **Search**: typeahead and full-text search, CirrusSearch-style operators
   (`intitle:`, `incategory:`, `insource:`, `morelike:`, and more), did-you-
-  mean, random article, and a related-articles panel.
+  mean, random article, a related-articles panel, and offline full-text
+  search (`:search-offline`) over saved and cached pages (SQLite FTS5) when
+  there's no network.
 - **Start page**: on-this-day panel and a "today I learned" widget.
 - **Themes**: six built-in themes (`terminal`, `full`, `homebrew`, `night`,
   `paper`, `contrast`) plus user themes, with 256-/16-color degradation and
   `NO_COLOR` support; `:theme <name>` or cycle at runtime.
-- **Multi-language**: a language switcher with langlink discovery and a
-  fallback chain.
+- **Multi-wiki & multi-language**: a language switcher with langlink
+  discovery and a fallback chain; the Wikimedia sister projects (Wiktionary,
+  Wikivoyage, Wikiquote, Wikinews) alongside Wikipedia; and, via
+  `[wiki.<name>]` sections in `config.toml`, **any MediaWiki site**
+  (ArchWiki and similar) pointed at its own `api.php`/`rest.php`, with
+  graceful feature degradation where a non-Wikimedia wiki lacks Wikifeeds,
+  pageviews, or Parsoid REST support; `:wiki <name>` switches at runtime.
+- **RTL** *(experimental)*: detects right-to-left article languages (Arabic,
+  Hebrew, and similar) and either hands reordering to the terminal's own VTE
+  bidi support or falls back to an app-side logical-to-visual reorder. Not a
+  full bidi implementation, by design — see `PRD.md` FR-ML-7.
+- **Accounts** *(OAuth 2.0 + PKCE login)*: watchlist, Echo notifications,
+  contributions, thanks, read-only prefs, gated typo-fix editing with
+  conflict detection, and two-way **Reading List sync** (`:sync`,
+  `:mirror-watchlist`) against Wikimedia's `Extension:ReadingLists` — the
+  same backend the official mobile apps use. Everything here degrades to a
+  login prompt, never an error, when logged out.
+- **Text-to-speech**: pipes the current article's paragraphs, from the
+  reading cursor onward, to a user-configured command (`tts_command`, e.g.
+  `espeak-ng` or macOS `say`) — opt-in, off by default.
+- **Reading stats** *(local-only)*: articles read, time, streaks, and topic
+  distribution, derived from your own reading history and interest model —
+  never uploaded anywhere; `wikitui stats --explain` shows top topics.
 - **Commands & keys**: a `:` ex-command line, a fuzzy command palette
   (`Ctrl-p`), a fully configurable keymap (`vim`/`emacs` presets or your own
   `keymap.toml`), and a context-sensitive `?` help overlay generated from
@@ -63,19 +90,46 @@ its contributors for charting this space first.
 - **Accessibility**: `--dump` (plain-text stdout, no alternate screen), a
   no-motion mode, `ACCESSIBLE` environment support, and mouse support with
   a keyboard equivalent for every mouse action.
+- **UI localization architecture**: wikitui's own interface text is
+  English-only through v1.x by deliberate product choice, but a string-table
+  seam (`t(Key::...)`, see `src/strings.rs`) already exists for a subset of
+  UI strings so a real v2 translation pass is a mechanical follow-up, not an
+  architecture change; keybindings never assume QWERTY (everything is
+  rebindable).
 - **Privacy**: no telemetry, ever — see [Privacy](#privacy) below.
 
-### Planned, not yet built
+### Known limitations / not yet built
 
-The following are on the roadmap (see `PRD.md` §12) but do **not** exist
-yet — mentioned here so nobody goes looking for them: OAuth login,
-watchlist/notifications/Reading List sync (v1.x); split panes and
-scrollbind, bilingual mode, arbitrary MediaWiki wikis, offline full-text
-search, text-to-speech, reading stats (v1.x); the `wiki://` protocol
-handler, RTL support, and UI localization (v2). A `.desktop` file with the
-protocol handler's `MimeType` declaration is shipped in `packaging/` as
-groundwork for distro packagers, but wikitui does not register or handle
-`wiki://` URIs today — see that file's own header comment.
+Honestly-deferred gaps, so nobody goes looking for them or assumes more
+than what's actually there:
+
+- **Inline image protocols**: only the half-block renderer (plain
+  fg/bg-colored cells, no terminal cooperation needed) is actually wired
+  into the reading view. The kitty-graphics and iTerm2 escape emitters are
+  implemented and unit-tested to spec but are not yet called from the
+  renderer, and are unverified against a real kitty/iTerm2 terminal. Sixel
+  is a documented stub (`graphics::sixel_escape`) — no color-quantization
+  encoder exists yet.
+- **`wiki://` protocol handler**: wikitui parses `wiki://`/`wiki:` URIs
+  passed to it as an argument (so `wikitui wiki://en.wikipedia.org/X`
+  works), and a `.desktop` file with the right `MimeType` declaration ships
+  in `packaging/` as groundwork — but wikitui does not register itself as
+  the OS's default handler for you. Routing real `wiki://` links to wikitui
+  is a one-time, manual `xdg-mime`/packager step; see the `.desktop` file's
+  own header comment for the exact commands.
+- **Image licensing in exports**: wikitui doesn't fetch per-image
+  `extmetadata` license data, so it can't *prove* a given thumbnail is
+  freely licensed. Saved-page and bookmark exports therefore omit image
+  data by default (alt text only) unless you opt in with
+  `--include-nonfree`, which is the conservative direction, not a missing
+  feature.
+- **Packaging breadth**: `cargo install wikitui` works today; Homebrew,
+  AUR, nixpkgs packages, and static GitHub-release binaries are planned
+  (see [Install](#install)) but not published yet.
+- **§6.8 performance targets**: the PRD's parse+layout targets (e.g. < 500 ms
+  for a 1.5 MB / 500+-reference article) are asserted in an `#[ignore]`d
+  test with a deliberately loose 10-second bound, not the real target — see
+  [Performance](#performance) below.
 
 ## Install
 
@@ -121,6 +175,23 @@ problems, user theme files and their contrast-ratio lint results, and a
 terminal-capability report (color depth, detected graphics protocol, and
 so on) — useful before ever launching the TUI itself.
 
+## Performance
+
+`PRD.md` §6.8 sets concrete wall-clock targets (e.g. parse+layout of a
+1.5 MB / 500+-reference pathological article in under 500 ms on a
+2020-era laptop; an L1 cache-hit article open in under 50 ms). These
+targets are **not validated in CI** and should not be read as a proven
+claim: CI runners (and the sandboxed environment this project is
+developed in) are shared, throttled, and not representative real
+hardware, so a strict wall-clock assertion there would fail on noisy-
+neighbor load, not a real regression. What exists today is
+`corpus_tests::perf_smoke_parse_and_layout_the_pathological_corpus`, an
+`#[ignore]`d test with a deliberately generous 10-second bound (20x the
+PRD target) that only catches a catastrophic algorithmic regression (an
+accidental O(n²) in the parser or wrap loop) — see that test's own doc
+comment. Confirming the actual §6.8 targets needs a real-hardware
+benchmark run outside CI; nobody has published one yet.
+
 ## Privacy
 
 wikitui sends no telemetry of any kind, ever. The only network calls it
@@ -155,9 +226,12 @@ wikitui *cannot* protect you from:
   `:prefetch-log` shows exactly what was fetched and why; incognito mode
   (`--incognito` / `zz`) disables it for the session.
 - **Personalization is 100% local.** Reading history, bookmarks, saved
-  pages, and (once built) the interest model and reading stats never leave
-  your machine — there is no sync service, no account required, and no
-  server-side profile of any kind. State lives in plain SQLite/JSONL files
+  pages, the interest model, and reading stats never leave your machine —
+  there is no sync service, no account required, and no server-side profile
+  of any kind (the opt-in Reading List sync feature is the one exception:
+  it syncs bookmarks *to your own Wikimedia account*, which you explicitly
+  logged into and enabled, not to wikitui or any third party). State lives
+  in plain SQLite/JSONL files
   under your platform's standard config/data/cache/state directories,
   readable and deletable with ordinary tools (see `wikitui clear-data
   --help` for a one-command wipe, and `[cache] dir` / `$XDG_CACHE_HOME` to
