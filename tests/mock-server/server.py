@@ -30,6 +30,8 @@ REVIDS = {
     "UK": 1017,
     "United_Kingdom": 1018,
     "Malformed_Showcase": 1019,
+    # PRD FR-RD-1 pty-verification fixture: a syntax-highlighted code block.
+    "Code_Showcase": 1020,
 }
 
 # PRD FR-RD-8 media fixture: build a real, tiny PNG at import time (stdlib
@@ -398,6 +400,24 @@ PAGES["Math_Showcase"] = """<html><head><title>Math Showcase</title></head><body
   </span></dd></dl>
 </body></html>"""
 
+# PRD FR-RD-1 pty-verification fixture: a syntax-highlighted code block. The
+# `<pre>` carries MediaWiki's SyntaxHighlight `mw-highlight-lang-<X>` class
+# (the primary hint `doc::code_lang_from_class` reads); the inner `<code>`
+# also carries the Parsoid/CommonMark `language-<X>` spelling, so both signal
+# paths are exercised. The Rust source deliberately mixes a keyword, a string
+# literal, a line comment, and a numeric literal so the rule-based highlighter
+# (`syntax.rs`) paints at least four distinct theme colours.
+PAGES["Code_Showcase"] = """<html><head><title>Code Showcase</title></head><body>
+  <p>This article exercises code syntax highlighting (FR-RD-1).</p>
+  <pre class="mw-highlight mw-highlight-lang-rust mw-content-ltr"><code class="language-rust">fn main() {
+    let answer = 42; // the answer
+    let name = "world";
+    println!("hello {name}");
+}</code></pre>
+  <p>An unhighlighted block (no language hint) renders uniformly:</p>
+  <pre>just some monospaced text with no language</pre>
+</body></html>"""
+
 # PRD FR-DL-5 pty-verification fixture: one link Parsoid itself pre-marks as
 # a redlink (`class="new"`, the cheap parse-time path — never reaches the
 # network), one link that looks ordinary in the HTML but isn't a real PAGES
@@ -707,6 +727,21 @@ SEARCH_PAGES = [
         "timestamp": "2026-04-01T00:00:00Z",
     },
 ]
+
+# PRD FR-SR-2 pagination fixture: 25 synthetic results that all match the
+# query token "pagination" (matched nowhere else), so a search for it returns
+# more than one page. `_serve_search_page` slices these by the `offset` query
+# param and emits a `continue.sroffset` while more remain — the exact
+# continuation shape the client's `search_from` reads back.
+for _i in range(1, 26):
+    SEARCH_PAGES.append({
+        "title": f"Pagination Result {_i:02d}",
+        "description": f"Synthetic pagination result number {_i}",
+        "text": f"This is pagination result {_i}, one of many results used to exercise load-more.",
+        "size": 100 + _i,
+        "wordcount": 20 + _i,
+        "timestamp": "2026-01-01T00:00:00Z",
+    })
 
 # PRD Appendix A "Summary" fixtures (FR-OFF-4 T2 link-peek): a plain-text
 # extract per title, served at /api/rest_v1/page/summary/{title}. A title with
@@ -2041,7 +2076,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             p for p in SEARCH_PAGES
             if effective_ql and (effective_ql in p["title"].lower() or effective_ql in p["text"].lower())
         ]
-        hits = hits[:limit]
+        # PRD FR-SR-2 pagination: slice the full hit list by the `offset` query
+        # param and hand back a `continue.sroffset` while more remain, exactly
+        # the Action-API continuation shape `search_from` reads. `offset=0`
+        # (or absent) is the first page.
+        offset = int(params.get('offset', ['0'])[0])
+        window = hits[offset:offset + limit]
         pages = [
             {
                 "title": p["title"],
@@ -2051,9 +2091,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "wordcount": p["wordcount"],
                 "timestamp": p["timestamp"],
             }
-            for p in hits
+            for p in window
         ]
         body = {"pages": pages}
+        if offset + limit < len(hits):
+            body["continue"] = {"sroffset": offset + limit}
         if rewritten:
             body["rewrittenquery"] = rewritten
         elif not pages and ql in DID_YOU_MEAN:

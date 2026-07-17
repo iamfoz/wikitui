@@ -52,6 +52,7 @@ mod split;
 mod startpage;
 mod stats;
 mod strings;
+mod syntax;
 mod tab;
 mod talk;
 mod target;
@@ -598,6 +599,26 @@ async fn main() -> Result<()> {
         }
     }
 
+    // PRD FR-TH-4 (live switching): ask a color-capable terminal to *push* an
+    // OSC 11 response whenever its light/dark scheme changes, so the theme can
+    // follow it mid-session (consumed by `intercept_color_scheme_push` in the
+    // event loop). The disabling counterpart is emitted symmetrically on
+    // terminal restore (`crashguard::restore_terminal_best_effort`). Gated
+    // exactly like the startup query above — an explicitly-pinned theme opts
+    // out of both. Best-effort: a terminal that doesn't know the mode ignores
+    // the escape.
+    let live_theme_switch = should_enable_color_scheme_notifications(
+        std::io::stdout().is_terminal(),
+        no_color,
+        resolved.terminal.auto_theme.value,
+        resolved.theme.source == config::Source::Default,
+    );
+    if live_theme_switch {
+        let mut out = std::io::stdout();
+        let _ = out.write_all(autotheme::ENABLE_COLOR_SCHEME_NOTIFICATIONS.as_bytes());
+        let _ = out.flush();
+    }
+
     run(
         guard.terminal(),
         &client,
@@ -608,6 +629,7 @@ async fn main() -> Result<()> {
         theme,
         no_color,
         color_depth,
+        live_theme_switch,
         user_themes,
         accessible,
         resolved.terminal.clone(),
@@ -746,6 +768,82 @@ pub(crate) fn clicolor_force_active() -> bool {
 /// PRD honors alongside `NO_COLOR`/`CLICOLOR_FORCE` (§6.7 precedence).
 pub(crate) fn accessible_active() -> bool {
     std::env::var("ACCESSIBLE").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
+/// PRD FR-TH-4 (live switching): whether to emit
+/// [`autotheme::ENABLE_COLOR_SCHEME_NOTIFICATIONS`] at startup. Enabled only
+/// on a color-capable interactive session that opted into auto-theme without
+/// pinning a theme of its own — the same gate the startup OSC 11 query itself
+/// runs under, since an explicitly-chosen theme always wins over
+/// auto-detection (§6.7). `no_color` disqualifies it (a mono session has no
+/// theme to live-switch); a non-TTY disqualifies it (no terminal to push).
+/// Kept pure and separately tested; `main` ANDs in the real env signals.
+pub(crate) fn should_enable_color_scheme_notifications(
+    is_tty: bool,
+    no_color: bool,
+    auto_theme: bool,
+    theme_is_default: bool,
+) -> bool {
+    is_tty && !no_color && auto_theme && theme_is_default
+}
+
+/// PRD FR-TH-4: reassemble a DEC-2031 color-scheme push from crossterm's
+/// mangled key-event burst (see [`autotheme::ENABLE_COLOR_SCHEME_NOTIFICATIONS`]'s
+/// doc comment for why the push arrives this way at all). While a capture is
+/// in progress — begun by the `Alt+]` introducer and ended by the `Alt+\`
+/// (ST) or `Ctrl+g` (BEL) terminator — every key belongs to the sequence and
+/// is swallowed, so the `rgb:…` body never reaches dispatch as stray
+/// keystrokes. Returns `true` when the key was consumed as part of a capture.
+///
+/// Only ever arms while `app.auto_theme_live` (i.e. only when this build
+/// actually enabled the mode), so an ordinary session's `Alt+]` — and every
+/// other key — is untouched. A malformed/oversized or non-OSC-11 burst aborts
+/// the capture defensively rather than eating input indefinitely.
+fn intercept_color_scheme_push(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> bool {
+    // A DEC-2031 OSC 11 push is short (`ESC ] 11 ; rgb:RRRR/GGGG/BBBB`); cap
+    // well above that so a stray `Alt+]` can never swallow an unbounded run of
+    // real keystrokes.
+    const MAX_CAPTURE: usize = 48;
+
+    if app.color_scheme_capture.is_some() {
+        let is_terminator = (matches!(code, KeyCode::Char('\\'))
+            && modifiers.contains(KeyModifiers::ALT))
+            || (matches!(code, KeyCode::Char('g')) && modifiers.contains(KeyModifiers::CONTROL));
+        if is_terminator {
+            let raw = app.color_scheme_capture.take().unwrap_or_default();
+            app.apply_color_scheme_notification(&raw);
+            return true;
+        }
+        if let KeyCode::Char(c) = code {
+            let buf = app.color_scheme_capture.as_mut().expect("is_some checked");
+            // The introducer seeds the buffer with `ESC ]`; the very next
+            // character of a real OSC 11 push is the `1` of `11;`. Anything
+            // else means this was a bare `Alt+]`, not a color-scheme push —
+            // abort and let the key through untouched.
+            if buf == "\x1b]" && c != '1' {
+                app.color_scheme_capture = None;
+                return false;
+            }
+            buf.push(c);
+            if buf.len() >= MAX_CAPTURE {
+                app.color_scheme_capture = None;
+            }
+            return true;
+        }
+        // A non-character key mid-sequence is not part of an OSC push — abort
+        // and let it be handled normally.
+        app.color_scheme_capture = None;
+        return false;
+    }
+
+    if app.auto_theme_live
+        && matches!(code, KeyCode::Char(']'))
+        && modifiers.contains(KeyModifiers::ALT)
+    {
+        app.color_scheme_capture = Some("\x1b]".to_string());
+        return true;
+    }
+    false
 }
 
 /// PRD FR-TH-4: attempts the guarded OSC 11 + DA1 query against the real
@@ -2667,6 +2765,7 @@ async fn run(
     theme: Theme,
     no_color: bool,
     color_depth: theme::ColorDepth,
+    live_theme_switch: bool,
     user_themes: Vec<theme::LoadedUserTheme>,
     accessible: bool,
     terminal_cfg: config::ResolvedTerminal,
@@ -2738,6 +2837,13 @@ async fn run(
     // change.
     app.color_depth = color_depth;
     app.user_themes = user_themes;
+    // PRD FR-TH-4 (live switching): mirror the startup decision (whether
+    // `main` enabled DEC-2031 notifications) and the light/dark picks, so a
+    // color-scheme push re-resolves against the same config the startup query
+    // used.
+    app.auto_theme_live = live_theme_switch;
+    app.auto_theme_light = terminal_cfg.theme_light.value.clone();
+    app.auto_theme_dark = terminal_cfg.theme_dark.value.clone();
     app.set_theme(app.theme);
     // PRD FR-NV-9 / FR-ACS-4 / FR-RD-2: the terminal-integration settings
     // this chunk adds. `mouse_enabled` mirrors the real
@@ -3410,6 +3516,11 @@ fn should_poll_instead_of_block(
 /// The panel shows its own "loading" status (`App::open_related`) until the
 /// result lands via `related_rx` and `App::deliver_related` installs it.
 const RELATED_LIMIT: u32 = 10;
+
+/// PRD FR-SR-2: the full-text results page size — the initial `run_search`
+/// request and every subsequent `load_more_results` page both use it, so a
+/// captured `sroffset` (a multiple of one page) always lines up.
+const SEARCH_PAGE_LIMIT: u32 = 20;
 
 fn fire_related(
     client: &WikiClient,
@@ -5101,6 +5212,16 @@ async fn handle_key(
     summary_tx: &UnboundedSender<SummaryOutcome>,
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
 ) {
+    // PRD FR-TH-4 (live switching): a DEC-2031 color-scheme push arrives (via
+    // crossterm's parser) as a burst of key events, not a distinct event —
+    // intercept and swallow it here, ahead of every latch and dispatch, so it
+    // re-resolves the theme instead of leaking `rgb:…` as stray keystrokes.
+    // Arms only while live auto-theme is on, so an ordinary session falls
+    // straight through untouched.
+    if intercept_color_scheme_push(app, code, modifiers) {
+        return;
+    }
+
     // The single choke point for `App::notice`'s "shown until the next
     // keypress" lifetime (PRD FR-CS-4-adjacent — see `ui::status_bar_text`):
     // every call to `handle_key` is a keypress, so every call starts by
@@ -5186,6 +5307,7 @@ async fn handle_key(
         && !app.pending_b
         && !app.pending_r
         && !app.pending_z
+        && !app.pending_leader
         && !app.pending_ctrl_w
         && app.pending_cn_bracket.is_none()
         && code == KeyCode::Char('p')
@@ -5209,6 +5331,7 @@ async fn handle_key(
         && !app.pending_b
         && !app.pending_r
         && !app.pending_z
+        && !app.pending_leader
         && !app.pending_ctrl_w
         && app.pending_cn_bracket.is_none()
         && let Some(ctx) = override_context(app)
@@ -5640,7 +5763,21 @@ async fn handle_key(
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 if !app.results.is_empty() {
+                    let at_bottom = app.selected_result + 1 >= app.results.len();
+                    // PRD FR-SR-2: pressing down at the last result auto-loads
+                    // the next page (when the server offered one), then the
+                    // selection advances onto the freshly appended rows.
+                    if at_bottom && app.search_continue.is_some() && !app.results_offline {
+                        load_more_results(client, app).await;
+                    }
                     app.selected_result = (app.selected_result + 1).min(app.results.len() - 1);
+                }
+            }
+            // PRD FR-SR-2: an explicit "load more" key, for readers who'd
+            // rather fetch the next page without scrolling to the very bottom.
+            KeyCode::Char('m') => {
+                if app.search_continue.is_some() && !app.results_offline {
+                    load_more_results(client, app).await;
                 }
             }
             KeyCode::Char('k') | KeyCode::Up => {
@@ -6310,6 +6447,42 @@ async fn handle_key(
                 }
                 return;
             }
+            // PRD FR-CS-3 leader chord: the leader-latch's second key. Unlike
+            // the g/b/z latches, an unrecognized key *cancels* (with a hint)
+            // rather than falling through — the leader is an explicit
+            // namespace, so `,x` for an unbound `x` should be a no-op, never a
+            // surprise `x` action. A recognized one dispatches through the
+            // same path a runtime rebinding does.
+            if app.pending_leader {
+                app.pending_leader = false;
+                if let Some(chord) = registry::Chord::from_key(code, modifiers)
+                    && let Some(action) = app.keymap.leader_action(&chord)
+                {
+                    dispatch_action(
+                        action,
+                        client,
+                        cache,
+                        app,
+                        revalidate_tx,
+                        open_tx,
+                        save_tx,
+                        related_tx,
+                        langlinks_tx,
+                        summary_tx,
+                        terminal,
+                    )
+                    .await;
+                } else if !matches!(code, KeyCode::Esc) {
+                    app.notice = Some(format!(
+                        "No leader binding for {} — :map {}<key> <action> to add one",
+                        registry::Chord::from_key(code, modifiers)
+                            .map(|c| c.label())
+                            .unwrap_or_else(|| "that key".to_string()),
+                        app.keymap.leader_key(),
+                    ));
+                }
+                return;
+            }
             // g-prefix chords (PRD Appendix B): the g-latch's second key.
             // `gg` top, `gt`/`gT` next/prev tab (FR-TB-1), `gb` back-stack
             // picker (FR-NV-7), `gh` home / start page (FR-DL-1), `gr`
@@ -6869,6 +7042,15 @@ async fn handle_key(
                 }
                 // PRD FR-ACC-2 / Appendix B's "Library: w watch/unwatch".
                 KeyCode::Char('w') => cmd_watch_toggle(client, app).await,
+                // PRD FR-CS-3: arm the leader latch (its second key is
+                // resolved at the top of this arm on the next keypress). The
+                // guard makes this a no-op when no leader is configured
+                // (`'\0'`), and it sits ahead of the g/b/z arms so a leader
+                // key that happens to be a letter would still win — the
+                // default `,` collides with none of them.
+                KeyCode::Char(c) if c == app.keymap.leader_key() && c != '\0' => {
+                    app.pending_leader = true;
+                }
                 // Arm the g-/b-/z-prefix latches (their second key is
                 // consumed at the top of this arm on the next keypress).
                 KeyCode::Char('g') => app.pending_g = true,
@@ -6904,6 +7086,13 @@ async fn handle_key(
     }
     if !matches!(code, KeyCode::Char('z')) {
         app.pending_z = false;
+    }
+    // PRD FR-CS-3: the same cross-mode safety net for the leader latch — it
+    // survives only the keypress that armed it (the leader key itself), then
+    // is force-cleared so a mode switch can't leave it dangling to eat a
+    // later keystroke.
+    if !matches!(code, KeyCode::Char(c) if c == app.keymap.leader_key()) {
+        app.pending_leader = false;
     }
     // UX-8 fix: the same cross-mode safety net as the four latches just
     // above — without it, a `Ctrl-w`/armed-bracket latch that survives past
@@ -9424,8 +9613,66 @@ async fn execute_command(
         Command::NoRedirect => open_noredirect(client, app).await,
         // PRD §7 "Article HTML fails to parse".
         Command::ReportPage => write_report_page(cache, app),
+        // PRD FR-CS-3: runtime key rebinding.
+        Command::Map { chord, action } => cmd_map(app, &chord, &action),
+        Command::Unmap { chord } => cmd_unmap(app, &chord),
         Command::Quit => app.should_quit = true,
     }
+}
+
+/// PRD FR-CS-3 (`:map`): rebind `chord` to `action` for the session. A
+/// two-character chord whose first key is the active leader binds in the
+/// leader space (`,t`); anything else is a `Chord::parse` spelling bound in
+/// the Reading override layer (`J`, `Ctrl-e`, `gg`) that `handle_key`
+/// consults ahead of its hardcoded arms. The action name was already
+/// validated at parse time; this re-checks defensively. Session-only —
+/// persistence to `keymap.toml` is intentionally left to a manual edit
+/// (writing/merging the file is out of this command's scope).
+fn cmd_map(app: &mut App, chord: &str, action: &str) {
+    let Some(act) = registry::Action::by_name(action) else {
+        app.notice = Some(format!("unknown command {action:?}"));
+        return;
+    };
+    let chars: Vec<char> = chord.chars().collect();
+    let leader = app.keymap.leader_key();
+    if chars.len() == 2 && chars[0] == leader && leader != '\0' {
+        app.keymap
+            .set_leader_binding(registry::Chord::ch(chars[1]), act);
+        app.notice = Some(format!("Mapped {chord} -> {action}"));
+    } else if let Some(parsed) = registry::Chord::parse(chord) {
+        app.keymap
+            .apply_override(registry::KeyContext::Reading, parsed, act);
+        app.notice = Some(format!("Mapped {chord} -> {action}"));
+    } else {
+        app.notice = Some(format!(
+            "{chord:?} isn't a recognizable key (try J, Ctrl-e, gg, or {leader}<key>)"
+        ));
+    }
+}
+
+/// PRD FR-CS-3 (`:unmap`): remove a session rebinding — a leader binding when
+/// `chord` is `<leader><key>`, otherwise a Reading override. Reports whether
+/// anything was actually removed; a hardcoded default binding is never
+/// touched (it lives in the base table / `handle_key`'s arms, not the
+/// override layer).
+fn cmd_unmap(app: &mut App, chord: &str) {
+    let chars: Vec<char> = chord.chars().collect();
+    let leader = app.keymap.leader_key();
+    let removed = if chars.len() == 2 && chars[0] == leader && leader != '\0' {
+        app.keymap
+            .remove_leader_binding(&registry::Chord::ch(chars[1]))
+    } else if let Some(parsed) = registry::Chord::parse(chord) {
+        app.keymap
+            .remove_override(registry::KeyContext::Reading, &parsed)
+    } else {
+        app.notice = Some(format!("{chord:?} isn't a recognizable key"));
+        return;
+    };
+    app.notice = Some(if removed {
+        format!("Unmapped {chord}")
+    } else {
+        format!("No session binding for {chord} to remove")
+    });
 }
 
 /// PRD FR-DL-8's `:xyzzy` — the classic. Extracted as a pure function (no
@@ -9619,12 +9866,19 @@ async fn run_search(client: &WikiClient, app: &mut App) {
         return;
     }
     app.loading = true;
-    match client.search(&app.lang, &app.search_input, 20).await {
+    match client
+        .search(&app.lang, &app.search_input, SEARCH_PAGE_LIMIT)
+        .await
+    {
         Ok(outcome) => {
             app.results_offline = false;
             app.results = outcome.results;
             app.search_suggestion = outcome.suggestion;
             app.search_rewritten_query = outcome.rewritten_query;
+            // PRD FR-SR-2: remember where the next page resumes (if any) so the
+            // results view can offer "load more".
+            app.search_continue = outcome.next_offset;
+            app.loading_more_results = false;
             // PRD FR-SR-4 / §7's offline-results section: an online search
             // that comes back genuinely empty still checks the local
             // offline index — a reader who's saved the very article
@@ -9692,6 +9946,44 @@ async fn run_search(client: &WikiClient, app: &mut App) {
     app.loading = false;
 }
 
+/// PRD FR-SR-2: fetch and append the next page of online full-text results.
+/// A no-op when there's no continuation, the results are offline, or a
+/// page fetch is already in flight (so a held-down `j` can't stack requests).
+/// On failure the continuation is left intact and a notice explains — the
+/// already-shown results stay put, unlike a first-page failure which falls
+/// back offline.
+async fn load_more_results(client: &WikiClient, app: &mut App) {
+    let Some(offset) = app.search_continue else {
+        return;
+    };
+    if app.results_offline || app.loading_more_results {
+        return;
+    }
+    app.loading_more_results = true;
+    let query = app.search_input.clone();
+    let lang = app.lang.clone();
+    match client
+        .search_from(&lang, &query, SEARCH_PAGE_LIMIT, offset)
+        .await
+    {
+        Ok(outcome) => {
+            let added = app.append_search_results(outcome.results, outcome.next_offset);
+            app.notice = Some(if added > 0 {
+                format!(
+                    "Loaded {added} more result{}",
+                    if added == 1 { "" } else { "s" }
+                )
+            } else {
+                "No more results".to_string()
+            });
+        }
+        Err(e) => {
+            app.notice = Some(format!("Couldn't load more results ({e})"));
+        }
+    }
+    app.loading_more_results = false;
+}
+
 /// PRD FR-SR-7's offline path: queries the local FTS index instead of the
 /// API, scoped to the active wiki + language (matching online search's own
 /// per-wiki scope — see `offline_search::OfflineIndex::search`'s doc
@@ -9732,6 +10024,9 @@ fn run_offline_search(app: &mut App) {
     app.search_suggestion = None;
     app.search_rewritten_query = None;
     app.offline_fallback_count = 0;
+    // FR-SR-2: the offline index isn't paginated — no "load more" here.
+    app.search_continue = None;
+    app.loading_more_results = false;
     app.selected_result = 0;
     app.mode = Mode::Results;
     app.loading = false;
@@ -9866,6 +10161,145 @@ mod tests {
     fn no_override_falls_back_to_tty_detection() {
         assert!(color_policy(false, false, false), "non-tty -> no color");
         assert!(!color_policy(false, false, true), "real tty -> color");
+    }
+
+    /// PRD FR-TH-4: the DEC-2031 enable is emitted only for a color-capable,
+    /// interactive, auto-theme-with-no-pinned-theme session — every other
+    /// combination opts out (a pinned theme, `NO_COLOR`, a non-TTY, or
+    /// auto-theme off).
+    #[test]
+    fn color_scheme_notifications_enabled_only_under_the_full_gate() {
+        assert!(should_enable_color_scheme_notifications(
+            true, false, true, true
+        ));
+        assert!(
+            !should_enable_color_scheme_notifications(false, false, true, true),
+            "non-tty: no terminal to push"
+        );
+        assert!(
+            !should_enable_color_scheme_notifications(true, true, true, true),
+            "NO_COLOR: no theme to live-switch"
+        );
+        assert!(
+            !should_enable_color_scheme_notifications(true, false, false, true),
+            "auto-theme off"
+        );
+        assert!(
+            !should_enable_color_scheme_notifications(true, false, true, false),
+            "an explicitly pinned theme wins over auto-detection"
+        );
+    }
+
+    /// PRD FR-TH-4: the reassembly of crossterm's mangled DEC-2031 burst —
+    /// `Alt+]` introducer, the `rgb:…` body as bare char keys, an `Alt+\` ST
+    /// terminator — reconstructs the OSC 11 sequence, swallows every key of
+    /// it, and live-switches the theme by the pushed background's luminance.
+    #[test]
+    fn intercept_reassembles_a_2031_burst_and_switches_theme() {
+        let mut app = App::new("en".to_string(), Theme::paper(), false);
+        app.auto_theme_live = true;
+        app.auto_theme_light = "paper".to_string();
+        app.auto_theme_dark = "full".to_string();
+
+        // ESC ] 1 1 ; r g b : 1 0 1 0 / 1 4 1 4 / 1 8 1 8  (a dark bg), then
+        // the ST terminator ESC \ — exactly the key events crossterm emits.
+        let ctrl = KeyModifiers::empty();
+        let alt = KeyModifiers::ALT;
+        assert!(intercept_color_scheme_push(
+            &mut app,
+            KeyCode::Char(']'),
+            alt
+        ));
+        for c in "11;rgb:1010/1414/1818".chars() {
+            assert!(
+                intercept_color_scheme_push(&mut app, KeyCode::Char(c), ctrl),
+                "body char {c:?} must be swallowed"
+            );
+        }
+        assert!(intercept_color_scheme_push(
+            &mut app,
+            KeyCode::Char('\\'),
+            alt
+        ));
+        assert_eq!(app.theme.name, "full", "dark push -> theme_dark");
+        assert!(app.color_scheme_capture.is_none(), "capture cleared");
+    }
+
+    /// A bare `Alt+]` that isn't the start of an OSC 11 push (the next key
+    /// isn't the `1` of `11;`) aborts the capture and lets that key through,
+    /// so live auto-theme doesn't silently eat unrelated input.
+    #[test]
+    fn intercept_aborts_on_a_non_osc_alt_bracket() {
+        let mut app = App::new("en".to_string(), Theme::full(), false);
+        app.auto_theme_live = true;
+        assert!(intercept_color_scheme_push(
+            &mut app,
+            KeyCode::Char(']'),
+            KeyModifiers::ALT
+        ));
+        // Next key is 'x', not '1' -> abort, and 'x' is NOT consumed.
+        assert!(!intercept_color_scheme_push(
+            &mut app,
+            KeyCode::Char('x'),
+            KeyModifiers::empty()
+        ));
+        assert!(app.color_scheme_capture.is_none());
+    }
+
+    /// PRD FR-CS-3: `:map J scroll-bottom` installs a live override that
+    /// `handle_key`'s `runtime_action` check then surfaces, and `:unmap J`
+    /// takes it back out.
+    #[test]
+    fn map_command_installs_a_live_override() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        assert_eq!(
+            app.keymap
+                .runtime_action(registry::KeyContext::Reading, &registry::Chord::ch('J')),
+            None
+        );
+        cmd_map(&mut app, "J", "scroll-bottom");
+        assert_eq!(
+            app.keymap
+                .runtime_action(registry::KeyContext::Reading, &registry::Chord::ch('J')),
+            Some(registry::Action::ScrollBottom),
+            "the rebinding must be live in the override layer"
+        );
+        cmd_unmap(&mut app, "J");
+        assert_eq!(
+            app.keymap
+                .runtime_action(registry::KeyContext::Reading, &registry::Chord::ch('J')),
+            None,
+            ":unmap must remove it"
+        );
+    }
+
+    /// PRD FR-CS-3: `:map ,x <action>` binds in the leader space (the active
+    /// leader key followed by one key), resolvable by `leader_action`.
+    #[test]
+    fn map_command_binds_the_leader_space() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        let leader = app.keymap.leader_key();
+        cmd_map(&mut app, &format!("{leader}x"), "stats-open");
+        assert_eq!(
+            app.keymap.leader_action(&registry::Chord::ch('x')),
+            Some(registry::Action::StatsOpen)
+        );
+        cmd_unmap(&mut app, &format!("{leader}x"));
+        assert_eq!(app.keymap.leader_action(&registry::Chord::ch('x')), None);
+    }
+
+    /// With live auto-theme off (the default), the interceptor never arms —
+    /// `Alt+]` and every other key fall straight through untouched.
+    #[test]
+    fn intercept_is_inert_when_live_auto_theme_is_off() {
+        let mut app = App::new("en".to_string(), Theme::full(), false);
+        assert!(!app.auto_theme_live);
+        assert!(!intercept_color_scheme_push(
+            &mut app,
+            KeyCode::Char(']'),
+            KeyModifiers::ALT
+        ));
+        assert!(app.color_scheme_capture.is_none());
     }
 
     /// PRD SEC-2: a hostile title containing raw ESC/BEL bytes must not be

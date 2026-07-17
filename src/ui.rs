@@ -165,6 +165,15 @@ fn kind_style(
         ),
         SpanKind::Quote => colored(no_color, theme.quote),
         SpanKind::Code => colored(no_color, theme.code),
+        // PRD FR-RD-1: code-token colors reuse existing theme slots (no new
+        // fields), so `colored`/the FR-TH-3 degradation pipeline handle
+        // NO_COLOR and 256/16/mono for them exactly as for every other slot.
+        // A monochrome theme (homebrew/night) points several of these at one
+        // hue, correctly collapsing to uniform coloring there.
+        SpanKind::CodeKeyword => colored(no_color, theme.heading).add_modifier(Modifier::BOLD),
+        SpanKind::CodeString => colored(no_color, theme.quote),
+        SpanKind::CodeComment => colored(no_color, theme.dim).add_modifier(Modifier::ITALIC),
+        SpanKind::CodeNumber => colored(no_color, theme.warning),
         SpanKind::Table => colored(no_color, theme.table),
         SpanKind::Infobox => colored(no_color, theme.infobox),
         SpanKind::Image => colored(no_color, theme.image).add_modifier(Modifier::ITALIC),
@@ -1582,6 +1591,16 @@ fn draw_results(frame: &mut Frame, app: &App, area: Rect) {
     // from each result's own "(offline · saved|cached)" description line
     // (`main::run_offline_search`) — the header marks the whole list, the
     // per-row text marks each result's provenance.
+    // PRD FR-SR-2: a "load more" affordance in the results title — shown only
+    // when the server offered a continuation (`search_continue`). `m` or
+    // scrolling past the last row fetches the next page (`main::load_more_results`).
+    let more_hint = if app.loading_more_results {
+        " · loading more…"
+    } else if app.search_continue.is_some() {
+        " · m/↓ more"
+    } else {
+        ""
+    };
     let title = if app.results_offline {
         format!(
             "Offline results for \"{}\" ({} found)",
@@ -1593,13 +1612,13 @@ fn draw_results(frame: &mut Frame, app: &App, area: Rect) {
         // these results are already for `rewritten`, not `search_input`
         // (distinct from the zero-results view's opt-in "did you mean").
         format!(
-            "Showing results for \"{rewritten}\" (rewritten from \"{}\") ({} found)",
+            "Showing results for \"{rewritten}\" (rewritten from \"{}\") ({} found){more_hint}",
             app.search_input,
             app.results.len()
         )
     } else {
         format!(
-            "Results for \"{}\" ({} found)",
+            "Results for \"{}\" ({} found){more_hint}",
             app.search_input,
             app.results.len()
         )
@@ -4392,6 +4411,47 @@ mod tests {
             picker_text.contains("selection") || picker_text.contains("confirm"),
             "generic navigation from the registry shown"
         );
+    }
+
+    /// PRD FR-RD-1: the code-token kinds paint in distinct theme colors, so a
+    /// keyword, string, comment, and number are visually separable — and
+    /// under NO_COLOR they all collapse to no-color (FR-TH-5's "plain").
+    #[test]
+    fn code_token_kinds_are_colored_and_no_color_flattens_them() {
+        let theme = Theme::full();
+        let links: Vec<LinkRef> = Vec::new();
+        let visited = HashSet::new();
+        let redlinks = HashSet::new();
+        let style = |kind: &SpanKind, no_color: bool| {
+            kind_style(
+                kind, None, &links, &visited, &redlinks, &theme, no_color, false,
+            )
+        };
+
+        let kw = style(&SpanKind::CodeKeyword, false);
+        let s = style(&SpanKind::CodeString, false);
+        let cmt = style(&SpanKind::CodeComment, false);
+        let num = style(&SpanKind::CodeNumber, false);
+        // `full` gives heading/quote/dim/warning four different hues, so the
+        // four token classes are four different foregrounds.
+        assert_ne!(kw.fg, s.fg);
+        assert_ne!(kw.fg, cmt.fg);
+        assert_ne!(kw.fg, num.fg);
+        assert_ne!(s.fg, cmt.fg);
+
+        // NO_COLOR strips every code-token foreground to none (plain).
+        for kind in [
+            SpanKind::CodeKeyword,
+            SpanKind::CodeString,
+            SpanKind::CodeComment,
+            SpanKind::CodeNumber,
+        ] {
+            assert_eq!(
+                style(&kind, true).fg,
+                None,
+                "{kind:?} must be color-plain under NO_COLOR"
+            );
+        }
     }
 
     /// The paint step maps each heading's layout line (via

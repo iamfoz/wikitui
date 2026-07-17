@@ -717,6 +717,149 @@ impl PaletteFallback {
     }
 }
 
+/// PRD Appendix C / FR-TH-3: a built-in theme's **declared** 256- and
+/// 16-color approximations. Appendix C asks each theme to *define* its
+/// low-capability fallbacks, not merely lean on [`adapt_color`]'s generic
+/// runtime quantization — so the RGB-defined built-ins carry the same
+/// explicit `[fallback]` table a user theme may (via [`PaletteFallback`]),
+/// which [`Theme::adapt`] consults ahead of [`rgb_to_256`]/[`rgb_to_16`]
+/// (see `App::set_theme`, which now looks a built-in's declaration up here
+/// when no same-named user theme shadows it).
+///
+/// Every `(slot, palette256, palette16)` triple below was seeded from the
+/// algorithmic quantization that used to be the *only* behavior, then
+/// hand-tuned where the nearest-color pick read wrong. The systematic wrong
+/// pick the seeds exposed: a saturated accent on a monochrome/near-monochrome
+/// theme (`homebrew`'s greens, `night`'s reds, `full`/`paper`'s links and
+/// warnings) whose 16-color nearest neighbor is a *gray* — quantization
+/// minimizing Euclidean distance happily lands a muted color on the gray
+/// ramp, which erases exactly the hue the theme is built around. The declared
+/// values pin those back to the theme's own hue family. Pinned, declared
+/// literals also mean a future change to the quantizer can't silently shift a
+/// shipped theme's low-capability rendering.
+///
+/// `terminal` and `contrast` are **absent by design**, not omitted: every one
+/// of their slots is already a named ANSI color (`Color::Blue`, `Color::White`,
+/// …), which [`adapt_color`] passes through unchanged at 256- and 16-color
+/// depth alike — the theme's own definition already *is* its declared
+/// low-capability approximation, so there is nothing to restate. This is the
+/// identical exclusion `as_rgb`/[`builtin_contrast_report`] already apply to
+/// the two named-palette themes for the same reason.
+pub fn builtin_fallback(name: &str) -> Option<PaletteFallback> {
+    use Color::{
+        Black, Blue, Cyan, DarkGray, Gray, Green, LightBlue, LightGreen, LightMagenta, LightRed,
+        Magenta, Red, Yellow,
+    };
+    // (slot, palette256 index, palette16 color). Slots whose theme color is a
+    // named ANSI value (not `Color::Rgb`) are simply absent — `adapt_color`
+    // passes those through unchanged, so a declaration would be an identity.
+    let table: &[(&str, u8, Color)] = match name {
+        "full" => &[
+            ("bg", 233, Black),
+            ("fg", 254, Gray),
+            ("link", 75, LightBlue),
+            // seed 248/DarkGray — a body-gray external link is indistinguishable
+            // from dim prose; pin it to a link-ish blue and the named-cyan hue
+            // `derive_link_external` itself falls back to.
+            ("link_external", 103, Cyan),
+            ("link_visited", 141, LightMagenta), // seed 16 LightBlue collided with `link`
+            ("quote", 144, DarkGray),
+            ("code", 144, DarkGray),
+            ("table", 254, Gray),
+            ("infobox", 237, Black),
+            ("image", 243, DarkGray),
+            ("dim", 243, DarkGray),
+            ("focus_fg", 233, Black),
+            ("focus_bg", 75, LightBlue),
+            ("status_fg", 254, Gray),
+            ("status_bg", 237, Black),
+            ("selected_bg", 75, LightBlue),
+            ("selected_fg", 233, Black),
+            ("match", 186, Yellow), // seed 16 Gray — a goldenrod highlight is not gray
+            ("warning", 173, Yellow), // seed 16 DarkGray
+            ("error", 131, Red),    // seed 16 DarkGray
+        ],
+        "homebrew" => &[
+            ("bg", 16, Black),
+            ("fg", 83, LightGreen),
+            ("heading", 83, LightGreen), // seed 16 DarkGray — a green theme is never gray
+            ("link", 120, LightGreen),   // seed 16 Gray
+            ("link_external", 120, LightGreen), // seed 16 DarkGray (homebrew keeps external in-green)
+            ("link_visited", 77, Green),        // seed 16 DarkGray
+            ("quote", 83, LightGreen),
+            ("code", 83, LightGreen),
+            ("table", 83, LightGreen),
+            ("infobox", 83, LightGreen), // seed 16 DarkGray
+            ("image", 28, Green),
+            ("dim", 28, Green),
+            ("focus_fg", 16, Black),
+            ("focus_bg", 83, LightGreen),
+            ("status_fg", 16, Black),
+            ("status_bg", 83, LightGreen),
+            ("selected_bg", 83, LightGreen), // seed 16 DarkGray
+            ("selected_fg", 16, Black),
+            ("match", 194, LightGreen),  // seed 16 Gray
+            ("warning", 83, LightGreen), // seed 16 DarkGray
+            ("error", 203, LightRed),    // the one deliberate non-green accent
+        ],
+        "night" => &[
+            ("bg", 16, Black),
+            ("fg", 196, LightRed),
+            ("heading", 203, LightRed),
+            ("link", 210, LightRed), // seed 16 DarkGray — a red theme is never gray
+            ("link_external", 209, Yellow), // amber-tilted, distinct from the red body by design
+            ("link_visited", 167, Red), // seed 16 DarkGray
+            ("quote", 196, LightRed),
+            ("code", 196, LightRed),
+            ("table", 196, LightRed),
+            ("infobox", 203, LightRed),
+            ("image", 88, Red),
+            ("dim", 88, Red),
+            ("focus_fg", 16, Black),
+            ("focus_bg", 196, LightRed),
+            ("status_fg", 16, Black),
+            ("status_bg", 196, LightRed),
+            ("selected_bg", 203, LightRed),
+            ("selected_fg", 16, Black),
+            ("match", 214, Yellow),
+            ("warning", 214, Yellow),
+            ("error", 196, LightRed),
+        ],
+        "paper" => &[
+            ("bg", 255, Gray),
+            ("fg", 237, Black),
+            ("heading", 234, Black),
+            ("link", 24, Blue), // seed 16 DarkGray — a link on cream reads as blue
+            ("link_external", 94, DarkGray), // seed 256 240 (flat gray) -> goldenrod-tilted brown
+            ("link_visited", 60, Magenta), // seed 16 DarkGray
+            ("quote", 240, DarkGray),
+            ("code", 24, Blue), // seed 16 DarkGray — paper's code shares the link blue
+            ("table", 237, Black),
+            ("infobox", 234, Black),
+            ("image", 245, DarkGray),
+            ("dim", 245, DarkGray),
+            ("focus_fg", 255, Gray),
+            ("focus_bg", 24, Blue),
+            ("status_fg", 255, Gray),
+            ("status_bg", 237, Black),
+            ("selected_bg", 24, Blue),
+            ("selected_fg", 255, Gray),
+            ("match", 136, Yellow),
+            ("warning", 136, Yellow),
+            ("error", 131, Red), // seed 16 DarkGray
+        ],
+        // terminal/contrast: named ANSI throughout — self-declaring, see the
+        // function doc comment.
+        _ => return None,
+    };
+    let mut fb = PaletteFallback::default();
+    for &(slot, i256, c16) in table {
+        fb.palette256.insert(slot.to_string(), i256);
+        fb.palette16.insert(slot.to_string(), c16);
+    }
+    Some(fb)
+}
+
 impl Theme {
     /// FR-TH-3: maps every color slot on this theme down to `depth`,
     /// preferring `fallback`'s declared per-slot approximation over computed
@@ -1702,6 +1845,112 @@ mod tests {
 
         let two56 = full.adapt(ColorDepth::TwoFiftySix, None);
         assert!(matches!(two56.link, Color::Indexed(_)));
+    }
+
+    /// PRD Appendix C / FR-TH-3: every RGB-defined built-in theme *declares*
+    /// explicit 256- and 16-color approximations for every one of its RGB
+    /// slots, rather than relying on `adapt_color`'s generic quantization.
+    #[test]
+    fn every_rgb_builtin_declares_a_full_palette_fallback() {
+        for name in ["full", "homebrew", "night", "paper"] {
+            let theme = Theme::by_name(name).unwrap();
+            let fb = builtin_fallback(name)
+                .unwrap_or_else(|| panic!("{name} must declare a palette fallback"));
+            assert!(!fb.palette256.is_empty(), "{name} palette256 is empty");
+            assert!(!fb.palette16.is_empty(), "{name} palette16 is empty");
+            // Every RGB slot the theme actually has must be declared at both
+            // depths (named-ANSI slots are correctly absent — see the
+            // function doc comment).
+            let rgb_slots: [(&str, Color); 21] = [
+                ("bg", theme.bg.unwrap_or(Color::Reset)),
+                ("fg", theme.fg.unwrap_or(Color::Reset)),
+                ("heading", theme.heading),
+                ("link", theme.link),
+                ("link_external", theme.link_external),
+                ("link_visited", theme.link_visited),
+                ("quote", theme.quote),
+                ("code", theme.code),
+                ("table", theme.table),
+                ("infobox", theme.infobox),
+                ("image", theme.image),
+                ("dim", theme.dim),
+                ("focus_fg", theme.focus_fg),
+                ("focus_bg", theme.focus_bg),
+                ("status_fg", theme.status_fg),
+                ("status_bg", theme.status_bg),
+                ("selected_bg", theme.selected_bg),
+                ("selected_fg", theme.selected_fg),
+                ("match", theme.match_fg),
+                ("warning", theme.warning),
+                ("error", theme.error),
+            ];
+            for (slot, color) in rgb_slots {
+                if matches!(color, Color::Rgb(..)) {
+                    assert!(
+                        fb.palette256.contains_key(slot),
+                        "{name} must declare palette256 for RGB slot {slot}"
+                    );
+                    assert!(
+                        fb.palette16.contains_key(slot),
+                        "{name} must declare palette16 for RGB slot {slot}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The two named-palette built-ins declare nothing here *by design*:
+    /// every slot is already a named ANSI color, which `adapt_color` carries
+    /// through unchanged at 256/16 — the definition is its own approximation.
+    #[test]
+    fn named_palette_builtins_are_self_declaring() {
+        for name in ["terminal", "contrast"] {
+            assert!(
+                builtin_fallback(name).is_none(),
+                "{name} is named-ANSI throughout — it declares no separate fallback"
+            );
+            let t = Theme::by_name(name).unwrap();
+            for c in [t.link, t.heading, t.code, t.dim, t.match_fg] {
+                assert!(
+                    !matches!(c, Color::Rgb(..)),
+                    "{name} slot is unexpectedly RGB: {c:?}"
+                );
+            }
+        }
+    }
+
+    /// PRD FR-TH-3's headline: the *declared* value is what a 256-/16-color
+    /// terminal renders, not a recomputed quantization. Proven on a
+    /// hand-tuned slot whose declaration deliberately differs from what
+    /// `rgb_to_256`/`rgb_to_16` alone would pick.
+    #[test]
+    fn declared_builtin_fallback_beats_recomputed_quantization() {
+        let night = Theme::night();
+        let fb = builtin_fallback("night").unwrap();
+
+        // `night.link` (#ff8080) quantizes to a *gray* at 16-color — the exact
+        // wrong pick the declarations exist to override. Confirm the seed is
+        // indeed gray, then that adapt uses the declared LightRed instead.
+        let Color::Rgb(r, g, b) = night.link else {
+            panic!("night.link is RGB")
+        };
+        assert_eq!(
+            rgb_to_16(r, g, b),
+            Color::DarkGray,
+            "seed check: pure quantization degrades night.link to gray"
+        );
+        assert_eq!(fb.palette16.get("link"), Some(&Color::LightRed));
+
+        let sixteen = night.adapt(ColorDepth::Sixteen, Some(&fb));
+        assert_eq!(
+            sixteen.link,
+            Color::LightRed,
+            "adapt must use the declared 16-color value, not recompute gray"
+        );
+
+        // And at 256-color, the declared index wins over the computed one.
+        let two56 = night.adapt(ColorDepth::TwoFiftySix, Some(&fb));
+        assert_eq!(two56.link, Color::Indexed(210));
     }
 
     /// A theme's own declared `[fallback]` (via `PaletteFallback`) takes

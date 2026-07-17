@@ -251,6 +251,18 @@ pub enum Command {
     /// anywhere (FR-PR-1) — purely a file on disk the reader can attach to
     /// an issue if *they* choose to.
     ReportPage,
+    /// `:map <key> <command>` (PRD FR-CS-3) — rebind a key to a command for
+    /// the session, in the override layer `main::handle_key` already consults
+    /// ahead of its hardcoded arms. `key` is a `Chord::parse` spelling (`J`,
+    /// `Ctrl-e`, `gg`) *or* a leader chord (`,t` — the leader key followed by
+    /// one key), resolved at execution time where the active leader key is
+    /// known (`main::cmd_map`). The command name is validated here; the key
+    /// spelling is resolved at execution time.
+    Map { chord: String, action: String },
+    /// `:unmap <key>` (PRD FR-CS-3) — remove a session rebinding (a `:map`, a
+    /// preset override, or a `keymap.toml` override / leader binding). Never
+    /// touches a hardcoded default binding.
+    Unmap { chord: String },
     /// `:q` / `:quit` — exit.
     Quit,
 }
@@ -545,7 +557,7 @@ fn validate_set_value(
     }
 }
 
-pub const USAGE: &str = "commands: open <title>, lang [<code>], theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, zim [open <path>|close|<title>], prefetch-log, interests, not-interested, stats, start, today, random [good], related, talk, info, set theme=<name>|images=on|off|prefetch=on|off|show-cn=on|off|measure=N|ambiguous_width=1|2|reading_wpm=N|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N|justify=on|off|hyphenate=on|off, set-tab measure=N|images=on|off|ambiguous_width=1|2|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N|justify=on|off|hyphenate=on|off (or set-tab key= to reset), config reload, vsplit, only, bilingual, wiki [<name>], set scrollbind, set show-cn, watchlist, notifications, contribs [username], prefs, enable-editing, edit [summary], sync, mirror-watchlist, search-offline, trail [all|days N|export md|dot|mermaid [path]], mksession <name>, session <name>, sessions, tts [stop], speak [stop], run <macro>, game [daily|share|<start> <goal>], xyzzy, noredirect, report-page, help, quit";
+pub const USAGE: &str = "commands: open <title>, lang [<code>], theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, zim [open <path>|close|<title>], prefetch-log, interests, not-interested, stats, start, today, random [good], related, talk, info, set theme=<name>|images=on|off|prefetch=on|off|show-cn=on|off|measure=N|ambiguous_width=1|2|reading_wpm=N|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N|justify=on|off|hyphenate=on|off, set-tab measure=N|images=on|off|ambiguous_width=1|2|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N|justify=on|off|hyphenate=on|off (or set-tab key= to reset), config reload, vsplit, only, bilingual, wiki [<name>], set scrollbind, set show-cn, watchlist, notifications, contribs [username], prefs, enable-editing, edit [summary], sync, mirror-watchlist, search-offline, trail [all|days N|export md|dot|mermaid [path]], mksession <name>, session <name>, sessions, tts [stop], speak [stop], run <macro>, game [daily|share|<start> <goal>], xyzzy, noredirect, report-page, map <key> <command>, unmap <key>, help, quit";
 
 /// PRD FR-CS-2's Tab-completion vocabulary: every top-level command word
 /// `parse_with_user_themes` recognizes before its first argument/subcommand,
@@ -608,6 +620,8 @@ pub const COMMAND_NAMES: &[&str] = &[
     "xyzzy",
     "noredirect",
     "report-page",
+    "map",
+    "unmap",
     "help",
     "quit",
 ];
@@ -1165,6 +1179,31 @@ pub fn parse_with_user_themes(input: &str, user_theme_names: &[String]) -> Resul
         // PRD §7 "Article HTML fails to parse".
         "report-page" => Ok(Command::ReportPage),
         "help" | "h" => Ok(Command::Help),
+        // PRD FR-CS-3: `:map <key> <command>` — validate the command name
+        // now (fail fast, same shape as `:theme`/`:style`); the key spelling
+        // is resolved at execution time, where the active leader key is known.
+        "map" => {
+            let (chord, action) = match arg.split_once(char::is_whitespace) {
+                Some((c, a)) => (c.trim(), a.trim()),
+                None => (arg, ""),
+            };
+            if chord.is_empty() || action.is_empty() {
+                return Err("usage: :map <key> <command> (e.g. :map J scroll-bottom)".to_string());
+            }
+            if crate::registry::Action::by_name(action).is_none() {
+                return Err(format!(
+                    "unknown command {action:?} — see the command palette (Ctrl-p) for names"
+                ));
+            }
+            Ok(Command::Map {
+                chord: chord.to_string(),
+                action: action.to_string(),
+            })
+        }
+        // PRD FR-CS-3: `:unmap <key>` — remove a session rebinding.
+        "unmap" => Ok(Command::Unmap {
+            chord: require_arg("key")?,
+        }),
         "q" | "quit" => Ok(Command::Quit),
         "" => Err(USAGE.to_string()),
         other => Err(format!("unknown command {other:?} — {USAGE}")),
@@ -1442,6 +1481,38 @@ mod tests {
         assert_eq!(parse("q"), Ok(Command::Quit));
         assert_eq!(parse("quit"), Ok(Command::Quit));
         assert_eq!(parse("help"), Ok(Command::Help));
+    }
+
+    /// PRD FR-CS-3: `:map`/`:unmap` parse their key + command, validate the
+    /// command name, and reject malformed input.
+    #[test]
+    fn map_and_unmap_parse_and_validate() {
+        assert_eq!(
+            parse("map J scroll-bottom"),
+            Ok(Command::Map {
+                chord: "J".to_string(),
+                action: "scroll-bottom".to_string(),
+            })
+        );
+        assert_eq!(
+            parse("map ,t toc"),
+            Ok(Command::Map {
+                chord: ",t".to_string(),
+                action: "toc".to_string(),
+            })
+        );
+        assert_eq!(
+            parse("unmap ,t"),
+            Ok(Command::Unmap {
+                chord: ",t".to_string(),
+            })
+        );
+        // An unknown command name is rejected at parse time.
+        assert!(parse("map J not-a-real-command").is_err());
+        // Missing operands are rejected.
+        assert!(parse("map J").is_err());
+        assert!(parse("map").is_err());
+        assert!(parse("unmap").is_err());
     }
 
     #[test]

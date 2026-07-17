@@ -331,6 +331,25 @@ struct SearchPageResponse {
     /// miss.
     #[serde(default)]
     rewrittenquery: Option<String>,
+    /// PRD FR-SR-2 pagination. The core REST `search/page` endpoint returns
+    /// up to `limit` results with no continuation; the Action API's
+    /// `list=search` (Appendix A's documented fallback) is what actually
+    /// pages, via `continue.sroffset`. Modeled here as the same kind of
+    /// schema extension `suggestion`/`rewrittenquery` already are
+    /// (`#[serde(default)]` — a deployment that doesn't page just omits it):
+    /// a `continue` object carrying the next `sroffset`, which the client
+    /// echoes back as `&offset=` to fetch the following page (see
+    /// [`WikiClient::search_from`]). The mock server emits it the same way.
+    #[serde(default, rename = "continue")]
+    continue_: Option<SearchContinue>,
+}
+
+/// PRD FR-SR-2: the Action API's `continue` object, of which the client only
+/// needs `sroffset` — the index to resume the next page at.
+#[derive(Debug, Deserialize, Default, Clone)]
+struct SearchContinue {
+    #[serde(default)]
+    sroffset: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -873,6 +892,11 @@ pub struct SearchOutcome {
     /// (`srinfo=rewrittenquery`) — a "showing results for X" notice, not a
     /// "did you mean" invitation (`suggestion`'s own job).
     pub rewritten_query: Option<String>,
+    /// PRD FR-SR-2 pagination: the `sroffset` to resume at for the next page,
+    /// or `None` when the server signalled no more results. The results view
+    /// keeps this to drive its "load more" affordance
+    /// (`main::load_more_results`).
+    pub next_offset: Option<u32>,
 }
 
 impl WikiClient {
@@ -2188,13 +2212,35 @@ impl WikiClient {
     }
 
     /// Full-text search (PRD Appendix A: `GET /w/rest.php/v1/search/page`).
+    /// The un-paginated first page — [`Self::search_from`] with offset 0, kept
+    /// as the name every existing caller already uses.
     pub async fn search(&self, lang: &str, query: &str, limit: u32) -> Result<SearchOutcome> {
-        let url = format!(
+        self.search_from(lang, query, limit, 0).await
+    }
+
+    /// PRD FR-SR-2: full-text search resuming at `offset` (the `sroffset` a
+    /// previous page's `SearchOutcome::next_offset` returned). `offset == 0`
+    /// is the first page and omits the parameter entirely, so the request is
+    /// byte-identical to the pre-pagination one; a nonzero offset appends
+    /// `&offset=`, which the mock honors and the Action-API fallback maps to
+    /// `sroffset`. The response's `continue.sroffset` (when present) becomes
+    /// the next page's `next_offset`.
+    pub async fn search_from(
+        &self,
+        lang: &str,
+        query: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<SearchOutcome> {
+        let mut url = format!(
             "{}/w/rest.php/v1/search/page?q={}&limit={}",
             self.host(lang),
             urlencoding::encode(query),
             limit
         );
+        if offset > 0 {
+            url.push_str(&format!("&offset={offset}"));
+        }
         let resp = self
             .http
             .get(&url)
@@ -2220,10 +2266,12 @@ impl WikiClient {
         let rewritten_query = parsed
             .rewrittenquery
             .map(|s| crate::sanitize::sanitize_single_line(&s).into_owned());
+        let next_offset = parsed.continue_.and_then(|c| c.sroffset);
         Ok(SearchOutcome {
             results: parsed.pages,
             suggestion,
             rewritten_query,
+            next_offset,
         })
     }
 
@@ -3357,6 +3405,59 @@ mod tests {
         }
         assert_eq!(totals.get("Enigma machine"), Some(&150));
         assert_eq!(totals.get("Computer science"), Some(&10));
+    }
+
+    /// PRD FR-SR-2 pagination: `search_from(offset)` sends the `&offset=` the
+    /// server pages on, and captures the response's `continue.sroffset` as the
+    /// next page's `next_offset`. The first page (offset 0) omits the param.
+    #[tokio::test]
+    async fn search_from_sends_offset_and_captures_continue() {
+        use std::io::{Read, Write};
+        let serve = |body: &'static [u8], cap: std::sync::Arc<std::sync::Mutex<String>>| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            std::thread::spawn(move || {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    *cap.lock().unwrap() = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes());
+                    let _ = stream.write_all(body);
+                }
+            });
+            port
+        };
+
+        // Page two (offset 20): the server still has more, so it returns a
+        // continuation at 40.
+        let cap = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let body = br#"{"pages":[{"title":"Result 21"}],"continue":{"sroffset":40}}"#;
+        let port = serve(body, cap.clone());
+        let client = WikiClient::new(format!("http://127.0.0.1:{port}")).unwrap();
+        let outcome = client
+            .search_from("en", "pagination", 20, 20)
+            .await
+            .unwrap();
+        assert_eq!(outcome.next_offset, Some(40), "continue.sroffset captured");
+        assert_eq!(outcome.results.len(), 1);
+        let req = cap.lock().unwrap().clone();
+        assert!(req.contains("offset=20"), "must send the offset: {req:?}");
+
+        // The first page (offset 0) omits the parameter entirely and, with no
+        // continuation in the response, reports `next_offset = None`.
+        let cap0 = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let port0 = serve(br#"{"pages":[]}"#, cap0.clone());
+        let client0 = WikiClient::new(format!("http://127.0.0.1:{port0}")).unwrap();
+        let outcome0 = client0.search("en", "pagination", 20).await.unwrap();
+        assert_eq!(outcome0.next_offset, None);
+        assert!(
+            !cap0.lock().unwrap().contains("offset="),
+            "first page must not send an offset param"
+        );
     }
 
     /// PRD FR-SR-3: CirrusSearch operator syntax is just query *string*

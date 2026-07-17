@@ -54,6 +54,18 @@ pub enum SpanKind {
     /// Body text inside a blockquote (rendered in `theme.quote`).
     Quote,
     Code,
+    /// PRD FR-RD-1 syntax-highlight token classes, emitted only inside a
+    /// `Block::Code` whose language the rule-based highlighter (`syntax::Lang`)
+    /// recognizes. Each maps to an existing theme slot in `ui::kind_style`
+    /// (keyword→heading, string→quote, comment→dim, number→warning), so the
+    /// FR-TH-3 degradation pipeline and `NO_COLOR` already cover them with no
+    /// new theme fields; an unhighlighted / unknown-language block keeps using
+    /// plain [`SpanKind::Code`] (`theme.code`). A monochrome theme collapses
+    /// all four onto its single hue, which is the correct behavior there.
+    CodeKeyword,
+    CodeString,
+    CodeComment,
+    CodeNumber,
     Table,
     Infobox,
     Image,
@@ -562,6 +574,39 @@ fn clusters_from_str(s: &str, kind: SpanKind, ambiguous_wide: bool) -> Vec<Clust
     s.graphemes(true)
         .map(|g| make_cluster(g, kind.clone(), ambiguous_wide))
         .collect()
+}
+
+/// PRD FR-RD-1: the `syntax::TokenKind`-to-`SpanKind` mapping. Kept here (not
+/// in `syntax`) so the tokenizer stays decoupled from the layout's span
+/// vocabulary — see [`SpanKind`]'s `CodeKeyword`/… doc comment for why these
+/// reuse existing theme slots rather than adding new ones.
+fn token_span_kind(k: crate::syntax::TokenKind) -> SpanKind {
+    match k {
+        crate::syntax::TokenKind::Plain => SpanKind::Code,
+        crate::syntax::TokenKind::Keyword => SpanKind::CodeKeyword,
+        crate::syntax::TokenKind::Str => SpanKind::CodeString,
+        crate::syntax::TokenKind::Comment => SpanKind::CodeComment,
+        crate::syntax::TokenKind::Number => SpanKind::CodeNumber,
+    }
+}
+
+/// PRD FR-RD-1: tokenize one code line and turn its `(text, kind)` runs into
+/// width-measured clusters carrying per-token `SpanKind`s — so highlighting
+/// survives width-chunking (`chunk_by_width`) and span coalescing
+/// (`finalize`) unchanged.
+fn highlight_clusters(
+    highlighter: &mut crate::syntax::Highlighter,
+    line: &str,
+    ambiguous_wide: bool,
+) -> Vec<Cluster> {
+    let mut out = Vec::new();
+    for (text, tok) in highlighter.highlight_line(line) {
+        let kind = token_span_kind(tok);
+        for g in text.graphemes(true) {
+            out.push(make_cluster(g, kind.clone(), ambiguous_wide));
+        }
+    }
+    out
 }
 
 /// The semantic kind of an inline span in the given block context. Plain text
@@ -1289,12 +1334,25 @@ impl Emitter<'_> {
                 self.blank();
                 block_lines.push(anchor);
             }
-            Block::Code(text) => {
+            Block::Code { text, lang } => {
                 let anchor = self.lines.len();
                 let gutter = "    ";
                 let avail = self.content_width.saturating_sub(4).max(1);
+                // PRD FR-RD-1: highlight only when the language hint resolves
+                // to one the rule-based tokenizer covers; otherwise every line
+                // is a single `SpanKind::Code` run (the prior uniform paint).
+                // The highlighter carries block-comment state across lines, so
+                // it's built once per block, not per line.
+                let mut highlighter = lang
+                    .as_deref()
+                    .and_then(crate::syntax::Lang::detect)
+                    .map(crate::syntax::Highlighter::new);
                 for src in text.lines() {
-                    let chunks = chunk_by_width(clusters_from_str(src, SpanKind::Code, aw), avail);
+                    let line_clusters = match highlighter.as_mut() {
+                        Some(h) => highlight_clusters(h, src, aw),
+                        None => clusters_from_str(src, SpanKind::Code, aw),
+                    };
+                    let chunks = chunk_by_width(line_clusters, avail);
                     if chunks.is_empty() {
                         self.push_line(
                             finalize(
@@ -2662,6 +2720,74 @@ mod tests {
                     .any(|s| matches!(s.kind, SpanKind::ImageRow { .. }))
             })
             .count()
+    }
+
+    /// Collect the distinct `SpanKind` discriminants present across a layout,
+    /// as a helper for the FR-RD-1 highlighting assertions below.
+    fn code_kinds_present(layout: &Layout) -> Vec<SpanKind> {
+        let mut kinds = Vec::new();
+        for line in &layout.lines {
+            for span in &line.spans {
+                let is_code_token = matches!(
+                    span.kind,
+                    SpanKind::Code
+                        | SpanKind::CodeKeyword
+                        | SpanKind::CodeString
+                        | SpanKind::CodeComment
+                        | SpanKind::CodeNumber
+                );
+                if is_code_token && !kinds.contains(&span.kind) {
+                    kinds.push(span.kind.clone());
+                }
+            }
+        }
+        kinds
+    }
+
+    const RUST_CODE_HTML: &str = r#"<html><head><title>Code</title></head><body>
+      <p>Lead.</p>
+      <pre class="mw-highlight mw-highlight-lang-rust"><code>fn main() {
+    let x = "hi"; // greet
+}</code></pre>
+    </body></html>"#;
+
+    /// PRD FR-RD-1: a fenced code block whose language the highlighter covers
+    /// gets multiple distinct token colors — keyword, string, and comment all
+    /// render in different `SpanKind`s (hence different theme slots).
+    #[test]
+    fn highlighted_code_block_has_distinct_token_kinds() {
+        let doc = parse_article_html("Code", RUST_CODE_HTML);
+        let layout = layout_document(&doc, 80, LayoutOptions::default());
+        let kinds = code_kinds_present(&layout);
+        assert!(
+            kinds.contains(&SpanKind::CodeKeyword),
+            "fn/let are keywords: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&SpanKind::CodeString),
+            "\"hi\" is a string: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&SpanKind::CodeComment),
+            "// greet is a comment: {kinds:?}"
+        );
+    }
+
+    /// PRD FR-RD-1's plain fallback: a code block with no/unknown language
+    /// hint stays uniform `SpanKind::Code` — no token classes emitted.
+    #[test]
+    fn unhighlighted_code_block_stays_uniform_code() {
+        let html = r#"<html><head><title>C</title></head><body>
+          <pre>fn main() { let x = "hi"; }</pre>
+        </body></html>"#;
+        let doc = parse_article_html("C", html);
+        let layout = layout_document(&doc, 80, LayoutOptions::default());
+        let kinds = code_kinds_present(&layout);
+        assert_eq!(
+            kinds,
+            vec![SpanKind::Code],
+            "no lang hint -> uniform code: {kinds:?}"
+        );
     }
 
     #[test]

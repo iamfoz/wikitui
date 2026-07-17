@@ -40,20 +40,23 @@ pub const DA1_QUERY: &str = "\x1b[c";
 /// FR-TH-4's live-switching half). Best-effort — ignored outright by any
 /// terminal that doesn't recognize the mode number.
 ///
-/// **Not sent by this build.** Enabling it would make a genuinely
-/// OSC-11-capable terminal push an *unprompted* OSC 11 response later in the
-/// session, on top of the ordinary crossterm key/mouse event stream this
-/// build reads from the same `stdin` — and nothing in this chunk's event
-/// loop consumes such a push (live re-theming mid-session is a documented
-/// scope cut, not wired into `main::run`'s loop, which has no distinct
-/// "raw terminal reply" event type to route it through without a much larger
-/// change to how input is read). Turning the notifications on without
-/// anything to consume them would only add the risk of stray bytes
-/// eventually reaching crossterm's key parser, for zero benefit — so this
-/// constant stays spec-complete and byte-tested (ready to wire once a
-/// consumer exists) exactly like `graphics.rs`'s not-yet-wired kitty/iTerm2
-/// escape emitters, rather than actually issued anywhere.
-#[allow(dead_code)]
+/// **Sent at startup** when the reader is on a color-capable TTY, `NO_COLOR`
+/// is not in force, and auto-theme is active with no explicitly-pinned theme
+/// (`main::should_enable_color_scheme_notifications` gates it; the disable
+/// counterpart below is emitted symmetrically on terminal restore). Once on,
+/// a genuinely OSC-11-capable terminal pushes an *unprompted* OSC 11 response
+/// whenever the OS/terminal flips between light and dark. crossterm has no
+/// event type for such a push — its parser strips the introducer `ESC` and
+/// re-emits the sequence as a burst of ordinary key events (`Alt+]`, then the
+/// body as bare character keys, then `Alt+\`/`Ctrl+g` for the ST/BEL
+/// terminator). `main::intercept_color_scheme_push` reassembles that burst
+/// (only while live auto-theme is on, so an ordinary session's input is
+/// untouched) and swallows it, handing the reconstructed sequence to
+/// `App::apply_color_scheme_notification` — which re-runs the exact
+/// [`classify_luminance`] light/dark decision the startup query already uses
+/// and live-switches the theme. That reassembly is what makes enabling the
+/// mode safe: without it, the `rgb:…` body would reach dispatch as stray
+/// `r`/`g`/… keystrokes.
 pub const ENABLE_COLOR_SCHEME_NOTIFICATIONS: &str = "\x1b[?2031h";
 /// The disabling counterpart, sent unconditionally on terminal restore
 /// (`crashguard::restore_terminal_best_effort`) exactly like

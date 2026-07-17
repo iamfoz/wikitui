@@ -1011,6 +1011,21 @@ impl Chord {
     }
 }
 
+/// PRD FR-CS-3: parse a leader-key spelling — a single visible character
+/// (`","`, `";"`, `"\\"`) or the word `Space`. Returns `None` for anything
+/// that isn't exactly one usable key, so the loader can warn and keep the
+/// default. Multi-character named keys (Enter/Tab/…) are deliberately not
+/// accepted as a leader — a leader must be a plain typed character.
+fn single_leader_char(s: &str) -> Option<char> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("space") {
+        return Some(' ');
+    }
+    let mut it = s.chars();
+    let c = it.next()?;
+    if it.next().is_some() { None } else { Some(c) }
+}
+
 /// A configurable keymap: a `base` table (the built-in preset, mirroring
 /// `handle_key`'s hardcoded arms) plus an `overrides` layer (the emacs
 /// preset's deltas and any user `keymap.toml`). Runtime dispatch reads only
@@ -1019,7 +1034,22 @@ impl Chord {
 pub struct Keymap {
     base: HashMap<KeyContext, HashMap<Chord, Action>>,
     overrides: HashMap<KeyContext, HashMap<Chord, Action>>,
+    /// PRD FR-CS-3's leader key: the single key that opens the leader-prefixed
+    /// binding space (`leader` below). `'\0'` means "no leader" (the `Default`
+    /// derive's value — never produced by a real preset, which all set
+    /// [`DEFAULT_LEADER`]).
+    leader_key: char,
+    /// PRD FR-CS-3: the leader-prefixed bindings — the *second* key (pressed
+    /// after `leader_key`) mapped to its action. A built-in set (see
+    /// [`Keymap::vim`]) that a `keymap.toml` `[leader]` section and the
+    /// `:map`-family commands extend at runtime.
+    leader: HashMap<Chord, Action>,
 }
+
+/// PRD FR-CS-3's default leader key. `,` rather than Space (Space is
+/// `PageDown` in Reading) or any letter already bound there — an otherwise
+/// unbound key, so turning it into a prefix steals nothing.
+pub const DEFAULT_LEADER: char = ',';
 
 impl Keymap {
     fn bind(
@@ -1132,9 +1162,26 @@ impl Keymap {
         Keymap::bind(b, Picker, Chord::key(Enter), Select);
         Keymap::bind(b, Picker, Chord::key(Esc), Close);
 
+        // PRD FR-CS-3 leader space (`,` then a key). A small built-in set of
+        // discoverable shortcuts — every one dispatched through the same
+        // `main::dispatch_action` path a runtime rebinding uses, so a
+        // `keymap.toml` `[leader]` section or `:map`/`:unmap` can add to or
+        // shadow it. Deliberately reuses actions that also have single-key
+        // bindings: the leader is a *namespace*, not a place to hide
+        // otherwise-unreachable actions.
+        let mut leader: HashMap<Chord, Action> = HashMap::new();
+        leader.insert(Chord::ch('t'), Toc);
+        leader.insert(Chord::ch('s'), SaveOffline);
+        leader.insert(Chord::ch('w'), WatchToggle);
+        leader.insert(Chord::ch('r'), Research);
+        leader.insert(Chord::ch('d'), Today);
+        leader.insert(Chord::ch('h'), Home);
+
         Keymap {
             base,
             overrides: HashMap::new(),
+            leader_key: DEFAULT_LEADER,
+            leader,
         }
     }
 
@@ -1166,6 +1213,41 @@ impl Keymap {
     /// Add or replace a binding in the override layer.
     pub fn apply_override(&mut self, ctx: KeyContext, chord: Chord, action: Action) {
         self.overrides.entry(ctx).or_default().insert(chord, action);
+    }
+
+    /// PRD FR-CS-3 (`:unmap`): remove a binding from the override layer,
+    /// returning whether one was actually there. Only the override layer is
+    /// touched — a `:unmap` can undo a `:map`/preset/`keymap.toml` override,
+    /// but never deletes a hardcoded default binding (which lives in `base`
+    /// and `main::handle_key`'s own arms, not here).
+    pub fn remove_override(&mut self, ctx: KeyContext, chord: &Chord) -> bool {
+        self.overrides
+            .get_mut(&ctx)
+            .and_then(|t| t.remove(chord))
+            .is_some()
+    }
+
+    /// PRD FR-CS-3: the active leader key (the prefix that opens the leader
+    /// binding space). `'\0'` when unset (no preset produces that).
+    pub fn leader_key(&self) -> char {
+        self.leader_key
+    }
+
+    /// PRD FR-CS-3: resolve the key pressed *after* the leader to its action.
+    pub fn leader_action(&self, chord: &Chord) -> Option<Action> {
+        self.leader.get(chord).copied()
+    }
+
+    /// PRD FR-CS-3: add or replace a leader binding (a `keymap.toml`
+    /// `[leader]` entry, or `:map ,<key> <action>` at runtime).
+    pub fn set_leader_binding(&mut self, chord: Chord, action: Action) {
+        self.leader.insert(chord, action);
+    }
+
+    /// PRD FR-CS-3: remove a leader binding (`:unmap ,<key>`), returning
+    /// whether one existed.
+    pub fn remove_leader_binding(&mut self, chord: &Chord) -> bool {
+        self.leader.remove(chord).is_some()
     }
 
     /// Resolve a chord to an action: override layer first, then the base
@@ -1248,9 +1330,46 @@ impl Keymap {
             }
         };
         for (section, value) in &table {
+            // PRD FR-CS-3: a top-level `leader-key = ","` sets the leader
+            // prefix key itself (a single character).
+            if section == "leader-key" {
+                match value.as_str().and_then(single_leader_char) {
+                    Some(c) => self.leader_key = c,
+                    None => warnings.push(
+                        "keymap.toml: leader-key must be a single-character string".to_string(),
+                    ),
+                }
+                continue;
+            }
+            // PRD FR-CS-3: the `[leader]` table — `"<key>" = "<command>"`
+            // bindings in the leader-prefixed space (the key pressed *after*
+            // the leader).
+            if section == "leader" {
+                let Some(bindings) = value.as_table() else {
+                    warnings
+                        .push("keymap.toml: [leader] must be a table of key = command".to_string());
+                    continue;
+                };
+                for (key, cmd) in bindings {
+                    let Some(chord) = Chord::parse(key) else {
+                        warnings.push(format!(
+                            "keymap.toml: [leader] {key:?} is not a recognizable key — ignored"
+                        ));
+                        continue;
+                    };
+                    let Some(action) = cmd.as_str().and_then(Action::by_name) else {
+                        warnings.push(format!(
+                            "keymap.toml: [leader] {key} -> unknown command — ignored"
+                        ));
+                        continue;
+                    };
+                    self.set_leader_binding(chord, action);
+                }
+                continue;
+            }
             let Some(ctx) = KeyContext::from_toml_name(section) else {
                 warnings.push(format!(
-                    "keymap.toml: unknown context [{section}] — ignored (try: global, reading, startpage, picker, search)"
+                    "keymap.toml: unknown context [{section}] — ignored (try: global, reading, startpage, picker, search, leader)"
                 ));
                 continue;
             };
@@ -1659,6 +1778,63 @@ mod tests {
         assert_eq!(km.resolve(Reading, &Chord::ch('k')), Some(ScrollBottom));
         // Global override reaches Reading.
         assert_eq!(km.resolve(Reading, &Chord::ctrl_ch('e')), Some(CycleTheme));
+    }
+
+    /// PRD FR-CS-3 leader key: the default is `,`, its built-in bindings
+    /// resolve, and an unbound leader key resolves to `None`.
+    #[test]
+    fn leader_key_defaults_to_comma_with_builtin_bindings() {
+        let km = Keymap::vim();
+        assert_eq!(km.leader_key(), ',');
+        assert_eq!(km.leader_action(&Chord::ch('t')), Some(Action::Toc));
+        assert_eq!(km.leader_action(&Chord::ch('w')), Some(Action::WatchToggle));
+        assert_eq!(km.leader_action(&Chord::ch('X')), None);
+    }
+
+    /// PRD FR-CS-3: a `keymap.toml` `[leader]` table adds/overrides leader
+    /// bindings and `leader-key` sets the prefix key itself.
+    #[test]
+    fn keymap_toml_configures_leader_key_and_bindings() {
+        let mut km = Keymap::vim();
+        let warnings = km.apply_user_toml(
+            r#"
+            leader-key = ";"
+
+            [leader]
+            g = "stats-open"
+            t = "today"
+            "#,
+        );
+        assert!(warnings.is_empty(), "clean leader config: {warnings:?}");
+        assert_eq!(km.leader_key(), ';');
+        // Added binding.
+        assert_eq!(km.leader_action(&Chord::ch('g')), Some(Action::StatsOpen));
+        // Overrode the built-in `,t -> Toc` to `today`.
+        assert_eq!(km.leader_action(&Chord::ch('t')), Some(Action::Today));
+    }
+
+    /// PRD FR-CS-3 (`:map`/`:unmap` substrate): a runtime override is what
+    /// `runtime_action` surfaces, and `remove_override` takes it back out
+    /// without disturbing the base binding.
+    #[test]
+    fn override_add_and_remove_round_trips() {
+        use KeyContext::Reading;
+        let mut km = Keymap::vim();
+        assert_eq!(km.runtime_action(Reading, &Chord::ch('J')), None);
+        km.apply_override(Reading, Chord::ch('J'), Action::ScrollBottom);
+        assert_eq!(
+            km.runtime_action(Reading, &Chord::ch('J')),
+            Some(Action::ScrollBottom)
+        );
+        assert!(km.remove_override(Reading, &Chord::ch('J')));
+        assert_eq!(km.runtime_action(Reading, &Chord::ch('J')), None);
+        // Removing something that was never overridden reports false.
+        assert!(!km.remove_override(Reading, &Chord::ch('J')));
+        // A leader binding round-trips the same way.
+        km.set_leader_binding(Chord::ch('q'), Action::Quit);
+        assert_eq!(km.leader_action(&Chord::ch('q')), Some(Action::Quit));
+        assert!(km.remove_leader_binding(&Chord::ch('q')));
+        assert!(!km.remove_leader_binding(&Chord::ch('q')));
     }
 
     #[test]

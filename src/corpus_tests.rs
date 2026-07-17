@@ -1210,7 +1210,7 @@ mod sanitizer_property {
                         }
                     }
                 }
-                Block::Code(t) => assert_span_clean(t, &format!("{ctx} (code)")),
+                Block::Code { text: t, .. } => assert_span_clean(t, &format!("{ctx} (code)")),
                 Block::Table(table) => {
                     for row in &table.rows {
                         for cell in row {

@@ -422,6 +422,14 @@ pub struct App {
     /// `main::open_offline_result`'s local-only serve instead of
     /// `main::open_title`'s network-first one).
     pub results_offline: bool,
+    /// PRD FR-SR-2 pagination: the `sroffset` for the next page of the current
+    /// online full-text results (`api::SearchOutcome::next_offset`), or `None`
+    /// when the results are complete, offline, or a search hasn't run. Drives
+    /// the results view's "load more" affordance (`main::load_more_results`).
+    pub search_continue: Option<u32>,
+    /// PRD FR-SR-2: whether a "load more" page fetch is in flight, so the
+    /// results footer can say so and a second trigger can't double-fetch.
+    pub loading_more_results: bool,
     /// PRD FR-SR-7's explicit `:search-offline` toggle: when set, `run_search`
     /// skips the API entirely and goes straight to the local index, even
     /// while online — independent of the automatic offline/API-failure
@@ -459,6 +467,10 @@ pub struct App {
     /// indicator (PRD FR-TB-3).
     pub loading: bool,
     pub pending_g: bool,
+    /// PRD FR-CS-3 leader key: armed when the leader (`,` by default) is
+    /// pressed in Reading, resolved by the next key against
+    /// `keymap.leader_action` — the same latch shape as `pending_g`/`pending_z`.
+    pub pending_leader: bool,
     pub theme: Theme,
     /// Set once at startup from the `NO_COLOR` environment variable (PRD
     /// FR-TH-5): when true, every style still applies but with colors
@@ -478,6 +490,23 @@ pub struct App {
     /// `[fallback]` (if any) is what `set_theme` looks up here for
     /// `Theme::adapt`'s precedence-over-computed-quantization rule.
     pub user_themes: Vec<LoadedUserTheme>,
+    /// PRD FR-TH-4 (live switching): true when DEC-2031 color-scheme
+    /// notifications were enabled at startup (`main::run` sets this from
+    /// `should_enable_color_scheme_notifications`), so an unsolicited push may
+    /// re-resolve the theme live. Gates `main::intercept_color_scheme_push` —
+    /// false leaves an ordinary session's key input entirely untouched.
+    pub auto_theme_live: bool,
+    /// PRD FR-TH-4: the `theme_light`/`theme_dark` picks a live color-scheme
+    /// push resolves to, mirroring the same config values the startup OSC 11
+    /// query uses. Meaningful only while `auto_theme_live`.
+    pub auto_theme_light: String,
+    pub auto_theme_dark: String,
+    /// PRD FR-TH-4: in-progress reassembly of a DEC-2031 push that crossterm
+    /// delivered as a mangled key-event burst — `Some` only between the
+    /// `Alt+]` introducer and the sequence terminator (see
+    /// `main::intercept_color_scheme_push`). Never persisted; as transient as
+    /// any other latch.
+    pub color_scheme_capture: Option<String>,
     /// PRD FR-ACS-6 (`ACCESSIBLE=1`): drives the layout's collapse-to-list
     /// table path (and could gate further linear-leaning behavior). Set once
     /// at startup from the `ACCESSIBLE` environment variable; part of
@@ -1553,6 +1582,8 @@ impl App {
             search_rewritten_query: None,
             offline_fallback_count: 0,
             results_offline: false,
+            search_continue: None,
+            loading_more_results: false,
             force_offline_search: false,
             search_operator_help: false,
             should_quit: false,
@@ -1567,6 +1598,7 @@ impl App {
             selected_wiki_pick: 0,
             loading: false,
             pending_g: false,
+            pending_leader: false,
             theme,
             no_color,
             // Truecolor is the identity mapping (`Theme::adapt` is a no-op
@@ -1576,6 +1608,13 @@ impl App {
             // first paint, same as `measure`/`mouse_enabled` below.
             color_depth: ColorDepth::Truecolor,
             user_themes: Vec::new(),
+            // FR-TH-4 live switching stays off until `main::run` opts in (an
+            // explicit theme or a non-TTY session never enables it), so an
+            // ordinary `App::new` test sees no color-scheme interception.
+            auto_theme_live: false,
+            auto_theme_light: "paper".to_string(),
+            auto_theme_dark: "full".to_string(),
+            color_scheme_capture: None,
             accessible: false,
             mouse_enabled: false,
             no_motion: false,
@@ -2480,6 +2519,25 @@ impl App {
                 true
             }
         }
+    }
+
+    /// PRD FR-SR-2 pagination: append the next page of full-text results and
+    /// advance the continuation. De-duplicates by title (a search index can
+    /// return a row that overlaps a page boundary), so "load more" never shows
+    /// the same article twice. Returns how many genuinely new rows landed.
+    pub fn append_search_results(
+        &mut self,
+        more: Vec<SearchResult>,
+        next_offset: Option<u32>,
+    ) -> usize {
+        let before = self.results.len();
+        for r in more {
+            if !self.results.iter().any(|e| e.title == r.title) {
+                self.results.push(r);
+            }
+        }
+        self.search_continue = next_offset;
+        self.results.len() - before
     }
 
     /// Closes the Related panel, restoring the prior mode.
@@ -3673,12 +3731,19 @@ impl App {
     /// already-adapted colors on `self.theme`.
     pub fn set_theme(&mut self, theme: Theme) {
         let before = self.images_enabled();
-        let fallback = self
+        // PRD FR-TH-3 / Appendix C: a same-named user theme's own declared
+        // `[fallback]` wins (it deliberately shadows a built-in name); absent
+        // that, a built-in theme carries its own declared 256-/16-color
+        // approximations (`theme::builtin_fallback`) rather than falling back
+        // to generic quantization. `None` for a user theme without a
+        // `[fallback]` section and for any name with no built-in declaration.
+        let user_fallback = self
             .user_themes
             .iter()
             .find(|t| t.name == theme.name)
-            .map(|t| &t.fallback);
-        self.theme = theme.adapt(self.color_depth, fallback);
+            .map(|t| t.fallback.clone());
+        let fallback = user_fallback.or_else(|| crate::theme::builtin_fallback(theme.name));
+        self.theme = theme.adapt(self.color_depth, fallback.as_ref());
         if self.images_enabled() != before {
             self.note_image_state_change();
         }
@@ -3695,6 +3760,35 @@ impl App {
     pub fn cycle_theme(&mut self) {
         self.set_theme(self.theme.next());
         self.status = format!("Theme: {}", self.theme.name);
+    }
+
+    /// PRD FR-TH-4 (live switching): apply an unsolicited DEC-2031 /
+    /// color-scheme push. `raw` is the reconstructed OSC 11 sequence
+    /// (`main::intercept_color_scheme_push` rebuilds it from crossterm's
+    /// mangled key burst). Reuses the exact same parse + luminance
+    /// classification the startup query does (`autotheme`), then live-switches
+    /// to the configured `theme_light`/`theme_dark`. Returns the classified
+    /// [`autotheme::BgMode`] when the push parsed, `None` on a malformed one
+    /// (which — per FR-TH-4's "malformed -> no-switch" — changes nothing).
+    pub fn apply_color_scheme_notification(
+        &mut self,
+        raw: &str,
+    ) -> Option<crate::autotheme::BgMode> {
+        let rgb = crate::autotheme::parse_osc11_response(raw)?;
+        let mode = crate::autotheme::classify_luminance(rgb);
+        let name = match mode {
+            crate::autotheme::BgMode::Light => self.auto_theme_light.clone(),
+            crate::autotheme::BgMode::Dark => self.auto_theme_dark.clone(),
+        };
+        // resolve_named borrows `user_themes` immutably and returns an owned
+        // `Theme` (Copy), so the borrow is released before `set_theme`'s
+        // `&mut self`.
+        if let Some(theme) = crate::theme::resolve_named(&name, &self.user_themes) {
+            let picked = theme.name;
+            self.set_theme(theme);
+            self.notice = Some(format!("Auto theme: {picked}"));
+        }
+        Some(mode)
     }
 
     /// Install a decoded (or failed) inline image delivered by the async
@@ -6703,7 +6797,7 @@ fn block_text(block: &crate::doc::Block) -> String {
             spans_text(spans)
         }
         Block::ListItem { spans, .. } => spans_text(spans),
-        Block::Code(text) => text.clone(),
+        Block::Code { text, .. } => text.clone(),
         Block::Table(table) => table.to_list_lines().join(" "),
         Block::Infobox(rows) => rows
             .iter()
@@ -6930,6 +7024,42 @@ mod tests {
         app.image_store.set_ready("u".to_string(), tiny_image());
         let map = app.image_box_map();
         assert!(map.contains_key("u"), "decoded image reserves a box");
+    }
+
+    /// PRD FR-TH-4: a simulated DEC-2031 push re-runs the light/dark
+    /// classification and live-switches to the configured pick — a dark
+    /// background resolves to `theme_dark`, a light one to `theme_light`.
+    #[test]
+    fn color_scheme_push_live_switches_theme_by_luminance() {
+        let mut app = App::new("en".to_string(), Theme::paper(), false);
+        app.auto_theme_live = true;
+        app.auto_theme_light = "paper".to_string();
+        app.auto_theme_dark = "full".to_string();
+
+        // A near-black background push -> dark -> theme_dark ("full").
+        let mode = app.apply_color_scheme_notification("\x1b]11;rgb:1010/1414/1818\x1b\\");
+        assert_eq!(mode, Some(crate::autotheme::BgMode::Dark));
+        assert_eq!(app.theme.name, "full");
+
+        // A near-white background push -> light -> theme_light ("paper").
+        let mode = app.apply_color_scheme_notification("\x1b]11;rgb:f5f5/f0f0/e1e1\x07");
+        assert_eq!(mode, Some(crate::autotheme::BgMode::Light));
+        assert_eq!(app.theme.name, "paper");
+    }
+
+    /// FR-TH-4's "malformed -> no-switch": a push that doesn't parse leaves
+    /// the active theme exactly as it was.
+    #[test]
+    fn malformed_color_scheme_push_changes_nothing() {
+        let mut app = App::new("en".to_string(), Theme::full(), false);
+        app.auto_theme_live = true;
+        app.auto_theme_dark = "night".to_string();
+        let before = app.theme.name;
+        assert_eq!(
+            app.apply_color_scheme_notification("\x1b]11;rgb:garbage"),
+            None
+        );
+        assert_eq!(app.theme.name, before, "malformed push must not switch");
     }
 
     #[test]
@@ -7193,6 +7323,31 @@ mod tests {
             wordcount: None,
             timestamp: None,
         }
+    }
+
+    /// PRD FR-SR-2: appending the next page grows the results, advances the
+    /// continuation, and de-duplicates a title that overlaps the page
+    /// boundary (so "load more" never shows the same row twice).
+    #[test]
+    fn append_search_results_grows_dedups_and_advances_continuation() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.results = vec![related_result("A", "1"), related_result("B", "2")];
+        app.search_continue = Some(20);
+
+        // Page two carries a fresh row plus a duplicate of "B".
+        let added = app.append_search_results(
+            vec![related_result("B", "2"), related_result("C", "3")],
+            Some(40),
+        );
+        assert_eq!(added, 1, "only the genuinely new row counts");
+        let titles: Vec<&str> = app.results.iter().map(|r| r.title.as_str()).collect();
+        assert_eq!(titles, vec!["A", "B", "C"], "duplicate B not re-added");
+        assert_eq!(app.search_continue, Some(40), "continuation advanced");
+
+        // The final page reports no continuation -> the affordance goes away.
+        app.append_search_results(vec![related_result("D", "4")], None);
+        assert_eq!(app.search_continue, None);
+        assert_eq!(app.results.len(), 4);
     }
 
     #[test]

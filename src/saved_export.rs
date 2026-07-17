@@ -168,8 +168,14 @@ fn render_md(doc: &Document, lang: &str) -> String {
             Block::Blockquote(spans) => {
                 out.push_str(&format!("> {}\n\n", spans_to_md(spans, lang)));
             }
-            Block::Code(text) => {
-                out.push_str("```\n");
+            Block::Code { text, lang } => {
+                // Round-trip the FR-RD-1 language hint into the fence info
+                // string so an exported Markdown file re-highlights elsewhere.
+                out.push_str("```");
+                if let Some(lang) = lang {
+                    out.push_str(lang);
+                }
+                out.push('\n');
                 out.push_str(text);
                 if !text.ends_with('\n') {
                     out.push('\n');
@@ -312,8 +318,17 @@ fn render_html(
                     spans_to_html(spans, lang)
                 ));
             }
-            Block::Code(text) => {
-                out.push_str(&format!("<pre><code>{}</code></pre>\n", escape_html(text)));
+            Block::Code { text, lang } => {
+                // Re-emit the FR-RD-1 language hint as the CommonMark
+                // `language-<X>` class the parser reads back on import.
+                let class = lang
+                    .as_deref()
+                    .map(|l| format!(" class=\"language-{}\"", escape_html(l)))
+                    .unwrap_or_default();
+                out.push_str(&format!(
+                    "<pre><code{class}>{}</code></pre>\n",
+                    escape_html(text)
+                ));
             }
             Block::Rule => out.push_str("<hr>\n"),
             Block::Table(table) => {

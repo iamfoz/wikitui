@@ -112,7 +112,20 @@ pub enum Block {
         spans: Vec<Span>,
     },
     Blockquote(Vec<Span>),
-    Code(String),
+    /// A preformatted code block (PRD FR-RD-1). `lang` is the syntax-
+    /// highlighting language hint parsed from the Parsoid/MediaWiki markup —
+    /// a `<pre>`/`<code>` `class="… lang-X"`, `mw-highlight-lang-X`, or
+    /// `language-X` (`doc::code_lang_from_class`). `None` when no hint was
+    /// present or it named a language the rule-based highlighter
+    /// (`syntax::Lang`) doesn't cover, in which case `layout.rs` paints the
+    /// block uniformly in `theme.code`. The `text` is the plain, already-
+    /// sanitized source; highlighting is applied at layout time only, so
+    /// `--dump`/`render_plain` and every other model consumer see the exact
+    /// source string.
+    Code {
+        text: String,
+        lang: Option<String>,
+    },
     Rule,
     /// A parsed table (PRD FR-RD-4): a rectangular grid of cells with
     /// rowspan/colspan already resolved by expansion (see [`Table`]). The
@@ -1217,7 +1230,7 @@ pub fn word_count(doc: &Document) -> u32 {
             | Block::Blockquote(spans) => total += count_words_in_spans(spans),
             Block::Table(_)
             | Block::Infobox(_)
-            | Block::Code(_)
+            | Block::Code { .. }
             | Block::Image { .. }
             | Block::Gallery(_)
             | Block::Rule
@@ -1700,6 +1713,76 @@ fn parse_table(node: NodeRef<Node>) -> Table {
     Table { rows, truncated }
 }
 
+/// The largest `data-mw` attribute [`is_infobox_template`] will parse. The
+/// attribute is JSON in an HTML attribute (a template's whole parameter set
+/// can be sizable), so it's size-capped before `serde_json` ever sees it —
+/// a pathological megabyte of transclusion metadata is not worth parsing to
+/// answer a yes/no question, and the class fallback still applies to it.
+const MAX_DATA_MW_BYTES: usize = 256 * 1024;
+
+/// PRD FR-RD-5: does this element's `data-mw` transclusion metadata name an
+/// `Infobox`-family template? Parsoid records every template that produced an
+/// element in `data-mw` as `{"parts":[{"template":{"target":{"wt":"Infobox
+/// person","href":"./Template:Infobox_person"}, …}}, …]}`. Parsed defensively
+/// (size-capped above; any parse failure or unexpected shape is a plain
+/// `false`, never a panic — the attribute is untrusted remote input): the
+/// template name is checked, case-insensitively, for `infobox` in either the
+/// human `wt` form or the `href` link form.
+fn is_infobox_template(data_mw: &str) -> bool {
+    if data_mw.len() > MAX_DATA_MW_BYTES {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(data_mw) else {
+        return false;
+    };
+    let Some(parts) = value.get("parts").and_then(|p| p.as_array()) else {
+        return false;
+    };
+    for part in parts {
+        let Some(target) = part.get("template").and_then(|t| t.get("target")) else {
+            continue;
+        };
+        for key in ["wt", "href"] {
+            if let Some(name) = target.get(key).and_then(|v| v.as_str())
+                && name.to_ascii_lowercase().contains("infobox")
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The display text of one infobox cell. PRD FR-RD-5 review note: plain
+/// [`text_content`] drops images, so an image-only value (a portrait, a flag,
+/// a logo) would silently empty. Append each image's `alt` in brackets so the
+/// value keeps its accessibility text — the same `[alt]` shape a standalone
+/// [`Block::Image`] placeholder uses (`layout::emit_image`), and sanitized
+/// downstream with every other infobox string.
+fn infobox_cell_text(cell: NodeRef<Node>) -> String {
+    let mut text = normalize_ws(&text_content(cell));
+    let mut alts = Vec::new();
+    for d in cell.descendants() {
+        if let Node::Element(el) = d.value()
+            && el.name() == "img"
+        {
+            let alt = el.attr("alt").unwrap_or("").trim();
+            if !alt.is_empty() {
+                alts.push(format!("[{alt}]"));
+            }
+        }
+    }
+    if !alts.is_empty() {
+        let joined = alts.join(" ");
+        text = if text.is_empty() {
+            joined
+        } else {
+            format!("{text} {joined}")
+        };
+    }
+    text
+}
+
 fn collapse_infobox(node: NodeRef<Node>) -> Vec<(String, String)> {
     let mut rows = Vec::new();
     let mut trs = Vec::new();
@@ -1710,7 +1793,7 @@ fn collapse_infobox(node: NodeRef<Node>) -> Vec<(String, String)> {
             if let Node::Element(el) = cell.value()
                 && (el.name() == "th" || el.name() == "td")
             {
-                let text = normalize_ws(&text_content(cell));
+                let text = infobox_cell_text(cell);
                 if !text.is_empty() {
                     cells.push(text);
                 }
@@ -1832,6 +1915,50 @@ fn find_gallery_caption(node: NodeRef<Node>, depth: usize) -> Option<String> {
     None
 }
 
+/// PRD FR-RD-1: the syntax-highlighting language hint carried on a code
+/// block's markup. MediaWiki's SyntaxHighlight extension (Pygments) tags the
+/// `<pre>` `class` with `mw-highlight-lang-<X>`; Parsoid/CommonMark fenced
+/// code tags the inner `<code>` with `language-<X>`; some renderers use a
+/// bare `lang-<X>`. This scans the space-separated `class` tokens for any of
+/// those and returns the raw `<X>` (lower-cased, unresolved — `syntax::Lang`
+/// decides at layout time whether it recognizes the name). `None` when no
+/// token matches.
+fn code_lang_from_class(class: &str) -> Option<String> {
+    for token in class.split_whitespace() {
+        for prefix in ["mw-highlight-lang-", "language-", "lang-", "source-"] {
+            if let Some(rest) = token.strip_prefix(prefix)
+                && !rest.is_empty()
+            {
+                return Some(rest.to_ascii_lowercase());
+            }
+        }
+    }
+    None
+}
+
+/// PRD FR-RD-1: find a code block's language hint. Checks the `<pre>`'s own
+/// `class` first (MediaWiki's `mw-highlight-lang-*`), then the first
+/// descendant `<code>`'s `class` (Parsoid/CommonMark's `language-*`) — the
+/// two places the hint lands in practice. Bounded to a shallow descendant
+/// walk so a pathological tree can't make this quadratic.
+fn detect_code_lang(pre: &scraper::node::Element, node: NodeRef<Node>) -> Option<String> {
+    if let Some(class) = pre.attr("class")
+        && let Some(lang) = code_lang_from_class(class)
+    {
+        return Some(lang);
+    }
+    for descendant in node.descendants() {
+        if let Node::Element(el) = descendant.value()
+            && el.name() == "code"
+            && let Some(class) = el.attr("class")
+            && let Some(lang) = code_lang_from_class(class)
+        {
+            return Some(lang);
+        }
+    }
+    None
+}
+
 /// Parse a `<ul class="gallery">` into its items (PRD FR-RD-8). Each `<li>`
 /// (`.gallerybox`) yields a [`GalleryItem`] with its thumbnail src and a
 /// caption (its `.gallerytext`, else the image alt). Boxes with neither an
@@ -1939,15 +2066,19 @@ fn walk_blocks(node: NodeRef<Node>, blocks: &mut Vec<Block>, list_depth: u8, dep
             "pre" => {
                 let text = text_content(child);
                 if !text.trim().is_empty() {
-                    blocks.push(Block::Code(text));
+                    let lang = detect_code_lang(el, child);
+                    blocks.push(Block::Code { text, lang });
                 }
             }
             "hr" => blocks.push(Block::Rule),
             "table" => {
-                let is_infobox = el
-                    .attr("class")
-                    .map(|c| c.contains("infobox"))
-                    .unwrap_or(false);
+                // PRD FR-RD-5: the CSS `class="infobox"` is a fallback signal;
+                // the PRD's *primary* one is Parsoid's `data-mw` template
+                // metadata — an infobox whose rendered table doesn't carry the
+                // class still transcludes an `Infobox`-family template, and
+                // that name lands in `data-mw` (see `is_infobox_template`).
+                let is_infobox = el.attr("class").is_some_and(|c| c.contains("infobox"))
+                    || el.attr("data-mw").is_some_and(is_infobox_template);
                 if is_infobox {
                     let rows = collapse_infobox(child);
                     if !rows.is_empty() {
@@ -2371,7 +2502,7 @@ fn sanitize_document(doc: &mut Document) {
             | Block::Paragraph(spans)
             | Block::ListItem { spans, .. }
             | Block::Blockquote(spans) => sanitize_spans(spans),
-            Block::Code(text) => {
+            Block::Code { text, .. } => {
                 *text = sanitize::sanitize_and_cap_multiline(text, sanitize::MAX_SPAN_CHARS);
             }
             Block::Table(table) => {
@@ -2589,7 +2720,7 @@ pub fn render_plain(doc: &Document, lang: &str) -> String {
             Block::Blockquote(spans) => {
                 out.push_str(&format!("> {}\n\n", flatten(spans)));
             }
-            Block::Code(text) => {
+            Block::Code { text, .. } => {
                 for line in text.lines() {
                     out.push_str("    ");
                     out.push_str(line);
@@ -2649,6 +2780,136 @@ pub fn render_plain(doc: &Document, lang: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PRD FR-RD-1: the language-hint scanner recognizes each of the class
+    /// spellings MediaWiki/Parsoid emit, and rejects unrelated tokens.
+    #[test]
+    fn code_lang_class_scanner_reads_every_spelling() {
+        assert_eq!(
+            code_lang_from_class("mw-highlight mw-highlight-lang-python mw-content-ltr"),
+            Some("python".to_string())
+        );
+        assert_eq!(
+            code_lang_from_class("language-rust"),
+            Some("rust".to_string())
+        );
+        assert_eq!(code_lang_from_class("lang-C"), Some("c".to_string()));
+        assert_eq!(code_lang_from_class("prettyprint"), None);
+        assert_eq!(code_lang_from_class(""), None);
+    }
+
+    /// PRD FR-RD-1: a `<pre class="mw-highlight …">` (MediaWiki's
+    /// SyntaxHighlight) and a `<pre><code class="language-…">` (Parsoid
+    /// fenced code) both surface their language on the parsed `Block::Code`;
+    /// an ordinary `<pre>` carries `None`.
+    #[test]
+    fn parses_code_block_language_hint_from_markup() {
+        let lang_of = |html: &str| -> Option<String> {
+            parse_article_html("X", html)
+                .blocks
+                .into_iter()
+                .find_map(|b| match b {
+                    Block::Code { lang, .. } => Some(lang),
+                    _ => None,
+                })
+                .flatten()
+        };
+        assert_eq!(
+            lang_of(
+                r#"<html><body><pre class="mw-highlight mw-highlight-lang-python">print(1)</pre></body></html>"#
+            ),
+            Some("python".to_string())
+        );
+        assert_eq!(
+            lang_of(
+                r#"<html><body><pre><code class="language-rust">fn main() {}</code></pre></body></html>"#
+            ),
+            Some("rust".to_string())
+        );
+        assert_eq!(
+            lang_of(r#"<html><body><pre>plain text</pre></body></html>"#),
+            None
+        );
+    }
+
+    /// PRD FR-RD-5: an infobox transcluded via an `Infobox`-family template is
+    /// detected from its `data-mw` metadata even when the rendered `<table>`
+    /// carries no `class="infobox"`.
+    #[test]
+    fn infobox_detected_from_data_mw_without_the_class() {
+        let data_mw = r#"{"parts":[{"template":{"target":{"wt":"Infobox scientist","href":"./Template:Infobox_scientist"},"params":{},"i":0}}]}"#;
+        let html = format!(
+            r#"<html><body><table typeof="mw:Transclusion" data-mw='{data_mw}'><tbody>
+                 <tr><th colspan="2">Ada Lovelace</th></tr>
+                 <tr><th>Born</th><td>1815</td></tr>
+               </tbody></table></body></html>"#
+        );
+        let doc = parse_article_html("X", &html);
+        assert!(
+            doc.blocks.iter().any(|b| matches!(b, Block::Infobox(_))),
+            "data-mw Infobox template must be detected: {:?}",
+            doc.blocks
+        );
+        assert!(
+            !doc.blocks.iter().any(|b| matches!(b, Block::Table(_))),
+            "must not also fall through to a plain Table"
+        );
+    }
+
+    /// PRD FR-RD-5: the CSS `class="infobox"` fallback still detects an
+    /// infobox that carries no `data-mw` at all.
+    #[test]
+    fn infobox_class_fallback_still_works() {
+        let html = r#"<html><body><table class="infobox vcard"><tbody>
+             <tr><th colspan="2">Subject</th></tr>
+             <tr><th>Field</th><td>Logic</td></tr>
+           </tbody></table></body></html>"#;
+        let doc = parse_article_html("X", html);
+        assert!(doc.blocks.iter().any(|b| matches!(b, Block::Infobox(_))));
+    }
+
+    /// A `data-mw` naming an ordinary (non-infobox) template does not turn a
+    /// data table into an infobox, and malformed/oversized JSON is rejected
+    /// defensively (no panic, treated as "not an infobox").
+    #[test]
+    fn non_infobox_data_mw_and_garbage_are_not_infoboxes() {
+        assert!(!is_infobox_template(
+            r#"{"parts":[{"template":{"target":{"wt":"Citation needed"}}}]}"#
+        ));
+        assert!(!is_infobox_template("not json at all"));
+        assert!(!is_infobox_template("{}"));
+        assert!(!is_infobox_template(&"x".repeat(MAX_DATA_MW_BYTES + 1)));
+        // The human `wt` form and the `href` link form both match.
+        assert!(is_infobox_template(
+            r#"{"parts":[{"template":{"target":{"wt":"Infobox person"}}}]}"#
+        ));
+        assert!(is_infobox_template(
+            r#"{"parts":["\n",{"template":{"target":{"href":"./Template:Infobox_settlement"}}}]}"#
+        ));
+    }
+
+    /// PRD FR-RD-5 review note: an image-only infobox value keeps its alt text
+    /// instead of vanishing (plain `text_content` would drop the `<img>`).
+    #[test]
+    fn infobox_value_preserves_image_alt_text() {
+        let html = r#"<html><body><table class="infobox"><tbody>
+             <tr><th colspan="2">Person</th></tr>
+             <tr><th>Photo</th><td><img src="https://ex.org/p.png" alt="A portrait"/></td></tr>
+           </tbody></table></body></html>"#;
+        let doc = parse_article_html("X", html);
+        let rows = doc
+            .blocks
+            .iter()
+            .find_map(|b| match b {
+                Block::Infobox(rows) => Some(rows),
+                _ => None,
+            })
+            .expect("infobox parsed");
+        assert!(
+            rows.iter().any(|(_, v)| v.contains("A portrait")),
+            "image alt must survive into the value: {rows:?}"
+        );
+    }
 
     /// A hand-written approximation of Parsoid HTML for a small article,
     /// covering the structures the parser needs to handle: headings,
@@ -3405,7 +3666,7 @@ mod tests {
             .blocks
             .iter()
             .find_map(|b| match b {
-                Block::Code(text) => Some(text),
+                Block::Code { text, .. } => Some(text),
                 _ => None,
             })
             .expect("code block present");
@@ -3938,7 +4199,7 @@ mod tests {
         assert!(
             doc.blocks
                 .iter()
-                .any(|b| matches!(b, Block::Infobox(_) | Block::Table(_) | Block::Code(_))),
+                .any(|b| matches!(b, Block::Infobox(_) | Block::Table(_) | Block::Code { .. })),
             "fixture must actually produce the excluded block kinds"
         );
         assert_eq!(
@@ -4124,7 +4385,9 @@ mod tests {
                         }
                     }
                 }
-                Block::Code(text) => assert_terminal_safe(text, &format!("{context} (code)")),
+                Block::Code { text, .. } => {
+                    assert_terminal_safe(text, &format!("{context} (code)"))
+                }
                 Block::Table(table) => {
                     for cell in table.rows.iter().flatten() {
                         assert_terminal_safe(&cell.text, &format!("{context} (table cell)"));

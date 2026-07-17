@@ -74,7 +74,7 @@ pub fn paragraphs_from(doc: &Document, from_block: usize) -> Vec<String> {
                 | Block::Paragraph(spans)
                 | Block::ListItem { spans, .. }
                 | Block::Blockquote(spans) => flatten_for_speech(spans),
-                Block::Code(text) => text.clone(),
+                Block::Code { text, .. } => text.clone(),
                 Block::Rule
                 | Block::Table(_)
                 | Block::Infobox(_)
