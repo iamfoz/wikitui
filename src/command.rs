@@ -547,6 +547,87 @@ fn validate_set_value(
 
 pub const USAGE: &str = "commands: open <title>, lang [<code>], theme <name>, style <name>, library, research, toc, export [style], tab close|new [title], tabs, bookmarks [export md|html|json|netscape [path]], readlater, history [clear today|all], save [t0|t1|t2|tag <t>|category <c>|tabs|export md|txt|html [path]], saved, fetch-queue, zim [open <path>|close|<title>], prefetch-log, interests, not-interested, stats, start, today, random [good], related, talk, info, set theme=<name>|images=on|off|prefetch=on|off|show-cn=on|off|measure=N|ambiguous_width=1|2|reading_wpm=N|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N|justify=on|off|hyphenate=on|off, set-tab measure=N|images=on|off|ambiguous_width=1|2|text_align=center|left|margin=N|paragraph_spacing=N|line_spacing=N|word_spacing=N|justify=on|off|hyphenate=on|off (or set-tab key= to reset), config reload, vsplit, only, bilingual, wiki [<name>], set scrollbind, set show-cn, watchlist, notifications, contribs [username], prefs, enable-editing, edit [summary], sync, mirror-watchlist, search-offline, trail [all|days N|export md|dot|mermaid [path]], mksession <name>, session <name>, sessions, tts [stop], speak [stop], run <macro>, game [daily|share|<start> <goal>], xyzzy, noredirect, report-page, help, quit";
 
+/// PRD FR-CS-2's Tab-completion vocabulary: every top-level command word
+/// `parse_with_user_themes` recognizes before its first argument/subcommand,
+/// in the same order `USAGE` lists them. Kept as an explicit list rather
+/// than derived from `USAGE` at runtime — that string is prose for a human
+/// to read, not a grammar to parse — but a test below cross-checks the two
+/// so they can't silently drift apart as commands are added.
+pub const COMMAND_NAMES: &[&str] = &[
+    "open",
+    "lang",
+    "theme",
+    "style",
+    "library",
+    "research",
+    "toc",
+    "export",
+    "tab",
+    "tabs",
+    "bookmarks",
+    "readlater",
+    "history",
+    "save",
+    "saved",
+    "fetch-queue",
+    "zim",
+    "prefetch-log",
+    "interests",
+    "not-interested",
+    "stats",
+    "start",
+    "today",
+    "random",
+    "related",
+    "talk",
+    "info",
+    "set",
+    "set-tab",
+    "config",
+    "vsplit",
+    "only",
+    "bilingual",
+    "wiki",
+    "watchlist",
+    "notifications",
+    "contribs",
+    "prefs",
+    "enable-editing",
+    "edit",
+    "sync",
+    "mirror-watchlist",
+    "search-offline",
+    "trail",
+    "mksession",
+    "session",
+    "sessions",
+    "tts",
+    "speak",
+    "run",
+    "game",
+    "xyzzy",
+    "noredirect",
+    "report-page",
+    "help",
+    "quit",
+];
+
+/// Tab-completion candidates for a partially typed command NAME (PRD
+/// FR-CS-2) — every [`COMMAND_NAMES`] entry that starts with `partial`,
+/// in table order (so ties resolve the same way every time, not by hash
+/// order). Empty when `partial` is itself empty: completion narrows an
+/// already-started word, it doesn't invent a first guess from nothing.
+pub fn complete_command_name(partial: &str) -> Vec<&'static str> {
+    if partial.is_empty() {
+        return Vec::new();
+    }
+    COMMAND_NAMES
+        .iter()
+        .filter(|name| name.starts_with(partial))
+        .copied()
+        .collect()
+}
+
 /// Parses one `:` command line. `user_theme_names` are accepted alongside
 /// the six built-ins for `:theme <name>` and `:set theme=<name>` (PRD
 /// FR-TH-1's "a user theme's name joins `Theme::NAMES`-equivalent
@@ -1100,6 +1181,44 @@ mod tests {
     /// `..._with_user_themes` tests further down cover the non-empty case.
     fn parse(input: &str) -> Result<Command, String> {
         parse_with_user_themes(input, &[])
+    }
+
+    // ---- PRD FR-CS-2 Tab-completion ---------------------------------------
+
+    /// `COMMAND_NAMES` is a hand-written parallel to `USAGE` (see its own
+    /// doc comment for why it isn't derived from that prose string at
+    /// runtime) — this is the guardrail against the two silently drifting
+    /// apart as commands are added to one and not the other.
+    #[test]
+    fn command_names_covers_every_first_word_usage_documents() {
+        let body = USAGE
+            .strip_prefix("commands: ")
+            .expect("USAGE's own prefix");
+        for segment in body.split(", ") {
+            let word = segment
+                .split_whitespace()
+                .next()
+                .expect("no empty segment in USAGE");
+            assert!(
+                COMMAND_NAMES.contains(&word),
+                "USAGE mentions {word:?} but COMMAND_NAMES doesn't list it"
+            );
+        }
+    }
+
+    #[test]
+    fn complete_command_name_prefix_matches_and_is_empty_for_an_empty_partial() {
+        let matches = complete_command_name("hi");
+        assert_eq!(matches, vec!["history"]);
+
+        let matches = complete_command_name("s");
+        assert!(matches.contains(&"style"));
+        assert!(matches.contains(&"saved"));
+        assert!(matches.contains(&"set"));
+        assert!(!matches.contains(&"open"));
+
+        assert!(complete_command_name("").is_empty());
+        assert!(complete_command_name("nonexistent-command").is_empty());
     }
 
     #[test]

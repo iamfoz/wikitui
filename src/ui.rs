@@ -196,11 +196,20 @@ fn kind_style(
             if Some(*occ) == focused_link {
                 colored_bg(no_color, theme.focus_fg, theme.focus_bg).add_modifier(Modifier::BOLD)
             } else {
-                let is_visited = links
-                    .get(*occ)
+                let link_ref = links.get(*occ);
+                // PRD FR-RD-2: internal vs. external is exactly
+                // `internal_title`'s own split (`doc::internal_title_from_href`
+                // resolves it only for a `./`/`/wiki/` href, never an
+                // `http(s)://` one) — the same signal `K`'s footnote-vs-preview
+                // routing and `y`'s whole-URL yank already rely on, so this
+                // never needs a second href-prefix check that could disagree.
+                let is_external = link_ref.is_some_and(|l| l.internal_title.is_none());
+                let is_visited = link_ref
                     .and_then(|l| l.internal_title.as_deref())
                     .is_some_and(|title| visited.contains(title));
-                let color = if is_visited {
+                let color = if is_external {
+                    theme.link_external
+                } else if is_visited {
                     theme.link_visited
                 } else {
                     theme.link
@@ -527,9 +536,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         | Mode::Find
         | Mode::Command
         | Mode::Hint
-        | Mode::Login => draw_reading(frame, app, content_area),
+        | Mode::Login
+        // PRD FR-NV-10: the visual-selection highlight paints inside
+        // `draw_reading` itself (see its own doc comment) — same "overlay
+        // the reading view" treatment as `Mode::Hint` above.
+        | Mode::Visual => draw_reading(frame, app, content_area),
         Mode::Results => draw_results(frame, app, content_area),
         Mode::Toc => draw_toc(frame, app, content_area),
+        Mode::SectionJump => draw_section_jump(frame, app, content_area),
         Mode::Research => draw_research(frame, app, content_area),
         Mode::Library => draw_library(frame, app, content_area),
         Mode::TabPicker => draw_tab_picker(frame, app, content_area),
@@ -931,6 +945,25 @@ fn draw_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+/// PRD FR-NV-10's visual-selection highlight: patches `style` onto every
+/// line in `[start, end]` (inclusive) — a background patched onto the
+/// line's own `Line::style` rather than overwriting each span's style,
+/// which leaves the existing per-span foreground coloring (link colors,
+/// headings, ...) untouched underneath it. A standalone function (not
+/// inlined in `draw_reading`) so the highlight itself is testable directly
+/// against a `Text`, without a `Frame`/`TestBackend`.
+fn highlight_selected_lines(text: &mut Text, start: usize, end: usize, style: Style) {
+    for line in text
+        .lines
+        .iter_mut()
+        .enumerate()
+        .filter(|(i, _)| *i >= start && *i <= end)
+        .map(|(_, l)| l)
+    {
+        line.style = line.style.patch(style);
+    }
+}
+
 fn draw_reading(frame: &mut Frame, app: &mut App, area: Rect) {
     // PRD FR-TB-4 / FR-ML-3: a split renders two panes side by side instead of
     // the single reading column. Additive — every mode that draws the reading
@@ -993,7 +1026,7 @@ fn draw_reading(frame: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 std::borrow::Cow::Borrowed(layout.lines.as_slice())
             };
-            let text = paint_document(
+            let mut text = paint_document(
                 &lines,
                 tab.focused_link,
                 &tab.links,
@@ -1006,6 +1039,13 @@ fn draw_reading(frame: &mut Frame, app: &mut App, area: Rect) {
                 tab.find_index,
                 &app.image_store,
             );
+            // PRD FR-NV-10: the visual-selection highlight.
+            if app.mode == Mode::Visual {
+                let (start, end) = app.visual_selected_range();
+                let highlight =
+                    colored_bg(app.no_color, app.theme.selected_fg, app.theme.selected_bg);
+                highlight_selected_lines(&mut text, start, end, highlight);
+            }
             let paragraph = Paragraph::new(text)
                 .style(base_style(&app.theme, app.no_color))
                 .scroll((scroll, 0));
@@ -1548,6 +1588,15 @@ fn draw_results(frame: &mut Frame, app: &App, area: Rect) {
             app.search_input,
             app.results.len()
         )
+    } else if let Some(rewritten) = &app.search_rewritten_query {
+        // PRD FR-SR-4: the "showing results for X" auto-correction notice —
+        // these results are already for `rewritten`, not `search_input`
+        // (distinct from the zero-results view's opt-in "did you mean").
+        format!(
+            "Showing results for \"{rewritten}\" (rewritten from \"{}\") ({} found)",
+            app.search_input,
+            app.results.len()
+        )
     } else {
         format!(
             "Results for \"{}\" ({} found)",
@@ -1685,7 +1734,12 @@ fn draw_zero_results(frame: &mut Frame, app: &App, area: Rect) {
     let message = if app.results_offline {
         format!("No offline results for \"{}\"", app.search_input)
     } else {
-        crate::app::zero_results_message(&app.search_input, app.search_suggestion.as_deref())
+        crate::app::zero_results_message(
+            &app.search_input,
+            app.search_suggestion.as_deref(),
+            app.search_rewritten_query.as_deref(),
+            app.offline_fallback_count,
+        )
     };
     let text = Text::from(vec![
         Line::from(""),
@@ -1834,6 +1888,49 @@ fn draw_toc(frame: &mut Frame, app: &App, area: Rect) {
         .style(base_style(&app.theme, app.no_color))
         .block(UiBlock::default().borders(Borders::ALL).title(title));
     render_selectable_list(frame, list, area, tab.selected_section);
+}
+
+/// PRD FR-NV-2's `gs` fuzzy section jump: the same full-width list idiom as
+/// [`draw_toc`], plus a `> query` filter line the plain TOC has no need for.
+/// Selection follows `App::section_jump_selected`, an index into the
+/// *filtered* row list (`App::section_jump_rows`) rather than
+/// `Tab::selected_section` — that field belongs to the unfiltered
+/// [`Mode::Toc`] browse view and would drift out of range against a
+/// narrowed list here.
+fn draw_section_jump(frame: &mut Frame, app: &App, area: Rect) {
+    let rows = app.section_jump_rows();
+    let mut items: Vec<ListItem> = vec![ListItem::new(Line::from(RSpan::styled(
+        format!("> {}", app.section_jump_input),
+        Style::default().add_modifier(Modifier::BOLD),
+    )))];
+    if rows.is_empty() {
+        items.push(ListItem::new(Line::from(RSpan::styled(
+            "no matching section",
+            colored(app.no_color, app.theme.dim),
+        ))));
+    } else {
+        items.extend(rows.iter().enumerate().map(|(i, (_, section))| {
+            let indent = "  ".repeat(section.level.saturating_sub(2) as usize);
+            let style = if i == app.section_jump_selected {
+                colored_bg(app.no_color, app.theme.selected_fg, app.theme.selected_bg)
+            } else {
+                Style::default()
+            };
+            ListItem::new(Line::from(format!("{indent}{}", section.title))).style(style)
+        }));
+    }
+
+    let title = format!(
+        "Fuzzy section jump ({} of {})",
+        rows.len(),
+        app.active_tab().sections.len()
+    );
+    let list = List::new(items)
+        .style(base_style(&app.theme, app.no_color))
+        .block(UiBlock::default().borders(Borders::ALL).title(title));
+    // `+ 1`: the filter-input line occupies row 0, so the selected section
+    // (not the input) is what `ListState` keeps scrolled into view.
+    render_selectable_list(frame, list, area, app.section_jump_selected + 1);
 }
 
 /// The `bb` / `:tabs` tab picker (PRD FR-TB-1): index, title, language, and a
@@ -3449,8 +3546,20 @@ fn draw_peek_popup(frame: &mut Frame, app: &App, area: Rect) {
             (format!("Reference {marker}"), body)
         }
         Some(crate::app::PeekPopup::LinkPreview { title, .. }) => {
+            // PRD FR-DL-3: the quality badge, prefixed on the title exactly
+            // like the status bar's own current-article badge and the
+            // search-results row (`draw_results`) — the third of the three
+            // documented surfaces, and session-cache-only like the other
+            // two, so a wiki with no PageAssessments support (or an
+            // unassessed title, or one the batched lookup simply hasn't
+            // reached yet) shows no prefix rather than blocking the popup on
+            // a fetch of its own.
+            let title_text = match app.quality_badge_for(&app.active_tab().wiki, title) {
+                Some(badge) => format!("{badge} {title}"),
+                None => title.clone(),
+            };
             let mut lines = vec![Line::from(RSpan::styled(
-                title.clone(),
+                title_text,
                 Style::default().add_modifier(Modifier::BOLD),
             ))];
             match app.peek_summary() {
@@ -3679,6 +3788,8 @@ fn status_bar_text(app: &App, width: u16) -> String {
         }
         Mode::Results => strings::t(Key::ResultsHint).to_string(),
         Mode::Toc => strings::t(Key::TocHint).to_string(),
+        Mode::SectionJump => "Type to filter   Enter: jump   Esc: cancel".to_string(),
+        Mode::Visual => "j/k: extend selection   y: yank   Esc: cancel".to_string(),
         Mode::TabPicker => strings::t(Key::TabPickerHint).to_string(),
         Mode::HistoryPicker => strings::t(Key::HistoryPickerHint).to_string(),
         Mode::WikiPicker => strings::t(Key::WikiPickerHint).to_string(),
@@ -4416,6 +4527,63 @@ mod tests {
         assert_eq!(unvisited_span.style.fg, Some(theme.link));
         assert_ne!(
             theme.link_visited, theme.link,
+            "the two colors must actually differ for this test to mean anything"
+        );
+    }
+
+    /// PRD FR-RD-2: an external (`http(s)://`) link renders in
+    /// `theme.link_external`, an internal (`./`) link stays `theme.link` —
+    /// the two must actually differ, not just come from different fields
+    /// that happen to hold the same value.
+    #[test]
+    fn external_link_gets_the_external_color_internal_link_does_not() {
+        let html = r##"<html><body><p>See <a href="./Internal_Page">Internal Page</a> and
+            <a href="https://example.com/">External Page</a>.</p></body></html>"##;
+        let doc = parse_article_html("Test Article", html);
+        let links = crate::doc::collect_links(&doc);
+        assert_eq!(links.len(), 2);
+        assert!(links[0].internal_title.is_some(), "the ./ link is internal");
+        assert!(
+            links[1].internal_title.is_none(),
+            "the https:// link is external"
+        );
+
+        let theme = Theme::full();
+        let layout = layout_document(&doc, 80, LayoutOptions::default());
+        let text = paint_document(
+            &layout.lines,
+            None,
+            &links,
+            &HashSet::new(),
+            &HashSet::new(),
+            &theme,
+            false,
+            false, // show_cn
+            &[],
+            0,
+            &crate::image::ImageStore::new(),
+        );
+
+        let paragraph_line = text
+            .lines
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content.contains("Internal Page")))
+            .expect("paragraph line present");
+        let internal_span = paragraph_line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("Internal Page"))
+            .unwrap();
+        let external_span = paragraph_line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("External Page"))
+            .unwrap();
+
+        assert_eq!(internal_span.style.fg, Some(theme.link));
+        assert_eq!(external_span.style.fg, Some(theme.link_external));
+        assert_ne!(
+            theme.link_external, theme.link,
             "the two colors must actually differ for this test to mean anything"
         );
     }
@@ -5217,6 +5385,64 @@ mod tests {
             .map(|c| c.symbol())
             .collect();
         assert!(rendered.contains("[incognito]"));
+    }
+
+    /// PRD FR-DL-3: the quality badge is one of three documented surfaces
+    /// (status bar, search results, link previews) — this locks the third,
+    /// previously missing one. Session-cache only, same as the other two:
+    /// no network call happens here, `App::quality_cache` is just
+    /// pre-populated the way a real batched `pageassessments` lookup would
+    /// have left it.
+    #[test]
+    fn link_preview_popup_shows_the_quality_badge_when_known() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        let wiki = app.active_tab().wiki.clone();
+        app.quality_cache.insert(
+            (wiki, "en".to_string(), "Alan Turing".to_string()),
+            crate::api::QualityClass::Fa,
+        );
+        app.peek = Some(crate::app::PeekPopup::LinkPreview {
+            lang: "en".to_string(),
+            title: "Alan Turing".to_string(),
+        });
+        app.mode = Mode::Peek;
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            rendered.contains("★FA"),
+            "the link preview popup must show the known quality badge: {rendered:?}"
+        );
+    }
+
+    /// PRD FR-NV-10: the visual-selection highlight patches a background
+    /// onto exactly the selected line range, and only that range — a line
+    /// just outside it must come back unstyled.
+    #[test]
+    fn highlight_selected_lines_patches_only_the_selected_range() {
+        let mut text = Text::from(vec![
+            Line::from("zero"),
+            Line::from("one"),
+            Line::from("two"),
+            Line::from("three"),
+        ]);
+        let highlight = Style::default().bg(Color::Blue);
+        highlight_selected_lines(&mut text, 1, 2, highlight);
+
+        assert_eq!(text.lines[0].style, Style::default(), "line 0 untouched");
+        assert_eq!(text.lines[1].style.bg, Some(Color::Blue));
+        assert_eq!(text.lines[2].style.bg, Some(Color::Blue));
+        assert_eq!(text.lines[3].style, Style::default(), "line 3 untouched");
     }
 
     // ---- Uniform notice priority across status-bar modes ------------------

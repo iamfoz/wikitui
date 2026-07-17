@@ -888,6 +888,16 @@ DID_YOU_MEAN = {
     "enigma mahcine": "Enigma machine",
 }
 
+# FR-SR-4's other zero/poor-result signal: `rewrittenquery` — a query the
+# engine auto-corrected and actually searched *with* (unlike DID_YOU_MEAN,
+# which only ever accompanies zero hits, a rewrite normally finds real
+# results under the corrected spelling). Keyed lowercase, same as
+# DID_YOU_MEAN; mutually exclusive with it in `_serve_search_page` below —
+# a fixture query is either a suggestion case or a rewrite case, not both.
+REWRITTEN_QUERY = {
+    "alan tuning": "Alan Turing",
+}
+
 # PRD FR-SR-5 / Appendix A "Random": `list=random` rotates through this fixed
 # list (real PAGES titles, so `gr`/`:random` always opens something real)
 # instead of using actual randomness — deterministic-testable, per a pty/CI
@@ -2020,16 +2030,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_json({"pages": pages})
             return
 
+        # FR-SR-4: a rewritten query is searched *with the correction*, not
+        # the raw typo — the whole point of `rewrittenquery` is that the
+        # engine already did this substitution server-side.
+        rewritten = REWRITTEN_QUERY.get(ql)
+        effective_q = rewritten if rewritten else q
+        effective_ql = effective_q.lower().strip()
+
         hits = [
             p for p in SEARCH_PAGES
-            if ql and (ql in p["title"].lower() or ql in p["text"].lower())
+            if effective_ql and (effective_ql in p["title"].lower() or effective_ql in p["text"].lower())
         ]
         hits = hits[:limit]
         pages = [
             {
                 "title": p["title"],
                 "description": p["description"],
-                "excerpt": make_excerpt(p["text"], q),
+                "excerpt": make_excerpt(p["text"], effective_q),
                 "size": p["size"],
                 "wordcount": p["wordcount"],
                 "timestamp": p["timestamp"],
@@ -2037,7 +2054,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             for p in hits
         ]
         body = {"pages": pages}
-        if not pages and ql in DID_YOU_MEAN:
+        if rewritten:
+            body["rewrittenquery"] = rewritten
+        elif not pages and ql in DID_YOU_MEAN:
             body["suggestion"] = DID_YOU_MEAN[ql]
         self._send_json(body)
 

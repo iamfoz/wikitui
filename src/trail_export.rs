@@ -54,8 +54,8 @@ pub fn default_export_path(format: &str) -> Option<PathBuf> {
 pub fn render(trail: &Trail, format: &str, retrieved_on: &str) -> Option<String> {
     match format {
         "md" => Some(render_markdown(trail, retrieved_on)),
-        "dot" => Some(render_dot(trail)),
-        "mermaid" => Some(render_mermaid(trail)),
+        "dot" => Some(render_dot(trail, retrieved_on)),
+        "mermaid" => Some(render_mermaid(trail, retrieved_on)),
         _ => None,
     }
 }
@@ -131,7 +131,7 @@ fn node_label(article: &ArticleKey, dwell_secs: i64) -> String {
     )
 }
 
-fn render_dot(trail: &Trail) -> String {
+fn render_dot(trail: &Trail, retrieved_on: &str) -> String {
     let ids: std::collections::HashMap<ArticleKey, String> = trail
         .graph
         .nodes
@@ -152,6 +152,13 @@ fn render_dot(trail: &Trail) -> String {
         }
     }
     out.push_str("}\n");
+    // PRD §10: "every export" carries the attribution footer, DOT/Mermaid
+    // included — Graphviz's lexer strips `//`-to-end-of-line comments
+    // wherever they appear, including after the closing brace, so this
+    // trails the graph body rather than needing to live inside it.
+    out.push_str("// ");
+    out.push_str(&crate::attribution::export_footer(retrieved_on, false));
+    out.push('\n');
     out
 }
 
@@ -161,7 +168,7 @@ fn mermaid_escape(s: &str) -> String {
     s.replace('"', "&quot;")
 }
 
-fn render_mermaid(trail: &Trail) -> String {
+fn render_mermaid(trail: &Trail, retrieved_on: &str) -> String {
     let ids: std::collections::HashMap<ArticleKey, String> = trail
         .graph
         .nodes
@@ -181,6 +188,12 @@ fn render_mermaid(trail: &Trail) -> String {
             out.push_str(&format!("    {from} --> {to}\n"));
         }
     }
+    // PRD §10: "every export" carries the attribution footer — `%%` is
+    // Mermaid's own comment syntax, so this trails the diagram without
+    // becoming a phantom node/edge.
+    out.push_str("%% ");
+    out.push_str(&crate::attribution::export_footer(retrieved_on, false));
+    out.push('\n');
     out
 }
 
@@ -277,9 +290,13 @@ mod tests {
     #[test]
     fn dot_export_is_a_valid_digraph_with_expected_nodes_and_edges() {
         let trail = sample_trail();
-        let dot = render_dot(&trail);
+        let dot = render_dot(&trail, "2026-07-15");
         assert!(dot.starts_with("digraph trail {\n"));
-        assert!(dot.trim_end().ends_with('}'));
+        // The graph body's closing brace is its own line — the §10
+        // attribution footer trails it as a `//` comment, not more graph
+        // syntax, so the file no longer ends on `}` (see the dedicated
+        // attribution test below).
+        assert!(dot.lines().any(|l| l == "}"));
         assert!(dot.contains("label=\"Alan Turing (1m)\""));
         assert!(dot.contains("label=\"Enigma machine (1m)\""));
         assert!(dot.contains("label=\"Bletchley Park (1m)\""));
@@ -292,10 +309,33 @@ mod tests {
         }
     }
 
+    /// PRD §10: "every export" embeds the attribution footer — DOT and
+    /// Mermaid included, as a format-appropriate comment (`//`/`%%`) so it
+    /// never breaks the graph a viewer parses.
+    #[test]
+    fn dot_and_mermaid_both_carry_the_attribution_footer_as_a_comment() {
+        let trail = sample_trail();
+        let dot = render_dot(&trail, "2026-07-15");
+        let dot_comment_line = dot
+            .lines()
+            .find(|l| l.starts_with("// "))
+            .expect("a `//` comment line carrying the footer");
+        assert!(dot_comment_line.contains("CC BY-SA 4.0"));
+        assert!(dot_comment_line.contains("Exported 2026-07-15"));
+
+        let mmd = render_mermaid(&trail, "2026-07-15");
+        let mmd_comment_line = mmd
+            .lines()
+            .find(|l| l.starts_with("%% "))
+            .expect("a `%%` comment line carrying the footer");
+        assert!(mmd_comment_line.contains("CC BY-SA 4.0"));
+        assert!(mmd_comment_line.contains("Exported 2026-07-15"));
+    }
+
     #[test]
     fn dot_escapes_quotes_and_backslashes_in_titles() {
         let trail = build(&[visit("A \"quote\" \\ test", 100, None)]);
-        let dot = render_dot(&trail);
+        let dot = render_dot(&trail, "2026-07-15");
         assert!(dot.contains("A \\\"quote\\\" \\\\ test"));
     }
 
@@ -307,7 +347,7 @@ mod tests {
             visit("C", 200, Some("A")),
             visit("C", 250, Some("B")), // "also from" in the tree, a real edge in DOT
         ]);
-        let dot = render_dot(&trail);
+        let dot = render_dot(&trail, "2026-07-15");
         let edge_lines: Vec<&str> = dot.lines().filter(|l| l.contains("->")).collect();
         assert_eq!(
             edge_lines.len(),
@@ -318,8 +358,11 @@ mod tests {
 
     #[test]
     fn empty_trail_dot_is_still_a_syntactically_valid_empty_digraph() {
-        let dot = render_dot(&Trail::default());
-        assert_eq!(dot, "digraph trail {\n}\n");
+        let dot = render_dot(&Trail::default(), "2026-07-15");
+        assert!(dot.starts_with("digraph trail {\n}\n"));
+        // PRD §10: "every export" — an empty trail is no exception.
+        assert!(dot.contains("// "));
+        assert!(dot.contains("CC BY-SA 4.0"));
     }
 
     // ---- Mermaid ----------------------------------------------------------
@@ -327,7 +370,7 @@ mod tests {
     #[test]
     fn mermaid_export_is_a_valid_graph_td_with_expected_nodes_and_edges() {
         let trail = sample_trail();
-        let mmd = render_mermaid(&trail);
+        let mmd = render_mermaid(&trail, "2026-07-15");
         assert!(mmd.starts_with("graph TD\n"));
         assert!(mmd.contains("[\"Alan Turing (1m)\"]"));
         assert!(mmd.contains("--> "));
@@ -338,15 +381,18 @@ mod tests {
     #[test]
     fn mermaid_escapes_quotes_in_titles() {
         let trail = build(&[visit("A \"quote\" test", 100, None)]);
-        let mmd = render_mermaid(&trail);
+        let mmd = render_mermaid(&trail, "2026-07-15");
         assert!(mmd.contains("A &quot;quote&quot; test"));
         assert!(!mmd.contains("A \"quote\" test"));
     }
 
     #[test]
     fn empty_trail_mermaid_is_still_a_syntactically_valid_empty_graph() {
-        let mmd = render_mermaid(&Trail::default());
-        assert_eq!(mmd, "graph TD\n");
+        let mmd = render_mermaid(&Trail::default(), "2026-07-15");
+        assert!(mmd.starts_with("graph TD\n"));
+        // PRD §10: "every export" — an empty trail is no exception.
+        assert!(mmd.contains("%% "));
+        assert!(mmd.contains("CC BY-SA 4.0"));
     }
 
     // ---- wiki-awareness ------------------------------------------------------
@@ -366,9 +412,9 @@ mod tests {
         }]);
         let md = render_markdown(&trail, "2026-07-15");
         assert!(md.contains("[wiktionary] Mercury"));
-        let dot = render_dot(&trail);
+        let dot = render_dot(&trail, "2026-07-15");
         assert!(dot.contains("[wiktionary] Mercury"));
-        let mmd = render_mermaid(&trail);
+        let mmd = render_mermaid(&trail, "2026-07-15");
         assert!(mmd.contains("[wiktionary] Mercury"));
     }
 }

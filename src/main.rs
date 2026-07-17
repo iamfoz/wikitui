@@ -687,11 +687,57 @@ fn cli_overrides_from(cli: &Cli) -> config::CliOverrides {
     }
 }
 
+/// PRD FR-TH-5's full color-policy precedence, pure so the three-way
+/// interaction (NO_COLOR, CLICOLOR_FORCE, and plain non-TTY detection) is
+/// testable without mutating process-wide env vars or needing a real
+/// terminal — the same "pure decision, thin env-reading caller" split
+/// `resolve_g_prefix` established for keybinding logic. `no_color_env` is
+/// NO_COLOR's own rule (present and non-empty); `clicolor_force_env` is the
+/// informal clicolor spec's CLICOLOR_FORCE rule (present and neither empty
+/// nor `"0"`); `is_tty` is whether stdout is a real terminal.
+///
+/// Precedence, highest first:
+///  1. `NO_COLOR` always strips color — even over an explicit
+///     `CLICOLOR_FORCE` (a reader who explicitly asked for no color should
+///     never see a force-color request win instead) or a real TTY.
+///  2. Absent that, `CLICOLOR_FORCE` forces color back on even when stdout
+///     is redirected/piped — the inverse of NO_COLOR, and the other half of
+///     FR-TH-5 this chunk implements (previously read in a comment only,
+///     never wired to a decision).
+///  3. Absent both, a non-TTY defaults to plain text (FR-TH-5's "non-TTY
+///     output is plain text") and a real TTY defaults to color.
+pub(crate) fn color_policy(no_color_env: bool, clicolor_force_env: bool, is_tty: bool) -> bool {
+    if no_color_env {
+        return true;
+    }
+    if clicolor_force_env {
+        return false;
+    }
+    !is_tty
+}
+
 /// PRD FR-TH-5: NO_COLOR, when present and non-empty, strips color from
-/// every theme regardless of which one is selected. Shared with `doctor`'s
-/// capability report so both agree on what "active" means.
+/// every theme regardless of which one is selected; CLICOLOR_FORCE (present
+/// and neither empty nor `"0"`) forces color back on even over a non-TTY;
+/// a plain non-TTY with neither set falls back to no color. Shared with
+/// `doctor`'s capability report so both agree on what "active" means. See
+/// [`color_policy`] for the precedence rules, kept pure and separately
+/// tested.
 pub(crate) fn no_color_active() -> bool {
-    std::env::var("NO_COLOR").is_ok_and(|v| !v.is_empty())
+    color_policy(
+        std::env::var("NO_COLOR").is_ok_and(|v| !v.is_empty()),
+        clicolor_force_active(),
+        std::io::stdout().is_terminal(),
+    )
+}
+
+/// PRD FR-TH-5 / the informal clicolor spec: CLICOLOR_FORCE, present and
+/// neither empty nor `"0"`, forces color even when stdout isn't a TTY —
+/// split out from [`no_color_active`] so `doctor`'s capability report can
+/// show the raw env-var signal alongside the fully resolved decision,
+/// mirroring how it already shows `ACCESSIBLE` next to `accessible_active`.
+pub(crate) fn clicolor_force_active() -> bool {
+    std::env::var("CLICOLOR_FORCE").is_ok_and(|v| !v.is_empty() && v != "0")
 }
 
 /// PRD FR-ACS-6: `ACCESSIBLE=1` (any non-empty, non-"0" value) implies
@@ -3275,6 +3321,32 @@ fn fire_typeahead(client: &WikiClient, app: &App, tx: &UnboundedSender<Typeahead
     });
 }
 
+/// PRD FR-CS-2's `:open`/`:o` Tab-completion fetch: the same typeahead
+/// endpoint `fire_typeahead` calls, just against an explicit `query` (the
+/// title-so-far typed after `open `/`o `) rather than `app.search_input`,
+/// and landing in `slot` (a plain `Arc<Mutex<_>>` — see
+/// `App::command_typeahead_slot`'s doc comment for why this doesn't get a
+/// dedicated channel the way Search's own typeahead does). Silently drops a
+/// failed fetch: a Tab press that doesn't complete anything is a no-op, not
+/// an error the reader needs to see.
+fn fire_command_typeahead(
+    client: &WikiClient,
+    lang: &str,
+    query: &str,
+    slot: &app::CommandTypeaheadSlot,
+) {
+    let query = query.to_string();
+    let lang = lang.to_string();
+    let client = client.clone();
+    let slot = slot.clone();
+    tokio::spawn(async move {
+        if let Ok(suggestions) = client.search_title(&lang, &query, TYPEAHEAD_LIMIT).await {
+            let titles = suggestions.into_iter().map(|s| s.title).collect();
+            *slot.lock().unwrap() = Some((query, titles));
+        }
+    });
+}
+
 /// The `run` loop's poll-vs-block decision (PRD FR-ACS-2): whether something
 /// is happening in the background that should keep the loop on a timer
 /// instead of blocking forever in `event::read()`. `start_page_still_loading`
@@ -5420,6 +5492,16 @@ async fn handle_key(
             KeyCode::Backspace => {
                 app.command_input.pop();
             }
+            // PRD FR-CS-2: command-name completion (synchronous, from the
+            // registry) while the cursor is still in the first word;
+            // `:open`/`:o` title typeahead once a title has started — see
+            // `App::complete_command_tab`'s own doc comment for the split.
+            KeyCode::Tab => {
+                if let Some(query) = app.complete_command_tab() {
+                    let lang = app.lang.clone();
+                    fire_command_typeahead(client, &lang, &query, &app.command_typeahead_slot);
+                }
+            }
             KeyCode::Char(c) => {
                 app.command_input.push(c);
             }
@@ -5682,6 +5764,60 @@ async fn handle_key(
             KeyCode::Char('?') => {
                 app.prior_mode = app.mode;
                 app.mode = Mode::Help;
+            }
+            _ => {}
+        },
+        // PRD FR-NV-2's `gs` fuzzy section jump: a type-to-filter list, so
+        // movement stays off `j`/`k` (typable filter characters) the same
+        // way `Mode::Palette` keeps them off its own — arrows/Ctrl-n/Ctrl-p
+        // move, any other char narrows the filter, Enter jumps.
+        Mode::SectionJump => match code {
+            KeyCode::Esc => {
+                app.mode = Mode::Reading;
+                app.section_jump_input.clear();
+            }
+            KeyCode::Enter => app.confirm_section_jump(),
+            KeyCode::Up => app.section_jump_move(-1),
+            KeyCode::Down => app.section_jump_move(1),
+            KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => {
+                app.section_jump_move(1)
+            }
+            KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => {
+                app.section_jump_move(-1)
+            }
+            KeyCode::Backspace => {
+                app.section_jump_input.pop();
+                app.section_jump_selected = 0;
+            }
+            KeyCode::Char(c) => {
+                app.section_jump_input.push(c);
+                app.section_jump_selected = 0;
+            }
+            _ => {}
+        },
+        // PRD FR-NV-10's visual-selection yank: `j`/`k`/arrows extend the
+        // line-range selection, `y` yanks it as plain text via the same
+        // OSC 52 clipboard path `y`/`Y` use in Reading, Esc cancels without
+        // copying anything.
+        Mode::Visual => match code {
+            KeyCode::Esc => app.mode = Mode::Reading,
+            KeyCode::Char('j') | KeyCode::Down => app.visual_move(1),
+            KeyCode::Char('k') | KeyCode::Up => app.visual_move(-1),
+            KeyCode::Char('y') => {
+                app.notice = Some(match app.visual_selected_text() {
+                    Some(text) => {
+                        let (start, end) = app.visual_selected_range();
+                        let lines = end - start + 1;
+                        match yank_to_clipboard(&text) {
+                            Ok(()) => {
+                                format!("Yanked {lines} line{}", if lines == 1 { "" } else { "s" })
+                            }
+                            Err(e) => format!("Yank failed: {e}"),
+                        }
+                    }
+                    None => "Nothing to yank".to_string(),
+                });
+                app.mode = Mode::Reading;
             }
             _ => {}
         },
@@ -6248,6 +6384,11 @@ async fn handle_key(
                             open_watchlist(client, app).await;
                             return;
                         }
+                        // PRD FR-NV-2: `gs` opens the fuzzy section jump.
+                        app::GPrefixAction::SectionJump => {
+                            app.open_section_jump();
+                            return;
+                        }
                         app::GPrefixAction::PassThrough => {} // handle this key normally below.
                     }
                 }
@@ -6411,6 +6552,8 @@ async fn handle_key(
                     app.search_input.clear();
                     app.typeahead.clear();
                     app.search_suggestion = None;
+                    app.search_rewritten_query = None;
+                    app.offline_fallback_count = 0;
                     app.search_debounce_at = None;
                 }
                 KeyCode::Char('?') => {
@@ -6645,6 +6788,11 @@ async fn handle_key(
                         app.notice = Some("Open an article first".to_string());
                     }
                 }
+                // PRD FR-NV-10: `v` enters visual-selection mode over the
+                // laid-out text — a line-range selection `y` yanks as plain
+                // text (see `App::enter_visual`'s own doc comment for the
+                // documented line-vs-character granularity tradeoff).
+                KeyCode::Char('v') => app.enter_visual(),
                 // PRD FR-OFF-2's "r to reload", Research mode's `r`
                 // entrypoint, and FR-BM-3's `rl` read-later chord all share
                 // this key: when a background revalidation just posted an
@@ -7304,6 +7452,8 @@ async fn dispatch_action(
             app.search_input.clear();
             app.typeahead.clear();
             app.search_suggestion = None;
+            app.search_rewritten_query = None;
+            app.offline_fallback_count = 0;
             app.search_debounce_at = None;
         }
         Action::CommandLine => {
@@ -9474,6 +9624,25 @@ async fn run_search(client: &WikiClient, app: &mut App) {
             app.results_offline = false;
             app.results = outcome.results;
             app.search_suggestion = outcome.suggestion;
+            app.search_rewritten_query = outcome.rewritten_query;
+            // PRD FR-SR-4 / §7's offline-results section: an online search
+            // that comes back genuinely empty still checks the local
+            // offline index — a reader who's saved the very article
+            // they're searching for shouldn't see a bare "no results" when
+            // it's sitting in their own saved pages. `app.results` itself
+            // stays empty (this is not `run_offline_search`'s "never even
+            // tried online" path — see `results_offline`'s own doc
+            // comment); the count surfaces separately via
+            // `app::zero_results_message`.
+            app.offline_fallback_count = if app.results.is_empty() {
+                let wiki = app.active_wiki_scope().to_string();
+                let lang = app.lang.clone();
+                app.search_index
+                    .search(&wiki, &lang, &app.search_input, 20)
+                    .len()
+            } else {
+                0
+            };
             app.selected_result = 0;
             app.mode = Mode::Results;
             // PRD FR-DL-3: every result title not already cached this
@@ -9555,10 +9724,14 @@ fn run_offline_search(app: &mut App) {
         })
         .collect();
     app.results_offline = true;
-    // FR-SR-4's "did you mean" is an online-only affordance (it comes from
-    // the API's own `suggestion` field) — never carried over from whatever
-    // the last online search happened to leave behind.
+    // FR-SR-4's "did you mean"/rewrite are online-only affordances (they
+    // come from the API's own response fields) — never carried over from
+    // whatever the last online search happened to leave behind. Likewise
+    // the offline-fallback count is meaningless here — this search *is* the
+    // offline fallback, not something checking for one.
     app.search_suggestion = None;
+    app.search_rewritten_query = None;
+    app.offline_fallback_count = 0;
     app.selected_result = 0;
     app.mode = Mode::Results;
     app.loading = false;
@@ -9667,6 +9840,33 @@ fn run_reindex(resolved: &config::ResolvedConfig) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PRD FR-TH-5: NO_COLOR wins outright — set alongside CLICOLOR_FORCE or
+    /// a real TTY, color still strips. This is the one precedence rule the
+    /// informal clicolor spec insists on and the PRD calls out by name.
+    #[test]
+    fn no_color_env_beats_clicolor_force_and_a_real_tty() {
+        assert!(color_policy(true, true, true));
+        assert!(color_policy(true, true, false));
+        assert!(color_policy(true, false, true));
+    }
+
+    /// PRD TH-5: CLICOLOR_FORCE forces color back on even though stdout
+    /// isn't a TTY — the exact scenario that was previously unimplemented
+    /// (the env var was mentioned in a comment only, nothing ever read it).
+    #[test]
+    fn clicolor_force_forces_color_on_a_non_tty() {
+        assert!(!color_policy(false, true, false));
+    }
+
+    /// Absent every override, a non-TTY defaults to plain text and a real
+    /// TTY defaults to color — FR-TH-5's "non-TTY output is plain text"
+    /// clause, and the ordinary interactive case it doesn't disturb.
+    #[test]
+    fn no_override_falls_back_to_tty_detection() {
+        assert!(color_policy(false, false, false), "non-tty -> no color");
+        assert!(!color_policy(false, false, true), "real tty -> color");
+    }
 
     /// PRD SEC-2: a hostile title containing raw ESC/BEL bytes must not be
     /// able to break out of the OSC 52 payload. In normal operation the

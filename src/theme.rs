@@ -41,6 +41,14 @@ pub struct Theme {
     pub heading: Color,
     pub link: Color,
     pub link_visited: Color,
+    /// PRD FR-RD-2's internal/external link distinction — an external
+    /// (`http(s)://`) link's color, painted instead of `link` for exactly
+    /// those (`ui::span_style`). Not a themeable Appendix C schema slot (no
+    /// `[colors] link_external` key exists): every theme, built-in or
+    /// user-authored, gets one derived automatically from `link`/`warning`
+    /// (see [`derive_link_external`]) rather than hand-picked, so this field
+    /// never goes stale relative to whatever `link` a theme actually chose.
+    pub link_external: Color,
     pub quote: Color,
     pub code: Color,
     pub table: Color,
@@ -75,6 +83,26 @@ pub struct Theme {
     pub error: Color,
 }
 
+/// PRD FR-RD-2's external-link color, derived from `link` (and, for an RGB
+/// `link`, `warning`) rather than a themeable schema slot — see
+/// [`Theme::link_external`]'s own doc comment for why. An RGB `link` blends
+/// 45% of the way toward `warning` via [`mix`] (the same blend primitive
+/// `expand_slots` already uses for its own derived slots): enough of a hue
+/// shift to read as a different color at a glance, never so much that the
+/// result stops relating back to the theme's own link color. `terminal` and
+/// `contrast` deliberately stay in the named 16-color palette rather than
+/// RGB (see their own doc comments) — `mix`'s fallback for a non-RGB input
+/// is mid-gray, which would quietly hand `terminal` a truecolor value and
+/// defeat the one thing that theme promises, so a named `link` instead maps
+/// through a small fixed table of visually distinct named colors.
+fn derive_link_external(link: Color, warning: Color) -> Color {
+    match link {
+        Color::Rgb(..) => mix(link, warning, 0.45),
+        Color::Cyan | Color::LightCyan => Color::Magenta,
+        _ => Color::Cyan,
+    }
+}
+
 const fn rgb(hex: u32) -> Color {
     Color::Rgb(
         ((hex >> 16) & 0xff) as u8,
@@ -91,6 +119,7 @@ impl Theme {
             fg: None,
             heading: Color::Reset,
             link: Color::Blue,
+            link_external: derive_link_external(Color::Blue, Color::Yellow),
             link_visited: Color::Magenta,
             quote: Color::Gray,
             code: Color::Green,
@@ -118,6 +147,7 @@ impl Theme {
             fg: Some(rgb(0xd8dee9)),
             heading: Color::White,
             link: rgb(0x6fb3ff),
+            link_external: derive_link_external(rgb(0x6fb3ff), rgb(0xd08770)),
             link_visited: rgb(0x9d8cff),
             quote: rgb(0xa3be8c),
             code: rgb(0xa3be8c),
@@ -151,6 +181,7 @@ impl Theme {
             fg: Some(rgb(0x33ff33)),
             heading: rgb(0x66ff66),
             link: rgb(0x99ff99),
+            link_external: derive_link_external(rgb(0x99ff99), rgb(0x66ff66)),
             link_visited: rgb(0x66cc66),
             quote: rgb(0x33ff33),
             code: rgb(0x33ff33),
@@ -182,6 +213,7 @@ impl Theme {
             fg: Some(rgb(0xff2b2b)),
             heading: rgb(0xff5555),
             link: rgb(0xff8080),
+            link_external: derive_link_external(rgb(0xff8080), rgb(0xffb000)),
             link_visited: rgb(0xcc5050),
             quote: rgb(0xff2b2b),
             code: rgb(0xff2b2b),
@@ -214,6 +246,7 @@ impl Theme {
             fg: Some(rgb(0x3a3a3a)),
             heading: rgb(0x1a1a1a),
             link: rgb(0x1a5276),
+            link_external: derive_link_external(rgb(0x1a5276), rgb(0xb8860b)),
             link_visited: rgb(0x6c3483),
             quote: rgb(0x555555),
             code: rgb(0x1a5276),
@@ -241,6 +274,7 @@ impl Theme {
             fg: Some(Color::White),
             heading: Color::White,
             link: Color::LightCyan,
+            link_external: derive_link_external(Color::LightCyan, Color::LightYellow),
             link_visited: Color::LightMagenta,
             quote: Color::White,
             code: Color::White,
@@ -704,6 +738,7 @@ impl Theme {
             fg: od(&["fg"], self.fg),
             heading: d(&["heading"], self.heading),
             link: d(&["link", "accent"], self.link),
+            link_external: d(&["link_external", "link", "accent"], self.link_external),
             link_visited: d(&["link_visited"], self.link_visited),
             quote: d(&["quote"], self.quote),
             code: d(&["code_bg", "code"], self.code),
@@ -850,6 +885,10 @@ pub fn expand_slots(slots: &SemanticSlots) -> Theme {
     let match_fg = slots.match_fg.or(slots.warning).unwrap_or(rgb(0xebcb8b));
     let warning = slots.warning.unwrap_or(match_fg);
     let error = slots.error.unwrap_or(rgb(0xbf616a));
+    // PRD FR-RD-2: no `[colors] link_external` schema slot exists (see
+    // `Theme::link_external`'s own doc comment) — every user theme derives
+    // one from its own `link`/`warning` the same way a built-in does.
+    let link_external = derive_link_external(link, warning);
 
     let table = slots.fg.unwrap_or(link);
     let infobox = heading;
@@ -867,6 +906,7 @@ pub fn expand_slots(slots: &SemanticSlots) -> Theme {
         fg: slots.fg,
         heading,
         link,
+        link_external,
         link_visited,
         quote,
         code,
@@ -1370,6 +1410,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// PRD FR-RD-2: every built-in theme's `link_external` must actually
+    /// differ from its own `link` — the whole point of the slot — for every
+    /// one of the six, not just the RGB-derived majority. `terminal` and
+    /// `contrast` exercise the named-color branch of `derive_link_external`;
+    /// the rest exercise the `mix`-toward-`warning` branch.
+    #[test]
+    fn external_link_color_differs_from_link_in_every_builtin_theme() {
+        for name in Theme::NAMES {
+            let theme = Theme::by_name(name).unwrap();
+            assert_ne!(
+                theme.link_external, theme.link,
+                "{name}: external-link color collides with internal link color"
+            );
+        }
+    }
+
+    /// `expand_slots` derives `link_external` the same way a built-in theme
+    /// does — from whatever `link`/`warning` the file (or their own
+    /// defaults) resolved to — so a minimal user theme file gets a sensible,
+    /// distinct external-link color with no `[colors] link_external` key at
+    /// all (PRD FR-RD-2's "auto-expansion", the same story `link_visited`'s
+    /// own derivation already tells).
+    #[test]
+    fn expand_slots_derives_a_link_external_distinct_from_link() {
+        let slots = SemanticSlots {
+            name: "mytheme".to_string(),
+            link: Some(rgb(0x6fb3ff)),
+            ..Default::default()
+        };
+        let theme = expand_slots(&slots);
+        assert_ne!(theme.link_external, theme.link);
+    }
+
+    /// `Theme::adapt`'s per-slot depth mapping must not silently drop
+    /// `link_external` — a 16-color adaptation still needs *some* distinct
+    /// approximation, not a value that quietly collapses onto `link`.
+    #[test]
+    fn adapt_carries_link_external_through_color_depth_reduction() {
+        let full = Theme::full();
+        let sixteen = full.adapt(ColorDepth::Sixteen, None);
+        assert_ne!(
+            sixteen.link_external, sixteen.link,
+            "adapting to 16 colors must not collapse the external-link color onto link"
+        );
     }
 
     /// The night-red contrast claim from the PRD ("pure red/black ≈

@@ -39,12 +39,38 @@ pub const CLOSED_TABS_CAP: usize = 10;
 /// has a query, so a burst of typing only fires one request, after it stops.
 pub const TYPEAHEAD_DEBOUNCE: Duration = Duration::from_millis(200);
 
+/// PRD FR-CS-2's `:open`/`:o` Tab-completion landing slot — a title fetch's
+/// `(query, titles)` result, shared between `App::complete_command_tab` and
+/// `main::fire_command_typeahead` without a dedicated channel (see
+/// `App::command_typeahead_slot`'s own doc comment). Named so both sides
+/// spell out the same type once instead of clippy's `type_complexity` lint
+/// forcing an inline repeat at every use.
+pub type CommandTypeaheadSlot = Arc<Mutex<Option<(String, Vec<String>)>>>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Reading,
     Search,
     Results,
     Toc,
+    /// `gs` (PRD FR-NV-2): the fuzzy section jump — a type-to-filter list
+    /// over the active tab's section outline, distinct from [`Mode::Toc`]'s
+    /// plain browse-everything list the same way [`Mode::Palette`] is
+    /// distinct from a picker with a separate `/`-filter submode (mirrors
+    /// its single-mode "type narrows, Enter jumps" shape rather than the
+    /// `BookmarkPicker`/`BookmarkFilter` two-mode split). Enter jumps to the
+    /// highlighted section (`App::jump_to_section`, which already returns to
+    /// [`Mode::Reading`]); Esc cancels back to Reading directly, since `gs`
+    /// is only ever armed from there.
+    SectionJump,
+    /// `v` (PRD FR-NV-10): visual-selection text yank. `j`/`k`/arrows extend
+    /// the selection from `App::visual_anchor_line` to `App::
+    /// visual_cursor_line`; `y` yanks the selected lines' plain text to the
+    /// clipboard (the same OSC 52 path `y`/`Y` already use in Reading) and
+    /// returns to Reading; Esc cancels without copying anything. Granularity
+    /// is whole laid-out (wrapped) lines, not characters — see
+    /// `App::enter_visual`'s doc comment for why.
+    Visual,
     Find,
     Research,
     Library,
@@ -376,6 +402,19 @@ pub struct App {
     /// search, shown by the zero-results view; `None` when the search had
     /// results or hasn't run yet.
     pub search_suggestion: Option<String>,
+    /// PRD FR-SR-4's other zero/poor-result signal: the "showing results for
+    /// X" auto-correction the search engine already applied to produce
+    /// `results` (`api::SearchOutcome::rewritten_query`) — distinct from
+    /// `search_suggestion`'s opt-in "did you mean", and typically present
+    /// alongside non-empty `results` rather than only on a zero-result miss.
+    pub search_rewritten_query: Option<String>,
+    /// PRD FR-SR-4 / §7's "offline-results section": how many local
+    /// saved/cached matches the offline index found for the same query when
+    /// an *online* search came back with zero results — `run_search`'s own
+    /// fallback check, distinct from `results_offline` (which means the
+    /// search never even tried the API). `0` when the online search found
+    /// something, or hasn't run, or (`run_offline_search`) never applies.
+    pub offline_fallback_count: usize,
     /// PRD FR-SR-7: whether `results` came from the local offline index
     /// rather than the API — set by `main::run_offline_search`, consulted
     /// by `ui::draw_results`/`draw_zero_results` (the "(offline)" header
@@ -532,6 +571,36 @@ pub struct App {
     pub pending_export_overwrite: Option<String>,
     /// The `:` command line's in-progress input (PRD FR-CS-2).
     pub command_input: String,
+    /// PRD FR-CS-2's Tab-completion: the current match list — either
+    /// `command::complete_command_name`'s results (cursor still in the
+    /// command word) or a landed `:open`/`:o` title-typeahead fetch's
+    /// titles. Repeated Tab cycles through this rather than recomputing it
+    /// every press.
+    pub command_completions: Vec<String>,
+    /// Which `command_completions` entry the next Tab installs — also how
+    /// `complete_command_tab` recognizes "am I continuing an existing
+    /// cycle": if `command_input`'s current word/title already equals
+    /// `command_completions[command_completion_index]`, this Tab advances
+    /// it; otherwise it's a fresh prefix to match from scratch.
+    pub command_completion_index: usize,
+    /// PRD FR-CS-2's best-effort `:open`/`:o` title typeahead: the in-flight
+    /// fetch's landing slot. A plain `Arc<Mutex<_>>` rather than a new
+    /// channel threaded through `handle_key`'s already-long parameter list —
+    /// this is an on-demand, Tab-triggered fill, not a per-keystroke
+    /// subsystem like Search's own debounced typeahead. `(query, titles)` so
+    /// a reply for a title the reader has since typed past is recognizable
+    /// as stale, mirroring `typeahead_is_current`'s own staleness check.
+    pub command_typeahead_slot: CommandTypeaheadSlot,
+    /// Whether a `:open` Tab-completion fetch relevant to the CURRENT
+    /// title-so-far is outstanding — set whenever `complete_command_tab`
+    /// fires one, cleared only once a result matching that exact prefix is
+    /// consulted (a stale reply for a prefix already typed past is
+    /// discarded, not treated as resolving this). Unlike
+    /// `summary_loading`/`related_loading` this drives no "still loading…"
+    /// UI and gates no poll-vs-block decision: nothing changes on screen
+    /// until the reader presses Tab again, which is exactly the point where
+    /// the slot gets checked anyway.
+    pub command_typeahead_loading: bool,
     /// Transient feedback from the last `:` command (":lang de" →
     /// "Language: de"), shown in the status bar with priority over the
     /// focused-link line — which would otherwise hide it instantly on any
@@ -1014,6 +1083,24 @@ pub struct App {
     /// The mode `Ctrl-p` was pressed from, restored on Esc and used to scope
     /// which commands the palette offers (its [`registry::KeyContext`]).
     pub palette_prior_mode: Mode,
+    /// PRD FR-NV-2's `gs` fuzzy section jump: the type-to-filter query, an
+    /// `App`-level field (not per-tab, like [`Tab::selected_section`] is)
+    /// because it's transient picker input, the same shape `palette_input`
+    /// already established.
+    pub section_jump_input: String,
+    /// Which fuzzy-filtered section row Enter jumps to (index into
+    /// `App::section_jump_rows`'s live list, not `Tab::sections` directly —
+    /// mirrors `palette_selected`).
+    pub section_jump_selected: usize,
+    /// PRD FR-NV-10's visual-selection yank: the line the selection was
+    /// anchored at (`App::enter_visual`) — absolute indices into the
+    /// current layout's `lines`, the same coordinate space `Tab::scroll`
+    /// itself uses. Paired with `visual_cursor_line` to form the selected
+    /// range (`App::visual_selected_range`).
+    pub visual_anchor_line: usize,
+    /// The line `j`/`k`/arrows have moved the visual cursor to since
+    /// entering (`App::visual_move`) — starts equal to `visual_anchor_line`.
+    pub visual_cursor_line: usize,
     /// The scroll offset of the `?` help overlay (PRD FR-CS-4): the sheet is
     /// scrollable so it can never clip, however tall the terminal.
     pub help_scroll: u16,
@@ -1463,6 +1550,8 @@ impl App {
             selected_suggestion: 0,
             search_debounce_at: None,
             search_suggestion: None,
+            search_rewritten_query: None,
+            offline_fallback_count: 0,
             results_offline: false,
             force_offline_search: false,
             search_operator_help: false,
@@ -1505,6 +1594,10 @@ impl App {
             library_prior_mode: Mode::Reading,
             pending_export_overwrite: None,
             command_input: String::new(),
+            command_completions: Vec::new(),
+            command_completion_index: 0,
+            command_typeahead_slot: Arc::new(Mutex::new(None)),
+            command_typeahead_loading: false,
             notice: None,
             layout: None,
             layout_cache: LayoutCache::new(layout::DEFAULT_L1_CAPACITY),
@@ -1608,6 +1701,10 @@ impl App {
             palette_input: String::new(),
             palette_selected: 0,
             palette_prior_mode: Mode::Reading,
+            section_jump_input: String::new(),
+            section_jump_selected: 0,
+            visual_anchor_line: 0,
+            visual_cursor_line: 0,
             help_scroll: 0,
             peek: None,
             peek_prior_mode: Mode::Reading,
@@ -4570,6 +4667,135 @@ impl App {
         self.mode = Mode::Reading;
     }
 
+    /// `gs` (PRD FR-NV-2): opens the fuzzy section jump over the active
+    /// tab's outline. Armed only from Reading (`resolve_g_prefix`'s `gs`),
+    /// so unlike `open_lang_picker`/`open_palette` there's no prior mode to
+    /// capture — Esc and a confirmed jump both land back in
+    /// [`Mode::Reading`] unconditionally, the same contract `jump_to_section`
+    /// already has.
+    pub fn open_section_jump(&mut self) {
+        self.section_jump_input.clear();
+        self.section_jump_selected = 0;
+        self.mode = Mode::SectionJump;
+        self.status = if self.active_tab().sections.is_empty() {
+            "No sections on this page — Esc to close".to_string()
+        } else {
+            "Type to filter   Enter: jump   Esc: cancel".to_string()
+        };
+    }
+
+    /// The live, fuzzy-filtered section rows for the current query (PRD
+    /// FR-NV-2) — see [`filter_sections`]. Each entry is `(original index
+    /// into `Tab::sections`, cloned `SectionRef`)`, so a caller has both the
+    /// index `jump_to_section` needs and the section to render/display
+    /// without a second lookup.
+    pub fn section_jump_rows(&self) -> Vec<(usize, crate::doc::SectionRef)> {
+        filter_sections(&self.active_tab().sections, &self.section_jump_input)
+            .into_iter()
+            .map(|i| (i, self.active_tab().sections[i].clone()))
+            .collect()
+    }
+
+    /// Move the section-jump selection, clamped to the current match count —
+    /// mirrors `palette_move`.
+    pub fn section_jump_move(&mut self, delta: i32) {
+        let len = self.section_jump_rows().len();
+        if len == 0 {
+            self.section_jump_selected = 0;
+            return;
+        }
+        let max = len - 1;
+        self.section_jump_selected =
+            (self.section_jump_selected as i32 + delta).clamp(0, max as i32) as usize;
+    }
+
+    /// Enter's action: jump to the highlighted row, or just return to
+    /// Reading when the filter matched nothing (mirrors
+    /// `jump_to_section`'s own "index out of range is a no-op scroll, not a
+    /// panic" contract, extended to "nothing to jump to at all").
+    pub fn confirm_section_jump(&mut self) {
+        match self.section_jump_rows().get(self.section_jump_selected) {
+            Some((index, _)) => self.jump_to_section(*index),
+            None => self.mode = Mode::Reading,
+        }
+    }
+
+    /// PRD FR-CS-2's `:` command-line Tab: completes the COMMAND NAME while
+    /// the cursor is still in the first word (synchronous, from
+    /// `command::complete_command_name` — the documented priority), or
+    /// cycles/fetches TITLE completions once the word is `open`/`o` and a
+    /// title has started (a best-effort, on-demand fill — see
+    /// `command_typeahead_slot`'s own doc comment for why this stays
+    /// deliberately lighter-weight than Search's per-keystroke typeahead).
+    /// Returns the title to fetch typeahead suggestions for when one is
+    /// needed and none is already in flight — `main::handle_key` is what
+    /// owns `client` and actually fires it, mirroring `open_lang_picker`'s
+    /// "App decides, caller fetches" split.
+    pub fn complete_command_tab(&mut self) -> Option<String> {
+        let input = self.command_input.clone();
+        let (word, rest) = match input.split_once(char::is_whitespace) {
+            Some((w, r)) => (w.to_string(), Some(r.trim().to_string())),
+            None => (input, None),
+        };
+
+        let Some(rest) = rest else {
+            // Still typing the command word itself. When the input already
+            // holds one of the cached candidates verbatim — the previous
+            // Tab just installed it — this press continues that cycle;
+            // comparing against what's actually displayed (rather than a
+            // separately tracked "query" string) means it can't drift out
+            // of sync with `command_input` the way re-deriving "the prefix"
+            // from an already-completed word would.
+            if self.command_completions.get(self.command_completion_index) != Some(&word) {
+                let matches = crate::command::complete_command_name(&word);
+                if matches.is_empty() {
+                    return None;
+                }
+                self.command_completions = matches.into_iter().map(str::to_string).collect();
+                self.command_completion_index = 0;
+            } else {
+                self.command_completion_index =
+                    (self.command_completion_index + 1) % self.command_completions.len();
+            }
+            self.command_input = self.command_completions[self.command_completion_index].clone();
+            return None;
+        };
+
+        if !(word == "open" || word == "o") || rest.is_empty() {
+            return None;
+        }
+
+        // Continuing an existing title cycle: same "compare against what's
+        // displayed" test as the command-word branch above.
+        if self.command_completions.get(self.command_completion_index) == Some(&rest) {
+            self.command_completion_index =
+                (self.command_completion_index + 1) % self.command_completions.len();
+            self.command_input = format!(
+                "{word} {}",
+                self.command_completions[self.command_completion_index]
+            );
+            return None;
+        }
+
+        // A landed fetch for this exact title-so-far takes precedence over
+        // firing a new one; a fetch for some other (since-typed-past) title
+        // is discarded rather than shown.
+        if let Some((query, titles)) = self.command_typeahead_slot.lock().unwrap().take()
+            && query == rest
+        {
+            self.command_completions = titles;
+            self.command_completion_index = 0;
+            self.command_typeahead_loading = false;
+            if let Some(first) = self.command_completions.first() {
+                self.command_input = format!("{word} {first}");
+            }
+            return None;
+        }
+
+        self.command_typeahead_loading = true;
+        Some(rest)
+    }
+
     pub fn cycle_link(&mut self, forward: bool) {
         let len = self.active_tab().links.len();
         if len == 0 {
@@ -5238,6 +5464,104 @@ impl App {
             scroll
         };
         self.active_tab_mut().scroll = new;
+    }
+
+    // -- Visual-selection yank (PRD FR-NV-10) -------------------------------
+
+    /// `v`: enters visual-selection mode, anchored at the top of the current
+    /// viewport (`scroll`) — Reading has no independent per-line reading
+    /// cursor to anchor on instead, so the first visible line is the least
+    /// surprising starting point. A no-op status message (no mode change)
+    /// when there's no document to select from.
+    ///
+    /// **Granularity**: whole laid-out (wrapped) lines, not characters or
+    /// words. A precise character/word range would need grapheme-column
+    /// tracking through the layout engine's own wrap decisions, which
+    /// nothing downstream of `layout::Layout` currently exposes at this call
+    /// site (the closest existing precedent, `MatchSpan`, only ever
+    /// addresses a single already-known line, never a multi-line span) —
+    /// building that machinery is a substantially larger change than this
+    /// chunk's scope. A line-range yank already covers FR-NV-10's core case
+    /// (copying a passage/paragraph out of the article), so this documents
+    /// the simplification rather than blocking on the fuller version.
+    pub fn enter_visual(&mut self) {
+        if self.active_tab().doc.is_none() {
+            self.status = "Open an article first".to_string();
+            return;
+        }
+        self.ensure_layout();
+        let line = self.active_tab().scroll as usize;
+        self.visual_anchor_line = line;
+        self.visual_cursor_line = line;
+        self.mode = Mode::Visual;
+        self.status = "j/k: extend selection   y: yank   Esc: cancel".to_string();
+    }
+
+    /// The selected line range, inclusive, lowest index first.
+    pub fn visual_selected_range(&self) -> (usize, usize) {
+        (
+            self.visual_anchor_line.min(self.visual_cursor_line),
+            self.visual_anchor_line.max(self.visual_cursor_line),
+        )
+    }
+
+    /// Moves the visual cursor by `delta` lines, clamped to the laid-out
+    /// document, and scrolls it into view exactly like
+    /// `scroll_focused_link_into_view` does for a Tab-cycled link.
+    pub fn visual_move(&mut self, delta: i32) {
+        self.ensure_layout();
+        let max_line = self
+            .layout
+            .as_ref()
+            .map(|l| l.lines.len().saturating_sub(1))
+            .unwrap_or(0);
+        let new = (self.visual_cursor_line as i32 + delta).clamp(0, max_line as i32) as usize;
+        self.visual_cursor_line = new;
+
+        if self.viewport_height == 0 {
+            return;
+        }
+        let (scroll, max_scroll) = {
+            let tab = self.active_tab();
+            (tab.scroll, tab.max_scroll)
+        };
+        let line = new as u16;
+        let vh = self.viewport_height;
+        let bottom = scroll.saturating_add(vh);
+        let new_scroll = if line < scroll {
+            line.min(max_scroll)
+        } else if line >= bottom {
+            line.saturating_sub(vh.saturating_sub(1)).min(max_scroll)
+        } else {
+            scroll
+        };
+        self.active_tab_mut().scroll = new_scroll;
+    }
+
+    /// `y` in visual mode: the plain text of every selected line,
+    /// newline-joined — `main::handle_key` copies this to the clipboard via
+    /// the same OSC 52 path `y`/`Y` already use in Reading (PRD FR-NV-10).
+    /// `None` only when there's no layout to read from (shouldn't happen
+    /// once `Mode::Visual` is entered via `enter_visual`, which requires a
+    /// document; a defensive `None` beats a panic if it ever did).
+    pub fn visual_selected_text(&self) -> Option<String> {
+        let layout = self.layout.as_ref()?;
+        let (start, end) = self.visual_selected_range();
+        let end = end.min(layout.lines.len().saturating_sub(1));
+        if layout.lines.is_empty() || start > end {
+            return None;
+        }
+        let text = layout.lines[start..=end]
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|s| s.text.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        Some(text)
     }
 
     // -- Link hints (PRD FR-NV-1) --------------------------------------
@@ -6086,11 +6410,34 @@ pub fn typeahead_is_current(response_query: &str, live_query: &str) -> bool {
 /// PRD FR-SR-4 / §7's "Search: zero results" copy: the did-you-mean
 /// suggestion when the server offered one, with the exact "(Enter to
 /// search)" affordance §7 specifies; a plain "no results" line otherwise.
-pub fn zero_results_message(query: &str, suggestion: Option<&str>) -> String {
-    match suggestion {
-        Some(s) => format!("No results for \"{query}\". Did you mean {s}? (Enter to search)"),
-        None => format!("No results for \"{query}\""),
+/// PRD FR-SR-4 / §7's "Search: zero results" row: `suggestion` is the
+/// server's "did you mean" (opt-in, via Enter); `rewritten_query`, when
+/// present, means the query the reader typed was ALREADY auto-corrected and
+/// re-searched — that combination (a rewrite that still finds nothing) is
+/// rare but not impossible, so it's handled rather than assumed away.
+/// `offline_fallback` is the count `run_search` found in the local index
+/// when the online search itself came back empty (`0` suppresses the
+/// clause entirely) — §7's "offline-results section if applicable".
+pub fn zero_results_message(
+    query: &str,
+    suggestion: Option<&str>,
+    rewritten_query: Option<&str>,
+    offline_fallback: usize,
+) -> String {
+    let mut msg = if let Some(rewritten) = rewritten_query {
+        format!("No results for \"{rewritten}\" (rewritten from \"{query}\")")
+    } else {
+        match suggestion {
+            Some(s) => format!("No results for \"{query}\". Did you mean {s}? (Enter to search)"),
+            None => format!("No results for \"{query}\""),
+        }
+    };
+    if offline_fallback > 0 {
+        msg.push_str(&format!(
+            "; {offline_fallback} in your saved pages (:search-offline to browse)"
+        ));
     }
+    msg
 }
 
 /// What the `b`-prefix chord's second key means (PRD FR-TB-1's `bb`, FR-BM-2's
@@ -6207,6 +6554,8 @@ pub enum GPrefixAction {
     /// but no dedicated open key; `gW` fits the existing `g`-prefix
     /// panel-open convention `gr`/`gR`/`gb` already established).
     Watchlist,
+    /// `gs` (PRD FR-NV-2): open the fuzzy section jump.
+    SectionJump,
     /// Any other second key: dead prefix — `handle_key` processes it as if
     /// `g` had never been typed (e.g. `gj` still scrolls).
     PassThrough,
@@ -6221,6 +6570,7 @@ pub fn resolve_g_prefix(second_key: char) -> GPrefixAction {
         'h' => GPrefixAction::Home,
         'r' => GPrefixAction::Random,
         'R' => GPrefixAction::Related,
+        's' => GPrefixAction::SectionJump,
         'K' => GPrefixAction::References,
         'W' => GPrefixAction::Watchlist,
         _ => GPrefixAction::PassThrough,
@@ -6273,6 +6623,31 @@ pub fn order_and_filter_langlinks(
         }
     }
     rows
+}
+
+/// PRD FR-NV-2's `gs` fuzzy section jump: every section title fuzzy-scored
+/// against `query` (`fuzzy::fuzzy_score`, the same subsequence matcher
+/// `palette_matches` ranks commands with), best match first, ties broken by
+/// original document order rather than alphabetically — a table of contents
+/// reads top-to-bottom, so two equally-good matches (including every
+/// section when `query` is empty, all scoring a perfect `1.0`) should still
+/// list in reading order, not shuffle alphabetically. Returns indices into
+/// `sections` itself so a caller can feed a result straight to
+/// `App::jump_to_section`. A pure function over `&[SectionRef]` (no `App`
+/// access), the same testability `order_and_filter_langlinks` established
+/// for its own picker.
+pub fn filter_sections(sections: &[crate::doc::SectionRef], query: &str) -> Vec<usize> {
+    let mut rows: Vec<(f64, usize)> = sections
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| crate::fuzzy::fuzzy_score(&s.title, query).map(|score| (score, i)))
+        .collect();
+    rows.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.cmp(&b.1))
+    });
+    rows.into_iter().map(|(_, i)| i).collect()
 }
 
 /// PRD FR-ML-2's "available in your preferred language" hint: the autonym
@@ -7425,6 +7800,284 @@ mod tests {
         app.mode = Mode::Toc;
         app.jump_to_section(5); // no sections at all
         assert_eq!(app.mode, Mode::Reading, "should still return to Reading");
+    }
+
+    // ---- PRD FR-NV-2 `gs` fuzzy section jump ------------------------------
+
+    fn section_jump_html() -> &'static str {
+        "<html><body><p>lead</p>\
+         <h2>History</h2><p>history body</p>\
+         <h2>Legacy and impact</h2><p>legacy body</p>\
+         <h2>See also</h2><p>see-also body</p></body></html>"
+    }
+
+    #[test]
+    fn filter_sections_ranks_the_best_fuzzy_match_first_ties_in_document_order() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(crate::doc::parse_article_html("T", section_jump_html()));
+        let sections = &app.active_tab().sections;
+        assert_eq!(sections.len(), 3);
+
+        // An empty query matches everything, ties broken by document order —
+        // not alphabetically, which would put "History" after "Legacy...".
+        let all = filter_sections(sections, "");
+        assert_eq!(all, vec![0, 1, 2]);
+
+        // "legacy" is a tight contiguous match against "Legacy and impact"
+        // only — the other two titles don't contain it as a subsequence at
+        // all, so they're absent, not merely ranked lower.
+        let legacy = filter_sections(sections, "legacy");
+        assert_eq!(legacy, vec![1]);
+    }
+
+    #[test]
+    fn gs_opens_filters_and_jumps_to_the_selected_section() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(crate::doc::parse_article_html("T", section_jump_html()));
+        app.layout_width = 80;
+        // A unit test never draws, so `max_scroll` (normally set by
+        // `draw_reading` from the real viewport height) stays at its
+        // default 0 — generous enough here that `jump_to_section`'s own
+        // clamp never kicks in, matching `jump_to_section_clamps_to_max_
+        // scroll`'s own workaround for the same gap.
+        app.active_tab_mut().max_scroll = 200;
+        app.mode = Mode::Reading;
+
+        app.open_section_jump();
+        assert_eq!(app.mode, Mode::SectionJump);
+        assert_eq!(
+            app.section_jump_rows().len(),
+            3,
+            "an empty filter lists every section"
+        );
+
+        // Typing narrows to just "See also".
+        for c in "see".chars() {
+            app.section_jump_input.push(c);
+            app.section_jump_selected = 0;
+        }
+        let rows = app.section_jump_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1.title, "See also");
+
+        app.confirm_section_jump();
+        assert_eq!(
+            app.mode,
+            Mode::Reading,
+            "a confirmed jump returns to Reading"
+        );
+        // The jump landed on the matched section's own block, not section 0
+        // — `jump_to_section` is fed the *original* index the filtered row
+        // carried, not its position in the narrowed list.
+        let expected_line = app.layout.as_ref().unwrap().block_lines[rows[0].1.block];
+        assert_eq!(app.active_tab().scroll, expected_line as u16);
+    }
+
+    #[test]
+    fn gs_with_no_match_confirms_back_to_reading_without_moving_scroll() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(crate::doc::parse_article_html("T", section_jump_html()));
+        app.layout_width = 80;
+        app.open_section_jump();
+        app.section_jump_input = "zzz-no-such-section".to_string();
+        assert!(app.section_jump_rows().is_empty());
+
+        let scroll_before = app.active_tab().scroll;
+        app.confirm_section_jump();
+        assert_eq!(app.mode, Mode::Reading);
+        assert_eq!(app.active_tab().scroll, scroll_before);
+    }
+
+    #[test]
+    fn section_jump_move_wraps_within_the_filtered_list_only() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(crate::doc::parse_article_html("T", section_jump_html()));
+        app.open_section_jump();
+        app.section_jump_input = "history".to_string();
+        assert_eq!(app.section_jump_rows().len(), 1);
+
+        app.section_jump_move(1);
+        assert_eq!(
+            app.section_jump_selected, 0,
+            "clamped to the single filtered row, not the full 3-section list"
+        );
+    }
+
+    // ---- PRD FR-CS-2 `:` command-line Tab-completion ----------------------
+
+    #[test]
+    fn complete_command_tab_completes_the_command_name_and_cycles_ties() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.command_input = "hi".to_string();
+        assert_eq!(app.complete_command_tab(), None, "no network fetch needed");
+        assert_eq!(
+            app.command_input, "history",
+            "the only command starting with \"hi\""
+        );
+
+        // A prefix with more than one match cycles through them on repeat
+        // Tab rather than picking arbitrarily and stopping.
+        app.command_input = "se".to_string();
+        app.complete_command_tab();
+        let first = app.command_input.clone();
+        app.complete_command_tab();
+        let second = app.command_input.clone();
+        assert_ne!(first, second, "a second Tab cycles to the next match");
+        assert!(first.starts_with("se") && second.starts_with("se"));
+    }
+
+    #[test]
+    fn complete_command_tab_on_an_unknown_prefix_is_a_no_op() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.command_input = "zzzznotacommand".to_string();
+        assert_eq!(app.complete_command_tab(), None);
+        assert_eq!(
+            app.command_input, "zzzznotacommand",
+            "no match means the input is left exactly as typed"
+        );
+    }
+
+    #[test]
+    fn complete_command_tab_on_open_with_a_title_requests_a_typeahead_fetch() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.command_input = "open Alan Tur".to_string();
+        let query = app.complete_command_tab();
+        assert_eq!(
+            query.as_deref(),
+            Some("Alan Tur"),
+            "no completions cached yet, so the caller must go fetch some"
+        );
+        assert!(app.command_typeahead_loading);
+
+        // A landed fetch for that exact title installs and cycles on the
+        // very next Tab, without a second network round trip.
+        *app.command_typeahead_slot.lock().unwrap() = Some((
+            "Alan Tur".to_string(),
+            vec![
+                "Alan Turing".to_string(),
+                "Alan Turing Institute".to_string(),
+            ],
+        ));
+        let query = app.complete_command_tab();
+        assert_eq!(query, None, "a cached match needs no fetch");
+        assert_eq!(app.command_input, "open Alan Turing");
+        assert!(!app.command_typeahead_loading);
+
+        let query = app.complete_command_tab();
+        assert_eq!(query, None);
+        assert_eq!(
+            app.command_input, "open Alan Turing Institute",
+            "a third Tab cycles to the second candidate"
+        );
+    }
+
+    #[test]
+    fn complete_command_tab_ignores_non_open_commands_with_arguments() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.command_input = "lang de".to_string();
+        assert_eq!(
+            app.complete_command_tab(),
+            None,
+            "only :open/:o get title completion"
+        );
+        assert_eq!(app.command_input, "lang de", "left untouched");
+    }
+
+    // ---- PRD FR-NV-10 visual-selection yank -------------------------------
+
+    fn visual_html() -> &'static str {
+        "<html><body><p>alpha line</p><p>bravo line</p><p>charlie line</p>\
+         <p>delta line</p><p>echo line</p></body></html>"
+    }
+
+    #[test]
+    fn enter_visual_anchors_at_the_current_scroll_and_needs_a_document() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.enter_visual();
+        assert_eq!(
+            app.mode,
+            Mode::Reading,
+            "no document open — visual mode must not start"
+        );
+
+        app.set_document(crate::doc::parse_article_html("T", visual_html()));
+        app.layout_width = 80;
+        app.active_tab_mut().scroll = 2;
+        app.enter_visual();
+        assert_eq!(app.mode, Mode::Visual);
+        assert_eq!(app.visual_anchor_line, 2);
+        assert_eq!(app.visual_cursor_line, 2);
+        assert_eq!(app.visual_selected_range(), (2, 2));
+    }
+
+    #[test]
+    fn visual_move_extends_the_range_in_either_direction_from_the_anchor() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(crate::doc::parse_article_html("T", visual_html()));
+        app.layout_width = 80;
+        app.viewport_height = 10;
+        app.enter_visual();
+        assert_eq!(app.visual_anchor_line, 0);
+
+        app.visual_move(1);
+        app.visual_move(1);
+        assert_eq!(
+            app.visual_selected_range(),
+            (0, 2),
+            "the anchor stays put; the range grows toward the cursor"
+        );
+
+        // Reversing past the anchor flips which end is the low side —
+        // `visual_selected_range` is always (min, max), not (anchor, cursor).
+        app.visual_move(-4);
+        assert_eq!(app.visual_cursor_line, 0);
+        assert_eq!(app.visual_selected_range(), (0, 0));
+    }
+
+    #[test]
+    fn visual_move_clamps_to_the_laid_out_document() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(crate::doc::parse_article_html("T", visual_html()));
+        app.layout_width = 80;
+        app.viewport_height = 10;
+        app.enter_visual();
+
+        app.visual_move(-5);
+        assert_eq!(app.visual_cursor_line, 0, "must not go negative");
+
+        app.visual_move(1000);
+        let max_line = app.layout.as_ref().unwrap().lines.len() - 1;
+        assert_eq!(app.visual_cursor_line, max_line, "clamped to the last line");
+    }
+
+    #[test]
+    fn visual_selected_text_joins_the_selected_lines_plain_text() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_document(crate::doc::parse_article_html("T", visual_html()));
+        app.layout_width = 80;
+        app.viewport_height = 10;
+        app.ensure_layout();
+        // Each `<p>` lays out on its own line with a blank separator line
+        // between (the layout engine's own paragraph spacing) — line 3 is
+        // "alpha line", line 5 is "bravo line", per the actual laid-out
+        // document, not an assumption about contiguous body text.
+        assert_eq!(
+            app.layout.as_ref().unwrap().lines[3]
+                .spans
+                .iter()
+                .map(|s| s.text.as_str())
+                .collect::<String>(),
+            "alpha line"
+        );
+        app.active_tab_mut().scroll = 3;
+        app.enter_visual();
+        app.visual_move(2); // extend down to line 5, "bravo line"
+
+        let text = app.visual_selected_text().expect("a layout exists");
+        assert_eq!(
+            text, "alpha line\n\nbravo line",
+            "the blank separator line between paragraphs is part of the selection too"
+        );
     }
 
     // ---- PRD FR-NV-3 section folding --------------------------------------
@@ -8620,12 +9273,41 @@ mod tests {
     #[test]
     fn zero_results_message_offers_did_you_mean_when_present() {
         assert_eq!(
-            zero_results_message("Alan Truing", Some("Alan Turing")),
+            zero_results_message("Alan Truing", Some("Alan Turing"), None, 0),
             "No results for \"Alan Truing\". Did you mean Alan Turing? (Enter to search)"
         );
         assert_eq!(
-            zero_results_message("xyzzy", None),
+            zero_results_message("xyzzy", None, None, 0),
             "No results for \"xyzzy\""
+        );
+    }
+
+    /// FR-SR-4's rewrite clause takes over from the plain/did-you-mean
+    /// wording — a rewritten query that still comes back empty is rare
+    /// (normally it finds the results it was rewritten *for*), but the
+    /// message must still make sense rather than silently ignoring it.
+    #[test]
+    fn zero_results_message_shows_the_rewritten_query_when_present() {
+        assert_eq!(
+            zero_results_message("teh alan tuning", None, Some("Alan Turing"), 0),
+            "No results for \"Alan Turing\" (rewritten from \"teh alan tuning\")"
+        );
+    }
+
+    /// FR-SR-4 / §7's offline-results section: an online zero-result search
+    /// that still has local matches says so, appended to whichever base
+    /// message applied; `0` suppresses the clause entirely (an ordinary
+    /// zero-result message must not gain a stray suffix).
+    #[test]
+    fn zero_results_message_appends_the_offline_fallback_count_when_nonzero() {
+        assert_eq!(
+            zero_results_message("xyzzy", None, None, 3),
+            "No results for \"xyzzy\"; 3 in your saved pages (:search-offline to browse)"
+        );
+        assert_eq!(
+            zero_results_message("xyzzy", None, None, 0),
+            "No results for \"xyzzy\"",
+            "zero offline matches must not add the clause at all"
         );
     }
 
@@ -9792,6 +10474,7 @@ mod tests {
         assert_eq!(resolve_g_prefix('h'), GPrefixAction::Home);
         assert_eq!(resolve_g_prefix('r'), GPrefixAction::Random);
         assert_eq!(resolve_g_prefix('R'), GPrefixAction::Related);
+        assert_eq!(resolve_g_prefix('s'), GPrefixAction::SectionJump);
         assert_eq!(resolve_g_prefix('j'), GPrefixAction::PassThrough);
     }
 

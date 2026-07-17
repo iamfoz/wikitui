@@ -320,6 +320,17 @@ struct SearchPageResponse {
     /// comment.
     #[serde(default)]
     suggestion: Option<String>,
+    /// Same schema-extension story as `suggestion` just above — PRD Appendix
+    /// A / FR-SR-4 also names the Action API's `srinfo=rewrittenquery`, the
+    /// "showing results for X" auto-correction the search engine *already
+    /// applied* to produce `pages` (distinct from `suggestion`'s "did you
+    /// mean" invitation, which the reader must opt into via Enter). A
+    /// rewritten query typically arrives *alongside* non-empty `pages`
+    /// (that's the whole point — it's how those results were found), unlike
+    /// `suggestion`, which the mock only ever sends on a genuine zero-result
+    /// miss.
+    #[serde(default)]
+    rewrittenquery: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -857,6 +868,11 @@ struct LegacyParseError {
 pub struct SearchOutcome {
     pub results: Vec<SearchResult>,
     pub suggestion: Option<String>,
+    /// PRD FR-SR-4's other zero/poor-result signal: the query the search
+    /// engine actually ran, when it differs from what the reader typed
+    /// (`srinfo=rewrittenquery`) — a "showing results for X" notice, not a
+    /// "did you mean" invitation (`suggestion`'s own job).
+    pub rewritten_query: Option<String>,
 }
 
 impl WikiClient {
@@ -2201,9 +2217,13 @@ impl WikiClient {
         let suggestion = parsed
             .suggestion
             .map(|s| crate::sanitize::sanitize_single_line(&s).into_owned());
+        let rewritten_query = parsed
+            .rewrittenquery
+            .map(|s| crate::sanitize::sanitize_single_line(&s).into_owned());
         Ok(SearchOutcome {
             results: parsed.pages,
             suggestion,
+            rewritten_query,
         })
     }
 
@@ -2569,6 +2589,24 @@ mod tests {
         let without_suggestion = r#"{"pages": []}"#;
         let parsed: SearchPageResponse = serde_json::from_str(without_suggestion).unwrap();
         assert_eq!(parsed.suggestion, None);
+    }
+
+    /// FR-SR-4's other zero/poor-result signal: `rewrittenquery`, this
+    /// module's own schema extension alongside `suggestion` — same
+    /// round-trip/absence contract, and distinct from `suggestion` (a
+    /// rewrite typically arrives with non-empty `pages`, since it's what
+    /// the engine actually searched for).
+    #[test]
+    fn search_page_response_parses_the_rewrittenquery_extension() {
+        let with_rewrite =
+            r#"{"pages": [{"title": "Alan Turing"}], "rewrittenquery": "Alan Turing"}"#;
+        let parsed: SearchPageResponse = serde_json::from_str(with_rewrite).unwrap();
+        assert_eq!(parsed.pages.len(), 1);
+        assert_eq!(parsed.rewrittenquery.as_deref(), Some("Alan Turing"));
+
+        let without_rewrite = r#"{"pages": []}"#;
+        let parsed: SearchPageResponse = serde_json::from_str(without_rewrite).unwrap();
+        assert_eq!(parsed.rewrittenquery, None);
     }
 
     /// FR-SR-2's size/wordcount/timestamp are all optional per-result — a

@@ -366,6 +366,14 @@ fn print_capabilities(configured_color_depth: &str, configured_bidi: &str) {
     println!("  truecolor ($COLORTERM={colorterm:?}): {truecolor}");
     println!("  $TERM: {:?}", std::env::var("TERM").unwrap_or_default());
     println!("  NO_COLOR active: {}", crate::no_color_active());
+    // PRD FR-TH-5: the raw CLICOLOR_FORCE signal, shown alongside the fully
+    // resolved `no_color_active` decision above (which already folds this
+    // in) — same "raw env var next to the resolved policy" pairing as
+    // `ACCESSIBLE`/`accessible_active` below.
+    println!(
+        "  CLICOLOR_FORCE active: {}",
+        crate::clicolor_force_active()
+    );
     // PRD FR-TH-3: the depth every theme's colors actually get mapped to —
     // NO_COLOR forces mono the same way it does everywhere else (FR-TH-5's
     // policy layer), otherwise `color_depth` resolves `auto` against the
