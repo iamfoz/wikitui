@@ -1,0 +1,115 @@
+# cargo-deny policy (PRD SEC-6 supply-chain, §10 "dependency licenses audited
+# via `cargo deny`"). Run with `cargo deny check` (or `cargo deny check
+# licenses` / `advisories` / `bans` / `sources` individually).
+#
+# This file's license allow-list was built from the *actual* dependency set
+# (`cargo metadata` / `cargo tree`, see the CI workflow's comment for the
+# command), not guessed — every permissive SPDX identifier appearing
+# anywhere in the resolved graph is listed below so a correct build passes
+# clean; nothing is allow-listed "just in case."
+
+[advisories]
+# SEC-6: `cargo deny check advisories` fails the build on both a real
+# vulnerability and an "unmaintained" notice by default (this cargo-deny
+# version has no separate severity dial for the two) — every entry below is
+# a specific, individually-justified `ignore`, never a blanket suppression.
+# `cargo tree --target all -i <crate>` traces each one's actual path; every
+# one of them lands in `zim`'s own pre-existing "accepted transitive cost"
+# footprint (see Cargo.toml's `zim` dependency comment) or a build-only dep
+# that never ships in the compiled binary — re-run that command if a new
+# advisory shows up here on a `cargo update` to confirm it's the same story
+# before extending this list.
+ignore = [
+    # zim -> stopwatch -> num/num-bigint/num-rational/num-complex ->
+    # rustc-serialize 0.3.25: a real stack-overflow-on-deep-JSON
+    # vulnerability, but in `rustc_serialize::json`, a parser wikitui's own
+    # code (and zim's actual ZIM-format decoder, `src/zim.rs` binds to)
+    # never calls — `stopwatch`/`num`'s crates are dead weight `zim`
+    # carries for its own unrelated `extract-zim`/`zim-info` CLI binaries,
+    # not code reachable from wikitui's binary. No upgrade exists (the
+    # crate is archived); removing the exposure means `zim` dropping this
+    # dependency, which is upstream's call, not this project's.
+    { id = "RUSTSEC-2022-0004", reason = "unreachable: rustc-serialize's JSON parser is never invoked from wikitui's or zim's own ZIM-decoding code path; only pulled in by zim's num/stopwatch chain for its unrelated bundled CLI tools" },
+    { id = "RUSTSEC-2025-0025", reason = "same rustc-serialize dependency as RUSTSEC-2022-0004 above (unmaintained notice on the same unreachable crate)" },
+    # zim -> memmap 0.7.0 (unmaintained since 2020; memmap2 is the
+    # maintained fork). Used by zim's own file-backed reader, but only
+    # memory-maps locally-supplied ZIM archive files the user chose to
+    # open — not attacker-controlled network input.
+    { id = "RUSTSEC-2020-0077", reason = "zim's own ZIM-file reader memory-maps a locally-opened archive, not untrusted network data; no upstream fix available from the unmaintained memmap crate" },
+    # zim -> indicatif -> number_prefix 0.4.0 (progress-bar byte-count
+    # formatting for zim's own CLI progress bars, unused by wikitui).
+    { id = "RUSTSEC-2025-0119", reason = "only formats progress-bar byte counts in zim's unused bundled CLI tools; not exercised by wikitui's own code paths" },
+    # zim -> ouroboros -> ouroboros_macro -> proc-macro-error 1.0.4 (a
+    # build-time proc-macro dependency; nothing it pulls in ships in the
+    # compiled wikitui binary).
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-only (build-time), via zim's ouroboros dependency; does not appear in the compiled binary" },
+    # hyphenation's build script (embed_en-us pattern compilation) depends
+    # on bincode 1.3.3 (unmaintained after a maintainer harassment
+    # incident, per the advisory's own text) at build time only — the
+    # compiled patterns are embedded as plain data; bincode itself never
+    # ships in or runs as part of the wikitui binary.
+    { id = "RUSTSEC-2025-0141", reason = "build-dependency only (hyphenation's build.rs pattern compiler); not linked into the compiled wikitui binary" },
+]
+
+[licenses]
+# PRD §10: "AGPL-compatible only." wikitui's own crate is intentionally
+# excluded from this check below (`[[licenses.exceptions]]`) since AGPL-3.0
+# is this project's *own* license, not a dependency's — the policy this file
+# enforces is about what wikitui *depends on*, not what wikitui *is*.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "CC0-1.0",
+    "MIT-0",
+    "Unicode-3.0",
+    "Unlicense",
+    "BSL-1.0",
+    # Weak (file-level) copyleft, FSF-listed as GPL/AGPL-compatible when not
+    # marked "Incompatible With Secondary Licenses" (none of this tree's
+    # MPL-2.0 crates — `cssparser`/`selectors`/`dtoa-short`/`option-ext` via
+    # `scraper` — carry that notice): combining with it doesn't change the
+    # combined work's license the way a strong-copyleft dependency would.
+    "MPL-2.0",
+    # Permissive data license on `webpki-root-certs`' bundled Mozilla root
+    # certificate data (not code) — CC-BY-style attribution only.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+exceptions = [
+    # wikitui's own crate is AGPL-3.0-only by design (see Cargo.toml's own
+    # license field comment) — this is the project's chosen license, not a
+    # dependency to audit for compatibility with itself.
+    { allow = ["AGPL-3.0-only"], crate = "wikitui" },
+]
+
+[[licenses.clarify]]
+# No SPDX `license` field upstream (last published 2019, pre-dates crates.io
+# license-file conventions settling) — its in-repo `LICENSE` file is a
+# verbatim 3-clause BSD text (Fuchsia/Google copyright header), confirmed by
+# reading that file directly. Reached transitively via `zim` -> `stopwatch`
+# -> `num`/`num-bigint`/`num-rational` -> `rand 0.4`, an old edition-2018
+# leaf with no newer release.
+crate = "fuchsia-cprng"
+expression = "BSD-3-Clause"
+license-files = [
+    { path = "LICENSE", hash = 0xf04ece33 },
+]
+
+[bans]
+# Multiple versions of the same crate in the tree (e.g. `windows-sys`,
+# `syn`, `bitflags` at different major versions across the dependency
+# graph) is normal Rust-ecosystem churn, not a bug this project can fix
+# unilaterally — warn so it's visible, never fail the build on it.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
