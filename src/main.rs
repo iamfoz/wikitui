@@ -1217,6 +1217,16 @@ fn fire_revalidation(
 /// exactly wrong for "the reader is watching this specific retry, right
 /// now" — a prefetch job ahead of it in line would delay the very retry the
 /// toast just promised.
+/// Doubles the rate-limit backoff for the next foreground retry, capped at
+/// [`api::MAX_RETRY_AFTER_SECS`] so the wait stays reasonable and the
+/// `Duration` multiply can never overflow (which would panic the detached
+/// retry task and leave `pending_foreground_retries` stuck, degrading the
+/// idle loop to a busy-poll).
+fn double_backoff(delay: Duration) -> Duration {
+    let cap = Duration::from_secs(api::MAX_RETRY_AFTER_SECS);
+    delay.checked_mul(2).unwrap_or(cap).min(cap)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn fire_foreground_retry(
     app: &mut App,
@@ -1253,10 +1263,10 @@ fn fire_foreground_retry(
                 // cache stood in) — try again unless retries are exhausted,
                 // backing off further since there's no fresher `Retry-After`
                 // to honor past the first one.
-                Ok(_still_offline) => delay *= 2,
+                Ok(_still_offline) => delay = double_backoff(delay),
                 Err(e) => {
                     if let Some(rl) = e.downcast_ref::<api::RateLimited>() {
-                        delay = rl.retry_after.unwrap_or(delay * 2);
+                        delay = rl.retry_after.unwrap_or_else(|| double_backoff(delay));
                         continue;
                     }
                     // A non-rate-limit failure: gracefully give up now, same
@@ -10135,6 +10145,26 @@ fn run_reindex(resolved: &config::ResolvedConfig) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A hostile/broken server (wikitui talks to arbitrary wikis) can drive
+    /// the rate-limit backoff toward `Duration::MAX`; `double_backoff` must
+    /// cap it at `api::MAX_RETRY_AFTER_SECS` and never panic on overflow,
+    /// which would strand `pending_foreground_retries` and busy-poll the loop.
+    #[test]
+    fn double_backoff_caps_and_never_overflows() {
+        let cap = Duration::from_secs(api::MAX_RETRY_AFTER_SECS);
+        // Ordinary doubling stays exact until it reaches the cap.
+        assert_eq!(
+            double_backoff(Duration::from_secs(5)),
+            Duration::from_secs(10)
+        );
+        // At/above the cap it clamps, not grows.
+        assert_eq!(double_backoff(cap), cap);
+        assert_eq!(double_backoff(Duration::from_secs(200)), cap);
+        // A pathological near-MAX delay would overflow a plain `* 2`; here it
+        // saturates to the cap instead of panicking.
+        assert_eq!(double_backoff(Duration::MAX), cap);
+    }
 
     /// PRD FR-TH-5: NO_COLOR wins outright — set alongside CLICOLOR_FORCE or
     /// a real TTY, color still strips. This is the one precedence rule the

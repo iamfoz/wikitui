@@ -2531,12 +2531,20 @@ fn bg_status_failure(resp: &reqwest::Response) -> Option<BgFailure> {
 /// PRD NF-NET-4: the `Retry-After` header as a `Duration`. Only the
 /// delta-seconds form is parsed (the HTTP-date form falls back to the
 /// substrate's default pause) — Wikimedia emits seconds.
+/// Maximum `Retry-After` we will honor, in seconds. wikitui talks to
+/// arbitrary third-party wikis (FR-ML-4/5), so a hostile or broken server
+/// could send an enormous `Retry-After`; we clamp it so neither a background
+/// job nor the foreground retry can be parked for an unreasonable time — and
+/// so the exponential backoff that doubles this value can never overflow a
+/// `Duration`. Five minutes matches the circuit-breaker cooldown magnitude.
+pub(crate) const MAX_RETRY_AFTER_SECS: u64 = 300;
+
 fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     headers
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.trim().parse::<u64>().ok())
-        .map(Duration::from_secs)
+        .map(|secs| Duration::from_secs(secs.min(MAX_RETRY_AFTER_SECS)))
 }
 
 /// PRD SEC-1: sanitizes every field of one full-text search result that the
@@ -2583,6 +2591,29 @@ fn sanitize_langlink(link: &mut LangLink) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An enormous `Retry-After` from an untrusted wiki is clamped to
+    /// `MAX_RETRY_AFTER_SECS` rather than parking a retry for years (and so
+    /// the doubling backoff downstream can never overflow a `Duration`).
+    #[test]
+    fn parse_retry_after_clamps_a_hostile_value() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("999999999999"),
+        );
+        assert_eq!(
+            parse_retry_after(&headers),
+            Some(Duration::from_secs(MAX_RETRY_AFTER_SECS))
+        );
+
+        // A sane value passes through untouched.
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("7"),
+        );
+        assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(7)));
+    }
 
     #[test]
     fn host_substitutes_lang_in_the_default_template() {
