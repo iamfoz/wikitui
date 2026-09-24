@@ -1,3 +1,11 @@
+//! The wikitui crate root: every module, plus the event loop and startup
+//! path that used to live in `src/main.rs` (comments across the tree that
+//! say `main.rs`/`main::` mean this file). The `wikitui` binary is a thin
+//! shim over [`main`]; this library target exists so `benches/` (PRD §9's
+//! criterion benches for the §6.8 targets) can link the parser, layout
+//! engine, cache, and renderer. Every module stays private — exactly as
+//! visible as it was when this was a binary-only crate.
+
 mod account;
 mod achievements;
 mod api;
@@ -257,8 +265,10 @@ enum RevalidationResult {
     },
 }
 
+/// The process entry point — the `wikitui` binary's `main` (`src/main.rs`)
+/// calls this and nothing else.
 #[tokio::main]
-async fn main() -> Result<()> {
+pub async fn main() -> Result<()> {
     let mut cli = Cli::parse();
 
     // `wikitui config doctor` runs before anything else touches the

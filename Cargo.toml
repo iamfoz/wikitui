@@ -35,6 +35,16 @@ categories = ["command-line-utilities", "text-processing"]
 # alongside a new stable release, not preemptively.
 rust-version = "1.92"
 
+# The crate is a library (`src/lib.rs`: every module, the event loop, and the
+# startup path) plus a thin `wikitui` binary shim over `wikitui::main` — split
+# only so `benches/` can link the internals (PRD §9 criterion benches for the
+# §6.8 targets). Doctests are off: the tree has no Rust doctests (its fenced
+# doc blocks are `text`/`toml`), and the tests all live in colocated
+# `#[cfg(test)]` modules, so a rustdoc pass would compile the crate again for
+# nothing on every `cargo test`.
+[lib]
+doctest = false
+
 [features]
 # PRD SEC-4 / §5.9: the OS-keychain token backend (`keyring` crate). Off by
 # default — the 0600-file store (always compiled) is the portable fallback,

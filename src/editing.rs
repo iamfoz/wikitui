@@ -1011,7 +1011,7 @@ mod tests {
         let forbidden = ["move", "rollback", "upload", "delete", "undo", "undelete"];
         for file in [
             "src/api.rs",
-            "src/main.rs",
+            "src/lib.rs",
             "src/editing.rs",
             "src/account.rs",
         ] {
