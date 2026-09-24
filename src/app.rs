@@ -471,6 +471,12 @@ pub struct App {
     /// keystroke in Search mode (`queue_typeahead`) and cleared once sent.
     /// `None` means no request is queued.
     pub search_debounce_at: Option<Instant>,
+    /// Typeahead requests fired (`main::fire_typeahead`) whose response
+    /// hasn't been drained yet. Together with `search_debounce_at` this is
+    /// what keeps Search mode on the event loop's short poll timer
+    /// ([`Self::typeahead_pending`]); with neither, an idle search prompt
+    /// blocks on input like every other idle view (PRD FR-ACS-2).
+    pub typeahead_in_flight: usize,
     /// PRD FR-SR-4 / §7's "did you mean" suggestion from the last full-text
     /// search, shown by the zero-results view; `None` when the search had
     /// results or hasn't run yet.
@@ -1691,6 +1697,7 @@ impl App {
             typeahead: Vec::new(),
             selected_suggestion: 0,
             search_debounce_at: None,
+            typeahead_in_flight: 0,
             search_suggestion: None,
             search_rewritten_query: None,
             offline_fallback_count: 0,
@@ -6300,6 +6307,16 @@ impl App {
         } else {
             self.search_debounce_at = Some(Instant::now() + TYPEAHEAD_DEBOUNCE);
         }
+    }
+
+    /// Whether a typeahead round trip is still underway — a keystroke's
+    /// debounce waiting to fire, or a fired request not yet answered. The
+    /// event loop only needs its short Search-mode poll timer while this
+    /// holds (PRD FR-SR-1); otherwise the dropdown is settled and the loop
+    /// can block on input (FR-ACS-2) instead of redrawing an unchanged
+    /// frame every 30 ms.
+    pub fn typeahead_pending(&self) -> bool {
+        self.search_debounce_at.is_some() || self.typeahead_in_flight > 0
     }
 
     /// Moves the highlighted typeahead suggestion, wrapping like every other

@@ -3603,11 +3603,13 @@ async fn run(
                 {
                     app.search_debounce_at = None;
                     fire_typeahead(client, &app, &typeahead_tx);
+                    app.typeahead_in_flight += 1;
                 }
                 // Non-blocking drain: a response for a query the user has
                 // since typed past (`typeahead_is_current` says no) is
                 // silently discarded — PRD FR-SR-1's in-flight cancellation.
                 while let Ok(outcome) = typeahead_rx.try_recv() {
+                    app.typeahead_in_flight = app.typeahead_in_flight.saturating_sub(1);
                     if app::typeahead_is_current(&outcome.query, &app.search_input)
                         && let Ok(suggestions) = outcome.result
                     {
@@ -3803,7 +3805,11 @@ fn should_poll_instead_of_block(
     start_page_still_loading: bool,
     image_loading_before_draw: bool,
 ) -> bool {
-    app.mode == Mode::Search
+    // PRD FR-SR-1: Search mode needs the short timer only while a typeahead
+    // round trip is underway (debounce armed or a request unanswered) — a
+    // settled search prompt blocks on input like any idle view (FR-ACS-2)
+    // rather than redrawing an unchanged frame every `TYPEAHEAD_POLL`.
+    (app.mode == Mode::Search && app.typeahead_pending())
         || app.pending_revalidations > 0
         || app.any_tab_loading()
         || image_loading_before_draw
@@ -13357,6 +13363,37 @@ mod tests {
     /// (snapshot says loading, live state already resolved) would have
     /// returned `false` — picking the block-forever branch despite `draw`
     /// having just painted a still-loading frame.
+    /// PRD FR-ACS-2 / FR-SR-1: an open search prompt keeps the loop on its
+    /// short poll timer only while a typeahead round trip is underway; once
+    /// the debounce has fired and every response has been drained, the loop
+    /// blocks on input instead of redrawing the same frame every 30 ms.
+    #[test]
+    fn search_mode_polls_only_while_a_typeahead_round_trip_is_underway() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.mode = Mode::Search;
+        assert!(
+            !should_poll_instead_of_block(&app, false, false),
+            "a settled search prompt blocks on input"
+        );
+
+        app.search_input = "axolotl".to_string();
+        app.queue_typeahead();
+        assert!(
+            should_poll_instead_of_block(&app, false, false),
+            "debounce armed"
+        );
+
+        app.search_debounce_at = None; // the debounce fired...
+        app.typeahead_in_flight = 1; // ...and its request is in flight
+        assert!(
+            should_poll_instead_of_block(&app, false, false),
+            "awaiting a response"
+        );
+
+        app.typeahead_in_flight = 0; // response drained
+        assert!(!should_poll_instead_of_block(&app, false, false));
+    }
+
     #[test]
     fn poll_decision_trusts_the_pre_draw_image_snapshot_over_live_state() {
         let app = App::new("en".to_string(), Theme::terminal(), false);
