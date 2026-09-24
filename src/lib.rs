@@ -3,8 +3,9 @@
 //! say `main.rs`/`main::` mean this file). The `wikitui` binary is a thin
 //! shim over [`main`]; this library target exists so `benches/` (PRD §9's
 //! criterion benches for the §6.8 targets) can link the parser, layout
-//! engine, cache, and renderer. Every module stays private — exactly as
-//! visible as it was when this was a binary-only crate.
+//! engine, cache, and renderer, through the `#[doc(hidden)]` [`bench`]
+//! facade. Every other module stays private — exactly as visible as it was
+//! when this was a binary-only crate.
 
 mod account;
 mod achievements;
@@ -14,6 +15,8 @@ mod atomicio;
 mod attribution;
 mod auth;
 mod autotheme;
+#[doc(hidden)]
+pub mod bench;
 mod bidi;
 mod bookmark_export;
 mod bookmarks;
@@ -47,6 +50,7 @@ mod migrate;
 mod netqueue;
 mod offline_search;
 mod paths;
+mod perflog;
 mod prefetch;
 mod privacy;
 mod random;
@@ -137,6 +141,9 @@ const MAX_FOREGROUND_RETRIES: u32 = 3;
 struct TypeaheadOutcome {
     query: String,
     result: std::result::Result<Vec<TitleSuggestion>, String>,
+    /// When the response was decoded — `Some` only while the opt-in perf log
+    /// is on (`perflog`), for §6.8's "render < 100 ms after response".
+    arrived: Option<Instant>,
 }
 
 /// One completed (or failed) background revalidation (PRD FR-OFF-2),
@@ -272,6 +279,7 @@ enum RevalidationResult {
 #[tokio::main]
 pub async fn main() -> Result<()> {
     let mut cli = Cli::parse();
+    perflog::init_from_env();
 
     // `wikitui config doctor` runs before anything else touches the
     // network, the cache, or the terminal (PRD §6.7: plain stdout, no TUI
@@ -412,6 +420,7 @@ pub async fn main() -> Result<()> {
     // `--dump`, which reads `resolved.terminal.hyperlinks` for its own
     // `[link: target]` fallback) sees the resolved config.
     config::apply_accessible_bundle(&mut resolved, accessible_active());
+    perflog::mark("config");
 
     // §6.7: unknown keys and rejected values warn, never crash — printed
     // once, before any terminal state change (raw mode/the alternate
@@ -482,6 +491,7 @@ pub async fn main() -> Result<()> {
         wiki_capabilities,
         contact,
     )?;
+    perflog::mark("http_client");
     let page_cache = PageCache::open(
         resolved.cache_dir.value.clone(),
         resolved.cache_max_mb.value.saturating_mul(1024 * 1024),
@@ -500,6 +510,7 @@ pub async fn main() -> Result<()> {
     // whatever the *previous* run tagged, regardless of this run's own
     // incognito state, before doing anything else with the cache.
     startup_sweep_incognito_leftovers(&page_cache);
+    perflog::mark("page_cache");
 
     if cli.dump {
         let title = cli
@@ -579,6 +590,7 @@ pub async fn main() -> Result<()> {
     // can't guarantee. See `crashguard`'s module doc comment for why the
     // panic hook above is still separately necessary.
     let mut guard = TerminalGuard::enter()?;
+    perflog::mark("terminal");
 
     // PRD FR-NV-9: opt-in mouse capture, toggled on before the event loop
     // ever reads an event so every input turn from the first draw onward is
@@ -3078,6 +3090,7 @@ async fn run(
     // behind (see that function's doc comment for why incognito must not
     // also erase history it didn't ask to touch).
     app.session_path = session::resolve_session_path();
+    perflog::mark("local_stores");
     // PRD FR-PC-2 / FR-CS-5: both file-only, resolved once at startup —
     // same "App::new defaults empty, main::run installs the real config"
     // split every other config-sourced field on `App` already follows.
@@ -3116,9 +3129,11 @@ async fn run(
     // PRD FR-ACC-3's login/startup poll (see `account.rs`'s poll-cadence
     // doc): a restored session gets its unread-count badge without waiting
     // for the reader to open `:notifications` first.
+    perflog::mark("auth_loaded");
     if app.auth.is_some() {
         poll_notifications_count(client, &mut app).await;
     }
+    perflog::mark("notifications_polled");
 
     // Delivers typeahead responses, background revalidation outcomes, and
     // background-tab fetch results back to the loop (PRD FR-SR-1 / FR-OFF-2 /
@@ -3276,6 +3291,13 @@ async fn run(
         app.mode = Mode::Onboarding;
     }
 
+    // Perf-log bookkeeping (`perflog`): frames drawn so far, and a typeahead
+    // response installed since the last frame (when it arrived, how many
+    // rows) — both untouched while the log is off.
+    let mut frames_drawn: u64 = 0;
+    let mut typeahead_unpainted: Option<(Instant, usize)> = None;
+    perflog::mark("event_loop");
+
     loop {
         // Checked once per turn rather than mid-`event::read()`, which
         // blocks on real input and can't be interrupted without
@@ -3326,7 +3348,22 @@ async fn run(
         // and `draw` mutates `image_store` further).
         let image_loading_before_draw = app.image_store.any_loading();
 
+        // PRD §6.8 validation: the opt-in local perf log (`perflog`, off
+        // unless `WIKITUI_PERF_LOG` names a file) times every frame.
+        let draw_started = perflog::enabled().then(Instant::now);
         terminal.draw(|f| ui::draw(f, &mut app))?;
+        if let Some(started) = draw_started {
+            frames_drawn += 1;
+            perflog::frame(
+                started.elapsed(),
+                &format!("{:?}", app.mode),
+                app.active_tab().scroll,
+                frames_drawn,
+            );
+            if let Some((arrived, count)) = typeahead_unpainted.take() {
+                perflog::typeahead_rendered(arrived.elapsed(), count);
+            }
+        }
 
         // PRD FR-RD-2 / SEC-2: overlay OSC 8 hyperlinks on top of the frame
         // ratatui just painted — see `emit_hyperlinks`'s own doc comment for
@@ -3421,6 +3458,9 @@ async fn run(
                     if app::typeahead_is_current(&outcome.query, &app.search_input)
                         && let Ok(suggestions) = outcome.result
                     {
+                        if let Some(arrived) = outcome.arrived {
+                            typeahead_unpainted = Some((arrived, suggestions.len()));
+                        }
                         app.typeahead = suggestions;
                         app.selected_suggestion = 0;
                     }
@@ -3546,7 +3586,12 @@ fn fire_typeahead(client: &WikiClient, app: &App, tx: &UnboundedSender<Typeahead
             .search_title(&lang, &query, TYPEAHEAD_LIMIT)
             .await
             .map_err(|e| e.to_string());
-        let _ = tx.send(TypeaheadOutcome { query, result });
+        let arrived = perflog::enabled().then(Instant::now);
+        let _ = tx.send(TypeaheadOutcome {
+            query,
+            result,
+            arrived,
+        });
     });
 }
 

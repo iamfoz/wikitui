@@ -1,4 +1,66 @@
-import http.server, urllib.parse, json, time, os, zlib, struct, hashlib, base64
+import http.server, urllib.parse, json, time, os, zlib, struct, hashlib, base64, gzip, sys, pathlib
+
+# PRD §6.8 perf mode (tests/perf/harness.py, docs/PERFORMANCE.md). Every
+# option defaults off, so a plain `python3 server.py` behaves exactly as it
+# always has (single-threaded, port 8943, no added latency). See this
+# directory's README ("Perf mode") for what each emulates and why.
+#
+# WIKITUI_MOCK_PORT           listen port (default 8943)
+# WIKITUI_MOCK_LATENCY_MS     delay before every non-/debug/ response starts
+#                             (one emulated round trip + server think time)
+# WIKITUI_MOCK_BANDWIDTH_KBIT throttle every non-/debug/ response body to this
+#                             many kbit/s, per connection (0 = unthrottled)
+# WIKITUI_MOCK_GZIP=1         gzip article HTML when the client accepts it,
+#                             as Wikipedia's CDN does
+# WIKITUI_MOCK_PERF_CORPUS=1  serve tests/perf/fixtures' generated articles
+#                             (Perf_Pathological, Perf_Typical, and the
+#                             cross-linked Perf_Corpus_<n> set)
+PERF_PORT = int(os.environ.get("WIKITUI_MOCK_PORT", "8943"))
+PERF_LATENCY_S = float(os.environ.get("WIKITUI_MOCK_LATENCY_MS", "0")) / 1000.0
+PERF_BYTES_PER_S = float(os.environ.get("WIKITUI_MOCK_BANDWIDTH_KBIT", "0")) * 1000.0 / 8.0
+PERF_GZIP = os.environ.get("WIKITUI_MOCK_GZIP") == "1"
+PERF_CORPUS = os.environ.get("WIKITUI_MOCK_PERF_CORPUS") == "1"
+# Any perf option switches to a threaded server: with added latency, a
+# single-threaded one would queue concurrent requests (foreground behind
+# prefetch) and measure the mock, not the client.
+PERF_MODE = bool(PERF_LATENCY_S or PERF_BYTES_PER_S or PERF_GZIP or PERF_CORPUS
+                 or "WIKITUI_MOCK_PORT" in os.environ)
+
+
+class _ThrottledWriter:
+    """Paces writes to `bytes_per_s` from the first byte written, sleeping
+    to the schedule (not per chunk) so pacing error never accumulates."""
+
+    CHUNK = 16 * 1024
+
+    def __init__(self, raw, bytes_per_s):
+        self._raw = raw
+        self._rate = bytes_per_s
+        self._sent = 0
+        self._start = None
+
+    def write(self, data):
+        view = memoryview(data)
+        for i in range(0, len(view), self.CHUNK):
+            chunk = view[i:i + self.CHUNK]
+            if self._start is None:
+                self._start = time.monotonic()
+            self._raw.write(chunk)
+            self._sent += len(chunk)
+            wait = self._start + self._sent / self._rate - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+        return len(data)
+
+    def flush(self):
+        self._raw.flush()
+
+    def close(self):
+        self._raw.close()
+
+    @property
+    def closed(self):
+        return self._raw.closed
 
 # PRD FR-OFF-1/2 fixture revids: stable fake MediaWiki revision ids, one per
 # PAGES key, exposed via the `ETag` header on `/page/{title}/html`
@@ -92,6 +154,9 @@ RATE_LIMIT_ARMED = {}
 # app's background revalidation notices the new revid and fetches visibly
 # different content.
 UPDATED_TITLE = os.environ.get("WIKITUI_MOCK_UPDATE_TITLE")
+
+# PRD §6.8 perf corpus (WIKITUI_MOCK_PERF_CORPUS=1): loaded after PAGES below.
+PERF_FIXTURES_DIR = pathlib.Path(__file__).resolve().parent.parent / "perf" / "fixtures"
 
 
 def current_revid(title):
@@ -531,6 +596,19 @@ PAGES["Mercury_(element)"] = """<html><head><title>Mercury (element)</title></he
 # `Policy::none()` (`fetch_article_html_noredirect`, `:noredirect`) instead
 # reads this 302 response directly — its body is the notice page above, so
 # that path still gets meaningful content instead of an empty redirect hop.
+if PERF_CORPUS:
+    sys.dont_write_bytecode = True
+    sys.path.insert(0, str(PERF_FIXTURES_DIR))
+    import generate as _perf_generate
+    PAGES["Perf_Pathological"] = (PERF_FIXTURES_DIR / "pathological.html").read_text()
+    PAGES["Perf_Typical"] = (PERF_FIXTURES_DIR / "typical.html").read_text()
+    REVIDS["Perf_Pathological"] = 5001
+    REVIDS["Perf_Typical"] = 5002
+    for _n in range(_perf_generate.CORPUS_SIZE):
+        _title = _perf_generate.corpus_title(_n)
+        PAGES[_title] = _perf_generate.corpus_article(_n)
+        REVIDS[_title] = 6000 + _n
+
 REDIRECTS = {
     "UK": "United_Kingdom",
 }
@@ -1155,17 +1233,39 @@ def make_excerpt(text, query):
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
+    def setup(self):
+        super().setup()
+        # Perf mode's bandwidth throttle wraps the socket writer; /debug/
+        # requests are exempted in `_perf_shape` (they're the harness's own
+        # control channel, not emulated network).
+        self._throttled = None
+        if PERF_BYTES_PER_S > 0:
+            self._throttled = _ThrottledWriter(self.wfile, PERF_BYTES_PER_S)
+
+    def _perf_shape(self, path):
+        """Apply perf mode's emulated round trip + bandwidth to one request."""
+        if path.startswith('/debug/'):
+            return
+        if PERF_LATENCY_S > 0:
+            time.sleep(PERF_LATENCY_S)
+        if self._throttled is not None:
+            self.wfile = self._throttled
+
     def do_GET(self):
         global LIFTWING_HITS
         parsed = urllib.parse.urlparse(self.path)
         parts = parsed.path.split('/')
         params = urllib.parse.parse_qs(parsed.query)
+        self._perf_shape(parsed.path)
 
-        # PRD NF-NET-2 verification: record every real request's path + UA.
+        # PRD NF-NET-2 verification: record every real request's path + UA
+        # (plus, for perf mode's typeahead-debounce check, when it arrived on
+        # the shared CLOCK_MONOTONIC the harness also reads).
         if not parsed.path.startswith('/debug/'):
             REQUEST_LOG.append({
                 "path": self.path,
                 "ua": self.headers.get('User-Agent', ''),
+                "t": time.monotonic(),
             })
 
         # PRD FR-ML-5 / §6.2 rule 3 fixture: a "wiki" (any base_url ending in
@@ -1653,6 +1753,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
+        self._perf_shape(parsed.path)
         length = int(self.headers.get('Content-Length', '0') or '0')
         body = self.rfile.read(length).decode('utf-8', 'replace') if length else ''
         form = {k: v[0] for k, v in urllib.parse.parse_qs(body).items()}
@@ -1981,6 +2082,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         body = current_html(title, html).encode()
         self.send_response(200)
         self.send_header('Content-Type', 'text/html')
+        # Perf mode: compressed on the wire like Wikipedia's CDN serves it,
+        # when (and only when) the client asked for gzip.
+        if PERF_GZIP and 'gzip' in self.headers.get('Accept-Encoding', ''):
+            body = _gzip_cached(title, body)
+            self.send_header('Content-Encoding', 'gzip')
         self.send_header('Content-Length', str(len(body)))
         # PRD FR-OFF-1/2: the Parsoid-shaped ETag api.rs's
         # parse_revid_from_etag parses the revid out of.
@@ -2113,4 +2219,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-http.server.HTTPServer(('127.0.0.1', 8943), Handler).serve_forever()
+
+# Perf mode's gzip bodies, compressed once per (title, body) — Wikipedia's
+# CDN serves pre-compressed objects, so compression time isn't on the
+# emulated wire either.
+_GZIP_CACHE = {}
+
+
+def _gzip_cached(title, body):
+    key = (title, len(body), hash(body))
+    if key not in _GZIP_CACHE:
+        _GZIP_CACHE[key] = gzip.compress(body, compresslevel=6, mtime=0)
+    return _GZIP_CACHE[key]
+
+
+_server_cls = http.server.ThreadingHTTPServer if PERF_MODE else http.server.HTTPServer
+_server_cls(('127.0.0.1', PERF_PORT), Handler).serve_forever()

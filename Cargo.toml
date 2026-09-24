@@ -136,3 +136,16 @@ unicode-segmentation = "1.13.3"
 unicode-width = "0.2.2"
 urlencoding = "2.1.3"
 zstd = "0.13.3"
+
+[dev-dependencies]
+# PRD §9 "Performance regression: criterion benches for parse/layout on the
+# pathological corpus". Default features off: no plotters/rayon (HTML charts
+# and parallel analysis aren't worth their dependency tree here — the
+# console report plus `--save-baseline`/`--baseline` comparison is what CI
+# and docs/PERFORMANCE.md use).
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+
+# `cargo bench` — see benches/perf.rs and docs/PERFORMANCE.md.
+[[bench]]
+name = "perf"
+harness = false

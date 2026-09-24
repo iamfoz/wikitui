@@ -339,6 +339,40 @@ the rendered `PAGES` HTML, because an edit fixes the source, not the render:
 - `GET /debug/reset` additionally clears `RECORDED_EDITS` and restores
   `WIKITEXT`/`WIKITEXT_REVID` to their seed.
 
+## Perf mode
+
+PRD §6.8's end-to-end measurements (`tests/perf/harness.py`, see
+`tests/perf/README.md`) need a network that behaves like one, and more
+article than the hand-written fixtures. Five environment variables, all
+off by default — with none set, the server is byte-for-byte the
+single-threaded, port-8943, unshaped mock described above:
+
+- `WIKITUI_MOCK_PORT=<n>` — listen on `n` instead of 8943 (the harness runs
+  several mocks side by side on free ports).
+- `WIKITUI_MOCK_LATENCY_MS=<ms>` — sleep that long before every response
+  starts: one emulated round trip (plus server think time, if you want it).
+  `5000` is the "network stalls on everything" case the cold-start scenario
+  uses to prove startup never waits on the network.
+- `WIKITUI_MOCK_BANDWIDTH_KBIT=<kbit/s>` — pace every response body to that
+  rate, per connection, scheduled from the first byte so pacing error never
+  accumulates.
+- `WIKITUI_MOCK_GZIP=1` — gzip article HTML when the request's
+  `Accept-Encoding` allows it (as Wikipedia's CDN does), compressed once per
+  article and cached, so compression time isn't on the emulated wire.
+- `WIKITUI_MOCK_PERF_CORPUS=1` — also serve `tests/perf/fixtures`' two
+  committed fixtures (`Perf_Pathological`, `Perf_Typical`) and the seeded,
+  cross-linked `Perf_Corpus_0`…`Perf_Corpus_399` set (generated at startup,
+  a few seconds).
+
+`/debug/` requests are never delayed or throttled — they're the harness's
+control channel, not emulated network. Any perf option switches to
+`ThreadingHTTPServer`, since with added latency a single-threaded server
+would queue a foreground request behind background prefetch and measure the
+mock instead of the client. Every entry in `/debug/requests` now also
+carries `t`, the request's arrival time on `time.monotonic()` (the same
+CLOCK_MONOTONIC the harness reads), which is how the typeahead debounce is
+measured from outside the app.
+
 ## Running it
 
 ```sh
