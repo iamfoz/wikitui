@@ -373,6 +373,12 @@ fn paint_line(
 /// (`hints::overlay_hint_labels`) without this function needing to know
 /// hints exist at all.
 ///
+/// `lines` is normally just the on-screen window of the layout (see
+/// [`visible_window`]), starting at laid-out line `first_line`: painting is
+/// the per-frame cost, so it must scale with the screen, not the article
+/// (PRD §6.8's ≤ 16 ms/frame scroll budget — painting every line of a
+/// pathological article on every keystroke took 20–35 ms a frame).
+///
 /// `find_occurrences` is `App::find_occurrences` verbatim — one entry per
 /// query occurrence, in document order, each carrying one or more `(line,
 /// range)` pieces (more than one only when a wrap split it) — and
@@ -383,6 +389,7 @@ fn paint_line(
 #[allow(clippy::too_many_arguments)]
 fn paint_document(
     lines: &[LaidLine],
+    first_line: usize,
     focused_link: Option<usize>,
     links: &[LinkRef],
     visited: &HashSet<&str>,
@@ -397,7 +404,10 @@ fn paint_document(
     let mut per_line: Vec<Vec<MatchSpan>> = vec![Vec::new(); lines.len()];
     for occurrence in find_occurrences {
         for &(line, range) in &occurrence.pieces {
-            if let Some(slot) = per_line.get_mut(line) {
+            if let Some(slot) = line
+                .checked_sub(first_line)
+                .and_then(|i| per_line.get_mut(i))
+            {
                 slot.push(range);
             }
         }
@@ -412,7 +422,8 @@ fn paint_document(
             .iter()
             .enumerate()
             .map(|(i, l)| {
-                let is_current = |m: MatchSpan| current_pieces.contains(&(i, m));
+                let abs = first_line + i;
+                let is_current = |m: MatchSpan| current_pieces.contains(&(abs, m));
                 paint_line(
                     l,
                     focused_link,
@@ -429,6 +440,14 @@ fn paint_document(
             })
             .collect::<Vec<_>>(),
     )
+}
+
+/// The laid-out lines a view `height` rows tall shows when scrolled to
+/// `scroll` (a line index, `app::line_to_scroll`'s unit): what
+/// [`paint_document`] is handed instead of the whole layout.
+fn visible_window(total_lines: usize, scroll: u16, height: u16) -> std::ops::Range<usize> {
+    let start = usize::from(scroll).min(total_lines);
+    start..(start + usize::from(height)).min(total_lines)
 }
 
 /// Parses the REST search API's highlighted excerpt markup (PRD §6.2 rule
@@ -1022,9 +1041,14 @@ fn draw_reading(frame: &mut Frame, app: &mut App, area: Rect) {
             // (PRD FR-NV-1) rather than the cached lines themselves — hints
             // are transient interactive state, never written back into the
             // cacheable `Layout` (see `layout::SpanKind::Hint`'s doc comment).
+            // Only the on-screen rows are copied/reordered/painted (PRD §6.8:
+            // per-frame cost scales with the screen, not the article).
+            let window = visible_window(layout.lines.len(), scroll, visible_height);
+            let visible = &layout.lines[window.clone()];
             let lines: std::borrow::Cow<[LaidLine]> = if app.mode == Mode::Hint {
                 std::borrow::Cow::Owned(crate::hints::overlay_hint_labels(
-                    &layout.lines,
+                    visible,
+                    window.start,
                     &app.hint_targets,
                     &app.hint_input,
                     app.ambiguous_wide,
@@ -1035,12 +1059,13 @@ fn draw_reading(frame: &mut Frame, app: &mut App, area: Rect) {
                 // hint-overlay branch just above for exactly the same
                 // reason: this is transient rendering state, not part of the
                 // document's cacheable layout).
-                std::borrow::Cow::Owned(bidi::reorder_laid_lines(&layout.lines, dir))
+                std::borrow::Cow::Owned(bidi::reorder_laid_lines(visible, dir))
             } else {
-                std::borrow::Cow::Borrowed(layout.lines.as_slice())
+                std::borrow::Cow::Borrowed(visible)
             };
             let mut text = paint_document(
                 &lines,
+                window.start,
                 tab.focused_link,
                 &tab.links,
                 &visited,
@@ -1052,16 +1077,22 @@ fn draw_reading(frame: &mut Frame, app: &mut App, area: Rect) {
                 tab.find_index,
                 &app.image_store,
             );
-            // PRD FR-NV-10: the visual-selection highlight.
+            // PRD FR-NV-10: the visual-selection highlight, clipped to the
+            // painted window (its range is in absolute laid-out lines).
             if app.mode == Mode::Visual {
                 let (start, end) = app.visual_selected_range();
-                let highlight =
-                    colored_bg(app.no_color, app.theme.selected_fg, app.theme.selected_bg);
-                highlight_selected_lines(&mut text, start, end, highlight);
+                if end >= window.start && start < window.end {
+                    let highlight =
+                        colored_bg(app.no_color, app.theme.selected_fg, app.theme.selected_bg);
+                    highlight_selected_lines(
+                        &mut text,
+                        start.saturating_sub(window.start),
+                        end - window.start,
+                        highlight,
+                    );
+                }
             }
-            let paragraph = Paragraph::new(text)
-                .style(base_style(&app.theme, app.no_color))
-                .scroll((scroll, 0));
+            let paragraph = Paragraph::new(text).style(base_style(&app.theme, app.no_color));
             frame.render_widget(paragraph, area);
         }
     } else if app.startpage_config == StartPageConfig::Blank {
@@ -1292,12 +1323,15 @@ fn paint_pane(
             // (that's the whole point of the bilingual split, FR-ML-3), so
             // the reorder decision — and the resulting transient copy — is
             // made per pane, exactly like `draw_reading`'s own Cow above.
+            let window = visible_window(layout.lines.len(), tab.scroll, content_area.height);
+            let visible = &layout.lines[window.clone()];
             let lines: std::borrow::Cow<[LaidLine]> = match app_reorder_direction(app, tab) {
-                Some(dir) => std::borrow::Cow::Owned(bidi::reorder_laid_lines(&layout.lines, dir)),
-                None => std::borrow::Cow::Borrowed(layout.lines.as_slice()),
+                Some(dir) => std::borrow::Cow::Owned(bidi::reorder_laid_lines(visible, dir)),
+                None => std::borrow::Cow::Borrowed(visible),
             };
             let text = paint_document(
                 &lines,
+                window.start,
                 tab.focused_link,
                 &tab.links,
                 &visited,
@@ -1310,9 +1344,7 @@ fn paint_pane(
                 &app.image_store,
             );
             frame.render_widget(
-                Paragraph::new(text)
-                    .style(base_style(&app.theme, app.no_color))
-                    .scroll((tab.scroll, 0)),
+                Paragraph::new(text).style(base_style(&app.theme, app.no_color)),
                 content_area,
             );
         }
@@ -4551,6 +4583,7 @@ mod tests {
         let theme = Theme::terminal();
         let text = paint_document(
             &layout.lines,
+            0,
             None,
             &[],
             &HashSet::new(),
@@ -4625,6 +4658,7 @@ mod tests {
         let layout = layout_document(&doc, 80, LayoutOptions::default());
         let text = paint_document(
             &layout.lines,
+            0,
             None,
             &links,
             &visited,
@@ -4683,6 +4717,7 @@ mod tests {
         let layout = layout_document(&doc, 80, LayoutOptions::default());
         let text = paint_document(
             &layout.lines,
+            0,
             None,
             &links,
             &HashSet::new(),
@@ -4739,6 +4774,7 @@ mod tests {
         // a redlink, not the ordinary focus highlight.
         let text = paint_document(
             &layout.lines,
+            0,
             Some(0),
             &links,
             &HashSet::new(),
@@ -4799,6 +4835,7 @@ mod tests {
         let layout = layout_document(&doc, 80, LayoutOptions::default());
         let text = paint_document(
             &layout.lines,
+            0,
             None,
             &links,
             &HashSet::new(),
@@ -4836,6 +4873,7 @@ mod tests {
 
         let off = paint_document(
             &layout.lines,
+            0,
             None,
             &[],
             &HashSet::new(),
@@ -4862,6 +4900,7 @@ mod tests {
 
         let on = paint_document(
             &layout.lines,
+            0,
             None,
             &[],
             &HashSet::new(),
@@ -4973,6 +5012,7 @@ mod tests {
 
         let text = paint_document(
             &layout.lines,
+            0,
             None,
             &[],
             &HashSet::new(),
@@ -5043,6 +5083,7 @@ mod tests {
         let theme = Theme::full();
         let text = paint_document(
             &layout.lines,
+            0,
             None,
             &[],
             &HashSet::new(),
@@ -5986,5 +6027,113 @@ mod tests {
         );
         assert!(text.contains("66% of 212 article opens"), "{text}");
         assert!(text.contains("target > 60%"), "{text}");
+    }
+
+    // ---- PRD §6.8: the reading view paints only the on-screen window -------
+
+    /// A long, link-dense test article: every paragraph carries a link and
+    /// the word "needle", so find matches and link spans exist on many lines.
+    fn long_windowing_doc() -> crate::doc::Document {
+        let mut html = String::from("<html><body>");
+        for i in 0..60 {
+            html.push_str(&format!(
+                "<p>Paragraph {i} mentions a needle and <a href=\"./T{i}\">topic {i}</a> \
+                 with enough words to wrap across more than one line at forty columns.</p>"
+            ));
+        }
+        html.push_str("</body></html>");
+        parse_article_html("Windowing", &html)
+    }
+
+    #[test]
+    fn visible_window_clamps_to_the_layout() {
+        assert_eq!(visible_window(100, 10, 24), 10..34);
+        assert_eq!(visible_window(100, 90, 24), 90..100);
+        assert_eq!(visible_window(100, 200, 24), 100..100);
+        assert_eq!(visible_window(0, 0, 24), 0..0);
+    }
+
+    /// Painting a window of the layout (with its `first_line`) produces
+    /// exactly the rows a whole-layout paint produces for those lines —
+    /// find-match highlights, the current-match emphasis, and the focused
+    /// link included — so windowing is purely a cost change.
+    #[test]
+    fn windowed_paint_matches_the_same_rows_of_a_whole_layout_paint() {
+        let doc = long_windowing_doc();
+        let links = crate::doc::collect_links(&doc);
+        let layout = layout_document(&doc, 40, LayoutOptions::default());
+        let occurrences =
+            crate::layout::find_matches(&layout.lines, &layout.continuation, "needle");
+        assert!(occurrences.len() > 20);
+        let theme = Theme::full();
+        let store = crate::image::ImageStore::new();
+        let (a, b) = (37, 61);
+        // The current match and the focused link both sit inside the window.
+        let current = occurrences
+            .iter()
+            .position(|o| o.pieces.iter().any(|&(l, _)| (a..b).contains(&l)))
+            .unwrap();
+        let focused = layout.link_lines.iter().position(|&l| (a..b).contains(&l));
+        assert!(focused.is_some());
+        let paint = |lines: &[LaidLine], first: usize| {
+            paint_document(
+                lines,
+                first,
+                focused,
+                &links,
+                &HashSet::new(),
+                &HashSet::new(),
+                &theme,
+                false,
+                false,
+                &occurrences,
+                current,
+                &store,
+            )
+        };
+        let whole = paint(&layout.lines, 0);
+        let window = paint(&layout.lines[a..b], a);
+        assert_eq!(window.lines.len(), b - a);
+        assert_eq!(window.lines, whole.lines[a..b]);
+    }
+
+    /// End to end through `draw`: scrolled to line N, the reading view's top
+    /// rows are laid-out lines N, N+1, … — what the scrolled whole-document
+    /// paragraph used to show.
+    #[test]
+    fn reading_view_shows_the_scrolled_window() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.open_document(long_windowing_doc());
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        app.scroll_by(23);
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let scroll = usize::from(app.active_tab().scroll);
+        assert_eq!(scroll, 23);
+        let layout = app.layout.as_ref().unwrap();
+        let area = app.last_content_area;
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| -> String {
+            (area.x..area.x + area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        let line_text = |i: usize| -> String {
+            layout.lines[i]
+                .spans
+                .iter()
+                .map(|s| s.text.as_str())
+                .collect()
+        };
+        for offset in 0..3u16 {
+            assert_eq!(
+                row(area.y + offset).trim_end(),
+                line_text(scroll + usize::from(offset)).trim_end(),
+                "row {offset}"
+            );
+        }
     }
 }

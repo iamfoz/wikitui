@@ -153,15 +153,25 @@ pub fn resolve(targets: &[HintTarget], typed: &str) -> HintOutcome {
 /// comment). A target whose label doesn't match `typed` is left alone
 /// entirely: its link keeps its ordinary text and style, which is exactly
 /// "narrowing hides the hints that no longer apply."
+///
+/// `lines` may be a window of the layout starting at laid-out line
+/// `first_line` (targets carry absolute line numbers): the reading view
+/// passes just the on-screen rows, so a hint keystroke copies a screenful,
+/// not the whole article (PRD §6.8's per-frame budget).
 pub fn overlay_hint_labels(
     lines: &[LaidLine],
+    first_line: usize,
     targets: &[HintTarget],
     typed: &str,
     ambiguous_wide: bool,
 ) -> Vec<LaidLine> {
     let mut out = lines.to_vec();
     for target in matching(targets, typed) {
-        if let Some(line) = out.get_mut(target.line) {
+        if let Some(line) = target
+            .line
+            .checked_sub(first_line)
+            .and_then(|i| out.get_mut(i))
+        {
             splice_label(line, target, ambiguous_wide);
         }
     }
@@ -451,7 +461,7 @@ mod tests {
             col: layout.link_cols[0].start,
             label: "as".to_string(),
         }];
-        let overlaid = overlay_hint_labels(&layout.lines, &targets, "", false);
+        let overlaid = overlay_hint_labels(&layout.lines, 0, &targets, "", false);
 
         // The line's total display width is unchanged: the label displaced
         // exactly as many cells as it occupies, not more or fewer.
@@ -488,12 +498,37 @@ mod tests {
 
         // Narrow to just the first target's label.
         let keep = &targets[0].label;
-        let overlaid = overlay_hint_labels(&layout.lines, &targets, keep, false);
+        let overlaid = overlay_hint_labels(&layout.lines, 0, &targets, keep, false);
         let joined: String = overlaid
             .iter()
             .flat_map(|l| l.spans.iter())
             .map(|s| s.text.as_str())
             .collect();
         assert!(joined.contains("Delta"), "unmatched link's text survives");
+    }
+
+    /// The reading view overlays only the on-screen window: a target lands
+    /// on its line *relative to* the window's first line, and a target above
+    /// the window is skipped rather than splicing into the wrong row.
+    #[test]
+    fn overlay_on_a_window_splices_relative_to_its_first_line() {
+        let html = r##"<html><body><p>First <a href="./X">Alpha</a>.</p>
+            <p>Second <a href="./Y">Delta</a>.</p></body></html>"##;
+        let doc = parse_article_html("T", html);
+        let layout = layout_document(&doc, 80, LayoutOptions::default());
+        let targets = visible_link_hints(&layout, 0, layout.lines.len() as u16);
+        assert_eq!(targets.len(), 2);
+        let second = targets[1].line;
+        assert!(second > targets[0].line);
+
+        let window = &layout.lines[second..];
+        let overlaid = overlay_hint_labels(window, second, &targets, "", false);
+        assert_eq!(overlaid.len(), window.len());
+        let row: String = overlaid[0].spans.iter().map(|s| s.text.as_str()).collect();
+        assert!(row.contains(&targets[1].label), "{row:?}");
+        // Only the in-window target's row changed; the off-window target
+        // (above the window) touched nothing.
+        assert_ne!(overlaid[0], window[0]);
+        assert_eq!(&overlaid[1..], &window[1..]);
     }
 }
