@@ -1031,15 +1031,22 @@ def scenario_search(args):
                 app.send("/")
                 app.wait_for(lambda t: "Search" in t or "search" in t, what="search prompt")
                 query = "alan"[: 2 + i % 3]
+                rendered = len(app.perf_events("typeahead_render"))
                 t_last = None
                 for ch in query:
                     t_last = app.send(ch)
                     time.sleep(0.06)
-                app.wait_for(has("Alan Turing"), what="suggestions", timeout=10)
-                app.wait_quiet(0.4)
+                # The app's own log says when the suggestions were drawn. (Not
+                # "wait until the screen is quiet": Search mode redraws on its
+                # 30 ms debounce tick, so it never is.)
+                deadline = time.monotonic() + 10
+                while (len(app.perf_events("typeahead_render")) <= rendered
+                       and time.monotonic() < deadline):
+                    time.sleep(0.02)
+                time.sleep(0.3)
                 reqs = [r for r in mock.requests() if "/search/title" in r["path"]]
                 app.send("\x1b")
-                app.wait_quiet(0.3)
+                time.sleep(0.3)
                 if i < args.warmup or not reqs:
                     continue
                 debounce.append(ms(t_last, reqs[-1]["t"]))
@@ -1223,6 +1230,16 @@ def main():
         sys.exit("build the release binary first: cargo build --release")
     chosen = args.scenarios or list(SCENARIOS)
     assert_no_survivors("before starting")
+
+    def save():
+        # After every scenario, so a later failure never loses finished rows.
+        if args.out:
+            args.out.write_text(json.dumps({
+                "results": RESULTS,
+                "binary": str(BIN),
+                "when": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }, indent=1))
+
     for name in chosen:
         if name == "memory":
             scenario_memory(args)
@@ -1230,13 +1247,8 @@ def main():
                 scenario_memory(args, low_memory=True)
         else:
             SCENARIOS[name](args)
+        save()
         assert_no_survivors(name)
-    if args.out:
-        args.out.write_text(json.dumps({
-            "results": RESULTS,
-            "binary": str(BIN),
-            "when": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        }, indent=1))
 
 
 if __name__ == "__main__":
