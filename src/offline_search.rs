@@ -56,7 +56,9 @@
 //!   called from `main.rs` right after a page is saved
 //!   (`saved::SavedPages::save`) or freshly fetched into L2
 //!   (`cache::PageCache::put`, at the interactive-open, revalidation, and
-//!   background-prefetch call sites).
+//!   background-prefetch call sites). In incognito, cached (read) pages are
+//!   not indexed at all (PRD FR-PR-3, `privacy::Write::OfflineIndex`);
+//!   explicitly saved pages still are.
 //! - `remove` deletes a row outright — wired to an explicit un-save (`d` in
 //!   the saved-pages browser).
 //! - Cache **eviction** does *not* call `remove`: `cache.rs`'s LRU/SLRU sweep
@@ -98,6 +100,7 @@
 //! itself can't today.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rusqlite::{Connection, params};
@@ -167,6 +170,11 @@ pub struct ReindexReport {
 #[derive(Clone)]
 pub struct OfflineIndex {
     conn: Arc<Mutex<Connection>>,
+    /// PRD FR-PR-3: whether this run is incognito, shared with the page
+    /// cache's own flag in production (`sharing_incognito`) so `--incognito`
+    /// and `zz` reach both stores at once. While set, `index` skips
+    /// `Kind::Cached` rows (`privacy::Write::OfflineIndex`).
+    incognito: Arc<AtomicBool>,
 }
 
 impl OfflineIndex {
@@ -217,7 +225,17 @@ impl OfflineIndex {
         }
         Self {
             conn: Arc::new(Mutex::new(conn)),
+            incognito: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Follows `flag` for this run's incognito state — in production the
+    /// page cache's own (`cache::PageCache::incognito_flag`), so every
+    /// incognito toggle applies here too without a second call site to
+    /// forget. Every clone made afterwards shares it.
+    pub fn sharing_incognito(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.incognito = flag;
+        self
     }
 
     /// PRD §6.8 `low_memory`: caps SQLite's page cache for this connection
@@ -249,6 +267,16 @@ impl OfflineIndex {
     /// codebase — losing one search row is never worth interrupting the
     /// save/cache write that triggered it.
     pub fn index(&self, wiki: &str, lang: &str, title: &str, kind: Kind, body: &str) {
+        // PRD FR-PR-3: an article merely *read* in incognito must not become
+        // findable by offline search afterwards (explicit saves still index).
+        if kind == Kind::Cached
+            && crate::privacy::decide(
+                self.incognito.load(Ordering::Relaxed),
+                crate::privacy::Write::OfflineIndex,
+            ) == crate::privacy::Verdict::Deny
+        {
+            return;
+        }
         let rowid = doc_rowid(wiki, lang, title);
         let Ok(conn) = self.conn.lock() else {
             return;
@@ -444,6 +472,35 @@ fn log_failure(op: &str, err: &rusqlite::Error) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PRD FR-PR-3: with incognito on, a merely-read (cached) article is
+    /// never indexed — otherwise offline search would surface what was read
+    /// in incognito long after the session's cache entries were wiped. An
+    /// explicit save still indexes, and turning incognito off resumes normal
+    /// indexing.
+    #[test]
+    fn incognito_skips_cached_rows_but_still_indexes_saved_pages() {
+        let flag = Arc::new(AtomicBool::new(true));
+        let index = OfflineIndex::in_memory().sharing_incognito(Arc::clone(&flag));
+        index.index("", "en", "Secret Topic", Kind::Cached, "zebrafish anatomy");
+        index.index("", "en", "Pinned Page", Kind::Saved, "zebrafish husbandry");
+        let hits: Vec<String> = index
+            .search("", "en", "zebrafish", 10)
+            .into_iter()
+            .map(|h| h.title)
+            .collect();
+        assert_eq!(hits, vec!["Pinned Page".to_string()]);
+
+        flag.store(false, Ordering::Relaxed);
+        index.index("", "en", "Public Topic", Kind::Cached, "zebrafish ecology");
+        let hits: Vec<String> = index
+            .search("", "en", "zebrafish", 10)
+            .into_iter()
+            .map(|h| h.title)
+            .collect();
+        assert!(hits.contains(&"Public Topic".to_string()));
+        assert!(!hits.contains(&"Secret Topic".to_string()));
+    }
 
     // ---- FTS5 availability (the ground-truth this whole module depends on) --
 

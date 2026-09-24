@@ -51,7 +51,7 @@ its contributors for charting this space first.
   (`intitle:`, `incategory:`, `insource:`, `morelike:`, and more), did-you-
   mean, random article, a related-articles panel, and offline full-text
   search (`:search-offline`) over saved and cached pages (SQLite FTS5) when
-  there's no network.
+  there's no network. Pages read in incognito are never indexed.
 - **Start page**: on-this-day panel and a "today I learned" widget.
 - **Themes**: six built-in themes (`terminal`, `full`, `homebrew`, `night`,
   `paper`, `contrast`) plus user themes, with 256-/16-color degradation and

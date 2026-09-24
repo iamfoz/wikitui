@@ -73,6 +73,15 @@ pub enum Write {
     Position,
     /// Scheduling a prefetch job (`app::prefetch_active`) — passive.
     Prefetch,
+    /// Indexing a *read* article's text into the offline full-text index
+    /// (PRD FR-SR-7, `offline_search::OfflineIndex::index` with
+    /// `Kind::Cached`) — passive. Unlike the page cache it's derived from
+    /// (tagged and wiped at session end, see `Cache` below), an index row is
+    /// a durable, searchable record of what was read that nothing wipes, so
+    /// it's denied outright like `History`. An explicitly saved page
+    /// (`Kind::Saved`) is still indexed: the save itself already persists
+    /// under `OfflineSave`'s warning.
+    OfflineIndex,
     /// `cache::PageCache::put_at` — see the module doc comment's "The
     /// passive/explicit split" for why this is never denied, only tagged
     /// (`cache.rs` `debug_assert!`s that this always resolves to `Allow`,
@@ -129,9 +138,12 @@ pub fn decide(incognito: bool, write: Write) -> Verdict {
     match write {
         // Passive tracking (PRD FR-PR-3's explicit list, plus the seams
         // it implies): suppressed outright.
-        Write::History | Write::Stats | Write::Interest | Write::Position | Write::Prefetch => {
-            Verdict::Deny
-        }
+        Write::History
+        | Write::Stats
+        | Write::Interest
+        | Write::Position
+        | Write::Prefetch
+        | Write::OfflineIndex => Verdict::Deny,
         // See the module doc comment's "The passive/explicit split": never
         // denied, only tagged for wipe by `cache::PageCache` itself.
         Write::Cache => Verdict::Allow,
@@ -228,6 +240,14 @@ fn find_analytics_reference(text: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PRD FR-PR-3: indexing read pages for offline search is passive
+    /// tracking — denied in incognito, allowed otherwise.
+    #[test]
+    fn offline_indexing_is_denied_only_in_incognito() {
+        assert_eq!(decide(true, Write::OfflineIndex), Verdict::Deny);
+        assert_eq!(decide(false, Write::OfflineIndex), Verdict::Allow);
+    }
 
     // ---- decide/append_warning_if_needed: the policy table ----------------
 

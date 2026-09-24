@@ -348,6 +348,14 @@ impl PageCache {
         self.incognito.load(Ordering::Relaxed)
     }
 
+    /// The shared incognito flag itself, so a store derived from this cache
+    /// (the offline search index, `offline_search::OfflineIndex::
+    /// sharing_incognito`) follows every `set_incognito` — `--incognito` and
+    /// `zz` alike — with no second flag to keep in sync.
+    pub fn incognito_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.incognito)
+    }
+
     /// This cache's configured on-open staleness decision for content this
     /// old — see the free function [`swr_decision`] for the pure logic.
     pub fn swr_decision(&self, age_secs: u64) -> SwrDecision {

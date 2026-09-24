@@ -3187,7 +3187,8 @@ async fn run(
     // dir) — `App::new` defaults to an in-memory store for the same reason
     // `history` does (see `App.search_index`'s doc comment); this is the one
     // place production opens the durable one.
-    app.search_index = offline_search::OfflineIndex::open();
+    app.search_index =
+        offline_search::OfflineIndex::open().sharing_incognito(cache.incognito_flag());
     // PRD §6.8 `low_memory`: SQLite's default page cache is ~2 MB per
     // connection; history and the offline index are both written once per
     // open and read rarely, so a small cache costs little speed here.
@@ -10707,6 +10708,28 @@ fn run_reindex(resolved: &config::ResolvedConfig) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PRD FR-PR-3 end to end: the offline index follows the *page cache's*
+    /// incognito flag (production wires it with `sharing_incognito(cache.
+    /// incognito_flag())`), so `zz`/`--incognito` — which only ever call
+    /// `cache.set_incognito` — keep read pages out of offline search too,
+    /// through the same `index_cached_html` every cache-filling path uses.
+    #[test]
+    fn toggling_the_cache_into_incognito_keeps_read_pages_out_of_offline_search() {
+        let (cache, dir) = temp_cache_dir("incognito-index");
+        let index =
+            offline_search::OfflineIndex::in_memory().sharing_incognito(cache.incognito_flag());
+        let html = "<html><body><p>Axolotls regrow limbs.</p></body></html>";
+
+        cache.set_incognito(true);
+        index_cached_html(&index, "", "en", "Axolotl", html);
+        assert!(index.search("", "en", "axolotls", 10).is_empty());
+
+        cache.set_incognito(false);
+        index_cached_html(&index, "", "en", "Axolotl", html);
+        assert_eq!(index.search("", "en", "axolotls", 10).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A real crossterm-backed `Terminal` for driving `handle_key`, with a
     /// fixed 100×30 viewport. `Terminal::new` asks the backend for the
