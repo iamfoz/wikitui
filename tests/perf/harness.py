@@ -19,6 +19,7 @@ docs/PERFORMANCE.md.
 """
 
 import argparse
+import atexit
 import codecs
 import contextlib
 import fcntl
@@ -26,6 +27,7 @@ import json
 import os
 import pathlib
 import random
+import re
 import select
 import shutil
 import signal
@@ -53,6 +55,63 @@ import generate  # noqa: E402  (the fixture generator: titles, lead markers)
 # connection throughput cap, with gzip on the wire.
 BROADBAND_RTT_MS = 40
 BROADBAND_KBIT = 25_000
+
+
+# ---------------------------------------------------------------------------
+# Child processes: every one is tracked and reaped, even on an exception.
+# (A wikitui whose pty hangs up without a clean quit can keep running — see
+# `App.quit` — so nothing this harness starts may outlive it: stray busy
+# processes would skew every later measurement on the machine.)
+# ---------------------------------------------------------------------------
+
+CHILDREN = []
+
+
+def set_binary(path):
+    """Drive a different build (e.g. a baseline for a before/after run)."""
+    global BIN
+    BIN = pathlib.Path(path).resolve()
+
+
+def reap_all():
+    for proc in CHILDREN:
+        if proc.poll() is None:
+            with contextlib.suppress(OSError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            with contextlib.suppress(OSError):
+                proc.kill()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=5)
+    CHILDREN.clear()
+
+
+atexit.register(reap_all)
+
+
+def surviving_children():
+    """PIDs of processes still running this harness's binary or mock."""
+    out = []
+    for proc_dir in pathlib.Path("/proc").iterdir():
+        if not proc_dir.name.isdigit():
+            continue
+        try:
+            cmd = (proc_dir / "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        if cmd and (cmd[0] == str(BIN).encode() or
+                    (len(cmd) > 1 and cmd[1] == str(MOCK).encode())):
+            out.append(int(proc_dir.name))
+    return out
+
+
+def assert_no_survivors(where):
+    reap_all()
+    left = surviving_children()
+    if left:
+        for pid in left:
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+        raise RuntimeError("%s: %d harness process(es) outlived their scenario: %s" % (where, len(left), left))
 
 
 # ---------------------------------------------------------------------------
@@ -259,8 +318,10 @@ class App:
         env.update(env_extra or {})
         self.profile = profile
         self.t_spawn = time.monotonic()
+        self.last_send = self.t_spawn
         self.proc = subprocess.Popen([str(BIN), *args], stdin=slave, stdout=slave, stderr=slave,
                                      env=env, start_new_session=True, close_fds=True)
+        CHILDREN.append(self.proc)
         os.close(slave)
         self.master = master
         self.alive = True
@@ -309,11 +370,14 @@ class App:
                 self.lock.wait(min(left, 0.25))
 
     def wait_quiet(self, quiet=0.3, timeout=30.0):
-        """Wait until no output has arrived for `quiet` seconds."""
+        """Wait until neither output nor our own input has happened for
+        `quiet` seconds. Counting from the last key sent too matters: a
+        check made right after a keypress must give the app time to answer
+        it, not return at once because the screen was already quiet."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             with self.lock:
-                last = getattr(self, "last_output", self.t_spawn)
+                last = max(getattr(self, "last_output", self.t_spawn), self.last_send)
             if time.monotonic() - last >= quiet:
                 return
             time.sleep(quiet / 4)
@@ -324,6 +388,8 @@ class App:
             data = data.encode()
         t = time.monotonic()
         os.write(self.master, data)
+        with self.lock:
+            self.last_send = t
         return t
 
     def text(self):
@@ -348,6 +414,9 @@ class App:
         return out
 
     def quit(self):
+        """Quit cleanly (`:q`), then make sure: SIGKILL the process group
+        if it's still there after 3 s, and always reap it. Never just close
+        the pty — a hung-up wikitui can keep running."""
         if self.proc.poll() is None:
             with contextlib.suppress(OSError):
                 self.send("\x1b")
@@ -356,8 +425,9 @@ class App:
             try:
                 self.proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
-                os.killpg(self.proc.pid, signal.SIGKILL)
-                self.proc.wait()
+                with contextlib.suppress(OSError):
+                    os.killpg(self.proc.pid, signal.SIGKILL)
+                self.proc.wait(timeout=5)
         self.alive = False
         self.thread.join(timeout=2)
         with contextlib.suppress(OSError):
@@ -386,8 +456,9 @@ class Mock:
             "WIKITUI_MOCK_PERF_CORPUS": "1" if corpus else "0",
             "PYTHONDONTWRITEBYTECODE": "1",
         })
-        self.proc = subprocess.Popen([sys.executable, str(MOCK)], env=env,
+        self.proc = subprocess.Popen([sys.executable, str(MOCK)], env=env, start_new_session=True,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        CHILDREN.append(self.proc)
         deadline = time.monotonic() + 120
         while True:
             try:
@@ -414,7 +485,10 @@ class Mock:
 
     def stop(self):
         self.proc.terminate()
-        with contextlib.suppress(subprocess.TimeoutExpired):
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
             self.proc.wait(timeout=5)
 
 
@@ -465,6 +539,28 @@ def ms(t0, t1):
 
 def has(*needles):
     return lambda text: all(n in text for n in needles)
+
+
+READ_TIME = re.compile(r"^\s*\d+ min read\s*$")
+
+
+def article_header(text):
+    """The title of the article at the top of the screen, if one is there:
+    the layout's first two rows are the title alone, then "N min read" —
+    ratatui paints rows top to bottom, so this is the first thing an opened
+    article puts on screen, at any terminal size (at 80 columns the lead
+    paragraph itself sits below an inline infobox card)."""
+    lines = text.splitlines()
+    for i in range(min(len(lines) - 1, 4)):
+        if READ_TIME.match(lines[i + 1]) and lines[i].strip():
+            return lines[i].strip()
+    return None
+
+
+def showing(title):
+    """Predicate: `title`'s article is painted at the top of the screen."""
+    display = title.replace("_", " ")
+    return lambda text: article_header(text) == display
 
 
 def lacks(*needles):
@@ -581,7 +677,7 @@ def seed_returning_profile(profile, mock):
         for title in SEED_TITLES:
             open_command(app, title)
             app.send("\r")
-            app.wait_for(has(generate.lead_marker(title)), what="seed open " + title, timeout=60)
+            app.wait_for(showing(title), what="seed open " + title, timeout=60)
         app.wait_quiet(1.0)
     finally:
         app.quit()
@@ -599,74 +695,111 @@ def seed_returning_profile_offline(profile, args):
 
 
 def open_and_wait(app, title, timeout=60):
-    """`:open <title>`, Enter, wait for its lead marker; returns ms from the
-    Enter keypress to the lead section on screen."""
+    """`:open <title>`, Enter, wait for the article's first paint (its
+    header rows at the top of the screen); returns ms from the Enter
+    keypress to that paint."""
     open_command(app, title)
     t_key = app.send("\r")
-    t_seen = app.wait_for(has(generate.lead_marker(title)), what="lead of " + title, timeout=timeout)
+    t_seen = app.wait_for(showing(title), what="first paint of " + title, timeout=timeout)
     return ms(t_key, t_seen)
 
 
 def scenario_open_cached(args):
     """§6.8 "Article open, L1 cache hit < 50 ms" and "L2 hit (re-layout)
-    < 150 ms". L1: reopen via Back after visiting another article (same
-    width → L1 layout hit). L2: a fresh process whose disk cache already
-    holds the article (no L1 at all → read + decompress + parse + layout)."""
+    < 150 ms", plus tab switching (default and low_memory — in low_memory a
+    background tab keeps only compressed HTML, so switching to it re-parses
+    and relayouts: judged against the L2 target, the same work).
+
+    L1: `H` (back) to an article laid out at this width in the same process.
+    Tab switch: `gt` between two tabs. L2: a fresh process whose disk cache
+    already holds the article, `:open` Enter. Each against a zero-latency
+    mock and the broadband emulation — a cached open must not wait on the
+    network, so the two should match."""
     print("open_cached", flush=True)
-    mock = Mock()
-    try:
-        for fixture, other in (("Perf_Typical", "Perf_Corpus_1"), ("Perf_Pathological", "Perf_Typical")):
-            profile = Profile("cached")
-            profile.write_config(mock.port)
-            try:
-                # Warm L2 for both articles in one session.
-                app = App(profile)
+    for net_label, latency, kbit in (("local", 0, 0), ("broadband", BROADBAND_RTT_MS, BROADBAND_KBIT)):
+        mock = Mock(latency_ms=latency, kbit=kbit, gzip=bool(kbit))
+        try:
+            for fixture, other in (("Perf_Typical", "Perf_Corpus_1"), ("Perf_Pathological", "Perf_Typical")):
+                profile = Profile("cached")
+                profile.write_config(mock.port)
                 try:
-                    app.wait_for(start_page_marker, what="start page")
-                    open_and_wait(app, fixture)
-                    open_and_wait(app, other)
-                    app.wait_quiet(1.0)
-                finally:
-                    app.quit()
-                # L1: back/forward between the two, in one process.
-                l1 = []
-                app = App(profile)
-                try:
-                    app.wait_for(start_page_marker, what="start page")
-                    open_and_wait(app, fixture)
-                    open_and_wait(app, other)
-                    app.wait_quiet(0.5)
-                    for i in range(args.n + args.warmup):
-                        t_key = app.send("\x7f")  # Backspace: back (vim preset)
-                        t_seen = app.wait_for(has(generate.lead_marker(fixture)), what="back to fixture")
-                        if i >= args.warmup:
-                            l1.append(ms(t_key, t_seen))
-                        app.wait_quiet(0.2)
-                        app.send("L")  # forward
-                        app.wait_for(has(generate.lead_marker(other)), what="forward to other")
-                        app.wait_quiet(0.2)
-                finally:
-                    app.quit()
-                record("open.l1_hit.%s_ms" % fixture, l1, "ms", "< 50",
-                       "Back to an article laid out at this width (L1 layout hit; L2 read + parse still happen)")
-                # L2: a fresh process per sample, warm disk cache.
-                l2 = []
-                for i in range(args.n + args.warmup):
+                    # Warm L2 for both articles in one session.
                     app = App(profile)
                     try:
                         app.wait_for(start_page_marker, what="start page")
-                        app.wait_quiet(0.3)
-                        t = open_and_wait(app, fixture)
-                        if i >= args.warmup:
-                            l2.append(t)
+                        open_and_wait(app, fixture)
+                        open_and_wait(app, other)
+                        app.wait_quiet(1.0)
                     finally:
                         app.quit()
-                record("open.l2_hit.%s_ms" % fixture, l2, "ms", "< 150",
-                       "fresh process, article in the disk cache (read + zstd + parse + layout + paint)")
-            finally:
-                profile.cleanup()
-    finally:
-        mock.stop()
+                    # L1: back/forward between the two, in one process.
+                    l1 = []
+                    app = App(profile)
+                    try:
+                        app.wait_for(start_page_marker, what="start page")
+                        open_and_wait(app, fixture)
+                        open_and_wait(app, other)
+                        app.wait_quiet(0.5)
+                        for i in range(args.n + args.warmup):
+                            t_key = app.send("H")
+                            t_seen = app.wait_for(showing(fixture), what="back to fixture")
+                            if i >= args.warmup:
+                                l1.append(ms(t_key, t_seen))
+                            app.wait_quiet(0.2)
+                            app.send("L")
+                            app.wait_for(showing(other), what="forward to other")
+                            app.wait_quiet(0.2)
+                    finally:
+                        app.quit()
+                    record("open.%s.l1_hit.%s_ms" % (net_label, fixture), l1, "ms", "< 50",
+                           "H (back) to an article already laid out at this width")
+                    # Tab switch, default and low_memory.
+                    for mode in ("default", "low_memory"):
+                        switch = []
+                        extra = ["--low-memory"] if mode == "low_memory" else []
+                        app = App(profile, args=extra)
+                        try:
+                            app.wait_for(start_page_marker, what="start page")
+                            open_and_wait(app, fixture)
+                            app.send(":")
+                            app.wait_for(lambda t: t.splitlines()[-1].lstrip().startswith(":"),
+                                         what="command line")
+                            app.send("tab new " + other + "\r")
+                            app.wait_for(showing(other), what="second tab")
+                            app.wait_quiet(0.5)
+                            for i in range(args.n + args.warmup):
+                                t_key = app.send("gt")
+                                t_seen = app.wait_for(showing(fixture), what="switch to fixture tab")
+                                if i >= args.warmup:
+                                    switch.append(ms(t_key, t_seen))
+                                app.wait_quiet(0.2)
+                                app.send("gt")
+                                app.wait_for(showing(other), what="switch back")
+                                app.wait_quiet(0.2)
+                        finally:
+                            app.quit()
+                        target = "< 150" if mode == "low_memory" else "< 50"
+                        record("open.%s.tab_switch_%s.%s_ms" % (net_label, mode, fixture), switch, "ms", target,
+                               "gt to a background tab" + (" (re-parse from compressed source)"
+                                                           if mode == "low_memory" else " (L1 layout hit)"))
+                    # L2: a fresh process per sample, warm disk cache.
+                    l2 = []
+                    for i in range(args.n + args.warmup):
+                        app = App(profile)
+                        try:
+                            app.wait_for(start_page_marker, what="start page")
+                            app.wait_quiet(0.3)
+                            t = open_and_wait(app, fixture)
+                            if i >= args.warmup:
+                                l2.append(t)
+                        finally:
+                            app.quit()
+                    record("open.%s.l2_hit.%s_ms" % (net_label, fixture), l2, "ms", "< 150",
+                           "fresh process, article in the disk cache (read + zstd + parse + layout + paint)")
+                finally:
+                    profile.cleanup()
+        finally:
+            mock.stop()
 
 
 def network_titles(count, rng):
@@ -769,6 +902,54 @@ def scenario_scroll(args):
                 RESULTS[key + ".draw_ms"]["final_scroll"] = final
                 RESULTS[key + ".draw_ms"]["presses"] = presses
                 RESULTS[key + ".draw_ms"]["frames"] = len(frames)
+        # Two-key chords too: `gt` (next tab) bursts at 60 Hz across three
+        # tabs, default and low_memory (where each switch re-parses). Every
+        # key must produce exactly one frame and the burst must land on the
+        # tab its count predicts.
+        tabs = ["Perf_Typical", "Perf_Corpus_1", "Perf_Pathological"]
+        for mode in ("default", "low_memory"):
+            profile = Profile("chords")
+            profile.write_config(mock.port)
+            app = App(profile, args=["--low-memory"] if mode == "low_memory" else [])
+            rounds, dropped, wrong = 0, 0, 0
+            try:
+                app.wait_for(start_page_marker, what="start page")
+                open_and_wait(app, tabs[0])
+                for t in tabs[1:]:
+                    app.send(":")
+                    app.wait_for(lambda s: s.splitlines()[-1].lstrip().startswith(":"), what="command line")
+                    app.send("tab new " + t + "\r")
+                    app.wait_for(showing(t), what="tab " + t)
+                app.wait_quiet(0.5)
+                display = [t.replace("_", " ") for t in tabs]
+                for _ in range(max(10, args.n // 2)):
+                    idx = display.index(article_header(app.text()))
+                    n0 = len(app.perf_events("frame"))
+                    k = 7
+                    t0 = time.monotonic()
+                    for i in range(k):
+                        delay = t0 + i / 60.0 - time.monotonic()
+                        if delay > 0:
+                            time.sleep(delay)
+                        app.send("gt")
+                    deadline = time.monotonic() + 10
+                    while len(app.perf_events("frame")) < n0 + 2 * k and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                    app.wait_quiet(0.3)
+                    rounds += 1
+                    if len(app.perf_events("frame")) - n0 != 2 * k:
+                        dropped += 1
+                    if article_header(app.text()) != display[(idx + k) % len(tabs)]:
+                        wrong += 1
+            finally:
+                app.quit()
+                profile.cleanup()
+            RESULTS["keys.gt_burst_60hz.%s" % mode] = {
+                "rounds": rounds, "keys_per_round": 14, "rounds_with_missing_frames": dropped,
+                "rounds_on_wrong_tab": wrong, "target": "no dropped input",
+            }
+            print("  keys.gt_burst_60hz.%-26s %d rounds x 7 gt: %d with a missing frame, %d on the wrong tab"
+                  % (mode, rounds, dropped, wrong), flush=True)
     finally:
         mock.stop()
 
@@ -799,7 +980,7 @@ def scenario_memory(args, low_memory=False):
                     app.send(":")
                     app.wait_for(lambda t: t.splitlines()[-1].lstrip().startswith(":"), what="command line")
                     app.send("tab new " + title + "\r")
-                    app.wait_for(has(generate.lead_marker(title)), what="tab " + title, timeout=60)
+                    app.wait_for(showing(title), what="tab " + title, timeout=60)
                 app.wait_quiet(2.0)
                 r, h = app.rss_kb()
                 rss.append(r / 1024.0)
@@ -860,6 +1041,144 @@ def scenario_search(args):
         mock.stop()
 
 
+def read_open_log(profile):
+    """The app's own cache-hit log (`src/hitrate.rs`): all-time counts."""
+    path = profile.dirs["state"] / "wikitui" / "cache_hits.json"
+    try:
+        return json.loads(path.read_text())["all_time"]
+    except (OSError, ValueError, KeyError):
+        return {"l1": 0, "disk": 0, "saved_offline": 0, "network": 0}
+
+
+def opens_counted(profile):
+    return sum(read_open_log(profile).values())
+
+
+# The browsing model behind the cache-hit-rate simulation (README "Cache-hit
+# rate simulation" has the reasoning). Per step, after the first open of a
+# session: go back, revisit something read earlier, jump to a new topic, or
+# (the rest) follow a link.
+SIM_P_BACK = 0.20
+SIM_P_REVISIT = 0.10
+SIM_P_JUMP = 0.05
+SIM_DWELL_S = 4.0
+# The simulation compresses reading time: a SIM_DWELL_S dwell stands in for a
+# ~2-minute real one, so the prefetch budgets (per wall-clock hour/day) are
+# scaled by the same factor in the "scaled budgets" variants.
+SIM_TIME_COMPRESSION = 30
+
+
+def sim_link_index(rng, model):
+    """Which link (0-based, document order) the simulated reader follows."""
+    if model == "lead_weighted":
+        # Clicks concentrate on early (lead/infobox-adjacent) links; an
+        # exponential with mean 6 puts ~57% of follows in the first 5.
+        return min(int(rng.expovariate(1 / 6.0)), 39)
+    return rng.randrange(40)  # "uniform40": any of the first 40 links
+
+
+def scenario_hit_rate(args):
+    """§6.8 "Steady-state cache-hit rate > 60% of article opens" — a
+    SIMULATION, not a field measurement: a seeded random walk over the mock's
+    cross-linked perf corpus (link following, back navigation, revisits and
+    topic jumps, with prefetch on, over broadband emulation and several
+    sessions), scored by the app's own cache-hit log — the figure `:stats`
+    shows. Variants vary the two assumptions the result is most sensitive to:
+    which links get clicked, and whether prefetch budgets are scaled for the
+    simulation's time compression."""
+    print("hit_rate (simulation)", flush=True)
+    variants = [
+        ("lead_weighted.scaled_budgets", "lead_weighted", True),
+        ("lead_weighted.default_budgets", "lead_weighted", False),
+        ("uniform40.scaled_budgets", "uniform40", True),
+    ]
+    mock = Mock(latency_ms=BROADBAND_RTT_MS, kbit=BROADBAND_KBIT, gzip=True)
+    try:
+        for label, model, scaled in variants:
+            rng = random.Random(0x60_0608)
+            profile = Profile("hitrate")
+            extra = ""
+            if scaled:
+                extra = "[prefetch]\ndaily_mb = %d\nhourly_requests = %d\n" % (
+                    20 * SIM_TIME_COMPRESSION, 100 * SIM_TIME_COMPRESSION)
+            # [prefetch] must follow the top-level keys write_config adds.
+            profile.write_config(mock.port)
+            if extra:
+                with open(profile.config_path, "a") as f:
+                    f.write("\n" + extra)
+            read = []
+            steps = failed = 0
+            try:
+                for session in range(args.sim_sessions):
+                    app = App(profile)
+                    try:
+                        app.wait_for(start_page_marker, what="start page")
+                        app.wait_quiet(0.5)
+                        depth = 0
+                        current = generate.corpus_title(rng.randrange(generate.CORPUS_SIZE))
+                        before = opens_counted(profile)
+                        open_and_wait(app, current)
+                        read.append(current)
+                        time.sleep(SIM_DWELL_S)
+                        for _ in range(args.sim_steps):
+                            steps += 1
+                            before = opens_counted(profile)
+                            r = rng.random()
+                            if r < SIM_P_BACK and depth > 0:
+                                app.send("H")
+                                depth -= 1
+                            elif r < SIM_P_BACK + SIM_P_REVISIT and len(read) > 1:
+                                title = rng.choice([t for t in read if t != current] or read)
+                                open_command(app, title)
+                                app.send("\r")
+                                depth += 1
+                            elif r < SIM_P_BACK + SIM_P_REVISIT + SIM_P_JUMP:
+                                title = generate.corpus_title(rng.randrange(generate.CORPUS_SIZE))
+                                open_command(app, title)
+                                app.send("\r")
+                                depth += 1
+                            else:
+                                app.send("\t" * (sim_link_index(rng, model) + 1))
+                                app.wait_quiet(0.2)
+                                app.send("\r")
+                                depth += 1
+                            deadline = time.monotonic() + 10
+                            while opens_counted(profile) == before and time.monotonic() < deadline:
+                                time.sleep(0.05)
+                            if opens_counted(profile) == before:
+                                # No open landed (a redlink, say): recover
+                                # and don't count the step.
+                                failed += 1
+                                app.send("\x1b")
+                                app.wait_quiet(0.3)
+                                continue
+                            app.wait_quiet(0.3)
+                            header = article_header(app.text())
+                            if header:
+                                current = header.replace(" ", "_")
+                                read.append(current)
+                            time.sleep(SIM_DWELL_S)
+                    finally:
+                        app.quit()
+                counts = read_open_log(profile)
+            finally:
+                profile.cleanup()
+            total = sum(counts.values())
+            hits = total - counts["network"]
+            rate = 100.0 * hits / total if total else float("nan")
+            print("  hit_rate.%-40s %.1f%% of %d opens (L1 %d, disk %d, saved/offline %d, network %d; "
+                  "%d steps, %d without an open)"
+                  % (label, rate, total, counts["l1"], counts["disk"], counts["saved_offline"],
+                     counts["network"], steps, failed), flush=True)
+            RESULTS["hit_rate." + label] = {
+                "rate_percent": round(rate, 1), "opens": total, "counts": counts,
+                "steps": steps, "steps_without_open": failed, "target": "> 60",
+                "note": "SIMULATION (seeded random walk over the mock corpus), not a field measurement",
+            }
+    finally:
+        mock.stop()
+
+
 SCENARIOS = {
     "cold_start": scenario_cold_start,
     "open_cached": scenario_open_cached,
@@ -867,6 +1186,7 @@ SCENARIOS = {
     "scroll": scenario_scroll,
     "memory": scenario_memory,
     "search": scenario_search,
+    "hit_rate": scenario_hit_rate,
 }
 
 
@@ -878,11 +1198,17 @@ def main():
     ap.add_argument("--n-memory", type=int, default=3, help="memory runs (default 3)")
     ap.add_argument("--warmup", type=int, default=2, help="discarded warm-up samples per row")
     ap.add_argument("--low-memory", action="store_true", help="also run memory with low_memory = true")
+    ap.add_argument("--sim-sessions", type=int, default=3, help="hit_rate: sessions per variant")
+    ap.add_argument("--sim-steps", type=int, default=60, help="hit_rate: browsing steps per session")
     ap.add_argument("--out", type=pathlib.Path, help="write results JSON here")
+    ap.add_argument("--bin", type=pathlib.Path, default=BIN,
+                    help="the wikitui binary to drive (default: target/release/wikitui)")
     args = ap.parse_args()
+    set_binary(args.bin)
     if not BIN.exists():
         sys.exit("build the release binary first: cargo build --release")
     chosen = args.scenarios or list(SCENARIOS)
+    assert_no_survivors("before starting")
     for name in chosen:
         if name == "memory":
             scenario_memory(args)
@@ -890,6 +1216,7 @@ def main():
                 scenario_memory(args, low_memory=True)
         else:
             SCENARIOS[name](args)
+        assert_no_survivors(name)
     if args.out:
         args.out.write_text(json.dumps({
             "results": RESULTS,

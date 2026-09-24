@@ -52,8 +52,12 @@ CS1 citations, each carrying its `data-mw` parameters twice over (JSON and
 rendered) plus COinS metadata.
 
 Every generated article's first lead sentence carries a unique token
-(`catalogue mark LEADxxxxx`, `generate.lead_marker(title)`): the harness
-waits for that token to call the lead section painted.
+(`catalogue mark LEADxxxxx`, `generate.lead_marker(title)`), handy when
+reading a screen dump. The harness itself calls an article painted when its
+header rows — the title alone, then `N min read` — are at the top of the
+screen: ratatui paints rows top to bottom, so that is the first thing an
+open puts on screen at every terminal size (at 80 columns the lead
+paragraph sits below an inline infobox card, so the lead token isn't).
 
 ## The mock's perf corpus
 
@@ -114,7 +118,12 @@ also answers the terminal queries a real emulator would. Timestamps are
 `time.monotonic()` at the moment the harness writes a key and at the
 moment it reads the output chunk that completes the awaited screen state.
 Every row discards `--warmup` samples (default 2) and reports N, p50, p95,
-max, min and standard deviation.
+max, min and standard deviation. Every process the harness starts (app or
+mock) is tracked and SIGKILLed if it outlives its scenario, and the run
+aborts if any harness process survives a scenario — a stray busy process
+would skew every later measurement on the machine. "Wait until the screen
+is quiet" counts from the later of the last output and the last key sent,
+so a check right after a keypress always gives the app time to answer it.
 
 - **cold_start** — spawn → first complete start-page frame (its title row
   and bottom key-hint row both on screen, which ratatui paints first and
@@ -125,25 +134,65 @@ max, min and standard deviation.
   non-expired token file) — each against a normal mock and one that stalls
   every response 5 s.
 - **open_cached** — L1: in one process, `H` (back) to an article already
-  laid out at this width, keypress → its lead marker on screen. L2: a fresh
-  process whose disk cache already holds the article, `:open` Enter → lead
-  marker.
+  laid out at this width, keypress → its first paint. Tab switch: `gt`
+  between two tabs, in default and `low_memory` mode (where the target tab
+  re-parses its compressed source — judged against the L2 target, the same
+  work). L2: a fresh process whose disk cache already holds the article,
+  `:open` Enter → first paint. Each against a zero-latency mock and the
+  broadband emulation: a cached open must not wait on the network, so the
+  two should match.
 - **open_network** — cold cache, fresh process per sample, broadband
-  emulation, `:open` Enter → lead marker, over seeded random corpus titles
+  emulation, `:open` Enter → first paint, over seeded random corpus titles
   (reported per class and as the mix) and the pathological fixture.
 - **scroll** — `j` key-repeat at 60 Hz and 120 Hz over the pathological
   article at 80×24, 120×40, 200×60. Pass/fail on dropped input is exact:
   the app's perf log records the scroll offset after every frame, and the
   last one must equal the number of presses. The per-frame draw times in
-  that log are the distribution reported.
+  that log are the distribution reported. Then two-key chords: bursts of
+  seven `gt` at 60 Hz across three tabs (default and `low_memory`), where
+  every key must produce exactly one frame and each burst must land on the
+  tab its count predicts.
 - **memory** — the pathological article plus the nine first long/very-long
   corpus articles, each in its own tab (`:tab new`), then VmRSS/VmHWM from
-  `/proc/<pid>/status` once output settles.
+  `/proc/<pid>/status` once output settles; `--low-memory` repeats it with
+  `low_memory = true`.
 - **search** — type a query at ~60 ms per key: last keystroke → the
   typeahead request's arrival at the mock (both on the shared
   CLOCK_MONOTONIC; the mock's request log records arrival times), and the
   app's own `typeahead_render` event (response decoded → first frame
   showing it).
+- **hit_rate** — a *simulation* of §6.8's steady-state cache-hit rate, not
+  a field measurement (see below).
+
+## Cache-hit rate simulation
+
+The app counts every article open by where it was served from
+(`src/hitrate.rs`: L1, disk, saved/offline, or network — the figure
+`:stats` shows). `hit_rate` drives a seeded random walk over the perf
+corpus with broadband emulation and prefetch at its defaults, and reads
+that same log back. Per step after a session's first open: 20% Back (when
+there is somewhere to go back to), 10% reopen an article read earlier, 5%
+jump to a random new corpus article, 65% follow a link. A 4 s dwell after
+each open gives prefetch its idle window. Three sessions of 60 steps each
+(new process per session, same profile, so L2 and history persist and L1
+doesn't).
+
+The walk compresses reading time — a 4 s dwell stands in for a ~2 minute
+real one — while prefetch budgets are per wall-clock hour and day, so the
+main variant scales them by the same factor (30×). The two assumptions the
+number is most sensitive to are varied explicitly:
+
+| Variant | Links followed | Prefetch budgets |
+|---|---|---|
+| `lead_weighted.scaled_budgets` | early links favored (exponential, mean index 6) — readers click lead/infobox links far more than late ones | scaled 30× for time compression |
+| `lead_weighted.default_budgets` | same | defaults (20 MB/day, 100 req/h): a lower bound |
+| `uniform40.scaled_budgets` | any of the first 40 links equally | scaled 30× |
+
+Every corpus link is equally "popular" to the mock (it has no pageview data
+for corpus titles), so prefetch ranks purely by link position; a real
+reader's clicks also follow popularity, which the real ranking uses. Treat
+the result as what the machinery achieves under these stated assumptions,
+not as a measured field KPI.
 
 ## The perf log
 
