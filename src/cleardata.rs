@@ -25,10 +25,11 @@
 //!
 //! `--stats` (FR-PC-3) deletes the **interest model** (`interest.json`, PRD
 //! §6.4) — the persisted local personalization state whose top categories are
-//! the reading-stats topic distribution. The reading stats *themselves* are
-//! derived on demand from the history database (there is no separate stats
-//! file), so `--history` already clears the numbers; `--stats` clears the
-//! learned-topic model those numbers surface. `--auth` (FR-ACC-1/9) **is** also
+//! the reading-stats topic distribution — and the **cache-hit log**
+//! (`cache_hits.json`, PRD §6.8 / §11, `hitrate.rs`), the one stat that can't
+//! be derived from history. The other reading stats are derived on demand
+//! from the history database, so `--history` already clears those numbers;
+//! `--stats` clears the learned-topic model and the cache-hit counts. `--auth` (FR-ACC-1/9) **is** also
 //! wired: it deletes the
 //! locally stored OAuth token file (`auth.json`, PRD SEC-4), the same tokens
 //! `:logout` removes — and, like `:logout`, tells the reader to revoke
@@ -89,6 +90,10 @@ pub struct Targets {
     /// PRD FR-PC-3 / FR-PF-3: the local interest model (`interest.json`),
     /// deleted by `--stats` (see the module doc comment's `--stats` note).
     pub interest: Option<PathBuf>,
+    /// PRD §6.8 / §11: the cache-hit-rate log (`cache_hits.json`,
+    /// `hitrate.rs`), also deleted by `--stats` — it is the one stats store
+    /// with state of its own rather than a view over history.
+    pub open_log: Option<PathBuf>,
 }
 
 /// Resolves `scope` against the real platform directories (`cache_dir_override`
@@ -109,6 +114,10 @@ pub fn resolve_targets(scope: Scope, cache_dir_override: Option<&Path>) -> Targe
             .wants_stats()
             .then(crate::interest::interest_path)
             .flatten(),
+        open_log: scope
+            .wants_stats()
+            .then(crate::hitrate::open_log_path)
+            .flatten(),
     }
 }
 
@@ -125,6 +134,7 @@ pub struct Report {
     pub cache: Option<Freed>,
     pub auth: Option<Freed>,
     pub interest: Option<Freed>,
+    pub open_log: Option<Freed>,
 }
 
 /// Recursively sums file sizes under `path` (0 for a missing path or a
@@ -203,6 +213,16 @@ pub fn delete(targets: &Targets, dry_run: bool) -> Report {
             }
         }),
         interest: targets.interest.as_deref().map(|p| {
+            if dry_run {
+                Freed {
+                    existed: p.exists(),
+                    bytes: std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
+                }
+            } else {
+                delete_file(p)
+            }
+        }),
+        open_log: targets.open_log.as_deref().map(|p| {
             if dry_run {
                 Freed {
                     existed: p.exists(),
@@ -303,6 +323,19 @@ pub fn run(resolved: &ResolvedConfig, scope: Scope, assume_yes: bool) -> i32 {
             }
         );
     }
+    if let (Some(path), Some(freed)) = (&targets.open_log, preview.open_log) {
+        any_real_target = true;
+        println!(
+            "  cache-hit log: {} ({}{})",
+            path.display(),
+            human_bytes(freed.bytes),
+            if freed.existed {
+                ""
+            } else {
+                " — not present"
+            }
+        );
+    }
     if scope.wants_stats() && targets.interest.is_none() {
         println!("  stats: no platform state directory — nothing to delete");
     }
@@ -368,6 +401,18 @@ pub fn run(resolved: &ResolvedConfig, scope: Scope, assume_yes: bool) -> i32 {
             total_bytes += freed.bytes;
         } else {
             println!("  interest model already absent: {}", path.display());
+        }
+    }
+    if let (Some(path), Some(freed)) = (&targets.open_log, report.open_log) {
+        if freed.existed {
+            println!(
+                "  deleted cache-hit log ({}): {}",
+                human_bytes(freed.bytes),
+                path.display()
+            );
+            total_bytes += freed.bytes;
+        } else {
+            println!("  cache-hit log already absent: {}", path.display());
         }
     }
     println!("Total freed: {}", human_bytes(total_bytes));
@@ -436,6 +481,7 @@ mod tests {
             cache_dir: _c,
             auth: _a,
             interest: _i,
+            open_log: _o,
         } = resolve_targets(
             Scope {
                 all: true,
@@ -456,6 +502,7 @@ mod tests {
             cache_dir: None,
             auth: None,
             interest: Some(path.clone()),
+            open_log: None,
         };
         let report = delete(&targets, false);
         assert_eq!(report.interest.map(|f| f.existed), Some(true));
@@ -471,6 +518,7 @@ mod tests {
             cache_dir,
             auth,
             interest,
+            open_log,
         } = resolve_targets(
             Scope {
                 stats: true,
@@ -482,6 +530,47 @@ mod tests {
         // `interest` is Some iff a platform state dir exists (None in a
         // sandbox without one) — either way it never leaks a history/cache path.
         let _ = interest;
+        // PRD §6.8 / §11: the cache-hit log is a stats store too, so it
+        // resolves exactly when the interest model does (same state dir).
+        assert_eq!(open_log.is_some(), interest.is_some());
+        if let Some(p) = open_log {
+            assert!(p.ends_with("cache_hits.json"));
+        }
+    }
+
+    #[test]
+    fn delete_removes_the_cache_hit_log_under_stats() {
+        let path = temp_dir("cache-hits").with_extension("json");
+        let mut log = crate::hitrate::OpenLog::new();
+        log.record(crate::hitrate::OpenSource::Disk);
+        log.save(&path).unwrap();
+        let targets = Targets {
+            history: None,
+            cache_dir: None,
+            auth: None,
+            interest: None,
+            open_log: Some(path.clone()),
+        };
+        let report = delete(&targets, false);
+        assert_eq!(report.open_log.map(|f| f.existed), Some(true));
+        assert!(!path.exists(), "cache_hits.json must be gone after --stats");
+        assert_eq!(
+            crate::hitrate::OpenLog::load(&path).window().total(),
+            0,
+            "and the next load starts from no data"
+        );
+    }
+
+    #[test]
+    fn history_scope_does_not_touch_the_cache_hit_log() {
+        let targets = resolve_targets(
+            Scope {
+                history: true,
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(targets.open_log.is_none(), "only --stats/--all name it");
     }
 
     // ---- --auth deletes the token file (PRD FR-ACC-9 / SEC-4) ----------
@@ -495,6 +584,7 @@ mod tests {
             cache_dir: None,
             auth: Some(path.clone()),
             interest: None,
+            open_log: None,
         };
         let report = delete(&targets, false);
         assert_eq!(report.auth.map(|f| f.existed), Some(true));
@@ -510,6 +600,7 @@ mod tests {
             cache_dir: None,
             auth: Some(path.clone()),
             interest: None,
+            open_log: None,
         };
         let report = delete(&targets, true);
         assert!(report.auth.unwrap().existed);
@@ -528,6 +619,7 @@ mod tests {
             cache_dir: None,
             auth: None,
             interest: None,
+            open_log: None,
         };
 
         let report = delete(&targets, false);
@@ -553,6 +645,7 @@ mod tests {
             cache_dir: Some(dir.clone()),
             auth: None,
             interest: None,
+            open_log: None,
         };
 
         let report = delete(&targets, false);
@@ -574,6 +667,7 @@ mod tests {
             cache_dir: Some(dir.join("nope-cache")),
             auth: None,
             interest: None,
+            open_log: None,
         };
         let report = delete(&targets, false);
         assert_eq!(
@@ -601,6 +695,7 @@ mod tests {
             cache_dir: None,
             auth: None,
             interest: None,
+            open_log: None,
         };
 
         let report = delete(&targets, true);

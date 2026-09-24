@@ -1010,6 +1010,19 @@ pub struct App {
     /// The `:stats` view's scroll offset — see `prefetch_log_scroll`'s doc
     /// comment for why this exists (UX-7). Reset to 0 on `open_stats`.
     pub stats_scroll: u16,
+    /// PRD §6.8 / §11: the local cache-hit-rate log — where each article
+    /// open was served from (`hitrate.rs` defines "open" and "hit"). `App::
+    /// new` starts empty and unpersisted, like `interest`; `main::run` loads
+    /// the real `cache_hits.json` and sets `open_log_path`.
+    pub open_log: crate::hitrate::OpenLog,
+    /// Where `open_log` persists, or `None` (tests, no state dir) to keep it
+    /// in memory only — `persist_open_log` writes only when this is set.
+    pub open_log_path: Option<std::path::PathBuf>,
+    /// Set by the SWR reload (`reload_from_pending_update`) so the one
+    /// `set_document` it drives doesn't arm a second open for an article
+    /// already counted — see `hitrate.rs`'s "Not opens". Consumed by that
+    /// `set_document`.
+    pub not_an_open_once: bool,
 
     // -- Start page, on-this-day panel, TIL widget (PRD FR-DL-1,2,7) -------
     /// The daily Wikifeeds cache, shared with the background substrate's
@@ -1717,6 +1730,9 @@ impl App {
             interests_scroll: 0,
             stats_prior_mode: Mode::Reading,
             stats_scroll: 0,
+            open_log: crate::hitrate::OpenLog::new(),
+            open_log_path: None,
+            not_an_open_once: false,
             feed_cache: None,
             startpage_config: StartPageConfig::default(),
             start_selected: 0,
@@ -2073,6 +2089,59 @@ impl App {
     /// `stats::compute` the `wikitui stats` CLI uses.
     pub fn reading_stats(&self) -> crate::stats::ReadingStats {
         crate::stats::compute(&self.history.all_visits(), self.interest.top_categories(8))
+    }
+
+    // -- Cache-hit-rate KPI (PRD §6.8, §11, G1) -------------------------------
+
+    /// Whether article opens may be counted right now: `privacy::decide`
+    /// allows a `Write::Stats` (incognito denies it — PRD FR-PR-3 "no
+    /// stats"). The single gate both arming and counting consult, so an open
+    /// made in incognito is never counted even if incognito is switched off
+    /// before it is first viewed.
+    fn stats_active(&self) -> bool {
+        crate::privacy::decide(self.incognito, crate::privacy::Write::Stats)
+            == crate::privacy::Verdict::Allow
+    }
+
+    /// Arms `tabs[index]`'s just-installed document as an uncounted article
+    /// open served from `tier` (see `hitrate.rs` for the definition). A
+    /// no-op for `None` (nothing was fetched) or while incognito. Called only
+    /// by the two install funnels — `set_document` and `main::
+    /// apply_tab_load_outcome` — right after `Tab::install_document`.
+    pub(crate) fn arm_open(&mut self, index: usize, tier: Option<crate::hitrate::OpenSource>) {
+        if !self.stats_active() {
+            return;
+        }
+        if let Some(tab) = self.tabs.get_mut(index) {
+            tab.pending_open = tier;
+        }
+    }
+
+    /// Counts `tabs[index]`'s armed open, if any — called from the first
+    /// layout of that tab (`ensure_layout`/`layout_for_tab`), which is the
+    /// "first on screen" moment and the only place `l1_hit` is known.
+    /// Disarms first, so every later layout of the same document (scroll,
+    /// resize, fold) is a no-op: exactly one count per open.
+    fn count_pending_open(&mut self, index: usize, l1_hit: bool) {
+        let Some(tier) = self.tabs.get_mut(index).and_then(|t| t.pending_open.take()) else {
+            return;
+        };
+        if !self.stats_active() {
+            return;
+        }
+        self.open_log
+            .record(crate::hitrate::OpenSource::resolve(tier, l1_hit));
+        self.persist_open_log();
+    }
+
+    /// Persist `open_log` to `open_log_path`, if one is set (a real run,
+    /// never a test). Best-effort, like `persist_interest`.
+    fn persist_open_log(&self) {
+        if let Some(path) = &self.open_log_path
+            && let Err(e) = self.open_log.save(path)
+        {
+            eprintln!("wikitui: cache-hit log: save failed: {e}");
+        }
     }
 
     /// Reset the status line to the article title (or the default hint) —
@@ -3556,9 +3625,14 @@ impl App {
             return;
         };
         if let Some(cached) = self.layout_cache.get(&key) {
+            // PRD §6.8 KPI: a just-opened document's first layout came from
+            // L1 — count its open as an L1 hit (unless it waited on the
+            // network; see `hitrate::OpenSource::resolve`).
+            self.count_pending_open(self.active, true);
             self.layout = Some(cached);
             return;
         }
+        self.count_pending_open(self.active, false);
         // Reserve boxes for any decoded inline images (empty when images are
         // off / no graphics protocol / below the size tier). Computed before
         // the mutable borrows below so it can read the store immutably.
@@ -3610,8 +3684,12 @@ impl App {
             (opts, folds, key)
         };
         if let Some(cached) = self.layout_cache.get(&key) {
+            // PRD §6.8 KPI: a split pane's first layout is its "on screen"
+            // moment, exactly like `ensure_layout`'s for the single pane.
+            self.count_pending_open(tab_idx, true);
             return Some(cached);
         }
+        self.count_pending_open(tab_idx, false);
         let img_map = {
             let tab = &self.tabs[tab_idx];
             self.image_box_map_for(tab, width, opts.measure)
@@ -3932,6 +4010,14 @@ impl App {
     pub fn set_document(&mut self, doc: Document) {
         let lang = self.lang.clone();
         let index = self.active;
+        // PRD §6.8 / §11 cache-hit KPI: every caller sets the tab's
+        // `page_source` *before* installing, so it names where this
+        // document's bytes came from — the tier this open is armed with
+        // (`hitrate::OpenSource::from_page_source`; `PageSource::None`, as a
+        // bare test fixture leaves it, arms nothing). The SWR reload opts out
+        // via `not_an_open_once` (the same open, already counted).
+        let open_tier = crate::hitrate::OpenSource::from_page_source(self.active_tab().page_source);
+        let is_open = !std::mem::take(&mut self.not_an_open_once);
 
         // Whatever the active tab was showing before this moment stops
         // accumulating dwell time now (PRD FR-HS-1) — must happen before
@@ -3971,6 +4057,9 @@ impl App {
             // history entry (see `main::open_history_entry`).
             tab.wiki = wiki;
             tab.install_document(doc);
+        }
+        if is_open {
+            self.arm_open(index, open_tier);
         }
         self.record_history_visit(index, referrer);
         // PRD FR-NV-8: offer to resume if this article has a saved position —
@@ -4515,6 +4604,9 @@ impl App {
             // PRD FR-NV-8: the SWR reload reinstalls the same article the
             // reader is already looking at — the resume toast would be noise.
             self.suppress_resume_once = true;
+            // PRD §6.8 KPI: and it is the same *open* — counted once already,
+            // as the stale L2 serve it began as (`hitrate.rs`, "Not opens").
+            self.not_an_open_once = true;
             self.set_document(document);
         }
     }
@@ -12343,5 +12435,249 @@ mod tests {
             "pro=true must never toast: {:?}",
             app.notice
         );
+    }
+
+    // ---- PRD §6.8 / §11: cache-hit-rate KPI (`hitrate.rs`) -----------------
+
+    const KPI_HTML: &str = "<html><body><p>kpi body text</p></body></html>";
+
+    /// Mirrors what every real open path does: set the tab's `page_source`
+    /// and revid, then install via `open_document` (a fresh navigation).
+    fn kpi_open(app: &mut App, title: &str, source: PageSource, revid: u64) {
+        {
+            let tab = app.active_tab_mut();
+            tab.page_source = source;
+            tab.current_revid = revid;
+        }
+        app.open_document(crate::doc::parse_article_html(title, KPI_HTML));
+    }
+
+    fn kpi_counts(app: &App) -> crate::hitrate::Counts {
+        app.open_log.window()
+    }
+
+    #[test]
+    fn kpi_an_open_is_counted_once_at_first_layout_not_at_install() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.layout_width = 80;
+        kpi_open(&mut app, "A", PageSource::Cached { age_secs: 5 }, 7);
+        assert_eq!(kpi_counts(&app).total(), 0, "armed, not yet on screen");
+        assert_eq!(
+            app.active_tab().pending_open,
+            Some(crate::hitrate::OpenSource::Disk)
+        );
+        app.ensure_layout();
+        assert_eq!(kpi_counts(&app).disk, 1, "first layout counts it");
+        assert!(app.active_tab().pending_open.is_none(), "disarmed");
+        // Re-draws, a resize relayout and a fold are not new opens.
+        app.ensure_layout();
+        app.layout_width = 60;
+        app.ensure_layout();
+        app.layout_width = 80;
+        app.ensure_layout();
+        assert_eq!(kpi_counts(&app).total(), 1, "exactly one count per open");
+    }
+
+    #[test]
+    fn kpi_live_is_a_network_miss_and_saved_offline_zim_share_a_bucket() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.layout_width = 80;
+        kpi_open(&mut app, "Live", PageSource::Live, 1);
+        app.ensure_layout();
+        kpi_open(&mut app, "Saved", PageSource::Saved { age_secs: 9 }, 2);
+        app.ensure_layout();
+        kpi_open(&mut app, "Offline", PageSource::Offline { age_secs: 9 }, 3);
+        app.ensure_layout();
+        kpi_open(&mut app, "Zim", PageSource::Zim, 0);
+        app.ensure_layout();
+        let c = kpi_counts(&app);
+        assert_eq!(c.network, 1);
+        assert_eq!(c.saved_offline, 3);
+        assert_eq!(c.hit_percent(), Some(75));
+    }
+
+    #[test]
+    fn kpi_reopening_an_article_whose_layout_is_in_l1_counts_as_l1() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.layout_width = 80;
+        kpi_open(&mut app, "A", PageSource::Cached { age_secs: 5 }, 7);
+        app.ensure_layout();
+        kpi_open(&mut app, "B", PageSource::Cached { age_secs: 5 }, 8);
+        app.ensure_layout();
+        // Back to A (same identity, same width): an L1 hit, no relayout.
+        let computations = app.layout_computations;
+        kpi_open(&mut app, "A", PageSource::Cached { age_secs: 5 }, 7);
+        app.ensure_layout();
+        assert_eq!(app.layout_computations, computations, "L1 served it");
+        let c = kpi_counts(&app);
+        assert_eq!((c.l1, c.disk, c.total()), (1, 2, 3));
+    }
+
+    #[test]
+    fn kpi_a_live_fetch_is_network_even_when_its_layout_is_already_in_l1() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.layout_width = 80;
+        kpi_open(&mut app, "A", PageSource::Cached { age_secs: 5 }, 7);
+        app.ensure_layout();
+        // A force-refetch of the same revid: L1 has the layout, but the
+        // reader waited on the network for the content.
+        kpi_open(&mut app, "A", PageSource::Live, 7);
+        app.ensure_layout();
+        let c = kpi_counts(&app);
+        assert_eq!((c.disk, c.l1, c.network), (1, 0, 1));
+    }
+
+    #[test]
+    fn kpi_an_unarmed_install_counts_nothing() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.layout_width = 80;
+        // `PageSource::None`: nothing was fetched (a bare fixture).
+        app.set_document(crate::doc::parse_article_html("Fixture", KPI_HTML));
+        app.ensure_layout();
+        assert_eq!(kpi_counts(&app).total(), 0);
+    }
+
+    #[test]
+    fn kpi_incognito_counts_nothing_even_if_toggled_off_before_first_view() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.layout_width = 80;
+        app.incognito = true;
+        kpi_open(&mut app, "A", PageSource::Cached { age_secs: 5 }, 7);
+        app.ensure_layout();
+        assert_eq!(kpi_counts(&app).total(), 0, "FR-PR-3: no stats");
+        // Armed-while-incognito never counts, even viewed after `zz` off.
+        kpi_open(&mut app, "B", PageSource::Live, 8);
+        assert!(app.active_tab().pending_open.is_none(), "never armed");
+        app.incognito = false;
+        app.ensure_layout();
+        assert_eq!(kpi_counts(&app).total(), 0);
+        assert_eq!(app.open_log.all_time().total(), 0);
+    }
+
+    #[test]
+    fn kpi_tab_switch_close_undo_and_vsplit_are_not_opens() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.layout_width = 80;
+        kpi_open(&mut app, "A", PageSource::Cached { age_secs: 5 }, 7);
+        app.ensure_layout();
+        app.new_foreground_tab();
+        kpi_open(&mut app, "B", PageSource::Live, 8);
+        app.ensure_layout();
+        assert_eq!(kpi_counts(&app).total(), 2);
+        // Tab switching back and forth re-lays out (L1) but opens nothing.
+        app.switch_to_tab(0);
+        app.ensure_layout();
+        app.switch_to_tab(1);
+        app.ensure_layout();
+        // Close B and `u`-reopen it.
+        assert!(!app.close_tab(1));
+        app.ensure_layout();
+        assert!(app.reopen_closed_tab());
+        app.ensure_layout();
+        // `:vsplit` duplicates the focused document into a new pane.
+        app.open_split(120).unwrap();
+        let (l, r) = {
+            let s = app.split.as_ref().unwrap();
+            (
+                app.tab_index_by_id(s.panes[0]).unwrap(),
+                app.tab_index_by_id(s.panes[1]).unwrap(),
+            )
+        };
+        app.layout_for_tab(l, 59);
+        app.layout_for_tab(r, 59);
+        assert_eq!(kpi_counts(&app).total(), 2, "still just the two opens");
+    }
+
+    #[test]
+    fn kpi_a_split_pane_counts_its_armed_open_on_its_first_pane_layout() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.layout_width = 80;
+        kpi_open(&mut app, "A", PageSource::Cached { age_secs: 5 }, 7);
+        app.ensure_layout();
+        // A second tab whose document landed (armed) but was never focused —
+        // e.g. `:bilingual`'s other-language pane.
+        let id = app.push_blank_tab("de".to_string());
+        let idx = app.tab_index_by_id(id).unwrap();
+        app.tabs[idx].page_source = PageSource::Live;
+        app.tabs[idx].install_document(crate::doc::parse_article_html("B", KPI_HTML));
+        app.arm_open(idx, Some(crate::hitrate::OpenSource::Network));
+        assert_eq!(kpi_counts(&app).total(), 1);
+        app.layout_for_tab(idx, 59);
+        app.layout_for_tab(idx, 59);
+        let c = kpi_counts(&app);
+        assert_eq!((c.disk, c.network), (1, 1), "counted once, as network");
+    }
+
+    #[test]
+    fn kpi_the_swr_reload_is_not_a_second_open() {
+        let dir =
+            std::env::temp_dir().join(format!("wikitui-kpi-reload-test-{}", std::process::id()));
+        let cache = crate::cache::PageCache::at(
+            dir.clone(),
+            crate::cache::DEFAULT_MAX_BYTES,
+            crate::cache::FRESH_TTL_SECS,
+            crate::cache::DEFAULT_FORCE_REFETCH_SECS,
+        );
+        cache.put("", "en", "A", KPI_HTML, 2, None);
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.layout_width = 80;
+        // The stale serve that started this open: counted once, as disk.
+        kpi_open(&mut app, "A", PageSource::Cached { age_secs: 100_000 }, 1);
+        app.ensure_layout();
+        app.active_tab_mut().pending_reload = Some(PendingReload {
+            lang: "en".to_string(),
+            title: "A".to_string(),
+        });
+        app.reload_from_pending_update(&cache);
+        assert_eq!(app.active_tab().current_revid, 2, "the reload happened");
+        app.ensure_layout();
+        let c = kpi_counts(&app);
+        assert_eq!((c.disk, c.total()), (1, 1), "same open, not a new one");
+        assert!(!app.not_an_open_once, "the opt-out is single-use");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kpi_counts_persist_to_the_open_log_path() {
+        let path = std::env::temp_dir().join(format!(
+            "wikitui-kpi-persist-test-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.open_log_path = Some(path.clone());
+        app.layout_width = 80;
+        kpi_open(&mut app, "A", PageSource::Cached { age_secs: 5 }, 7);
+        app.ensure_layout();
+        kpi_open(&mut app, "B", PageSource::Live, 8);
+        app.ensure_layout();
+        let loaded = crate::hitrate::OpenLog::load(&path);
+        assert_eq!(loaded.window().disk, 1);
+        assert_eq!(loaded.window().network, 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn kpi_a_background_open_counts_on_first_view_not_when_it_lands() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.layout_width = 80;
+        kpi_open(&mut app, "A", PageSource::Cached { age_secs: 5 }, 7);
+        app.ensure_layout();
+        let id = app.open_background_tab("B".to_string(), "en".to_string());
+        let idx = app.tab_index_by_id(id).unwrap();
+        // What `main::apply_tab_load_outcome` does when the load lands.
+        app.tabs[idx].page_source = PageSource::Cached { age_secs: 5 };
+        app.tabs[idx].install_document(crate::doc::parse_article_html("B", KPI_HTML));
+        app.arm_open(idx, Some(crate::hitrate::OpenSource::Disk));
+        app.ensure_layout(); // the active tab (A) redraws — not B's view
+        assert_eq!(kpi_counts(&app).total(), 1, "landed, but not yet viewed");
+        app.switch_to_tab(idx);
+        app.ensure_layout();
+        assert_eq!(kpi_counts(&app).disk, 2, "counted on first view");
+        app.switch_to_tab(0);
+        app.ensure_layout();
+        app.switch_to_tab(idx);
+        app.ensure_layout();
+        assert_eq!(kpi_counts(&app).total(), 2, "and only then");
     }
 }

@@ -191,6 +191,15 @@ pub struct Tab {
     /// that landed in a background tab — so the chooser appears exactly once
     /// per install and "Esc: view as text" sticks across tab switches.
     pub disambig_pending: bool,
+    /// PRD §6.8 / §11 cache-hit KPI: the fetch tier of the installed document
+    /// when it was installed by a reader-requested open that hasn't been
+    /// counted yet. Armed by `App::set_document` / `main::
+    /// apply_tab_load_outcome` and consumed (counted into `App::open_log`) by
+    /// the first layout of this tab — `App::ensure_layout` or `App::
+    /// layout_for_tab` — which is also where an L1 hit upgrades the tier.
+    /// `install_document` clears it (a fresh install is unarmed until its
+    /// caller says it was an open); see `hitrate.rs` for what counts.
+    pub pending_open: Option<crate::hitrate::OpenSource>,
 }
 
 impl Tab {
@@ -230,6 +239,7 @@ impl Tab {
             interest_scroll_signaled: false,
             redirected_from: None,
             disambig_pending: false,
+            pending_open: None,
         }
     }
 
@@ -261,6 +271,9 @@ impl Tab {
         // previous document would collapse the wrong ranges (PRD FR-NV-3).
         self.folded_blocks.clear();
         self.disambig_pending = doc.is_disambiguation;
+        // Unarmed until the installing caller says this was an open (PRD
+        // §6.8 KPI) — a split duplicate or a rehydration never counts.
+        self.pending_open = None;
         self.doc = Some(doc);
         self.scroll = 0;
         self.table_col_offset = 0;
@@ -316,6 +329,7 @@ impl Tab {
         self.interest_scroll_signaled = false;
         self.redirected_from = None;
         self.disambig_pending = false;
+        self.pending_open = None;
         self.clear_find();
     }
 

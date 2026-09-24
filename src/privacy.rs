@@ -39,10 +39,10 @@
 //! ## Seams (not built yet, listed so the gate doesn't have to be rediscovered)
 //!
 //! - **Reading stats** (PRD FR-PC-3) and the **interest-affinity model**
-//!   (FR-PF-3) don't exist yet ([`Write::Stats`]/[`Write::Interest`] exist
-//!   here so `decide`'s table is already complete for them — a future
-//!   `stats.rs`/`interest.rs` just has to call `decide` before its first
-//!   write, not invent the policy).
+//!   (FR-PF-3) have since landed and route through [`Write::Stats`]/
+//!   [`Write::Interest`] (the cache-hit log in `hitrate.rs` for the former,
+//!   `App::interest_active` for the latter) — kept in this list so the
+//!   history of which seams were anticipated stays legible.
 //! - **Reading-position memory** (FR-NV-8) and **session save/restore**
 //!   (FR-TB-5) are later chunks too; when they land, their writes are
 //!   passive (nothing the reader explicitly asked to persist) and belong
@@ -56,11 +56,11 @@ pub enum Write {
     /// `history::History::record_visit` / dwell tracking
     /// (`app::record_history_visit`, `app::flush_tab_dwell`) — passive.
     History,
-    /// Reading stats (PRD FR-PC-3) — not built yet; no real call site
-    /// constructs this today (see the module doc comment's "Seams"), so a
-    /// future `stats.rs` finds the policy already decided rather than having
-    /// to invent it.
-    #[allow(dead_code)]
+    /// Reading stats (PRD FR-PC-3) — passive. Most of `stats.rs` is derived
+    /// on demand from history/interest (already gated upstream); the one
+    /// stats store with writes of its own is the PRD §6.8 cache-hit log
+    /// (`hitrate::OpenLog`), which `App::arm_open`/`App::count_pending_open`
+    /// consult this for (via `App::stats_active`) before counting an open.
     Stats,
     /// The interest-affinity model (PRD FR-PF-3) — not built yet; same seam
     /// posture as `Stats` above.

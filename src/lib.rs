@@ -35,6 +35,7 @@ mod game;
 mod graphics;
 mod hints;
 mod history;
+mod hitrate;
 mod hyperlink;
 mod image;
 mod interest;
@@ -2114,12 +2115,70 @@ fn apply_tab_load_outcome(
     outcome: TabLoadOutcome,
     revalidate_tx: &UnboundedSender<RevalidationOutcome>,
 ) {
+    apply_tab_load_outcome_as(client, app, outcome, revalidate_tx, LoadKind::Background);
+}
+
+/// PRD §7 "429 / maxlag on interactive request": a foreground retry
+/// (`fire_foreground_retry`) landing — installed exactly like a background
+/// tab's completed fetch, differing only in how the PRD §6.8 cache-hit KPI
+/// counts it (see [`LoadKind::ForegroundRetry`]).
+fn apply_foreground_retry_outcome(
+    client: &WikiClient,
+    app: &mut App,
+    outcome: TabLoadOutcome,
+    revalidate_tx: &UnboundedSender<RevalidationOutcome>,
+) {
+    apply_tab_load_outcome_as(
+        client,
+        app,
+        outcome,
+        revalidate_tx,
+        LoadKind::ForegroundRetry,
+    );
+}
+
+/// Which completion `apply_tab_load_outcome_as` is installing — the one
+/// distinction the PRD §6.8 cache-hit KPI (`hitrate.rs`) needs between two
+/// otherwise identical install paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadKind {
+    /// A background tab (`Ctrl-Enter`/`F`) or session-restore load: the
+    /// reader asked for this document, so its install is an open, counted
+    /// when the tab is first on screen.
+    Background,
+    /// A foreground 429 retry: *not* a new open when it replaces a stale copy
+    /// already shown for the same `(wiki, lang, title)` (the same request,
+    /// upgraded — whatever count that stale serve armed carries over), but
+    /// the open itself when nothing had been served for the request yet.
+    ForegroundRetry,
+}
+
+fn apply_tab_load_outcome_as(
+    client: &WikiClient,
+    app: &mut App,
+    outcome: TabLoadOutcome,
+    revalidate_tx: &UnboundedSender<RevalidationOutcome>,
+    kind: LoadKind,
+) {
     let Some(index) = app.tab_index_by_id(outcome.tab_id) else {
         return; // the background tab was closed before its fetch landed.
     };
     match outcome.result {
         Ok(fetch) => {
             let document = doc::parse_article_html(&fetch.resolved_title, &fetch.html);
+            // PRD §6.8 KPI: a retry that upgrades the stale copy already on
+            // screen for this very request is the same open (keep whatever
+            // it armed); anything else installing here is an open of its own.
+            let (arm, carried) = {
+                let tab = &app.tabs[index];
+                let upgrades_same_request = kind == LoadKind::ForegroundRetry
+                    && tab.wiki == outcome.wiki
+                    && tab.lang == outcome.lang
+                    && tab.doc.as_ref().is_some_and(|d| {
+                        d.title == outcome.title || d.title == fetch.resolved_title
+                    });
+                (!upgrades_same_request, tab.pending_open)
+            };
             {
                 let tab = &mut app.tabs[index];
                 tab.loading = false;
@@ -2131,6 +2190,12 @@ fn apply_tab_load_outcome(
                 tab.page_source = fetch.source;
                 tab.current_revid = fetch.revid;
                 tab.install_document(document);
+                if !arm {
+                    tab.pending_open = carried;
+                }
+            }
+            if arm {
+                app.arm_open(index, hitrate::OpenSource::from_page_source(fetch.source));
             }
             // PRD FR-TB-5: a session-restore fetch (`main::restore_session_tabs`)
             // stashed the scroll/fold-set to apply once `install_document`
@@ -2965,6 +3030,16 @@ async fn run(
             app.interest = interest::InterestModel::new(interest_half_life_days);
         }
     }
+    // PRD §6.8 / §11: the local cache-hit-rate log (`cache_hits.json`),
+    // loaded like the interest model just above — `App::new` keeps an empty
+    // in-memory one so tests never touch the real state dir; setting
+    // `open_log_path` is what enables persistence. Incognito is enforced at
+    // record time (`App::stats_active`), not by skipping the load, so the
+    // `:stats` panel still shows the reader's non-incognito figure.
+    if let Some(path) = hitrate::open_log_path() {
+        app.open_log = hitrate::OpenLog::load(&path);
+        app.open_log_path = Some(path);
+    }
     // PRD FR-TB-5 (§6.4: sessions live in state): resolved unconditionally,
     // even under `--incognito` — `App::persist_session` is the one gate
     // that stops incognito writing anything new, so a later non-incognito
@@ -3331,7 +3406,7 @@ async fn run(
             // any other completed tab fetch (`apply_tab_load_outcome`).
             while let Ok(outcome) = app.foreground_retry_rx.try_recv() {
                 app.pending_foreground_retries = app.pending_foreground_retries.saturating_sub(1);
-                apply_tab_load_outcome(client, &mut app, outcome, &revalidate_tx);
+                apply_foreground_retry_outcome(client, &mut app, outcome, &revalidate_tx);
             }
             // PRD FR-RD-8: install decoded inline images; each triggers one
             // relayout so its half-block box appears (`App::deliver_image`).
@@ -4513,7 +4588,8 @@ async fn open_title(
         match cache.peek(&client.wiki_scope(), &lang, title) {
             Some(cached) => {
                 let document = doc::parse_article_html(title, &cached.html);
-                app.open_document(document);
+                // Source first, then install — `set_document` reads it to arm
+                // the PRD §6.8 KPI open (and to paint the status glyph).
                 {
                     let tab = app.active_tab_mut();
                     tab.page_source = PageSource::Offline {
@@ -4521,6 +4597,7 @@ async fn open_title(
                     };
                     tab.current_revid = cached.revid;
                 }
+                app.open_document(document);
                 app.notice = Some(format!(
                     "\"{title}\" may have moved or been deleted — showing the last cached copy"
                 ));
@@ -13407,6 +13484,12 @@ mod tests {
             app.active_tab().doc.as_ref().map(|d| d.title.as_str()),
             Some("Deleted Article")
         );
+        // PRD §6.8 KPI: the stale-cache fallback is armed as a saved/offline
+        // hit (the reader got it from local storage, not the network).
+        assert_eq!(
+            app.active_tab().pending_open,
+            Some(hitrate::OpenSource::SavedOffline)
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -13530,5 +13613,223 @@ mod tests {
             notice.contains("No saved sessions yet") || notice.contains("Saved sessions:"),
             "{notice:?}"
         );
+    }
+
+    // ---- PRD §6.8 / §11: cache-hit-rate KPI across the real open paths -----
+
+    fn kpi_fetch(title: &str, source: PageSource, revid: u64) -> FetchOutcome {
+        FetchOutcome {
+            html: format!(
+                "<html><head><title>{title}</title></head><body><p>body</p></body></html>"
+            ),
+            source,
+            revid,
+            resolved_title: title.to_string(),
+            revalidate: None,
+            redirected_from: None,
+            rate_limited: None,
+            missing: false,
+        }
+    }
+
+    /// Background tabs (`Ctrl-Enter`/`F`) and session-restore tabs both land
+    /// through `apply_tab_load_outcome`: armed on landing, counted the first
+    /// time the tab is on screen — and never again on later tab switches.
+    #[test]
+    fn kpi_background_and_restore_loads_count_once_on_first_view() {
+        let client = test_client();
+        let (revalidate_tx, _rx) = mpsc::unbounded_channel::<RevalidationOutcome>();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.layout_width = 80;
+        let id = app.open_background_tab("Enigma machine".to_string(), "en".to_string());
+        apply_tab_load_outcome(
+            &client,
+            &mut app,
+            TabLoadOutcome {
+                tab_id: id,
+                wiki: String::new(),
+                lang: "en".to_string(),
+                title: "Enigma machine".to_string(),
+                result: Ok(kpi_fetch(
+                    "Enigma machine",
+                    PageSource::Cached { age_secs: 3 },
+                    4,
+                )),
+            },
+            &revalidate_tx,
+        );
+        let idx = app.tab_index_by_id(id).unwrap();
+        assert_eq!(
+            app.tabs[idx].pending_open,
+            Some(hitrate::OpenSource::Disk),
+            "armed with the tier it was fetched from"
+        );
+        assert_eq!(app.open_log.window().total(), 0, "not viewed yet");
+        app.switch_to_tab(idx);
+        app.ensure_layout();
+        assert_eq!(app.open_log.window().disk, 1);
+        app.switch_to_tab(0);
+        app.ensure_layout();
+        app.switch_to_tab(idx);
+        app.ensure_layout();
+        assert_eq!(app.open_log.window().total(), 1);
+    }
+
+    /// PRD §7 429 retry, case 1: the open already served a stale copy of this
+    /// exact article (counted as saved/offline); the retry's fresh content is
+    /// the same open upgraded, not a second one.
+    #[test]
+    fn kpi_a_retry_replacing_the_stale_copy_it_served_is_not_a_second_open() {
+        let client = test_client();
+        let (revalidate_tx, _rx) = mpsc::unbounded_channel::<RevalidationOutcome>();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.layout_width = 80;
+        {
+            let tab = app.active_tab_mut();
+            tab.page_source = PageSource::Offline { age_secs: 99 };
+            tab.current_revid = 1;
+        }
+        app.open_document(crate::doc::parse_article_html(
+            "Busy Page",
+            "<html><body><p>stale</p></body></html>",
+        ));
+        app.ensure_layout();
+        assert_eq!(app.open_log.window().saved_offline, 1);
+        let tab_id = app.active_tab().id;
+        apply_foreground_retry_outcome(
+            &client,
+            &mut app,
+            TabLoadOutcome {
+                tab_id,
+                wiki: String::new(),
+                lang: "en".to_string(),
+                title: "Busy Page".to_string(),
+                result: Ok(kpi_fetch("Busy Page", PageSource::Live, 2)),
+            },
+            &revalidate_tx,
+        );
+        assert_eq!(app.active_tab().current_revid, 2, "fresh content landed");
+        app.ensure_layout();
+        let c = app.open_log.window();
+        assert_eq!((c.saved_offline, c.network, c.total()), (1, 0, 1));
+    }
+
+    /// PRD §7 429 retry, case 2: nothing was served for the request (no
+    /// cached copy — the offline card showed); the retry landing *is* the
+    /// open, and it waited on the network.
+    #[test]
+    fn kpi_a_retry_landing_where_nothing_was_served_is_the_network_open() {
+        let client = test_client();
+        let (revalidate_tx, _rx) = mpsc::unbounded_channel::<RevalidationOutcome>();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.layout_width = 80;
+        let tab_id = app.active_tab().id;
+        apply_foreground_retry_outcome(
+            &client,
+            &mut app,
+            TabLoadOutcome {
+                tab_id,
+                wiki: String::new(),
+                lang: "en".to_string(),
+                title: "Busy Page".to_string(),
+                result: Ok(kpi_fetch("Busy Page", PageSource::Live, 2)),
+            },
+            &revalidate_tx,
+        );
+        app.ensure_layout();
+        assert_eq!(app.open_log.window().network, 1);
+    }
+
+    /// The real foreground paths end to end: a first `open_title` goes to the
+    /// network (a miss); reopening it is a fresh L2 hit whose layout is still
+    /// in L1 (an L1 hit); a disk-only article opened next counts as disk;
+    /// and back (`open_history_entry`) to the first is L1 again. A background
+    /// revalidation landing in between installs nothing and counts nothing.
+    #[tokio::test]
+    async fn kpi_open_title_and_back_forward_record_their_real_sources() {
+        let client = WikiClient::new(spawn_one_article("Alan Turing")).unwrap();
+        let dir = temp_state_path("kpi-open-title").with_extension("cachedir");
+        let cache = PageCache::at(dir.clone(), 10_000_000, 86_400, 604_800);
+        cache.put(
+            "",
+            "en",
+            "Enigma machine",
+            "<html><head><title>Enigma machine</title></head><body><p>rotors</p></body></html>",
+            5,
+            None,
+        );
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.interest_learning = false;
+        app.layout_width = 80;
+        let (revalidate_tx, _rrx) = mpsc::unbounded_channel::<RevalidationOutcome>();
+        let (langlinks_tx, _lrx) = mpsc::unbounded_channel::<LangLinksOutcome>();
+
+        open_title(
+            &client,
+            &cache,
+            &mut app,
+            "Alan Turing",
+            &revalidate_tx,
+            &langlinks_tx,
+        )
+        .await;
+        app.ensure_layout();
+        assert_eq!(app.open_log.window().network, 1, "first open: a miss");
+
+        open_title(
+            &client,
+            &cache,
+            &mut app,
+            "Alan Turing",
+            &revalidate_tx,
+            &langlinks_tx,
+        )
+        .await;
+        app.ensure_layout();
+        assert_eq!(app.open_log.window().l1, 1, "reopen: L2 + L1 layout");
+
+        open_title(
+            &client,
+            &cache,
+            &mut app,
+            "Enigma machine",
+            &revalidate_tx,
+            &langlinks_tx,
+        )
+        .await;
+        app.ensure_layout();
+        assert_eq!(app.open_log.window().disk, 1, "disk-only article");
+
+        // A revalidation result for the article on screen writes L2 and
+        // arms the "r to reload" notice — it is not an open.
+        let tab_id = app.active_tab().id;
+        apply_revalidation_outcome(
+            &mut app,
+            &cache,
+            RevalidationOutcome {
+                tab_id,
+                wiki: String::new(),
+                lang: "en".to_string(),
+                title: "Enigma machine".to_string(),
+                result: Some(RevalidationResult::Changed {
+                    html: "<html><head><title>Enigma machine</title></head><body><p>new</p></body></html>".to_string(),
+                    revid: 6,
+                    etag: None,
+                }),
+            },
+        );
+        app.ensure_layout();
+        assert_eq!(app.open_log.window().total(), 3);
+
+        let entry = app.navigate_back_target().expect("a back entry");
+        open_history_entry(&client, &cache, &mut app, entry, &revalidate_tx).await;
+        app.ensure_layout();
+        let c = app.open_log.window();
+        assert_eq!(
+            (c.network, c.l1, c.disk, c.total()),
+            (1, 2, 1, 4),
+            "back to Alan Turing: an L1 hit"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

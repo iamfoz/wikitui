@@ -120,8 +120,9 @@ pub enum Commands {
         cache: bool,
         /// Deletes the local interest model (`interest.json`, PRD FR-PC-3 /
         /// FR-PF-3) — the learned-topic state the reading-stats topic
-        /// distribution reads. The stats numbers themselves derive from
-        /// history (cleared by `--history`).
+        /// distribution reads — and the cache-hit-rate log
+        /// (`cache_hits.json`, PRD §6.8). The other stats numbers derive
+        /// from history (cleared by `--history`).
         #[arg(long)]
         stats: bool,
         /// Deletes locally stored auth tokens (PRD FR-ACC-9) — a seam
@@ -138,7 +139,8 @@ pub enum Commands {
         yes: bool,
     },
     /// PRD FR-PC-3: print local-only reading stats (articles read, total
-    /// time, streaks, topic distribution) to stdout and exit — a standalone,
+    /// time, streaks, cache-hit rate, topic distribution) to stdout and
+    /// exit — a standalone,
     /// TUI-free subcommand like `config doctor`/`clear-data`. Reads the local
     /// reading history and interest model; nothing leaves the machine
     /// (FR-PR-2). `--explain` additionally shows the interest model's top

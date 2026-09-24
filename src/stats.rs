@@ -12,6 +12,12 @@
 //! leaves nothing for this module to count — the suppression FR-PC-3 requires
 //! is a consequence of the privacy gate, not a second check here.
 //!
+//! **The one exception is the cache-hit rate** (PRD §6.8 / §11): history
+//! records *what* was read, never *where the bytes came from*, so that KPI
+//! keeps its own tiny local log (`hitrate.rs`, `cache_hits.json`) — gated by
+//! the same privacy chokepoint (`privacy::Write::Stats`), cleared by
+//! `clear-data --stats`, and shown here and on `:stats`.
+//!
 //! The `compute` step is a pure function of a visit list plus the interest
 //! model's top topics, so streak/total/distinct arithmetic is unit-testable
 //! without a database or a clock; `run` is the thin `wikitui stats` CLI shell
@@ -148,6 +154,15 @@ pub fn run(resolved: &ResolvedConfig, explain: bool) -> i32 {
     println!("  current streak: {} day(s)", stats.current_streak_days);
     println!("  longest streak: {} day(s)", stats.longest_streak_days);
 
+    // PRD §6.8 / §11: the cache-hit-rate KPI, from its own small local log
+    // (`hitrate.rs` — history doesn't record where content came from).
+    let open_log = crate::hitrate::open_log_path()
+        .map(|p| crate::hitrate::OpenLog::load(&p))
+        .unwrap_or_default();
+    for line in cache_hit_lines(&open_log) {
+        println!("{line}");
+    }
+
     if stats.top_topics.is_empty() {
         println!("  top topics    : (none yet — read a few articles to build the interest model)");
     } else {
@@ -183,6 +198,32 @@ pub fn run(resolved: &ResolvedConfig, explain: bool) -> i32 {
         }
     }
     0
+}
+
+/// The `wikitui stats` cache-hit lines (PRD §6.8 / §11), split out of `run`
+/// so the exact CLI wording is unit-testable without stdout: the steady-state
+/// headline with its per-source breakdown — "cache-hit rate: 64% of the last
+/// 212 article opens (L1 80 · disk 56 · saved/offline 4 · network 72)" — then
+/// the all-time figure, or a single "no article opens recorded yet" line.
+pub fn cache_hit_lines(log: &crate::hitrate::OpenLog) -> Vec<String> {
+    let window = log.window();
+    if window.total() == 0 {
+        return vec![format!(
+            "  cache-hit rate: {}",
+            crate::hitrate::describe_window(&window)
+        )];
+    }
+    vec![
+        format!(
+            "  cache-hit rate: {} ({})",
+            crate::hitrate::describe_window(&window),
+            crate::hitrate::breakdown(&window)
+        ),
+        format!(
+            "  all-time      : {} (target: > 60% steady state, PRD §6.8)",
+            crate::hitrate::describe_all_time(&log.all_time())
+        ),
+    ]
 }
 
 /// How many topics the stats surface lists. Small: the point is a distribution
@@ -283,6 +324,42 @@ mod tests {
         ];
         let stats = compute(&[visit("en", "A", 0, 0)], topics.clone());
         assert_eq!(stats.top_topics, topics);
+    }
+
+    #[test]
+    fn cache_hit_lines_say_so_when_there_is_no_data_instead_of_zero_percent() {
+        let lines = cache_hit_lines(&crate::hitrate::OpenLog::new());
+        assert_eq!(
+            lines,
+            vec!["  cache-hit rate: no article opens recorded yet".to_string()]
+        );
+    }
+
+    #[test]
+    fn cache_hit_lines_show_the_steady_state_breakdown_and_all_time() {
+        use crate::hitrate::{OpenLog, OpenSource};
+        let mut log = OpenLog::new();
+        for (source, n) in [
+            (OpenSource::L1, 80),
+            (OpenSource::Disk, 56),
+            (OpenSource::SavedOffline, 4),
+            (OpenSource::Network, 72),
+        ] {
+            for _ in 0..n {
+                log.record(source);
+            }
+        }
+        let lines = cache_hit_lines(&log);
+        assert_eq!(
+            lines[0],
+            "  cache-hit rate: 66% of the last 212 article opens \
+             (L1 80 · disk 56 · saved/offline 4 · network 72)"
+        );
+        assert!(
+            lines[1].contains("66% of 212 article opens"),
+            "{}",
+            lines[1]
+        );
     }
 
     #[test]

@@ -2883,6 +2883,30 @@ fn stats_content(app: &App) -> Vec<Line<'static>> {
         "longest streak",
         format!("{} day(s)", stats.longest_streak_days),
     ));
+    // PRD §6.8 / §11: the reader's own cache-hit rate — "users can verify our
+    // headline claim themselves". Steady state (the last
+    // `hitrate::STEADY_STATE_WINDOW` opens) first, since that's what the
+    // > 60% target is about; "no article opens recorded yet" rather than a
+    // misleading 0% before anything has been counted.
+    let window = app.open_log.window();
+    lines.push(row(
+        "cache-hit rate",
+        crate::hitrate::describe_window(&window),
+    ));
+    if window.total() > 0 {
+        lines.push(row("  by source", crate::hitrate::breakdown(&window)));
+        lines.push(row(
+            "  all-time",
+            crate::hitrate::describe_all_time(&app.open_log.all_time()),
+        ));
+        lines.push(Line::from(RSpan::styled(
+            format!(
+                "  (target > 60% over the last {} opens — PRD §6.8)",
+                crate::hitrate::STEADY_STATE_WINDOW
+            ),
+            colored(app.no_color, app.theme.dim),
+        )));
+    }
     lines.push(Line::from(""));
     lines.push(Line::from(RSpan::styled(
         "Top topics (from the interest model):",
@@ -5912,5 +5936,55 @@ mod tests {
             "Enter/s: save citation   R: library   Esc: done   j/k: move",
             "clearing the notice must restore Research's own hint line"
         );
+    }
+
+    fn stats_text(app: &App) -> String {
+        stats_content(app)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// PRD §11: the `:stats` panel shows the reader's own cache-hit rate —
+    /// and says there's nothing yet rather than a misleading "0%".
+    #[test]
+    fn stats_panel_says_so_when_no_article_opens_are_recorded() {
+        let app = App::new("en".to_string(), Theme::terminal(), false);
+        let text = stats_text(&app);
+        assert!(
+            text.contains("cache-hit rate") && text.contains("no article opens recorded yet"),
+            "{text}"
+        );
+        assert!(!text.contains("0%"), "{text}");
+    }
+
+    #[test]
+    fn stats_panel_shows_the_steady_state_rate_breakdown_and_all_time() {
+        use crate::hitrate::OpenSource;
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        for (source, n) in [
+            (OpenSource::L1, 80),
+            (OpenSource::Disk, 56),
+            (OpenSource::SavedOffline, 4),
+            (OpenSource::Network, 72),
+        ] {
+            for _ in 0..n {
+                app.open_log.record(source);
+            }
+        }
+        let text = stats_text(&app);
+        assert!(text.contains("66% of the last 212 article opens"), "{text}");
+        assert!(
+            text.contains("L1 80 · disk 56 · saved/offline 4 · network 72"),
+            "{text}"
+        );
+        assert!(text.contains("66% of 212 article opens"), "{text}");
+        assert!(text.contains("target > 60%"), "{text}");
     }
 }

@@ -81,6 +81,13 @@ its contributors for charting this space first.
 - **Reading stats** *(local-only)*: articles read, time, streaks, and topic
   distribution, derived from your own reading history and interest model —
   never uploaded anywhere; `wikitui stats --explain` shows top topics.
+  `:stats` and `wikitui stats` also show your own **cache-hit rate** — the
+  share of your recent article opens served without waiting on the network
+  (in-memory layout cache, disk cache, or saved/offline copies), which is
+  the §6.8 "> 60% steady state" claim, checkable on your own machine. It is
+  kept as four counters plus one letter per recent open (no titles, no
+  timestamps), is never written in incognito, and `wikitui clear-data
+  --stats` deletes it.
 - **Commands & keys**: a `:` ex-command line, a fuzzy command palette
   (`Ctrl-p`), a fully configurable keymap (`vim`/`emacs` presets or your own
   `keymap.toml`), and a context-sensitive `?` help overlay generated from
@@ -194,6 +201,14 @@ PRD target) that only catches a catastrophic algorithmic regression (an
 accidental O(n²) in the parser or wrap loop) — see that test's own doc
 comment. Confirming the actual §6.8 targets needs a real-hardware
 benchmark run outside CI; nobody has published one yet.
+
+The one §6.8 target you can check yourself is the steady-state cache-hit
+rate (> 60% of article opens): `:stats` / `wikitui stats` report it over
+your last 500 article opens, broken down by source (L1 memory · disk ·
+saved/offline · network). An "open" is an article you asked for appearing
+on screen — tab switches, the stale-while-revalidate `r` reload, prefetch,
+and link previews don't count — and anything but a live network fetch the
+open waited on is a hit (see `src/hitrate.rs` for the exact rules).
 
 ## Privacy
 
