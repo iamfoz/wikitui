@@ -203,6 +203,12 @@ pub struct Tab {
     /// The revid of this tab's document (PRD FR-OFF-1); participates in the L1
     /// layout-cache key. `0` in degraded mode.
     pub current_revid: u64,
+    /// `current_revid` as it was when the current document was installed —
+    /// the revision that document actually is, kept apart from
+    /// `current_revid` because the open paths set the *next* document's revid
+    /// before installing it. What `App::recent_docs` files a document under
+    /// when it's navigated away from.
+    pub doc_revid: u64,
     /// Whether a background fetch for this tab is still in flight (PRD
     /// FR-TB-3): drives the "…" indicator in the tab bar and keeps the event
     /// loop on its scoped-poll path so the UI stays responsive.
@@ -303,6 +309,7 @@ impl Tab {
             find_index: 0,
             page_source: crate::app::PageSource::None,
             current_revid: 0,
+            doc_revid: 0,
             loading: false,
             pending_title: None,
             pending_reload: None,
@@ -417,6 +424,7 @@ impl Tab {
         // hands it over via `App::remember_source`) and is resident.
         self.source_html = None;
         self.dehydrated = None;
+        self.doc_revid = self.current_revid;
         self.doc = Some(doc);
         self.scroll = 0;
         self.table_col_offset = 0;

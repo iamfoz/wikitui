@@ -855,33 +855,45 @@ impl AuthState {
     /// here) so the refresh decision is testable — the caller supplies
     /// `chrono::Utc::now().timestamp()`.
     pub async fn valid_access_token(&mut self, now: i64) -> Result<String> {
-        if self.tokens.needs_refresh(now) {
-            let resp = refresh_tokens(
-                &self.http,
-                &self.token_url,
-                &self.client_id,
-                &self.tokens.refresh_token,
-            )
-            .await
-            .context("refreshing access token")?;
-            let mut refreshed = Tokens::from_response(
-                &resp,
-                self.tokens.username.clone(),
-                now,
-                Some(&self.tokens.refresh_token),
-            )?;
-            // PRD FR-ACC-8: a refresh preserves the editing opt-in — a
-            // near-expiry token refresh must not silently downgrade an
-            // editing session back to read-only.
-            refreshed.editpage = self.tokens.editpage;
-            // Persist before returning so a crash right after refresh doesn't
-            // lose the new refresh token (the old one may now be invalid).
-            self.store
-                .save(&refreshed)
-                .context("persisting refreshed tokens")?;
-            self.tokens = refreshed;
+        if let Some(request) = self.refresh_request(now) {
+            let refreshed = request.run(now).await?;
+            self.install_refreshed(refreshed)?;
         }
         Ok(self.tokens.access_token.clone())
+    }
+
+    /// Everything a token refresh needs, detached from `self` — `Some` exactly
+    /// when the access token is at/near expiry. The network half of
+    /// [`valid_access_token`](Self::valid_access_token), split out so the
+    /// startup notification poll can refresh on a spawned task (PRD §6.8:
+    /// nothing network-blocking before the first frame) and hand the result
+    /// back through [`install_refreshed`](Self::install_refreshed).
+    pub fn refresh_request(&self, now: i64) -> Option<RefreshRequest> {
+        self.tokens.needs_refresh(now).then(|| RefreshRequest {
+            http: self.http.clone(),
+            token_url: self.token_url.clone(),
+            client_id: self.client_id.clone(),
+            refresh_token: self.tokens.refresh_token.clone(),
+            username: self.tokens.username.clone(),
+            editpage: self.tokens.editpage,
+        })
+    }
+
+    /// The current access token as stored, without refreshing — valid only
+    /// when [`refresh_request`](Self::refresh_request) says no refresh is due.
+    pub fn stored_access_token(&self) -> String {
+        self.tokens.access_token.clone()
+    }
+
+    /// Installs tokens a [`RefreshRequest`] obtained. Persists them *before*
+    /// swapping them in, so a crash right after a refresh doesn't lose the
+    /// new refresh token (the old one may now be invalid).
+    pub fn install_refreshed(&mut self, refreshed: Tokens) -> Result<()> {
+        self.store
+            .save(&refreshed)
+            .context("persisting refreshed tokens")?;
+        self.tokens = refreshed;
+        Ok(())
     }
 
     /// PRD FR-ACC-9 / FR-PR-4: local logout — deletes the stored tokens. The
@@ -889,6 +901,37 @@ impl AuthState {
     /// [`MANAGE_GRANTS_URL`] for server-side revocation.
     pub fn logout(&self) -> Result<()> {
         self.store.delete()
+    }
+}
+
+/// A token refresh detached from its [`AuthState`] — see
+/// [`AuthState::refresh_request`].
+pub struct RefreshRequest {
+    http: reqwest::Client,
+    token_url: String,
+    client_id: String,
+    refresh_token: String,
+    username: String,
+    editpage: bool,
+}
+
+impl RefreshRequest {
+    /// Runs the refresh grant; the new [`Tokens`] carry the username and —
+    /// PRD FR-ACC-8 — the editing opt-in forward, since a near-expiry refresh
+    /// must not silently downgrade an editing session back to read-only.
+    pub async fn run(self, now: i64) -> Result<Tokens> {
+        let resp = refresh_tokens(
+            &self.http,
+            &self.token_url,
+            &self.client_id,
+            &self.refresh_token,
+        )
+        .await
+        .context("refreshing access token")?;
+        let mut refreshed =
+            Tokens::from_response(&resp, self.username, now, Some(&self.refresh_token))?;
+        refreshed.editpage = self.editpage;
+        Ok(refreshed)
     }
 }
 

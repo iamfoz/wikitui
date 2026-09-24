@@ -149,6 +149,14 @@ pub struct PageCache {
     incognito: Arc<AtomicBool>,
 }
 
+/// An L2 entry's identity and freshness without its content — see
+/// [`PageCache::get_meta`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CachedMeta {
+    pub revid: u64,
+    pub age_secs: u64,
+}
+
 pub struct CachedPage {
     pub html: String,
     /// Seconds since this content was fetched from the network (or, after a
@@ -436,6 +444,30 @@ impl PageCache {
             age_secs,
             revid: entry.revid,
             etag: entry.etag,
+        })
+    }
+
+    /// [`Self::get`] without the content: the current entry's revid and age,
+    /// with the same read-side LRU/SLRU touch but no blob read or zstd
+    /// decompress — for an open that already holds the parsed document in
+    /// memory (`App::recent_docs`, PRD §6.8's L1-hit target) and only needs
+    /// to know it is still the cached revision, and how fresh. `None` on a
+    /// miss, or when the entry's content blob is gone (current format only:
+    /// a legacy flat entry carries no revid to match against).
+    pub fn get_meta(&self, wiki: &str, lang: &str, title: &str) -> Option<CachedMeta> {
+        let index_path = self.index_path(wiki, lang, title)?;
+        let text = std::fs::read_to_string(&index_path).ok()?;
+        let entry: IndexEntry = serde_json::from_str(&text).ok()?;
+        let blob_path = self.blob_path(wiki, lang, title, entry.revid)?;
+        if !blob_path.is_file() {
+            return None;
+        }
+        touch_mtime(&index_path);
+        touch_mtime(&blob_path);
+        self.touch_hit(&index_path);
+        Some(CachedMeta {
+            revid: entry.revid,
+            age_secs: now_unix().saturating_sub(entry.fetched_at),
         })
     }
 
@@ -1904,6 +1936,41 @@ mod tests {
             cache.get("", "en", "Turing").is_some(),
             "and must survive the wipe — the legacy source is already gone, so loss would be permanent"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `get_meta` reports the same revid/age `get` would, and counts as a
+    /// read for eviction exactly like `get` (hit bump → SLRU promotion on the
+    /// second read) — it only skips the content — so serving an open from
+    /// an in-memory parse doesn't starve that entry's recency.
+    #[test]
+    fn get_meta_reports_revid_and_age_and_touches_like_get() {
+        let (cache, dir) = temp_cache(DEFAULT_MAX_BYTES);
+        cache.put("", "en", "Turing", "content", 42, None);
+        let index_path = dir.join("page").join("en").join("Turing.json");
+        let meta = cache.get_meta("", "en", "Turing").expect("hit");
+        assert_eq!(meta.revid, 42);
+        assert!(meta.age_secs < 5);
+        cache.get_meta("", "en", "Turing").unwrap();
+        let entry: IndexEntry =
+            serde_json::from_str(&std::fs::read_to_string(&index_path).unwrap()).unwrap();
+        assert_eq!(entry.hits, 2);
+        assert_eq!(entry.segment, Segment::Protected);
+        assert!(cache.get_meta("", "en", "Missing").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An index entry whose content blob is gone is a miss for `get_meta`
+    /// too: nothing on disk vouches for that revision any more.
+    #[test]
+    fn get_meta_misses_when_the_blob_is_gone() {
+        let (cache, dir) = temp_cache(DEFAULT_MAX_BYTES);
+        cache.put("", "en", "Turing", "content", 42, None);
+        let blob_dir = dir.join("blob").join("en");
+        for entry in std::fs::read_dir(&blob_dir).unwrap().flatten() {
+            std::fs::remove_file(entry.path()).unwrap();
+        }
+        assert!(cache.get_meta("", "en", "Turing").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

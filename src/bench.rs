@@ -152,6 +152,51 @@ impl Reader {
         true
     }
 
+    /// Back (`H`) the way `open_history_entry` does it, minus the network:
+    /// the tab's back target is served from its in-memory parse when
+    /// `App::recent_docs` still holds that revision (`reopen_from_memory` —
+    /// the §6.8 L1-hit path), else read from L2 and re-parsed. Returns
+    /// whether anything was installed.
+    pub fn back(&mut self, cache: &DiskCache) -> bool {
+        let Some(entry) = self.app.navigate_back_target() else {
+            return false;
+        };
+        self.install_history_entry(cache, entry)
+    }
+
+    /// Forward (`L`), the mirror of [`back`](Reader::back).
+    pub fn forward(&mut self, cache: &DiskCache) -> bool {
+        let Some(entry) = self.app.navigate_forward_target() else {
+            return false;
+        };
+        self.install_history_entry(cache, entry)
+    }
+
+    fn install_history_entry(
+        &mut self,
+        cache: &DiskCache,
+        entry: crate::tab::HistoryEntry,
+    ) -> bool {
+        let outcome = crate::reopen_from_memory(
+            &cache.0,
+            &mut self.app,
+            &entry.wiki,
+            &entry.lang,
+            &entry.title,
+        );
+        let (document, revid) = match outcome {
+            Some(mut outcome) => (outcome.document(), outcome.revid),
+            None => match cache.get(&entry.title) {
+                Some((html, revid)) => (doc::parse_article_html(&entry.title, &html), revid),
+                None => return false,
+            },
+        };
+        self.app.active_tab_mut().current_revid = revid;
+        self.app.set_document(document);
+        self.app.active_tab_mut().scroll = entry.scroll;
+        true
+    }
+
     /// One full frame: `ui::draw` into the backend (laying out first if the
     /// installed article has no current layout — an L1 lookup, then a
     /// relayout on a miss).
@@ -160,6 +205,14 @@ impl Reader {
         self.terminal
             .draw(|f| crate::ui::draw(f, app))
             .expect("TestBackend never fails");
+    }
+
+    /// `:vsplit` (PRD FR-TB-4): the current article side by side with a
+    /// duplicate of itself, each pane laid out at half width. Needs a prior
+    /// [`draw`](Reader::draw) so the content width is known.
+    pub fn split(&mut self) -> bool {
+        let width = self.app.last_content_area.width;
+        self.app.open_split(width).is_ok()
     }
 
     pub fn scroll_by(&mut self, lines: i32) {
@@ -266,6 +319,36 @@ mod tests {
         reader.open(parse("Bench Probe", HTML), 1);
         reader.draw();
         assert_eq!(reader.layout_computations(), 2, "L1 cleared: relayout");
+    }
+
+    /// `back`/`forward` drive the app's real reopen path: after A → B, Back
+    /// shows A again as an L1 layout hit from its in-memory parse, and
+    /// Forward returns to B the same way.
+    #[test]
+    fn back_and_forward_reopen_from_memory_as_l1_hits() {
+        let dir = std::env::temp_dir().join(format!("wikitui-bench-back-{}", std::process::id()));
+        let cache = DiskCache::at(&dir);
+        let b = HTML.replace("Bench Probe", "Other Probe");
+        cache.put("Bench Probe", HTML, 1);
+        cache.put("Other Probe", &b, 2);
+        let mut reader = Reader::new(80, 24);
+        assert!(reader.open_from_cache(&cache, "Bench Probe"));
+        reader.draw();
+        assert!(reader.open_from_cache(&cache, "Other Probe"));
+        reader.draw();
+        let layouts = reader.layout_computations();
+        assert!(reader.back(&cache));
+        reader.draw();
+        assert!(
+            reader
+                .screen_text()
+                .iter()
+                .any(|r| r.contains("Alpha beta gamma"))
+        );
+        assert!(reader.forward(&cache));
+        reader.draw();
+        assert_eq!(reader.layout_computations(), layouts, "both were L1 hits");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The L2 round trip returns exactly what was stored.

@@ -525,7 +525,7 @@ pub async fn main() -> Result<()> {
         // reader here to search it, so `--dump` indexes into a throwaway
         // in-memory instance rather than touching the real on-disk one for
         // a process that exits immediately after printing.
-        let outcome = fetch_page(
+        let mut outcome = fetch_page(
             &client,
             &page_cache,
             &offline_search::OfflineIndex::in_memory(),
@@ -534,7 +534,7 @@ pub async fn main() -> Result<()> {
             &title,
         )
         .await?;
-        let document = doc::parse_article_html(&outcome.resolved_title, &outcome.html);
+        let document = outcome.document();
         print!("{}", doc::render_plain(&document, &resolved.lang.value));
         // `--dump` never reaches `run`'s own end-of-session wipe below, so it
         // does its own — a one-shot process is still a "session" for FR-PR-3's
@@ -1043,10 +1043,17 @@ fn spawn_sighup_listener(_flag: Arc<AtomicBool>) {}
 /// the cached revid a background revalidation should compare against.
 struct FetchOutcome {
     html: String,
+    /// The parsed article, when `fetch_page` already had to parse it: a live
+    /// network result is parsed once, there, to learn its canonical title
+    /// (the cache key) and its plain text (the offline index) — see
+    /// [`FetchOutcome::document`], which hands that parse on instead of
+    /// letting the caller repeat it. `None` for cache hits and offline
+    /// fallbacks, which the caller parses.
+    document: Option<doc::Document>,
     source: PageSource,
     revid: u64,
     /// H2 (PRD FR-OFF-2, FR-ML-4): the canonical title this content is keyed
-    /// on — Parsoid's `<head><title>` (`doc::resolved_title`), which is what
+    /// on — Parsoid's `<head><title>` (`Document::title`), which is what
     /// history/bookmarks/saved/trail all key on via `doc.title`. On a fresh
     /// network fetch this is the *resolved* title (a redirect alias or a
     /// case/spacing variant becomes its canonical form), and the L2 cache is
@@ -1090,6 +1097,61 @@ struct FetchOutcome {
     missing: bool,
 }
 
+impl FetchOutcome {
+    /// The article this outcome carries, parsed exactly once: the network
+    /// path's own parse when there was one, else a parse of the cached HTML
+    /// under `resolved_title` (what every caller did before this existed).
+    fn document(&mut self) -> doc::Document {
+        self.document
+            .take()
+            .unwrap_or_else(|| doc::parse_article_html(&self.resolved_title, &self.html))
+    }
+}
+
+/// PRD §6.8's L1-hit reopen: a Back/Forward target whose parsed document is
+/// still in `App::recent_docs` is served from there, skipping the L2 read, the
+/// zstd decompress and the re-parse — as long as the disk cache still holds
+/// that very revision (`PageCache::get_meta`, which also applies the same
+/// recency touch a read would). The serve policy is `fetch_page`'s own: a
+/// fresh entry is simply shown, a stale-but-within-backstop one is shown with
+/// a background revalidation, and one past the force-refetch backstop — or
+/// any revision mismatch or cache miss — falls back to `fetch_page` (the
+/// stashed copy is dropped). `html` is left empty: the only reader of an
+/// outcome's HTML after the parse is `App::remember_source`, which only acts
+/// in `low_memory` mode, where `recent_docs` holds nothing.
+fn reopen_from_memory(
+    cache: &PageCache,
+    app: &mut App,
+    wiki: &str,
+    lang: &str,
+    title: &str,
+) -> Option<FetchOutcome> {
+    let key = (wiki.to_string(), lang.to_string(), title.to_string());
+    let (revid, document) = app.recent_docs.take(&key)?;
+    let meta = cache.get_meta(wiki, lang, title)?;
+    if meta.revid != revid {
+        return None;
+    }
+    let revalidate = match cache.swr_decision(meta.age_secs) {
+        SwrDecision::Fresh => None,
+        SwrDecision::RevalidateInBackground => Some(revid),
+        SwrDecision::ForceRefetch => return None,
+    };
+    Some(FetchOutcome {
+        html: String::new(),
+        document: Some(document),
+        source: PageSource::Cached {
+            age_secs: meta.age_secs,
+        },
+        revid,
+        resolved_title: title.to_string(),
+        revalidate,
+        redirected_from: None,
+        rate_limited: None,
+        missing: false,
+    })
+}
+
 /// The cache-aware fetch (PRD FR-OFF-2's serve policy): render whatever
 /// cached copy exists immediately — instantly for a fresh one, and for a
 /// stale-but-within-backstop one too, deferring the staleness check to a
@@ -1119,6 +1181,7 @@ async fn fetch_page(
             SwrDecision::Fresh => {
                 return Ok(FetchOutcome {
                     html: page.html.clone(),
+                    document: None,
                     source: PageSource::Cached {
                         age_secs: page.age_secs,
                     },
@@ -1136,6 +1199,7 @@ async fn fetch_page(
             SwrDecision::RevalidateInBackground => {
                 return Ok(FetchOutcome {
                     html: page.html.clone(),
+                    document: None,
                     source: PageSource::Cached {
                         age_secs: page.age_secs,
                     },
@@ -1156,6 +1220,16 @@ async fn fetch_page(
     match client.fetch_article_html(lang, title).await {
         Ok(fetched) => {
             let wiki = client.wiki_scope();
+            // One parse serves everything below and the caller's display
+            // (PRD §6.8: a network open used to parse the same HTML three
+            // times before its first paint — a whole-document parse just to
+            // read `<head><title>` for the cache key, another in
+            // `index_cached_html` for the offline index, then the caller's
+            // own for display). `Document::title` is exactly that canonical
+            // key: Parsoid's `<head><title>` (spaces, canonical casing),
+            // falling back to the requested `title` when the HTML has none,
+            // through the same SEC-1 sanitizer every stored title passes.
+            let document = doc::parse_article_html(title, &fetched.html);
             // H2 (PRD FR-OFF-2, FR-ML-4): key the cache write on the *resolved*
             // canonical title (Parsoid `<head><title>`), not the requested
             // string. A redirect alias ("NYC") or a case/spacing variant
@@ -1167,7 +1241,7 @@ async fn fetch_page(
             // one page. The first fetch was still *requested* by the raw
             // string (its cache miss above was correct); only the write
             // normalizes.
-            let resolved_title = doc::resolved_title(&fetched.html, title);
+            let resolved_title = document.title.clone();
             cache.put(
                 &wiki,
                 lang,
@@ -1176,12 +1250,25 @@ async fn fetch_page(
                 fetched.revid,
                 fetched.etag.as_deref(),
             );
-            // PRD FR-SR-7: index the freshly cached HTML for offline search
-            // right where it's cached — under the same canonical title the
-            // cache used, so search and cache agree. Best-effort like the
-            // cache write itself; a parse failure here never blocks the
-            // article from opening.
-            index_cached_html(search_index, &wiki, lang, &resolved_title, &fetched.html);
+            // PRD FR-SR-7: index the freshly cached article for offline
+            // search under the same canonical title the cache used, so search
+            // and cache agree — from the parse above, and on the blocking
+            // pool: the SQLite upsert (two commits) is bookkeeping the reader
+            // isn't waiting for, so it stays off the path to first paint.
+            // Best-effort like the cache write itself.
+            let plain = doc::render_plain(&document, lang);
+            let search_index = search_index.clone();
+            let (index_wiki, index_lang, index_title) =
+                (wiki.clone(), lang.to_string(), resolved_title.clone());
+            tokio::task::spawn_blocking(move || {
+                search_index.index(
+                    &index_wiki,
+                    &index_lang,
+                    &index_title,
+                    offline_search::Kind::Cached,
+                    &plain,
+                );
+            });
             // PRD §7 "Redirect": the requested string itself is the "Redirected
             // from X" identity — `resolved_title` (just above) is where it
             // resolved *to*, already sitting in the rendered document's own
@@ -1189,6 +1276,7 @@ async fn fetch_page(
             let redirected_from = fetched.redirected.then(|| title.to_string());
             Ok(FetchOutcome {
                 html: fetched.html,
+                document: Some(document),
                 source: PageSource::Live,
                 revid: fetched.revid,
                 resolved_title,
@@ -1201,6 +1289,7 @@ async fn fetch_page(
         Err(network_error) => match cached {
             Some(page) => Ok(FetchOutcome {
                 html: page.html,
+                document: None,
                 source: PageSource::Offline {
                     age_secs: page.age_secs,
                 },
@@ -2245,8 +2334,8 @@ fn apply_tab_load_outcome_as(
         return; // the background tab was closed before its fetch landed.
     };
     match outcome.result {
-        Ok(fetch) => {
-            let document = doc::parse_article_html(&fetch.resolved_title, &fetch.html);
+        Ok(mut fetch) => {
+            let document = fetch.document();
             // PRD §6.8 KPI: a retry that upgrades the stale copy already on
             // screen for this very request is the same open (keep whatever
             // it armed); anything else installing here is an open of its own.
@@ -3190,12 +3279,11 @@ async fn run(
     app.watch_mirror_state_path = account::watch_mirror_state_path();
     // PRD FR-ACC-3's login/startup poll (see `account.rs`'s poll-cadence
     // doc): a restored session gets its unread-count badge without waiting
-    // for the reader to open `:notifications` first.
+    // for the reader to open `:notifications` first — fired, not awaited
+    // (PRD §6.8: nothing network-blocking on the startup path; see
+    // `fire_startup_notifications_poll`).
     perflog::mark("auth_loaded");
-    if app.auth.is_some() {
-        poll_notifications_count(client, &mut app).await;
-    }
-    perflog::mark("notifications_polled");
+    fire_startup_notifications_poll(client, &mut app);
 
     // Delivers typeahead responses, background revalidation outcomes, and
     // background-tab fetch results back to the loop (PRD FR-SR-1 / FR-OFF-2 /
@@ -3612,6 +3700,16 @@ async fn run(
             app.pending_langlinks = app.pending_langlinks.saturating_sub(1);
             app.deliver_langlinks(outcome.wiki, outcome.lang, outcome.title, outcome.result);
         }
+        // PRD FR-ACC-3: the startup notification poll landed.
+        while let Ok(outcome) = app.notif_poll_rx.try_recv() {
+            apply_notifications_poll(&mut app, outcome);
+        }
+        // PRD FR-DL-3/FR-DL-5/FR-PF-3: a post-open enrichment (`fire_enrichment`)
+        // landed — badge, redlinks, interest signal.
+        while let Ok(outcome) = app.enrich_rx.try_recv() {
+            app.pending_enrichments = app.pending_enrichments.saturating_sub(1);
+            apply_enrichment(&mut app, outcome);
+        }
 
         if app.should_quit {
             break;
@@ -3732,6 +3830,11 @@ fn should_poll_instead_of_block(
         // true right after opening a plain article with no other
         // background activity.
         || app.pending_langlinks > 0
+        // A post-open enrichment is in flight (`fire_enrichment`): its badge
+        // and redlink styling land without a keypress, same as langlinks.
+        || app.pending_enrichments > 0
+        // ... and the startup notification poll's badge the same way.
+        || app.notif_poll_pending
         // PRD §7 "429 / maxlag on interactive request": an automatic
         // foreground retry is waiting out `Retry-After` on its own detached
         // task — this keeps the loop waking on a timer so the eventual
@@ -4444,45 +4547,78 @@ fn write_report_bundle(contents: &str, title: &str) -> Option<std::path::PathBuf
     write_report_bundle_at(&dir, contents, &report_bundle_slug(title), unix_time).ok()
 }
 
-/// PRD FR-DL-3/FR-DL-5: after an article installs, opportunistically fetches
-/// its quality-assessment badge and checks its own outgoing links for
-/// redlinks the parse-time `class="new"` signal didn't already catch — both
-/// single batched calls (never a fanout: `WikiClient::page_assessments`
-/// takes one title, `fetch_missing_links` takes one source and gets every
-/// one of its links in the same request) — and both session-cached
-/// (`App::quality_cache`/`checked_redlink_sources`) so a re-visited article
-/// costs nothing the second time.
-///
-/// Awaited inline rather than backgrounded through a channel+`tokio::spawn`
-/// (contrast `fire_langlinks`, deliberately fire-and-forget): doing the same
-/// for these two would mean threading a third `_tx`/`*Outcome` pair through
-/// every one of `open_title`/`open_history_entry`'s many call sites for a
-/// pair of small, already-batched, already-tested requests — this chunk
-/// judged that plumbing cost not worth it against the extra latency of
-/// awaiting them inline. Routing both through the netqueue substrate
-/// (PRD's "at low priority") instead of a dedicated call is the documented
-/// seam for a later pass, not a limitation of the API methods themselves.
-/// The redlink check is additionally skipped outright when prefetch is off
-/// (kill switch or incognito) — FR-DL-5's "skippable on budget", realized as
-/// "skippable when the reader already said no to background traffic."
+/// [`fire_enrichment`]'s awaited form: the same plan/run/apply steps with the
+/// applied result in hand when it returns — what the tests below drive.
+#[cfg(test)]
 async fn enrich_article(client: &WikiClient, app: &mut App, lang: &str, title: &str) {
+    let plan = plan_enrichment(client, app, lang, title);
+    let outcome = run_enrichment(client, &plan).await;
+    apply_enrichment(app, outcome);
+}
+
+/// What one article's enrichment needs from the network — decided
+/// synchronously from session state by [`plan_enrichment`], so the spawned
+/// half ([`run_enrichment`]) never touches `App`.
+struct EnrichPlan {
+    wiki: String,
+    lang: String,
+    title: String,
+    quality: Option<QualityLookup>,
+    redlinks: bool,
+    /// Interest learning is on (not incognito): apply the "open" signal.
+    learn: bool,
+    /// ... and this article's categories aren't known yet, so fetch them.
+    categories: bool,
+}
+
+enum QualityLookup {
+    PageAssessments,
+    LiftWing { base_url: String, rev_id: u64 },
+}
+
+impl EnrichPlan {
+    fn needs_network(&self) -> bool {
+        self.quality.is_some() || self.redlinks || self.categories
+    }
+}
+
+/// One enrichment's network results, applied by [`apply_enrichment`].
+pub(crate) struct EnrichOutcome {
+    wiki: String,
+    lang: String,
+    title: String,
+    /// `None`: no quality lookup ran, or it failed (a later open may retry).
+    /// `Some(None)`: it ran and this article has no assessment — cached as
+    /// such, so it isn't asked again this session. `Some(Some(class))`: the
+    /// badge.
+    quality: Option<Option<api::QualityClass>>,
+    /// The batched redlink check's confirmed-missing titles, when it ran and
+    /// succeeded.
+    missing_links: Option<Vec<String>>,
+    learn: bool,
+    /// The article's raw categories for the interest model: fetched when the
+    /// plan asked (empty on failure), empty when already known.
+    categories: Vec<String>,
+}
+
+/// Decides what [`run_enrichment`] should fetch. The redlink check claims its
+/// session slot (`checked_redlink_sources`) here, before any request, exactly
+/// as it always did: one attempt per source per session, success or not.
+fn plan_enrichment(client: &WikiClient, app: &mut App, lang: &str, title: &str) -> EnrichPlan {
     // Every session-state key here is scoped to the wiki the article was
     // fetched from (PRD FR-ML-4), so a same-titled article on another wiki
     // gets its own quality badge / redlink set, never this one's.
     let wiki = client.wiki_scope();
     let key = (wiki.clone(), lang.to_string(), title.to_string());
+    let unknown_quality =
+        !app.quality_cache.contains_key(&key) && !app.quality_checked.contains(&key);
     // PRD FR-ML-5: a wiki without PageAssessments never gets the lookup
     // attempted, so `quality_cache` simply never gains an entry for it — the
     // same visible result (no badge) as a wiki that has the extension but no
     // assessment for this one title.
-    if client.capabilities().pageassessments {
-        if !app.quality_cache.contains_key(&key)
-            && let Ok(assessments) = client.page_assessments(lang, &[title.to_string()]).await
-            && let Some(class) = assessments.get(title)
-        {
-            app.quality_cache.insert(key.clone(), *class);
-        }
-    } else if app.liftwing_enabled && !app.quality_cache.contains_key(&key) {
+    let quality = if client.capabilities().pageassessments {
+        unknown_quality.then_some(QualityLookup::PageAssessments)
+    } else if app.liftwing_enabled && unknown_quality {
         // PRD FR-DL-3 v2 / §6.2 rule 1's stated exception: a wiki with no
         // PageAssessments capability falls back to Lift Wing, but only when
         // the reader opted in (default off — gateway survival unverified,
@@ -4494,46 +4630,147 @@ async fn enrich_article(client: &WikiClient, app: &mut App, lang: &str, title: &
         // (`App::quality_badge_for` doesn't know or care which path filled
         // it in).
         let rev_id = app.active_tab().current_revid;
-        if rev_id != 0
-            && let Ok(Some(class)) = client
-                .fetch_liftwing_quality(&app.liftwing_base_url, lang, rev_id)
-                .await
-        {
+        (rev_id != 0).then(|| QualityLookup::LiftWing {
+            base_url: app.liftwing_base_url.clone(),
+            rev_id,
+        })
+    } else {
+        None
+    };
+    // FR-DL-5's "skippable on budget", realized as "skippable when the reader
+    // already said no to background traffic" (kill switch or incognito).
+    let redlinks = app.prefetch_active() && app.checked_redlink_sources.insert(key);
+    // PRD FR-PF-3: learn from this read. On a first read this session the
+    // article's categories are fetched (one batched `prop=categories` call)
+    // with the "open" signal; on a revisit they're already known and only
+    // the signal applies. All gated on `interest_active` (learning on and
+    // not incognito), so incognito reads leave the model untouched.
+    let learn = app.interest_active();
+    let categories = learn && !app.interest.knows_categories(&wiki, title);
+    EnrichPlan {
+        wiki,
+        lang: lang.to_string(),
+        title: title.to_string(),
+        quality,
+        redlinks,
+        learn,
+        categories,
+    }
+}
+
+/// The network half of an enrichment: only the requests `plan` asked for.
+async fn run_enrichment(client: &WikiClient, plan: &EnrichPlan) -> EnrichOutcome {
+    let quality = match &plan.quality {
+        Some(QualityLookup::PageAssessments) => client
+            .page_assessments(&plan.lang, std::slice::from_ref(&plan.title))
+            .await
+            .ok()
+            .map(|assessments| assessments.get(&plan.title).copied()),
+        Some(QualityLookup::LiftWing { base_url, rev_id }) => client
+            .fetch_liftwing_quality(base_url, &plan.lang, *rev_id)
+            .await
+            .ok(),
+        None => None,
+    };
+    let missing_links = if plan.redlinks {
+        client
+            .fetch_missing_links(&plan.lang, &plan.title)
+            .await
+            .ok()
+            .map(|missing| missing.into_iter().collect())
+    } else {
+        None
+    };
+    let categories = if plan.categories {
+        client
+            .fetch_categories(&plan.lang, std::slice::from_ref(&plan.title))
+            .await
+            .ok()
+            .and_then(|mut by_title| by_title.remove(&plan.title))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    EnrichOutcome {
+        wiki: plan.wiki.clone(),
+        lang: plan.lang.clone(),
+        title: plan.title.clone(),
+        quality,
+        missing_links,
+        learn: plan.learn,
+        categories,
+    }
+}
+
+/// Folds an enrichment's results into session state. Everything here is
+/// keyed by `(wiki, lang, title)`, so an outcome that lands after the reader
+/// has moved on still files under the article it belongs to.
+fn apply_enrichment(app: &mut App, outcome: EnrichOutcome) {
+    let key = (
+        outcome.wiki.clone(),
+        outcome.lang.clone(),
+        outcome.title.clone(),
+    );
+    if let Some(found) = outcome.quality {
+        if let Some(class) = found {
             app.quality_cache.insert(key.clone(), class);
         }
+        app.quality_checked.insert(key);
     }
-
-    if app.prefetch_active() && !app.checked_redlink_sources.contains(&key) {
-        app.checked_redlink_sources.insert(key.clone());
-        if let Ok(missing) = client.fetch_missing_links(lang, title).await {
-            app.confirmed_redlinks.extend(
-                missing
-                    .into_iter()
-                    .map(|t| (wiki.clone(), lang.to_string(), t)),
-            );
-        }
+    if let Some(missing) = outcome.missing_links {
+        app.confirmed_redlinks.extend(
+            missing
+                .into_iter()
+                .map(|t| (outcome.wiki.clone(), outcome.lang.clone(), t)),
+        );
     }
-
-    // PRD FR-PF-3: learn from this read. On a first read this session we fetch
-    // the article's categories (one batched `prop=categories` call) and apply
-    // the "open" signal; on a revisit the categories are already cached, so
-    // we apply the open signal without re-fetching. Then schedule interest-
-    // driven `morelike:` prefetch. All gated on `interest_active` (learning on
-    // and not incognito), so incognito reads leave the model untouched.
-    if app.interest_active() {
-        let raw = if app.interest.knows_categories(&wiki, title) {
-            Vec::new()
-        } else {
-            client
-                .fetch_categories(lang, &[title.to_string()])
-                .await
-                .ok()
-                .and_then(|mut m| m.remove(title))
-                .unwrap_or_default()
-        };
-        app.note_article_read(&wiki, title, &raw);
+    if outcome.learn {
+        app.note_article_read(&outcome.wiki, &outcome.title, &outcome.categories);
         schedule_interest_prefetch(app);
     }
+}
+
+/// PRD FR-DL-3/FR-DL-5/FR-PF-3: after an article installs, opportunistically
+/// fetches its quality-assessment badge, checks its own outgoing links for
+/// redlinks the parse-time `class="new"` signal didn't already catch, and
+/// (interest learning on) its categories — each a single batched call (never
+/// a fanout: `WikiClient::page_assessments` takes one title,
+/// `fetch_missing_links` takes one source and gets every one of its links in
+/// the same request) and each session-cached (`App::quality_cache`/
+/// `quality_checked`/`checked_redlink_sources`, the interest model's own
+/// category memory) so a re-visited article costs nothing the second time.
+///
+/// Three steps, so the network part runs off the event loop:
+/// [`plan_enrichment`] decides from session state what (if anything) needs
+/// fetching, [`run_enrichment`] does only the requests on a spawned task, and
+/// [`apply_enrichment`] folds the answers back into `App` when the loop drains
+/// them (`App::enrich_rx`): PRD §6.8 — a cached open must never wait on the
+/// network to paint. Awaiting them inline, as this once did, put up to three
+/// round trips (up to three 5 s timeouts on a stalled network) between the
+/// article being ready and its first frame, on L2 and L1 hits alike. A plan
+/// with nothing to fetch (a revisit) is applied immediately.
+fn fire_enrichment(client: &WikiClient, app: &mut App, lang: &str, title: &str) {
+    let plan = plan_enrichment(client, app, lang, title);
+    if !plan.needs_network() {
+        let outcome = EnrichOutcome {
+            wiki: plan.wiki,
+            lang: plan.lang,
+            title: plan.title,
+            quality: None,
+            missing_links: None,
+            learn: plan.learn,
+            categories: Vec::new(),
+        };
+        apply_enrichment(app, outcome);
+        return;
+    }
+    app.pending_enrichments += 1;
+    let client = client.clone();
+    let tx = app.enrich_tx.clone();
+    tokio::spawn(async move {
+        let outcome = run_enrichment(&client, &plan).await;
+        let _ = tx.send(outcome);
+    });
 }
 
 async fn open_title(
@@ -4568,7 +4805,7 @@ async fn open_title(
             .await
         };
         match outcome {
-            Ok(outcome) => {
+            Ok(mut outcome) => {
                 // PRD §5.7: a pinned saved copy is the intended offline
                 // artifact, so it takes precedence over a stale cache serve
                 // — but never over a live/fresh copy, which is genuinely
@@ -4580,7 +4817,7 @@ async fn open_title(
                     open_saved(app, &client.wiki_scope(), lang, title);
                     return;
                 }
-                let document = doc::parse_article_html(&outcome.resolved_title, &outcome.html);
+                let document = outcome.document();
                 let article_title = document.title.clone();
                 app.lang = lang.clone();
                 {
@@ -4661,10 +4898,9 @@ async fn open_title(
                 fire_langlinks(client, lang, title, langlinks_tx);
                 app.pending_langlinks += 1;
                 // PRD FR-DL-3/FR-DL-5: quality badge + redlink info, both
-                // session-cached and batched — see `enrich_article`'s doc
-                // comment for why this is awaited inline rather than
-                // threaded through yet another background channel.
-                enrich_article(client, app, lang, &article_title).await;
+                // session-cached and batched, fetched off the event loop so
+                // the article paints first — see `fire_enrichment`.
+                fire_enrichment(client, app, lang, &article_title);
                 app.loading = false;
                 return;
             }
@@ -4780,27 +5016,33 @@ async fn open_history_entry(
 ) {
     app.loading = true;
     app.lang = entry.lang.clone();
-    let outcome = {
-        let _fg = app
-            .prefetch
-            .as_ref()
-            .map(netqueue::SubstrateHandle::foreground_guard);
-        // Read L2 in the history entry's *own* wiki scope (PRD FR-ML-4), not
-        // the current active wiki — a back/forward hop to an article read on
-        // another wiki before a `:wiki` switch still finds its cached copy.
-        fetch_page(
-            client,
-            cache,
-            &app.search_index,
-            &entry.wiki,
-            &entry.lang,
-            &entry.title,
-        )
-        .await
+    // PRD §6.8 L1 hit: the document itself may still be in memory from when
+    // this tab navigated away from it — then nothing is read or parsed.
+    let outcome = match reopen_from_memory(cache, app, &entry.wiki, &entry.lang, &entry.title) {
+        Some(outcome) => Ok(outcome),
+        None => {
+            let _fg = app
+                .prefetch
+                .as_ref()
+                .map(netqueue::SubstrateHandle::foreground_guard);
+            // Read L2 in the history entry's *own* wiki scope (PRD FR-ML-4),
+            // not the current active wiki — a back/forward hop to an article
+            // read on another wiki before a `:wiki` switch still finds its
+            // cached copy.
+            fetch_page(
+                client,
+                cache,
+                &app.search_index,
+                &entry.wiki,
+                &entry.lang,
+                &entry.title,
+            )
+            .await
+        }
     };
     match outcome {
-        Ok(outcome) => {
-            let document = doc::parse_article_html(&outcome.resolved_title, &outcome.html);
+        Ok(mut outcome) => {
+            let document = outcome.document();
             let article_title = document.title.clone();
             let entry_lang = entry.lang.clone();
             let entry_wiki = entry.wiki.clone();
@@ -4844,8 +5086,9 @@ async fn open_history_entry(
             schedule_link_prefetch(app);
             // PRD FR-DL-3/FR-DL-5: session-cached, so a back/forward hop to
             // an article already visited this session costs no extra
-            // request — see `enrich_article`'s doc comment.
-            enrich_article(client, app, &entry_lang, &article_title).await;
+            // request, and fired off the event loop either way — see
+            // `fire_enrichment`'s doc comment.
+            fire_enrichment(client, app, &entry_lang, &article_title);
         }
         Err(e) => {
             app.status = format!("Error: {e}");
@@ -4882,7 +5125,7 @@ async fn open_trail_node(
         fetch_page(client, cache, &app.search_index, wiki, lang, title).await
     };
     match outcome {
-        Ok(outcome) => {
+        Ok(mut outcome) => {
             // PRD §5.7: prefer a pinned saved copy over a stale offline
             // degrade — same precedence `open_title` gives it.
             if matches!(outcome.source, PageSource::Offline { .. })
@@ -4892,7 +5135,7 @@ async fn open_trail_node(
                 open_saved(app, wiki, lang, title);
                 return;
             }
-            let document = doc::parse_article_html(&outcome.resolved_title, &outcome.html);
+            let document = outcome.document();
             app.lang = lang.to_string();
             {
                 let tab = app.active_tab_mut();
@@ -8316,6 +8559,7 @@ async fn finish_login(
 /// A refresh failure logs the reader out gracefully (§7 "Login: OAuth
 /// failure/expiry").
 async fn reverify_session(client: &WikiClient, app: &mut App) {
+    settle_startup_notifications_poll(app).await;
     let now = chrono::Utc::now().timestamp();
     let Some(auth_state) = app.auth.as_mut() else {
         return;
@@ -8645,6 +8889,7 @@ async fn edit_with_retry(
 /// refreshed) access token. A refresh failure logs the reader out, mirroring
 /// `reverify_session`'s own handling of the same failure mode.
 async fn require_login(app: &mut App, feature_prompt: &str) -> Option<String> {
+    settle_startup_notifications_poll(app).await;
     let now = chrono::Utc::now().timestamp();
     let Some(auth_state) = app.auth.as_mut() else {
         app.notice = Some(format!("Log in to {feature_prompt} (:login)"));
@@ -9360,6 +9605,94 @@ async fn poll_notifications_count(client: &WikiClient, app: &mut App) {
         && let Ok(counts) = account::parse_notif_count(&body)
     {
         app.notif_counts = counts;
+    }
+}
+
+/// The startup poll's result, delivered on `App::notif_poll_rx`: tokens a
+/// refresh obtained (to install), and the unread counts.
+pub(crate) struct NotifPollOutcome {
+    refreshed: Option<auth::Tokens>,
+    counts: Option<account::NotifCounts>,
+}
+
+/// PRD FR-ACC-3's startup poll without blocking startup (PRD §6.8 "nothing
+/// network-blocking on the startup path"): the same token-then-count requests
+/// as [`poll_notifications_count`], but on a spawned task whose outcome the
+/// loop applies ([`apply_notifications_poll`]). Awaited inline, as it once
+/// was, it held the first frame for a returning logged-in reader until the
+/// wiki answered — measured at 5 s against a network stalling 5 s. A token
+/// at/near expiry is refreshed on that task too (`auth::RefreshRequest`),
+/// and [`settle_startup_notifications_poll`] keeps any foreground
+/// authenticated action from racing it with a second refresh of the same
+/// refresh token.
+fn fire_startup_notifications_poll(client: &WikiClient, app: &mut App) {
+    let Some(auth_state) = app.auth.as_ref() else {
+        return;
+    };
+    let now = chrono::Utc::now().timestamp();
+    let refresh = auth_state.refresh_request(now);
+    let stored = auth_state.stored_access_token();
+    let client = client.clone();
+    let lang = app.lang.clone();
+    let tx = app.notif_poll_tx.clone();
+    app.notif_poll_pending = true;
+    tokio::spawn(async move {
+        let refreshed = match refresh {
+            Some(request) => match request.run(now).await {
+                Ok(tokens) => Some(tokens),
+                Err(_) => {
+                    // Silent, like the inline poll's own failure: the next
+                    // foreground authenticated action retries the refresh
+                    // and handles a genuinely dead session.
+                    let _ = tx.send(NotifPollOutcome {
+                        refreshed: None,
+                        counts: None,
+                    });
+                    return;
+                }
+            },
+            None => None,
+        };
+        let token = refreshed
+            .as_ref()
+            .map(|t| t.access_token.clone())
+            .unwrap_or(stored);
+        let counts = match client.fetch_notifications_count(&lang, &token).await {
+            Ok(body) => account::parse_notif_count(&body).ok(),
+            Err(_) => None,
+        };
+        let _ = tx.send(NotifPollOutcome { refreshed, counts });
+    });
+}
+
+/// Applies the startup poll's outcome: installs (and persists) refreshed
+/// tokens if the same session is still logged in, and the unread counts.
+fn apply_notifications_poll(app: &mut App, outcome: NotifPollOutcome) {
+    app.notif_poll_pending = false;
+    if let Some(tokens) = outcome.refreshed
+        && let Some(auth_state) = app.auth.as_mut()
+        && auth_state.username() == tokens.username
+    {
+        let _ = auth_state.install_refreshed(tokens);
+    }
+    if let Some(counts) = outcome.counts {
+        app.notif_counts = counts;
+    }
+}
+
+/// Waits for an in-flight startup poll (if any) and applies it, so a
+/// foreground authenticated action never refreshes concurrently with it —
+/// the provider may rotate refresh tokens, making the second refresh fail
+/// and log the reader out. Called at the top of the foreground token paths
+/// (`require_login`, `reverify_session`); a no-op once the poll has landed.
+async fn settle_startup_notifications_poll(app: &mut App) {
+    if !app.notif_poll_pending {
+        return;
+    }
+    if let Some(outcome) = app.notif_poll_rx.recv().await {
+        apply_notifications_poll(app, outcome);
+    } else {
+        app.notif_poll_pending = false;
     }
 }
 
@@ -11733,6 +12066,293 @@ mod tests {
         assert!(app.quality_cache.is_empty());
     }
 
+    // ---- PRD §6.8: enrichment never stands between an open and its paint --
+
+    /// A raw-socket Action API mock answering every request with `body`,
+    /// counting connections — or, with `body = None`, accepting and then
+    /// never answering (a stalled network).
+    fn spawn_action_api_mock(
+        body: Option<&'static str>,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits2 = hits.clone();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while let Ok((mut stream, _)) = listener.accept() {
+                hits2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                match body {
+                    Some(body) => {
+                        let header = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(header.as_bytes());
+                        let _ = stream.write_all(body.as_bytes());
+                    }
+                    None => held.push(stream),
+                }
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), hits)
+    }
+
+    fn pageassessments_client(base_url: String) -> WikiClient {
+        WikiClient::with_wiki(
+            "test-wiki".to_string(),
+            base_url,
+            api::WikiCapabilities {
+                parser: api::ParserMode::Auto,
+                wikifeeds: false,
+                pageviews: false,
+                pageassessments: true,
+            },
+            api::DEFAULT_CONTACT,
+        )
+        .unwrap()
+    }
+
+    /// PRD §6.8: opening an article that's in the disk cache must not wait on
+    /// the network at all — even when every request would stall (here: a
+    /// server that accepts and never answers, so the old inline quality
+    /// lookup sat out the client's full 5 s timeout before the article could
+    /// paint). The enrichment is left in flight instead.
+    #[tokio::test]
+    async fn a_cached_open_returns_without_waiting_on_enrichment() {
+        let (base_url, hits) = spawn_action_api_mock(None);
+        let client = pageassessments_client(base_url);
+        let dir = temp_state_path("cached-open-no-wait").with_extension("cachedir");
+        let cache = PageCache::at(dir.clone(), 10_000_000, 86_400, 604_800);
+        cache.put(
+            "test-wiki",
+            "en",
+            "Cached Article",
+            "<html><head><title>Cached Article</title></head><body><p>Body.</p></body></html>",
+            7,
+            None,
+        );
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.interest_learning = false;
+        let (revalidate_tx, _rrx) = mpsc::unbounded_channel::<RevalidationOutcome>();
+        let (langlinks_tx, _lltx) = mpsc::unbounded_channel::<LangLinksOutcome>();
+
+        let started = Instant::now();
+        open_title(
+            &client,
+            &cache,
+            &mut app,
+            "Cached Article",
+            &revalidate_tx,
+            &langlinks_tx,
+        )
+        .await;
+        let took = started.elapsed();
+
+        assert!(
+            took < Duration::from_secs(2),
+            "a cached open waited {took:?} on the network"
+        );
+        assert_eq!(
+            app.active_tab().doc.as_ref().map(|d| d.title.as_str()),
+            Some("Cached Article")
+        );
+        assert_eq!(app.pending_enrichments, 1, "the lookup is still in flight");
+        assert!(!app.loading);
+        let _ = hits;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The fired enrichment's outcome arrives on `App::enrich_rx` and, once
+    /// the loop applies it, the badge is there — the same end state the
+    /// inline version reached, one frame later.
+    #[tokio::test]
+    async fn a_fired_enrichment_lands_through_the_app_channel() {
+        let (base_url, _hits) = spawn_action_api_mock(Some(
+            r#"{"batchcomplete":true,"query":{"pages":[{"pageid":1,"ns":0,"title":"Some Article","pageassessments":{"Biography":{"class":"GA","importance":"Mid"}}}]}}"#,
+        ));
+        let client = pageassessments_client(base_url);
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.interest_learning = false;
+        fire_enrichment(&client, &mut app, "en", "Some Article");
+        assert_eq!(app.pending_enrichments, 1);
+        let outcome = tokio::time::timeout(Duration::from_secs(10), app.enrich_rx.recv())
+            .await
+            .expect("the outcome arrives")
+            .expect("channel open");
+        app.pending_enrichments -= 1;
+        apply_enrichment(&mut app, outcome);
+        let key = (
+            "test-wiki".to_string(),
+            "en".to_string(),
+            "Some Article".to_string(),
+        );
+        assert_eq!(app.quality_cache.get(&key), Some(&api::QualityClass::Ga));
+    }
+
+    /// PRD FR-DL-3's session cache now remembers "no assessment" too: most
+    /// articles have none, and each used to be re-asked on every open (and
+    /// every Back to it) because only a found class was cached.
+    #[tokio::test]
+    async fn an_unassessed_article_is_looked_up_once_per_session() {
+        let (base_url, hits) = spawn_action_api_mock(Some(
+            r#"{"batchcomplete":true,"query":{"pages":[{"pageid":1,"ns":0,"title":"Some Article"}]}}"#,
+        ));
+        let client = pageassessments_client(base_url);
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.interest_learning = false;
+        enrich_article(&client, &mut app, "en", "Some Article").await;
+        enrich_article(&client, &mut app, "en", "Some Article").await;
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            app.quality_cache.is_empty(),
+            "no badge for an unassessed article"
+        );
+    }
+
+    // ---- PRD §6.8: Back reuses the document it left, when still current ---
+
+    const ARTICLE_A: &str =
+        "<html><head><title>Article A</title></head><body><p>Alpha text.</p></body></html>";
+    const ARTICLE_B: &str =
+        "<html><head><title>Article B</title></head><body><p>Beta text.</p></body></html>";
+
+    /// A cache holding A (revid 7) and B (revid 8), and an app that opened A
+    /// then B — so A's parse sits in `recent_docs`.
+    fn a_then_b(tag: &str) -> (PageCache, std::path::PathBuf, App) {
+        let dir = temp_state_path(tag).with_extension("cachedir");
+        let cache = PageCache::at(dir.clone(), 10_000_000, 86_400, 604_800);
+        cache.put("", "en", "Article A", ARTICLE_A, 7, None);
+        cache.put("", "en", "Article B", ARTICLE_B, 8, None);
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.active_tab_mut().current_revid = 7;
+        app.open_document(doc::parse_article_html("Article A", ARTICLE_A));
+        app.active_tab_mut().current_revid = 8;
+        app.open_document(doc::parse_article_html("Article B", ARTICLE_B));
+        (cache, dir, app)
+    }
+
+    /// Back to the article just left is served from its in-memory parse: no
+    /// L2 read, no re-parse. Proven by making the L2 content unreadable
+    /// (the blob is garbage) and the network unreachable — the old path
+    /// (`fetch_page`: L2 read fails → network fails) could only error.
+    #[tokio::test]
+    async fn back_reuses_the_parsed_document_it_left() {
+        let (cache, dir, mut app) = a_then_b("back-reuse");
+        for entry in std::fs::read_dir(dir.join("blob").join("en"))
+            .unwrap()
+            .flatten()
+        {
+            std::fs::write(entry.path(), b"not zstd").unwrap();
+        }
+        let (revalidate_tx, _rrx) = mpsc::unbounded_channel::<RevalidationOutcome>();
+        let entry = app.navigate_back_target().expect("B has A behind it");
+        open_history_entry(&test_client(), &cache, &mut app, entry, &revalidate_tx).await;
+        assert_eq!(
+            app.active_tab().doc.as_ref().map(|d| d.title.as_str()),
+            Some("Article A")
+        );
+        assert!(!app.status.starts_with("Error"), "{}", app.status);
+        assert!(matches!(
+            app.active_tab().page_source,
+            PageSource::Cached { .. }
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stashed parse is only served while the disk cache still holds that
+    /// same revision: once a newer one landed (a revalidation, say), Back
+    /// takes the ordinary L2 path and the stale parse is dropped.
+    #[test]
+    fn a_stashed_parse_of_an_older_revision_is_not_served() {
+        let (cache, dir, mut app) = a_then_b("back-stale");
+        cache.put("", "en", "Article A", ARTICLE_A, 9, None);
+        assert!(reopen_from_memory(&cache, &mut app, "", "en", "Article A").is_none());
+        let key = (String::new(), "en".to_string(), "Article A".to_string());
+        assert!(app.recent_docs.take(&key).is_none(), "dropped, not kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- PRD §6.8: the startup notification poll never blocks startup ------
+
+    fn logged_in_app(tag: &str, token_url: String, expires_at: i64) -> (App, std::path::PathBuf) {
+        let dir = temp_state_path(tag).with_extension("authdir");
+        let path = dir.join("auth.json");
+        let store = Box::new(auth::FileTokenStore::new(path)) as Box<dyn auth::TokenStore>;
+        let tokens = auth::Tokens {
+            access_token: "STORED".into(),
+            refresh_token: "RT".into(),
+            expires_at,
+            username: "Reader".into(),
+            editpage: false,
+        };
+        store.save(&tokens).unwrap();
+        let http = auth::token_http_client("c").unwrap();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.auth = Some(auth::AuthState::new(
+            tokens,
+            "id".into(),
+            token_url,
+            http,
+            store,
+        ));
+        (app, dir)
+    }
+
+    /// PRD §6.8 "nothing network-blocking on the startup path": a returning
+    /// logged-in reader's badge poll is fired, not awaited — against a wiki
+    /// that never answers, the startup call still returns at once, with the
+    /// poll left in flight for the loop to apply.
+    #[tokio::test]
+    async fn the_startup_notification_poll_is_fired_not_awaited() {
+        let (wiki_url, _hits) = spawn_action_api_mock(None);
+        let client = WikiClient::new(wiki_url).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let (mut app, dir) = logged_in_app("notif-fire", "http://127.0.0.1:1".into(), now + 86_400);
+        let started = Instant::now();
+        fire_startup_notifications_poll(&client, &mut app);
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(app.notif_poll_pending);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With the stored token near expiry the fired poll refreshes it on its
+    /// own task; a foreground authenticated action meanwhile waits for that
+    /// refresh and uses its tokens rather than refreshing the same refresh
+    /// token a second time (which a rotating provider would reject, logging
+    /// the reader out). The badge counts land too.
+    #[tokio::test]
+    async fn a_foreground_token_request_waits_for_the_startup_refresh() {
+        let (token_url, refreshes) = spawn_action_api_mock(Some(
+            r#"{"access_token":"REFRESHED","refresh_token":"NEW_RT","expires_in":14400}"#,
+        ));
+        let (wiki_url, _hits) = spawn_action_api_mock(Some(
+            r#"{"query":{"notifications":{"alert":{"count":2},"message":{"count":1}}}}"#,
+        ));
+        let client = WikiClient::new(wiki_url).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let (mut app, dir) = logged_in_app("notif-refresh", token_url, now + 5);
+
+        fire_startup_notifications_poll(&client, &mut app);
+        let token = require_login(&mut app, "test").await;
+
+        assert_eq!(token.as_deref(), Some("REFRESHED"));
+        assert_eq!(refreshes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(app.auth.is_some(), "still logged in");
+        assert!(!app.notif_poll_pending);
+        assert_eq!(
+            app.notif_counts,
+            account::NotifCounts {
+                alert: 2,
+                message: 1
+            }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ---- Lift Wing fallback wiring (PRD FR-DL-3 v2) ------------------------
 
     /// Spawns a raw-socket Lift Wing mock that always answers revision 1001
@@ -12003,6 +12623,7 @@ mod tests {
                 lang: "en".to_string(),
                 title: "Enigma machine".to_string(),
                 result: Ok(FetchOutcome {
+                    document: None,
                     html: "<html><body><p>rotor cipher</p></body></html>".to_string(),
                     source: PageSource::Live,
                     revid: 42,
@@ -12035,6 +12656,7 @@ mod tests {
             lang: "en".to_string(),
             title: "Mercury".to_string(),
             result: Ok(FetchOutcome {
+                document: None,
                 html: DISAMBIG_PAGE.to_string(),
                 source: PageSource::Live,
                 revid: 7,
@@ -12120,6 +12742,7 @@ mod tests {
                 lang: "en".to_string(),
                 title: "Enigma machine".to_string(),
                 result: Ok(FetchOutcome {
+                    document: None,
                     html: "<html><body><p>rotor cipher</p></body></html>".to_string(),
                     source: PageSource::Live,
                     revid: 42,
@@ -12161,6 +12784,7 @@ mod tests {
                 lang: "en".to_string(),
                 title: "Enigma machine".to_string(),
                 result: Ok(FetchOutcome {
+                    document: None,
                     html: "<html><body><p>rotor cipher</p></body></html>".to_string(),
                     source: PageSource::Live,
                     revid: 42,
@@ -12202,6 +12826,7 @@ mod tests {
                 lang: "en".to_string(),
                 title: "Enigma machine".to_string(),
                 result: Ok(FetchOutcome {
+                    document: None,
                     html: "<html><body><p>x</p></body></html>".to_string(),
                     source: PageSource::Live,
                     revid: 1,
@@ -12357,6 +12982,7 @@ mod tests {
                 lang: "en".to_string(),
                 title: "Alan Turing".to_string(),
                 result: Ok(FetchOutcome {
+                    document: None,
                     html: "<html><body><h2>A</h2><p>x</p><h2>B</h2><p>y</p></body></html>"
                         .to_string(),
                     source: PageSource::Live,
@@ -13500,6 +14126,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// PRD §6.8: a network fetch parses its HTML exactly once and hands that
+    /// parse to the caller (`FetchOutcome::document`) — titled with the same
+    /// canonical title the cache entry is keyed on — while the offline index
+    /// (PRD FR-SR-7) still receives the article, now off the open's critical
+    /// path.
+    #[tokio::test]
+    async fn a_network_fetch_hands_its_one_parse_to_the_caller_and_still_indexes_it() {
+        let base = spawn_one_article("Alan Turing");
+        let client = WikiClient::new(base).unwrap();
+        let dir = temp_state_path("one-parse").with_extension("cachedir");
+        let cache = PageCache::at(dir.clone(), 10_000_000, 86_400, 604_800);
+        let index = offline_search::OfflineIndex::in_memory();
+
+        let mut outcome = fetch_page(&client, &cache, &index, "", "en", "alan turing")
+            .await
+            .unwrap();
+        assert!(matches!(outcome.source, PageSource::Live));
+        let parsed = outcome
+            .document
+            .as_ref()
+            .expect("the live path hands its parse on");
+        assert_eq!(parsed.title, outcome.resolved_title);
+        assert_eq!(outcome.document().title, "Alan Turing");
+        assert!(cache.get("", "en", "Alan Turing").is_some());
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while index.search("", "en", "content", 5).is_empty() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let hits = index.search("", "en", "content", 5);
+        assert_eq!(hits.len(), 1, "indexed under the canonical title");
+        assert_eq!(hits[0].title, "Alan Turing");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// PRD §7 "429 / maxlag on interactive request": a stale-cache fallback
     /// must not silently swallow *why* the live attempt failed when it was a
     /// rate limit — `open_title` needs `rate_limited` set to show the busy
@@ -13847,6 +14509,7 @@ mod tests {
 
     fn kpi_fetch(title: &str, source: PageSource, revid: u64) -> FetchOutcome {
         FetchOutcome {
+            document: None,
             html: format!(
                 "<html><head><title>{title}</title></head><body><p>body</p></body></html>"
             ),

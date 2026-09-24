@@ -34,6 +34,67 @@ use crate::tts::TtsRuntime;
 /// closes, not to the dawn of the session.
 pub const CLOSED_TABS_CAP: usize = 10;
 
+/// PRD §6.8's L1-hit target (< 50 ms) for Back/Forward: how many
+/// navigated-away-from documents `App::recent_docs` keeps parsed. Matches the
+/// reach of a typical back-and-forth without holding a long trail in memory.
+pub const DEFAULT_RECENT_DOCS: usize = 4;
+
+/// The parsed documents of the last few articles a tab navigated away from,
+/// keyed by `(wiki, lang, title)` with the revision each is — so Back/Forward
+/// to one of them (`main::reopen_from_memory`) skips the L2 read, zstd
+/// decompress and full re-parse, the way its L1 layout entry already skips
+/// the layout pass. Without it an "L1 hit" still paid the whole parse: 52 ms
+/// in-process for the 1.55 MB pathological fixture, over §6.8's 50 ms. A
+/// document is *moved* in on navigation and moved back out on reuse, never
+/// copied; an entry whose revision is no longer the cached one is simply not
+/// used. Disabled (capacity 0) in `low_memory` mode.
+pub struct RecentDocs {
+    capacity: usize,
+    /// Least-recently stashed first; linear scans, like `LayoutCache`.
+    entries: Vec<((String, String, String), u64, Document)>,
+}
+
+impl RecentDocs {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            entries: Vec::new(),
+        }
+    }
+
+    /// Resizes, dropping the oldest entries past the new capacity (all of
+    /// them at 0).
+    pub fn set_capacity(&mut self, capacity: usize) {
+        self.capacity = capacity;
+        let excess = self.entries.len().saturating_sub(capacity);
+        self.entries.drain(..excess);
+    }
+
+    /// Stashes `doc` (revision `revid`) under `key`, replacing any older copy
+    /// of the same key and evicting the oldest entry once full.
+    pub fn put(&mut self, key: (String, String, String), revid: u64, doc: Document) {
+        if self.capacity == 0 {
+            return;
+        }
+        self.entries.retain(|(k, _, _)| k != &key);
+        self.entries.push((key, revid, doc));
+        let excess = self.entries.len().saturating_sub(self.capacity);
+        self.entries.drain(..excess);
+    }
+
+    /// Removes and returns `key`'s document and its revision, if stashed.
+    pub fn take(&mut self, key: &(String, String, String)) -> Option<(u64, Document)> {
+        let pos = self.entries.iter().position(|(k, _, _)| k == key)?;
+        let (_, revid, doc) = self.entries.remove(pos);
+        Some((revid, doc))
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 /// PRD §6.8 `low_memory`: the L1 layout cache holds at most what can be on
 /// screen at once — the two panes of a split (single-pane reading keeps its
 /// layout in `App::layout` alone). See `App::set_low_memory`.
@@ -662,6 +723,8 @@ pub struct App {
     /// layout pass. Keyed additionally by `current_revid` and the layout
     /// engine's schema version — see `layout::LayoutCacheKey`.
     pub layout_cache: LayoutCache,
+    /// PRD §6.8 L1-hit reopens: see [`RecentDocs`].
+    pub recent_docs: RecentDocs,
     /// Incremented only when `ensure_layout` actually calls
     /// `layout::layout_document` (an L1 cache miss) — never on a hit or on
     /// the fast "nothing changed since last draw" path. A plain counter
@@ -695,6 +758,23 @@ pub struct App {
     /// in hand.
     pub foreground_retry_tx: tokio::sync::mpsc::UnboundedSender<crate::TabLoadOutcome>,
     pub foreground_retry_rx: tokio::sync::mpsc::UnboundedReceiver<crate::TabLoadOutcome>,
+    /// PRD FR-DL-3/FR-DL-5/FR-PF-3: post-open enrichments in flight
+    /// (`main::fire_enrichment`), keeping the loop waking on a timer — like
+    /// `pending_foreground_retries` — until their outcomes are applied.
+    pub pending_enrichments: u32,
+    /// Delivers `main::fire_enrichment`'s results back to the loop. On `App`
+    /// for the same reason as `foreground_retry_tx`: the open paths that fire
+    /// it already hold `&mut App`, and threading a channel through their
+    /// dozens of call chains would buy nothing.
+    pub enrich_tx: tokio::sync::mpsc::UnboundedSender<crate::EnrichOutcome>,
+    pub enrich_rx: tokio::sync::mpsc::UnboundedReceiver<crate::EnrichOutcome>,
+    /// PRD FR-ACC-3: the startup notification poll (`main::
+    /// fire_startup_notifications_poll`) is in flight — keeps the loop waking
+    /// to apply it, and makes the foreground token paths wait for it rather
+    /// than race its token refresh.
+    pub notif_poll_pending: bool,
+    pub notif_poll_tx: tokio::sync::mpsc::UnboundedSender<crate::NotifPollOutcome>,
+    pub notif_poll_rx: tokio::sync::mpsc::UnboundedReceiver<crate::NotifPollOutcome>,
     /// PRD §7 "Disambiguation page": the highlighted row in the chooser
     /// (`Mode::Disambig`) over `doc::disambiguation_candidates`. Reset to `0`
     /// whenever `set_document` installs a disambiguation page; not persisted
@@ -954,6 +1034,10 @@ pub struct App {
     /// run_search` (one batched call for every result row) — never a
     /// per-article fanout (§6.2 rule 10 / NF-NET-5).
     pub quality_cache: HashMap<(String, String, String), crate::api::QualityClass>,
+    /// PRD FR-DL-3: every key whose quality lookup has *completed* this
+    /// session, found or not — the negative half `quality_cache` can't hold,
+    /// so an unassessed article (most of them) isn't re-asked on every open.
+    pub quality_checked: HashSet<(String, String, String)>,
     /// PRD FR-DL-5: `(lang, title)` pairs the batched `generator=links&
     /// prop=info` missing-flag check has confirmed don't exist — the
     /// async-checked complement to a `LinkRef`'s own parse-time `redlink`
@@ -1584,6 +1668,8 @@ impl App {
         // rather than being threaded as a parameter like every other
         // background-result channel.
         let (foreground_retry_tx, foreground_retry_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (enrich_tx, enrich_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (notif_poll_tx, notif_poll_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             mode: Mode::Reading,
             prior_mode: Mode::Reading,
@@ -1667,11 +1753,18 @@ impl App {
             notice: None,
             layout: None,
             layout_cache: LayoutCache::new(layout::DEFAULT_L1_CAPACITY),
+            recent_docs: RecentDocs::new(DEFAULT_RECENT_DOCS),
             layout_computations: 0,
             pending_revalidations: 0,
             pending_foreground_retries: 0,
             foreground_retry_tx,
             foreground_retry_rx,
+            pending_enrichments: 0,
+            enrich_tx,
+            enrich_rx,
+            notif_poll_pending: false,
+            notif_poll_tx,
+            notif_poll_rx,
             disambig_selected: 0,
             layout_width: 80,
             viewport_height: 0,
@@ -1727,6 +1820,7 @@ impl App {
             offline_card_target: None,
             zim: None,
             quality_cache: HashMap::new(),
+            quality_checked: HashSet::new(),
             confirmed_redlinks: HashSet::new(),
             checked_redlink_sources: HashSet::new(),
             redlink_card_target: None,
@@ -2174,6 +2268,10 @@ impl App {
     /// rule to whatever is already open.
     pub fn set_low_memory(&mut self, on: bool) {
         self.low_memory = on;
+        // Low-memory keeps no parse of anything off screen, so no
+        // navigated-away-from documents either.
+        self.recent_docs
+            .set_capacity(if on { 0 } else { DEFAULT_RECENT_DOCS });
         self.layout_cache.set_capacity(if on {
             LOW_MEMORY_L1_CAPACITY
         } else {
@@ -3337,8 +3435,10 @@ impl App {
         let dup_idx = self.tabs.len() - 1;
         if let Some(doc) = doc {
             let t = &mut self.tabs[dup_idx];
-            t.install_document(doc);
+            // Before the install, like every open path: it records the
+            // document's revision (`Tab::doc_revid`) from this.
             t.current_revid = revid;
+            t.install_document(doc);
             t.page_source = page_source;
             t.scroll = scroll;
             t.folded_blocks = folded;
@@ -4229,6 +4329,17 @@ impl App {
         self.selected_citation = 0;
 
         let wiki = self.active_wiki_scope().to_string();
+        // PRD §6.8: the document being navigated away from is moved into
+        // `recent_docs` (not dropped), so Back/Forward to it can skip the
+        // re-parse — see `RecentDocs`.
+        {
+            let tab = &mut self.tabs[index];
+            if let Some(previous) = tab.doc.take() {
+                let key = (tab.wiki.clone(), tab.lang.clone(), previous.title.clone());
+                let revid = tab.doc_revid;
+                self.recent_docs.put(key, revid, previous);
+            }
+        }
         {
             let tab = self.active_tab_mut();
             tab.lang = lang;
@@ -9269,6 +9380,59 @@ mod tests {
             "wrapping back to the top link must scroll it into view (scroll {}, line {first_line})",
             app.active_tab().scroll
         );
+    }
+
+    fn titled(title: &str) -> Document {
+        crate::doc::parse_article_html(
+            title,
+            &format!(
+                "<html><head><title>{title}</title></head><body><p>{title} body.</p></body></html>"
+            ),
+        )
+    }
+
+    /// PRD §6.8 L1-hit reopens: `RecentDocs` keeps the newest `capacity`
+    /// entries, one per key (a re-stash replaces), hands each back exactly
+    /// once, and holds nothing at capacity 0.
+    #[test]
+    fn recent_docs_is_a_small_take_once_lru() {
+        let key = |t: &str| (String::new(), "en".to_string(), t.to_string());
+        let mut recent = RecentDocs::new(2);
+        recent.put(key("A"), 1, titled("A"));
+        recent.put(key("B"), 2, titled("B"));
+        recent.put(key("A"), 3, titled("A"));
+        assert_eq!(recent.len(), 2);
+        recent.put(key("C"), 4, titled("C"));
+        assert!(recent.take(&key("B")).is_none(), "oldest evicted");
+        let (revid, doc) = recent.take(&key("A")).expect("kept");
+        assert_eq!((revid, doc.title.as_str()), (3, "A"));
+        assert!(recent.take(&key("A")).is_none(), "taken once");
+        recent.set_capacity(0);
+        assert_eq!(recent.len(), 0);
+        recent.put(key("D"), 5, titled("D"));
+        assert_eq!(recent.len(), 0);
+    }
+
+    /// Navigating away from an article moves its parsed document into
+    /// `recent_docs` under the revision it was installed at — not the next
+    /// document's, which the open paths set before installing — and
+    /// `low_memory` stashes nothing.
+    #[test]
+    fn navigating_away_stashes_the_document_under_its_own_revision() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.active_tab_mut().current_revid = 7;
+        app.open_document(titled("A"));
+        app.active_tab_mut().current_revid = 8;
+        app.open_document(titled("B"));
+        let key = (String::new(), "en".to_string(), "A".to_string());
+        let (revid, doc) = app.recent_docs.take(&key).expect("A was stashed");
+        assert_eq!((revid, doc.title.as_str()), (7, "A"));
+
+        let mut low = App::new("en".to_string(), Theme::terminal(), false);
+        low.set_low_memory(true);
+        low.open_document(titled("A"));
+        low.open_document(titled("B"));
+        assert_eq!(low.recent_docs.len(), 0);
     }
 
     #[test]
