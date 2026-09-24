@@ -454,18 +454,22 @@ mod tests {
             format!("#!/bin/sh\ncat >> \"{}\"\n", capture_file.display()),
         )
         .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&script_path, perms).unwrap();
-        }
 
         let malicious = "Some prose. $(whoami) `id` ; rm -rf / && echo pwned";
+        // Run through `/bin/sh` rather than exec'ing the freshly written
+        // script: exec'ing a file this (multi-threaded) test process just
+        // wrote races every other test's process spawn — a spawned child
+        // briefly inherits the write fd until its own exec, and the kernel
+        // refuses to exec a file open for writing ("Text file busy"). `sh`
+        // only *reads* the script, so there's nothing to race. The paragraph
+        // still reaches `cat` purely as stdin; `sh` takes its commands from
+        // the script file, never from stdin.
         let result = speak_one(
-            script_path.to_str().unwrap(),
-            &[capture_file.to_str().unwrap().to_string()],
+            "/bin/sh",
+            &[
+                script_path.to_str().unwrap().to_string(),
+                capture_file.to_str().unwrap().to_string(),
+            ],
             malicious,
         )
         .await;
@@ -507,20 +511,15 @@ mod tests {
             ),
         )
         .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&script_path, perms).unwrap();
-        }
 
         // The capture path is baked into the script itself (config-derived,
-        // fixed at setup time — not the paragraph), so each call takes no
-        // arguments; every paragraph's text still only ever reaches the
-        // script via its own stdin, one process per paragraph.
+        // fixed at setup time — not the paragraph), so the only argument is
+        // the script `/bin/sh` runs (for the same "Text file busy" reason as
+        // the SEC-5 test above); every paragraph's text still only ever
+        // reaches the script via its own stdin, one process per paragraph.
+        let script_arg = [script_path.to_str().unwrap().to_string()];
         for para in ["First paragraph.", "Second paragraph.", "Third paragraph."] {
-            let result = speak_one(script_path.to_str().unwrap(), &[], para).await;
+            let result = speak_one("/bin/sh", &script_arg, para).await;
             assert!(result.is_ok(), "{result:?}");
         }
 

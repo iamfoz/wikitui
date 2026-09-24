@@ -169,7 +169,11 @@ fn kind_style(
         // fields), so `colored`/the FR-TH-3 degradation pipeline handle
         // NO_COLOR and 256/16/mono for them exactly as for every other slot.
         // A monochrome theme (homebrew/night) points several of these at one
-        // hue, correctly collapsing to uniform coloring there.
+        // hue, correctly collapsing to uniform coloring there. Under NO_COLOR
+        // they follow `colored`'s crate-wide rule: the hue goes, the
+        // modifiers stay — keywords remain bold and comments italic, exactly
+        // like headings keep their bold, because NO_COLOR is a request for no
+        // *color*, not for losing structure (no-color.org).
         SpanKind::CodeKeyword => colored(no_color, theme.heading).add_modifier(Modifier::BOLD),
         SpanKind::CodeString => colored(no_color, theme.quote),
         SpanKind::CodeComment => colored(no_color, theme.dim).add_modifier(Modifier::ITALIC),
@@ -2602,9 +2606,9 @@ fn human_size(bytes: u64) -> String {
 /// very keys meant to scroll it).
 fn draw_prefetch_log(frame: &mut Frame, app: &App, area: Rect) {
     let (title, lines) = prefetch_log_content(app);
-    let inner_rows = area.height.saturating_sub(2);
-    let max_scroll = (lines.len() as u16).saturating_sub(inner_rows);
-    let offset = app.prefetch_log_scroll.min(max_scroll);
+    let offset = app
+        .prefetch_log_scroll
+        .min(panel_max_scroll(lines.len(), area));
     let para = Paragraph::new(lines)
         .style(base_style(&app.theme, app.no_color))
         .scroll((offset, 0))
@@ -2714,9 +2718,9 @@ fn prefetch_log_content(app: &App) -> (String, Vec<Line<'static>>) {
 /// split (UX-7).
 fn draw_interests(frame: &mut Frame, app: &App, area: Rect) {
     let (title, lines) = interests_content(app);
-    let inner_rows = area.height.saturating_sub(2);
-    let max_scroll = (lines.len() as u16).saturating_sub(inner_rows);
-    let offset = app.interests_scroll.min(max_scroll);
+    let offset = app
+        .interests_scroll
+        .min(panel_max_scroll(lines.len(), area));
     let para = Paragraph::new(lines)
         .style(base_style(&app.theme, app.no_color))
         .scroll((offset, 0))
@@ -2833,9 +2837,7 @@ fn interests_content(app: &App) -> (String, Vec<Line<'static>>) {
 /// split (UX-7).
 fn draw_stats(frame: &mut Frame, app: &App, area: Rect) {
     let lines = stats_content(app);
-    let inner_rows = area.height.saturating_sub(2);
-    let max_scroll = (lines.len() as u16).saturating_sub(inner_rows);
-    let offset = app.stats_scroll.min(max_scroll);
+    let offset = app.stats_scroll.min(panel_max_scroll(lines.len(), area));
     let para = Paragraph::new(lines)
         .style(base_style(&app.theme, app.no_color))
         .scroll((offset, 0))
@@ -4073,27 +4075,53 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
 /// arrows, Ctrl-d/u, g/G — handled in `main::handle_key`) so however tall the
 /// content and short the terminal, it can always reach its own bottom: the
 /// single fixed-height popup this replaced clipped ~40 rows into ~29.
-fn draw_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
-    let (title, lines) = help_content(app);
+/// The largest useful scroll offset for a bordered full-content panel
+/// (`:prefetch-log`, `:interests`, `:stats`) holding `len` lines, drawn over
+/// `content_area`. The single definition both the panel draws and
+/// `main::handle_key`'s scroll clamp use: they used to compute it
+/// independently (terminal height − 4 there, content height − 2 here), which
+/// disagreed by a row whenever the tab bar was hidden (one tab open) — a dead
+/// keypress at the bottom, then an extra one to start scrolling back up.
+pub fn panel_max_scroll(len: usize, content_area: Rect) -> u16 {
+    crate::app::line_to_scroll(len).saturating_sub(content_area.height.saturating_sub(2))
+}
 
+/// The `?` overlay's popup over `area` (the whole frame): up to 66 columns,
+/// and as tall as the content allows — the content scrolls within it.
+fn help_popup_rect(area: Rect, len: usize) -> Rect {
     let width = 66.min(area.width.saturating_sub(4)).max(20);
-    // Take most of the screen height; the content scrolls within it.
-    let height = (lines.len() as u16 + 2)
+    let height = crate::app::line_to_scroll(len)
+        .saturating_add(2)
         .min(area.height.saturating_sub(2))
         .max(6);
-    let popup = Rect {
+    Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
         y: area.y + (area.height.saturating_sub(height)) / 2,
         width,
         height,
-    };
+    }
+}
+
+/// The `?` overlay's scroll clamp for `len` lines over the frame `area` —
+/// derived from the same [`help_popup_rect`] the draw uses, so the key
+/// handler's clamp is always exactly what's visible.
+pub fn help_max_scroll(len: usize, area: Rect) -> u16 {
+    crate::app::line_to_scroll(len)
+        .saturating_sub(help_popup_rect(area, len).height.saturating_sub(2))
+}
+
+fn draw_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
+    let (title, lines) = help_content(app);
+    let popup = help_popup_rect(area, lines.len());
 
     // Rows visible inside the border, and the furthest we can usefully scroll.
     let inner_rows = popup.height.saturating_sub(2);
-    let max_scroll = (lines.len() as u16).saturating_sub(inner_rows);
+    let max_scroll = help_max_scroll(lines.len(), area);
     let offset = app.help_scroll.min(max_scroll);
     let heading = if max_scroll > 0 {
-        let last = (offset + inner_rows).min(lines.len() as u16);
+        let last = offset
+            .saturating_add(inner_rows)
+            .min(crate::app::line_to_scroll(lines.len()));
         format!("{title}  ({}-{}/{})", offset + 1, last, lines.len())
     } else {
         title
@@ -4442,19 +4470,35 @@ mod tests {
         assert_ne!(kw.fg, num.fg);
         assert_ne!(s.fg, cmt.fg);
 
-        // NO_COLOR strips every code-token foreground to none (plain).
+        // NO_COLOR strips every code-token foreground (and background)...
         for kind in [
             SpanKind::CodeKeyword,
             SpanKind::CodeString,
             SpanKind::CodeComment,
             SpanKind::CodeNumber,
         ] {
-            assert_eq!(
-                style(&kind, true).fg,
-                None,
-                "{kind:?} must be color-plain under NO_COLOR"
-            );
+            let st = style(&kind, true);
+            assert_eq!(st.fg, None, "{kind:?} must carry no color under NO_COLOR");
+            assert_eq!(st.bg, None, "{kind:?} must carry no color under NO_COLOR");
         }
+        // ...but deliberately keeps the non-color cues, the same crate-wide
+        // rule headings follow (`colored`): keywords stay bold, comments
+        // italic, so highlighting still carries structure without color.
+        assert!(
+            style(&SpanKind::CodeKeyword, true)
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        assert!(
+            style(&SpanKind::CodeComment, true)
+                .add_modifier
+                .contains(Modifier::ITALIC)
+        );
+        assert_eq!(
+            style(&SpanKind::CodeKeyword, true).add_modifier,
+            style(&SpanKind::CodeKeyword, false).add_modifier,
+            "NO_COLOR changes only color, never the modifiers"
+        );
     }
 
     /// The paint step maps each heading's layout line (via
@@ -5270,6 +5314,49 @@ mod tests {
 
     /// PRD §6.3 hard floor: below 60×16 the whole draw is replaced by the
     /// "terminal too small" screen, whatever mode the app is in.
+    /// The panel scroll clamp comes from the area actually drawn, not a
+    /// fixed offset from the terminal height: the tab bar only exists with
+    /// 2+ tabs, so a single-tab view has one more visible panel row. The old
+    /// key-handler formula (terminal − 4) was one row too generous there.
+    #[test]
+    fn panel_scroll_clamp_tracks_the_tab_bar() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        // One tab: 30 rows − status bar = 29 content rows, 27 inside borders.
+        assert_eq!(app.last_content_area.height, 29);
+        assert_eq!(panel_max_scroll(100, app.last_content_area), 100 - 27);
+
+        app.open_background_tab("Second".to_string(), "en".to_string());
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        // Two tabs: the tab bar takes a row, so one fewer visible line.
+        assert_eq!(app.last_content_area.height, 28);
+        assert_eq!(panel_max_scroll(100, app.last_content_area), 100 - 26);
+
+        // Fits entirely: nothing to scroll.
+        assert_eq!(panel_max_scroll(5, app.last_content_area), 0);
+        // A count past u16::MAX saturates rather than wrapping (CORR-L2 class).
+        assert_eq!(
+            panel_max_scroll(70_000, app.last_content_area),
+            u16::MAX - 26
+        );
+    }
+
+    /// The `?` overlay's clamp is derived from the same popup rect the draw
+    /// uses, so scrolling to `help_max_scroll` shows the last line and no
+    /// further.
+    #[test]
+    fn help_scroll_clamp_matches_the_drawn_popup() {
+        let area = Rect::new(0, 0, 80, 24);
+        // 24-row frame: popup capped at 22 rows, 20 inside the border.
+        assert_eq!(help_max_scroll(100, area), 80);
+        // Short content: the popup shrinks to fit and nothing scrolls.
+        assert_eq!(help_max_scroll(10, area), 0);
+    }
+
     #[test]
     fn a_sub_floor_terminal_draws_the_too_small_screen() {
         use ratatui::Terminal;

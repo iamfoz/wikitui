@@ -156,13 +156,12 @@ pub struct WikiCapabilities {
 }
 
 impl WikiCapabilities {
-    /// Every feature on, Parsoid-first — the implicit behavior every wiki
-    /// had before this chunk, and still the built-in `wikipedia` default.
-    /// Only reachable today via [`WikiClient::new`]/[`WikiClient::
-    /// with_contact`] (production always resolves real capabilities through
-    /// [`WikiClient::with_wiki`] instead — see their own doc comments for
-    /// why they're kept anyway).
-    #[allow(dead_code)]
+    /// Every feature on, Parsoid-first: the capability set the test-only
+    /// [`WikiClient::new`]/[`WikiClient::with_contact`] constructors assume.
+    /// Test-only itself — production never builds capabilities this way; it
+    /// resolves each wiki's real set (the built-in `wikipedia` entry
+    /// included) through `config` and hands it to [`WikiClient::with_wiki`].
+    #[cfg(test)]
     pub fn full() -> Self {
         Self {
             parser: ParserMode::Auto,

@@ -2152,18 +2152,15 @@ fn apply_tab_load_outcome(
                 // stale overlay over content that just updated underneath
                 // it. Any other mode the reader has since navigated to (a
                 // picker, a different tab's card) is left alone.
-                if app.mode == Mode::OfflineCard {
-                    app.mode = if app
-                        .active_tab()
-                        .doc
-                        .as_ref()
-                        .is_some_and(|d| d.is_disambiguation)
-                    {
-                        app.disambig_selected = 0;
-                        Mode::Disambig
-                    } else {
-                        Mode::Reading
-                    };
+                //
+                // The same goes for Reading: a reader who switched to this
+                // tab while it was still loading is looking at it now, so a
+                // disambiguation page gets its chooser the moment it lands
+                // rather than on the next tab switch.
+                if matches!(app.mode, Mode::OfflineCard | Mode::Reading)
+                    && !app.show_pending_disambig()
+                {
+                    app.mode = Mode::Reading;
                 }
             }
             if let Some(cached_revid) = fetch.revalidate
@@ -5370,11 +5367,11 @@ async fn handle_key(
         // however tall the generated cheatsheet. Navigation keys scroll;
         // Esc/?/q/Enter close (returning to the view it was opened over).
         Mode::Help => {
-            let visible = terminal
+            let frame_area = terminal
                 .size()
-                .map(|s| s.height.saturating_sub(4))
-                .unwrap_or(20);
-            let max_scroll = (ui::help_view_len(app) as u16).saturating_sub(visible);
+                .map(|s| ratatui::layout::Rect::new(0, 0, s.width, s.height))
+                .unwrap_or_default();
+            let max_scroll = ui::help_max_scroll(ui::help_view_len(app), frame_area);
             let set = |v: u16| v.min(max_scroll);
             match code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?') | KeyCode::Char('q') => {
@@ -5453,11 +5450,8 @@ async fn handle_key(
         // `resolve_panel_key`'s doc comment for why "any key closes it" was
         // wrong for content taller than the viewport).
         Mode::PrefetchLog => {
-            let visible = terminal
-                .size()
-                .map(|s| s.height.saturating_sub(4))
-                .unwrap_or(20);
-            let max_scroll = (ui::prefetch_log_view_len(app) as u16).saturating_sub(visible);
+            let max_scroll =
+                ui::panel_max_scroll(ui::prefetch_log_view_len(app), app.last_content_area);
             match resolve_panel_key(code, modifiers, app.prefetch_log_scroll, max_scroll) {
                 PanelKeyAction::Close => app.close_prefetch_log(),
                 PanelKeyAction::Scroll(v) => app.prefetch_log_scroll = v,
@@ -5467,11 +5461,8 @@ async fn handle_key(
         // PRD FR-PF-3 / FR-PC-3: the interest and stats panels — same
         // scrollable treatment as the prefetch log just above (UX-7).
         Mode::Interests => {
-            let visible = terminal
-                .size()
-                .map(|s| s.height.saturating_sub(4))
-                .unwrap_or(20);
-            let max_scroll = (ui::interests_view_len(app) as u16).saturating_sub(visible);
+            let max_scroll =
+                ui::panel_max_scroll(ui::interests_view_len(app), app.last_content_area);
             match resolve_panel_key(code, modifiers, app.interests_scroll, max_scroll) {
                 PanelKeyAction::Close => app.close_interests(),
                 PanelKeyAction::Scroll(v) => app.interests_scroll = v,
@@ -5479,11 +5470,7 @@ async fn handle_key(
             }
         }
         Mode::Stats => {
-            let visible = terminal
-                .size()
-                .map(|s| s.height.saturating_sub(4))
-                .unwrap_or(20);
-            let max_scroll = (ui::stats_view_len(app) as u16).saturating_sub(visible);
+            let max_scroll = ui::panel_max_scroll(ui::stats_view_len(app), app.last_content_area);
             match resolve_panel_key(code, modifiers, app.stats_scroll, max_scroll) {
                 PanelKeyAction::Close => app.close_stats(),
                 PanelKeyAction::Scroll(v) => app.stats_scroll = v,
@@ -11718,6 +11705,81 @@ mod tests {
         assert!(!tab.loading, "the background tab is no longer loading");
         assert_eq!(tab.current_revid, 42);
         assert_eq!(tab.doc.as_ref().unwrap().title, "Enigma machine");
+    }
+
+    const DISAMBIG_PAGE: &str = r#"<html><head><link rel="mw:PageProp/disambiguation"/></head><body>
+<p><b>Mercury</b> may refer to:</p><ul>
+<li><a href="./Mercury_(planet)">Mercury</a>, the smallest planet</li>
+<li><a href="./Mercury_(element)">Mercury</a>, a chemical element</li>
+</ul></body></html>"#;
+
+    fn disambig_outcome(tab_id: TabId) -> TabLoadOutcome {
+        TabLoadOutcome {
+            tab_id,
+            wiki: String::new(),
+            lang: "en".to_string(),
+            title: "Mercury".to_string(),
+            result: Ok(FetchOutcome {
+                html: DISAMBIG_PAGE.to_string(),
+                source: PageSource::Live,
+                revid: 7,
+                resolved_title: "Mercury".to_string(),
+                revalidate: None,
+                redirected_from: None,
+                rate_limited: None,
+                missing: false,
+            }),
+        }
+    }
+
+    /// PRD §7 "Disambiguation page": a disambiguation page that finished
+    /// loading in a *background* tab gets its chooser the first time the
+    /// reader focuses that tab (not raw prose), and only that first time —
+    /// once dismissed with Esc ("view as text"), switching away and back
+    /// leaves the reader in the text view they chose.
+    #[test]
+    fn background_loaded_disambiguation_shows_its_chooser_on_first_focus_only() {
+        let client = test_client();
+        let (revalidate_tx, _rx) = mpsc::unbounded_channel::<RevalidationOutcome>();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        let id = app.open_background_tab("Mercury".to_string(), "en".to_string());
+        apply_tab_load_outcome(&client, &mut app, disambig_outcome(id), &revalidate_tx);
+        // Landing in a tab the reader isn't looking at changes nothing yet.
+        assert_eq!(app.mode, Mode::Reading);
+
+        let bg = app.tab_index_by_id(id).unwrap();
+        app.switch_to_tab(bg);
+        assert_eq!(app.mode, Mode::Disambig, "first focus shows the chooser");
+        assert_eq!(app.disambig_candidates().len(), 2);
+
+        app.mode = Mode::Reading; // Esc: view as text
+        app.switch_to_tab(0);
+        app.switch_to_tab(bg);
+        assert_eq!(
+            app.mode,
+            Mode::Reading,
+            "a dismissed chooser stays dismissed"
+        );
+    }
+
+    /// The other background-load shape: the reader switched to the tab while
+    /// it was still loading, so it's on screen when the disambiguation page
+    /// lands — the chooser opens right then, not on some later tab switch.
+    #[test]
+    fn disambiguation_landing_on_the_tab_being_watched_opens_the_chooser() {
+        let client = test_client();
+        let (revalidate_tx, _rx) = mpsc::unbounded_channel::<RevalidationOutcome>();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        let id = app.open_background_tab("Mercury".to_string(), "en".to_string());
+        app.switch_to_tab(app.tab_index_by_id(id).unwrap());
+        assert_eq!(
+            app.mode,
+            Mode::Reading,
+            "still loading: nothing to choose yet"
+        );
+
+        apply_tab_load_outcome(&client, &mut app, disambig_outcome(id), &revalidate_tx);
+        assert_eq!(app.mode, Mode::Disambig);
     }
 
     /// PRD §7 "429 / maxlag on interactive request": a foreground retry

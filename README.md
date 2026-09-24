@@ -25,8 +25,9 @@ its contributors for charting this space first.
 ## Features
 
 - **Article reading**: Parsoid HTML rendered as styled, wrapped, scrollable
-  text — theme-aware headings, emphasis, lists, blockquotes, code blocks,
-  full tables, infobox cards, inline images (half-block rendering, terminal
+  text — theme-aware headings, emphasis, lists, blockquotes, syntax-
+  highlighted code blocks (Rust, Python, C-family, JavaScript, shell; other
+  languages render uniformly), full tables, infobox cards, inline images (half-block rendering, terminal
   graphics protocol detection), math passthrough, and CJK-correct line
   wrapping (double-width-aware, no mid-glyph splits).
 - **Navigation**: link cycling, vimium-style link hints, table of contents
@@ -54,7 +55,9 @@ its contributors for charting this space first.
 - **Start page**: on-this-day panel and a "today I learned" widget.
 - **Themes**: six built-in themes (`terminal`, `full`, `homebrew`, `night`,
   `paper`, `contrast`) plus user themes, with 256-/16-color degradation and
-  `NO_COLOR` support; `:theme <name>` or cycle at runtime.
+  `NO_COLOR` support (color is removed everywhere; bold/italic/underline
+  cues such as headings, code keywords, and comments are kept, per the
+  no-color.org convention); `:theme <name>` or cycle at runtime.
 - **Multi-wiki & multi-language**: a language switcher with langlink
   discovery and a fallback chain; the Wikimedia sister projects (Wiktionary,
   Wikivoyage, Wikiquote, Wikinews) alongside Wikipedia; and, via

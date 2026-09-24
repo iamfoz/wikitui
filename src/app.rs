@@ -3041,6 +3041,27 @@ impl App {
     /// `doc::disambiguation_candidates` for the short lists a real
     /// disambiguation page has. Empty for a tab with no document, or one
     /// whose document isn't a disambiguation page at all.
+    /// PRD §7 "Disambiguation page": if the active tab holds a
+    /// disambiguation document whose chooser hasn't been shown yet
+    /// (`Tab::disambig_pending`, set by `install_document`), enter
+    /// `Mode::Disambig` and consume the flag; returns whether it did. Every
+    /// document-install path funnels through here — `set_document` for a
+    /// foreground open (fresh navigation, back/forward, bookmark/history
+    /// reopen, SWR reload), `sync_active_tab` for a page that finished
+    /// loading in a background tab, and `main::apply_tab_load_outcome` for
+    /// one that lands while its tab is already on screen — so the chooser
+    /// appears however the page was reached, exactly once per install.
+    pub(crate) fn show_pending_disambig(&mut self) -> bool {
+        let tab = self.active_tab_mut();
+        if !(tab.disambig_pending && tab.doc.as_ref().is_some_and(|d| d.is_disambiguation)) {
+            return false;
+        }
+        tab.disambig_pending = false;
+        self.disambig_selected = 0;
+        self.mode = Mode::Disambig;
+        true
+    }
+
     pub fn disambig_candidates(&self) -> Vec<crate::doc::DisambigCandidate> {
         self.active_tab()
             .doc
@@ -3178,6 +3199,11 @@ impl App {
             self.active = idx;
         }
         self.active = self.active.min(self.tabs.len().saturating_sub(1));
+        // Same invariant `close_tab` keeps: the tab picker's selection never
+        // points past the end after a tab was removed.
+        self.selected_tab_pick = self
+            .selected_tab_pick
+            .min(self.tabs.len().saturating_sub(1));
         self.sync_active_tab();
         true
     }
@@ -3278,7 +3304,9 @@ impl App {
         self.layout = None;
         self.pending_g = false;
         self.pending_b = false;
-        self.mode = Mode::Reading;
+        if !self.show_pending_disambig() {
+            self.mode = Mode::Reading;
+        }
         self.notice = self
             .active_tab()
             .pending_reload
@@ -3932,14 +3960,6 @@ impl App {
         self.citations = citations;
         self.selected_citation = 0;
 
-        // PRD §7 "Disambiguation page": captured before `install_document`
-        // (below) moves `doc` in — this decides the mode switch a few lines
-        // down, the one place every document-install path (fresh
-        // navigation, back/forward, bookmark/read-later/history reopen, the
-        // SWR "r to reload") funnels through, so the chooser shows up no
-        // matter how the disambiguation page was reached.
-        let is_disambiguation = doc.is_disambiguation;
-
         let wiki = self.active_wiki_scope().to_string();
         {
             let tab = self.active_tab_mut();
@@ -3957,10 +3977,7 @@ impl App {
         // raised after the visit is recorded and before the status refresh
         // below, so its toast (a `notice`) is the last word for this open.
         self.check_resume_position(index);
-        if is_disambiguation {
-            self.disambig_selected = 0;
-            self.mode = Mode::Disambig;
-        } else {
+        if !self.show_pending_disambig() {
             self.mode = Mode::Reading;
         }
         // A new document invalidates the cached layout; it is rebuilt lazily
@@ -12040,6 +12057,17 @@ mod tests {
             app.tabs.iter().any(|t| t.id == other_id),
             "the reopened tab is the same one that was closed"
         );
+    }
+
+    /// Closing a split removes the duplicate pane's tab, so — like
+    /// `close_tab` — it must keep the tab picker's selection in bounds.
+    #[test]
+    fn closing_the_split_keeps_the_tab_picker_selection_in_bounds() {
+        let mut app = split_app();
+        app.open_split(100).unwrap();
+        app.selected_tab_pick = app.tabs.len() - 1; // the duplicate pane's tab
+        assert!(app.close_split());
+        assert!(app.selected_tab_pick < app.tabs.len());
     }
 
     #[test]

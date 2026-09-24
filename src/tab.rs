@@ -184,6 +184,13 @@ pub struct Tab {
     /// it back to `Some` right after, when that particular fetch did redirect
     /// — the one caller with the fetch-level knowledge this field needs.
     pub redirected_from: Option<String>,
+    /// PRD §7 "Disambiguation page": set when a disambiguation document is
+    /// installed and its chooser hasn't been shown yet. Consumed (cleared) by
+    /// `App::show_pending_disambig` the first time this tab is on screen —
+    /// immediately for a foreground open, or on first focus for a document
+    /// that landed in a background tab — so the chooser appears exactly once
+    /// per install and "Esc: view as text" sticks across tab switches.
+    pub disambig_pending: bool,
 }
 
 impl Tab {
@@ -222,6 +229,7 @@ impl Tab {
             interest_dwell_signaled: false,
             interest_scroll_signaled: false,
             redirected_from: None,
+            disambig_pending: false,
         }
     }
 
@@ -252,6 +260,7 @@ impl Tab {
         // A fresh document's block indices are new — any folds from the
         // previous document would collapse the wrong ranges (PRD FR-NV-3).
         self.folded_blocks.clear();
+        self.disambig_pending = doc.is_disambiguation;
         self.doc = Some(doc);
         self.scroll = 0;
         self.table_col_offset = 0;
@@ -306,6 +315,7 @@ impl Tab {
         self.interest_dwell_signaled = false;
         self.interest_scroll_signaled = false;
         self.redirected_from = None;
+        self.disambig_pending = false;
         self.clear_find();
     }
 
