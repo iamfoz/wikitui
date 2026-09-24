@@ -6911,6 +6911,10 @@ async fn handle_key(
                         'l' => {
                             app.focus_split_pane(1);
                         }
+                        // Collapsing this into `'c' | 'o' | 'q' if
+                        // !app.close_split() =>` (clippy's suggestion) would
+                        // hide the split actually closing inside a match guard.
+                        #[allow(clippy::collapsible_match)]
                         'c' | 'o' | 'q' => {
                             if !app.close_split() {
                                 app.notice = Some("not split".to_string());
@@ -10704,6 +10708,22 @@ fn run_reindex(resolved: &config::ResolvedConfig) -> i32 {
 mod tests {
     use super::*;
 
+    /// A real crossterm-backed `Terminal` for driving `handle_key`, with a
+    /// fixed 100×30 viewport. `Terminal::new` asks the backend for the
+    /// terminal size, which needs a tty: CI runners have none (and no
+    /// `/dev/tty`), so every test built on it panicked there while passing
+    /// in any interactive shell. A `Fixed` viewport never queries the size,
+    /// and drawing into it works on any stdout.
+    fn test_terminal() -> Terminal<CrosstermBackend<io::Stdout>> {
+        Terminal::with_options(
+            CrosstermBackend::new(io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 100, 30)),
+            },
+        )
+        .unwrap()
+    }
+
     /// PRD §6.7: SIGHUP stays a config reload while the terminal is intact —
     /// including for a process that never had a controlling terminal, where
     /// `/dev/tty` fails from the start.
@@ -11056,7 +11076,7 @@ mod tests {
         let (related_tx, _) = mpsc::unbounded_channel();
         let (langlinks_tx, _) = mpsc::unbounded_channel();
         let (summary_tx, _) = mpsc::unbounded_channel();
-        let terminal = Terminal::new(CrosstermBackend::new(io::stdout())).unwrap();
+        let terminal = test_terminal();
         (
             client,
             cache,
@@ -13201,7 +13221,7 @@ mod tests {
         let (related_tx, _rltx) = mpsc::unbounded_channel::<RelatedOutcome>();
         let (langlinks_tx, _lltx) = mpsc::unbounded_channel::<LangLinksOutcome>();
         let (summary_tx, _sutx) = mpsc::unbounded_channel::<SummaryOutcome>();
-        let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout())).unwrap();
+        let mut terminal = test_terminal();
 
         let mut app = App::new("en".to_string(), Theme::terminal(), false);
         // The active tab/wiki is the default (Wikipedia) throughout — the

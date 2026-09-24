@@ -331,7 +331,7 @@ impl BookmarkStore {
             .map(|(original_index, &slot)| (original_index, self.bookmarks[slot].clone()))
             .collect();
         subset.sort_by_key(|(original_index, b)| (rank(b), *original_index));
-        for (&slot, (_, bookmark)) in slots.iter().zip(subset.into_iter()) {
+        for (&slot, (_, bookmark)) in slots.iter().zip(subset) {
             self.bookmarks[slot] = bookmark;
         }
         if let Some(path) = &self.path {
