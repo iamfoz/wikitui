@@ -956,8 +956,23 @@ fn debug_panic_requested() -> bool {
 /// Listens for SIGHUP and sets `flag`, picked up by the event loop on its
 /// next turn (PRD §6.7's live-reload). No-op on non-Unix targets — there's
 /// no SIGHUP there; `:config reload` still works everywhere.
+///
+/// The kernel sends the same signal when the controlling terminal hangs up
+/// (a closed terminal window, `tmux kill-session`, a dropped SSH
+/// connection), and that one must not be mistaken for a reload request:
+/// crossterm 0.29's reader treats a hung-up tty's 0-byte reads as neither
+/// end-of-input nor "no data yet", so `event::read`/`event::poll` spin inside
+/// crossterm forever and the event loop never gets control back — the
+/// process was left orphaned, burning most of a core. So each SIGHUP first
+/// asks whether the terminal is still there ([`terminal_hung_up`]), and if it
+/// isn't, exits from this task (it runs on a runtime worker thread, so it
+/// still gets scheduled while the main thread is stuck in crossterm). What's
+/// written on every meaningful change — session, history, cache, stats — is
+/// already on disk; only the on-screen tab's scroll position and dwell time
+/// since the last save are lost, and there's no terminal left to restore.
 #[cfg(unix)]
 fn spawn_sighup_listener(flag: Arc<AtomicBool>) {
+    let at_start = TtyProbe::now();
     tokio::spawn(async move {
         let Ok(mut stream) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
         else {
@@ -967,9 +982,56 @@ fn spawn_sighup_listener(flag: Arc<AtomicBool>) {
             if stream.recv().await.is_none() {
                 return;
             }
+            if terminal_hung_up(at_start, TtyProbe::now()) {
+                // 128 + SIGHUP: the conventional "hung up" exit status.
+                std::process::exit(129);
+            }
             flag.store(true, Ordering::SeqCst);
         }
     });
+}
+
+/// Whether each route to the terminal currently answers as a terminal. After
+/// a hangup, every descriptor that was open on the tty fails terminal ioctls
+/// (so `is_terminal()` turns false on stdin/stdout, whichever crossterm reads
+/// and draws through) and the process loses its controlling terminal (so
+/// `/dev/tty` no longer opens — crossterm's input route when stdin is
+/// redirected).
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TtyProbe {
+    stdin: bool,
+    stdout: bool,
+    dev_tty: bool,
+}
+
+#[cfg(unix)]
+impl TtyProbe {
+    fn now() -> Self {
+        use std::io::IsTerminal;
+        Self {
+            stdin: std::io::stdin().is_terminal(),
+            stdout: std::io::stdout().is_terminal(),
+            dev_tty: std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/tty")
+                .is_ok(),
+        }
+    }
+}
+
+/// A SIGHUP means "the terminal hung up" rather than "reload the config"
+/// when some route to the terminal that worked at startup no longer does.
+/// Comparing against the startup snapshot, not against absolute values,
+/// keeps a deliberate `kill -HUP` a reload even for a process that never
+/// had a controlling terminal (a pty handed to it without `setsid`), where
+/// `/dev/tty` fails from the very start.
+#[cfg(unix)]
+fn terminal_hung_up(at_start: TtyProbe, now: TtyProbe) -> bool {
+    (at_start.stdin && !now.stdin)
+        || (at_start.stdout && !now.stdout)
+        || (at_start.dev_tty && !now.dev_tty)
 }
 
 #[cfg(not(unix))]
@@ -10306,6 +10368,85 @@ fn run_reindex(resolved: &config::ResolvedConfig) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PRD §6.7: SIGHUP stays a config reload while the terminal is intact —
+    /// including for a process that never had a controlling terminal, where
+    /// `/dev/tty` fails from the start.
+    #[cfg(unix)]
+    #[test]
+    fn sighup_with_the_terminal_intact_is_a_reload() {
+        let tty = TtyProbe {
+            stdin: true,
+            stdout: true,
+            dev_tty: true,
+        };
+        assert!(!terminal_hung_up(tty, tty));
+        let no_ctty = TtyProbe {
+            stdin: true,
+            stdout: true,
+            dev_tty: false,
+        };
+        assert!(!terminal_hung_up(no_ctty, no_ctty));
+        let not_a_tty = TtyProbe {
+            stdin: false,
+            stdout: false,
+            dev_tty: false,
+        };
+        assert!(!terminal_hung_up(not_a_tty, not_a_tty));
+    }
+
+    /// A route to the terminal that worked at startup and no longer does
+    /// means the terminal hung up — whichever route it was.
+    #[cfg(unix)]
+    #[test]
+    fn sighup_after_the_terminal_went_away_is_a_hangup() {
+        let start = TtyProbe {
+            stdin: true,
+            stdout: true,
+            dev_tty: true,
+        };
+        let gone = TtyProbe {
+            stdin: false,
+            stdout: false,
+            dev_tty: false,
+        };
+        assert!(terminal_hung_up(start, gone));
+        assert!(terminal_hung_up(
+            start,
+            TtyProbe {
+                stdin: false,
+                ..start
+            }
+        ));
+        assert!(terminal_hung_up(
+            start,
+            TtyProbe {
+                stdout: false,
+                ..start
+            }
+        ));
+        assert!(terminal_hung_up(
+            start,
+            TtyProbe {
+                dev_tty: false,
+                ..start
+            }
+        ));
+        // stdin redirected from the start: crossterm reads /dev/tty, and
+        // losing it is the hangup.
+        let redirected = TtyProbe {
+            stdin: false,
+            stdout: true,
+            dev_tty: true,
+        };
+        assert!(terminal_hung_up(
+            redirected,
+            TtyProbe {
+                dev_tty: false,
+                ..redirected
+            }
+        ));
+    }
 
     /// A hostile/broken server (wikitui talks to arbitrary wikis) can drive
     /// the rate-limit backoff toward `Duration::MAX`; `double_backoff` must
