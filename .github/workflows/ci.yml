@@ -1,0 +1,148 @@
+name: CI
+
+# PRD SEC-6 ("cargo audit/cargo deny in CI; lockfile committed"), FR-PR-1
+# ("CI check asserts no analytics endpoints exist in the binary" — the
+# no_analytics_endpoints_in_the_real_source_tree test below), and §9
+# ("performance regression: criterion benches ... wired to CI thresholds")
+# all name CI machinery the repo didn't have before this workflow. It runs the exact gate battery CONTRIBUTING.md asks contributors
+# to run locally before every commit, so a PR that passes locally passes
+# here too, and one that doesn't can't merge.
+on:
+  push:
+    # `main` is this repo's eventual release branch; `tui-wikipedia-prd` is
+    # where active development actually happens today (see `git log` — every
+    # PRD-implementing commit so far lives there, `main` is still just the
+    # initial commit). Both get push-triggered CI; `pull_request` below
+    # covers any other branch once one opens a PR against either.
+    branches: [main, tui-wikipedia-prd]
+  pull_request:
+
+# A newer push to the same PR/branch cancels the previous run's jobs instead
+# of queuing behind them — this repo has no paid runner minutes to burn on
+# a commit nobody will look at once its successor lands.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  fmt:
+    name: cargo fmt --check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: cargo clippy (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ["default", "math-layout"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - if: matrix.features == 'default'
+        run: cargo clippy --all-targets -- -D warnings
+      - if: matrix.features == 'math-layout'
+        run: cargo clippy --all-targets --features math-layout -- -D warnings
+
+  test:
+    name: cargo test (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ["default", "math-layout"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - if: matrix.features == 'default'
+        run: cargo test
+      - if: matrix.features == 'math-layout'
+        run: cargo test --features math-layout
+      # FR-PR-1's telemetry guarantee ("CI check asserts no analytics
+      # endpoints exist") is the plain `#[cfg(test)]` test
+      # `privacy::tests::no_analytics_endpoints_in_the_real_source_tree`,
+      # which the `cargo test` runs above already execute — this step adds
+      # no new coverage, it just makes that specific guarantee a named,
+      # individually green/red line in the Checks tab instead of one
+      # anonymous assertion buried inside a few thousand others.
+      - if: matrix.features == 'default'
+        name: FR-PR-1 telemetry guardrail (named check)
+        run: cargo test privacy::tests::no_analytics_endpoints_in_the_real_source_tree -- --exact
+
+  # PRD §9 "Performance regression: criterion benches for parse/layout on
+  # the pathological corpus wired to CI thresholds (§6.8)". Blocking: the
+  # in-process §6.8 rows as release-mode tests (src/perf_budget.rs). Each
+  # asserts the PRD target itself only where the reference VM measured at
+  # least 3x headroom under it, and a documented regression bound otherwise
+  # (docs/PERFORMANCE.md has the numbers), so a slower shared runner doesn't
+  # flake it while a lost target or an algorithmic regression still fails.
+  # One test thread: the rows are timings, not to be run against each other.
+  # The first two steps check the instruments: the committed fixtures still
+  # match their generator, and the pty harness / mock perf-mode self-tests.
+  perf-budget:
+    name: perf budget (§6.8, release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: python3 tests/perf/fixtures/generate.py --check
+      - run: python3 -m unittest discover -s tests/perf -p 'test_*.py'
+      - run: cargo test --release perf_budget -- --nocapture --test-threads=1
+
+  # The criterion benches themselves (benches/perf.rs), for the record in
+  # every run's log. Non-blocking: a shared runner's absolute numbers aren't
+  # comparable run to run — the perf-budget job above is the gate; this is
+  # the detail behind it. Short measurement windows keep it to a few minutes.
+  bench:
+    name: criterion benches (non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo bench --bench perf -- --warm-up-time 1 --measurement-time 3
+
+  # SEC-6 supply-chain: advisories (vulnerabilities + unmaintained, minus the
+  # specific documented exceptions in deny.toml), license compatibility
+  # (§10: "AGPL-compatible only"), banned/duplicate-source policy. Policy
+  # lives in `deny.toml` at the repo root; see that file's own comments for
+  # why each `advisories.ignore` entry is there.
+  cargo-deny:
+    name: cargo deny check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-deny --locked
+      - run: cargo deny check
+
+  # SEC-6's other named tool. Folded into advisories above via cargo-deny's
+  # own advisory-database check (same RUSTSEC data source, same
+  # deny.toml ignore list), plus this job as the tool named explicitly in
+  # the PRD so an audit-specific report still shows up as its own check.
+  cargo-audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit --ignore RUSTSEC-2022-0004 --ignore RUSTSEC-2025-0025 --ignore RUSTSEC-2020-0077 --ignore RUSTSEC-2025-0119 --ignore RUSTSEC-2024-0370 --ignore RUSTSEC-2025-0141
