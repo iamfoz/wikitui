@@ -65,7 +65,8 @@ paragraph sits below an inline infobox card, so the lead token isn't).
 two fixtures (`Perf_Pathological`, `Perf_Typical`) plus 400 generated,
 cross-linked articles `Perf_Corpus_0`…`Perf_Corpus_399` (every wiki link in
 every one of them targets another corpus title, so a link-following walk
-never leaves the corpus). Each corpus article's size class is drawn from a
+never leaves the corpus), plus `Perf_Large_0`…`Perf_Large_9`: ten distinct
+pathological-size articles for the memory scenario's worst case. Each corpus article's size class is drawn from a
 fixed seed:
 
 | Class | Weight | Articles | Median size | Median refs |
@@ -152,10 +153,13 @@ so a check right after a keypress always gives the app time to answer it.
   seven `gt` at 60 Hz across three tabs (default and `low_memory`), where
   every key must produce exactly one frame and each burst must land on the
   tab its count predicts.
-- **memory** — the pathological article plus the nine first long/very-long
-  corpus articles, each in its own tab (`:tab new`), then VmRSS/VmHWM from
-  `/proc/<pid>/status` once output settles; `--low-memory` repeats it with
-  `low_memory = true`.
+- **memory** — two ten-tab sets, each article in its own tab (`:tab new`):
+  "mixed" (the pathological article plus the corpus's first nine long/very-
+  long articles, ~8 MB of HTML) and "ten_1.5MB" (`Perf_Large_0`…`9`, ten
+  distinct ~1.5 MB, 520-reference articles). Every tab is then visited once
+  more (`gt` around the ring), and VmRSS/VmHWM are read from
+  `/proc/<pid>/status` once output settles; `--low-memory` repeats both
+  sets with `low_memory = true`.
 - **search** — type a query at ~60 ms per key: last keystroke → the
   typeahead request's arrival at the mock (both on the shared
   CLOCK_MONOTONIC; the mock's request log records arrival times), and the

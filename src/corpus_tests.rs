@@ -8,9 +8,10 @@
 //! corpus §9 separately calls for.
 //!
 //! **Why its own file, not folded into `doc.rs`'s or `layout.rs`'s existing
-//! `mod tests`**: this crate is a binary with no library target (see
-//! `main.rs`'s flat `mod` list), so a `tests/*.rs` integration file cannot
-//! link against `doc`/`layout`/`sanitize` at all — colocation is the only
+//! `mod tests`**: every module is private to the crate (see `lib.rs`'s flat
+//! `mod` list — the library target exists only for `benches/`, through its
+//! narrow `bench` facade), so a `tests/*.rs` integration file cannot link
+//! against `doc`/`layout`/`sanitize` at all — colocation is the only
 //! option available, the same constraint every other module's own `mod
 //! tests` already lives under. Almost every test here is inherently
 //! cross-module (parse with `doc::parse_article_html`, lay out with
@@ -1372,46 +1373,4 @@ mod sanitizer_property {
             assert_span_clean(&entries[0].title, &format!("{ctx} readinglist.title"));
         }
     }
-}
-
-// ===========================================================================
-// Perf smoke (PRD §6.8, light)
-// ===========================================================================
-
-/// PRD §9's "performance regression: criterion benches ... wired to CI
-/// thresholds (§6.8)", scaled down to something this environment can run
-/// honestly. §6.8's own target ("<500 ms on a 2020-era laptop" for
-/// parse+layout of a 1.5 MB / 500+-ref pathological article) is a wall-clock
-/// promise this sandboxed, possibly shared/throttled environment cannot be
-/// trusted to hold to — the same reason `doc.rs`'s own
-/// `oversized_html_is_truncated_and_flagged_with_a_banner` deliberately
-/// dropped its own timing assertion entirely rather than tighten it (a
-/// hard bound flakes under load from an unrelated cause, which is a false
-/// failure, not a real regression signal).
-///
-/// This test keeps a *generous* bound (a large multiple of the PRD target)
-/// so it still catches a catastrophic regression (an accidental O(n²) in
-/// the parser or the wrap loop), and is `#[ignore]`d so it never
-/// contributes flaky noise to a normal `cargo test` run. Run explicitly with:
-/// `cargo test --release corpus_tests::perf_smoke -- --ignored`
-#[test]
-#[ignore]
-fn perf_smoke_parse_and_layout_the_pathological_corpus() {
-    let html = fixtures::large_article_html(1_600_000);
-    let refs_html = fixtures::many_references_html(550);
-
-    let start = std::time::Instant::now();
-    let big_doc = parse_article_html("Large Article", &html);
-    let refs_doc = parse_article_html("Big Refs", &refs_html);
-    let _layout = layout_document(&big_doc, 80, LayoutOptions::default());
-    let _refs_layout = layout_document(&refs_doc, 80, LayoutOptions::default());
-    let elapsed = start.elapsed();
-
-    assert!(
-        elapsed < std::time::Duration::from_secs(10),
-        "parse+layout of the 1.5 MB / 500+-ref pathological corpus took {elapsed:?} — a \
-         generous 10s bound (20x the PRD §6.8 500ms target) meant to catch a catastrophic \
-         regression, not to hold this sandboxed environment to the PRD's real \
-         2020-laptop target"
-    );
 }

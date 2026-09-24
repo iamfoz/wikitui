@@ -96,6 +96,16 @@ impl DiskCache {
         self.0.put(WIKI, LANG, title, html, revid, None);
     }
 
+    /// Stores `html` the way a network open does — keyed on its canonical
+    /// title (`Document::title`, Parsoid's `<head><title>`), which is also
+    /// the title history entries, and so Back/Forward, look it up by — and
+    /// returns that title.
+    pub fn put_article(&self, html: &str, revid: u64) -> String {
+        let title = doc::parse_article_html("", html).title;
+        self.put(&title, html, revid);
+        title
+    }
+
     /// The L2 read an open does (`PageCache::get`: index read, blob read,
     /// zstd decompress, UTF-8 check, recency touch).
     pub fn get(&self, title: &str) -> Option<(String, u64)> {

@@ -883,6 +883,23 @@ def corpus_article(index):
                    math=2 if big else 0).render()
 
 
+# `Perf_Large_<n>`: ten distinct pathological-size articles (PRD §6.8's
+# "10 tabs" memory row at its worst case: every tab ~1.55 MB, 520 refs).
+LARGE_COUNT = 10
+LARGE_SEED = 0x0608_1A26
+
+
+def large_title(n):
+    return "Perf_Large_%d" % n
+
+
+def large_article(n):
+    """`Perf_Large_<n>`: pathological-shaped, distinct per index, linking
+    into the same corpus as everything else."""
+    return Article(large_title(n), LARGE_SEED + n, target_bytes=1_640_000, target_refs=520,
+                   navboxes=4, tables=6, figures=14, math=10).render()
+
+
 def describe(html):
     return {
         "bytes": len(html.encode("utf-8")),

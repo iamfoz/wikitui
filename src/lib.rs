@@ -50,6 +50,8 @@ mod migrate;
 mod netqueue;
 mod offline_search;
 mod paths;
+#[cfg(test)]
+mod perf_budget;
 mod perflog;
 mod prefetch;
 mod privacy;

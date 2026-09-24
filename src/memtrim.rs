@@ -8,8 +8,8 @@
 //! resident memory ratchets up to the high-water mark of the biggest parse
 //! and stays there. `malloc_trim(0)` walks every arena and `madvise`s whole
 //! free pages back to the kernel, which is what turns "the parse is freed"
-//! into "RSS actually drops". Measured on the 10-tab large-article fixture
-//! (`tests/mock-server/large_pages.py`), see `App::enforce_residency`'s
+//! into "RSS actually drops". Measured on ten tabs of large generated
+//! articles (`tests/perf/harness.py memory`), see `App::enforce_residency`'s
 //! callers for when it runs: only after something was actually dropped or
 //! re-parsed, never per frame.
 //!

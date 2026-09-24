@@ -68,10 +68,13 @@ fn parse_and_layout(c: &mut Criterion) {
     g.finish();
 }
 
-/// A throwaway L2 directory holding both fixtures, removed on drop.
+/// A throwaway L2 directory holding both fixtures, removed on drop, each
+/// keyed on its canonical title like a real network open stores it
+/// (`titles`, in `FIXTURES` order) — the key history, and so Back, uses.
 struct TempCache {
     dir: std::path::PathBuf,
     cache: DiskCache,
+    titles: Vec<String>,
 }
 
 impl TempCache {
@@ -79,10 +82,18 @@ impl TempCache {
         let dir = std::env::temp_dir().join(format!("wikitui-bench-l2-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let cache = DiskCache::at(&dir);
-        for (i, (name, html)) in FIXTURES.iter().enumerate() {
-            cache.put(name, html, 1000 + i as u64);
-        }
-        TempCache { dir, cache }
+        let titles = FIXTURES
+            .iter()
+            .enumerate()
+            .map(|(i, (_, html))| cache.put_article(html, 1000 + i as u64))
+            .collect();
+        TempCache { dir, cache, titles }
+    }
+
+    /// The canonical title of the fixture labeled `name`.
+    fn title(&self, name: &str) -> &str {
+        let i = FIXTURES.iter().position(|(n, _)| *n == name).unwrap();
+        &self.titles[i]
     }
 }
 
@@ -103,9 +114,9 @@ fn opens(c: &mut Criterion) {
         // Visit `name`, then `other`: Back to `name` is then the reader's
         // real L1 hit — its parse still in `App::recent_docs`, its layout in
         // L1 — and Forward restores the setup for the next iteration.
-        assert!(reader.open_from_cache(&l2.cache, name));
+        assert!(reader.open_from_cache(&l2.cache, l2.title(name)));
         reader.draw();
-        assert!(reader.open_from_cache(&l2.cache, other));
+        assert!(reader.open_from_cache(&l2.cache, l2.title(other)));
         reader.draw();
         let before = reader.layout_computations();
         g.bench_function(name, |b| {
@@ -113,10 +124,10 @@ fn opens(c: &mut Criterion) {
                 let mut timed = Duration::ZERO;
                 for _ in 0..iters {
                     let start = Instant::now();
-                    reader.back(&l2.cache);
+                    assert!(reader.back(&l2.cache));
                     reader.draw();
                     timed += start.elapsed();
-                    reader.forward(&l2.cache);
+                    assert!(reader.forward(&l2.cache));
                     reader.draw();
                 }
                 timed
@@ -137,12 +148,13 @@ fn opens(c: &mut Criterion) {
     g.sample_size(20).measurement_time(Duration::from_secs(8));
     for (name, _) in FIXTURES {
         let mut reader = Reader::new(120, 40);
-        assert!(reader.open_from_cache(&l2.cache, name));
+        let title = l2.title(name);
+        assert!(reader.open_from_cache(&l2.cache, title));
         reader.draw();
         let before = reader.layout_computations();
         g.bench_function(name, |b| {
             b.iter(|| {
-                reader.reopen_from_cache(&l2.cache, name);
+                assert!(reader.reopen_from_cache(&l2.cache, title));
                 reader.draw();
             })
         });
@@ -154,11 +166,12 @@ fn opens(c: &mut Criterion) {
     g.sample_size(20).measurement_time(Duration::from_secs(10));
     for (name, _) in FIXTURES {
         let mut reader = Reader::new(120, 40);
-        assert!(reader.open_from_cache(&l2.cache, name));
+        let title = l2.title(name);
+        assert!(reader.open_from_cache(&l2.cache, title));
         g.bench_function(name, |b| {
             b.iter(|| {
                 reader.forget_layouts();
-                reader.reopen_from_cache(&l2.cache, name);
+                assert!(reader.reopen_from_cache(&l2.cache, title));
                 reader.draw();
             })
         });

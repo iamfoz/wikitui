@@ -29,6 +29,33 @@ cargo clippy --all-targets --features math-layout -- -D warnings
 plus `cargo deny check` on every push and pull request, so a change that's
 clean locally is clean there too.
 
+The crate is a library (`src/lib.rs` — every module, the event loop, the
+startup path) plus a thin `wikitui` binary (`src/main.rs`); the split exists
+only so `benches/` can reach the internals, through the `#[doc(hidden)]`
+`bench` facade. The unit tests run under the library target.
+
+### Performance (PRD §6.8)
+
+A change that touches parsing, layout, drawing, the cache or the open path
+should keep the §6.8 budgets. CI enforces the in-process rows as release-mode
+tests; run them, and the benches behind them, with:
+
+```sh
+cargo test --release perf_budget -- --nocapture --test-threads=1
+cargo bench --bench perf
+```
+
+The end-to-end rows (cold start, opens over an emulated network, scroll on a
+real pty, memory with ten tabs, typeahead) need the release binary and the
+mock server; `tests/perf/README.md` documents the harness, and
+[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) the reference numbers:
+
+```sh
+cargo build --release
+python3 tests/perf/harness.py                 # every scenario
+python3 tests/perf/harness.py scroll --n 30   # or a subset
+```
+
 ### The mock MediaWiki server
 
 Live Wikipedia is not something the test suite or a dev loop should hit

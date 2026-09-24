@@ -608,6 +608,10 @@ if PERF_CORPUS:
         _title = _perf_generate.corpus_title(_n)
         PAGES[_title] = _perf_generate.corpus_article(_n)
         REVIDS[_title] = 6000 + _n
+    for _n in range(_perf_generate.LARGE_COUNT):
+        _title = _perf_generate.large_title(_n)
+        PAGES[_title] = _perf_generate.large_article(_n)
+        REVIDS[_title] = 7000 + _n
 
 REDIRECTS = {
     "UK": "United_Kingdom",

@@ -954,44 +954,58 @@ def scenario_scroll(args):
         mock.stop()
 
 
-MEMORY_TITLES = ["Perf_Pathological"] + [
-    generate.corpus_title(n) for n in range(generate.CORPUS_SIZE)
-    if generate.corpus_size_class(n)[0] in ("very-long", "long")][:9]
+MEMORY_SETS = {
+    # The pathological fixture plus the corpus's first nine long/very-long
+    # articles: 0.43–1.55 MB each, ~8 MB of HTML across the ten tabs.
+    "mixed": ["Perf_Pathological"] + [
+        generate.corpus_title(n) for n in range(generate.CORPUS_SIZE)
+        if generate.corpus_size_class(n)[0] in ("very-long", "long")][:9],
+    # The worst case: ten distinct ~1.55 MB, 520-reference articles.
+    "ten_1.5MB": [generate.large_title(n) for n in range(generate.LARGE_COUNT)],
+}
 
 
 def scenario_memory(args, low_memory=False):
     """§6.8 "Memory < 150 MB RSS with 10 tabs; low_memory mode < 50 MB".
-    Opens the pathological article plus the corpus's nine first long/very-
-    long articles, each in its own tab (`:tab new`), then reads VmRSS and
-    VmHWM from /proc/<pid>/status once output settles."""
+    For each tab set: open the first article, then each of the others in a
+    new tab (`:tab new`), then visit every tab once more (`gt` around the
+    ring — in low_memory mode each visit re-parses), and read VmRSS/VmHWM
+    from /proc/<pid>/status once output settles. Cold cache, fresh process
+    and profile per run."""
     label = "low_memory" if low_memory else "default"
     print("memory (%s)" % label, flush=True)
     mock = Mock()
-    rss, hwm = [], []
     try:
-        for i in range(args.n_memory):
-            profile = Profile("memory")
-            profile.write_config(mock.port, extra="low_memory = true\n" if low_memory else "")
-            app = App(profile)
-            try:
-                app.wait_for(start_page_marker, what="start page")
-                open_and_wait(app, MEMORY_TITLES[0])
-                for title in MEMORY_TITLES[1:]:
-                    app.send(":")
-                    app.wait_for(lambda t: t.splitlines()[-1].lstrip().startswith(":"), what="command line")
-                    app.send("tab new " + title + "\r")
-                    app.wait_for(showing(title), what="tab " + title, timeout=60)
-                app.wait_quiet(2.0)
-                r, h = app.rss_kb()
-                rss.append(r / 1024.0)
-                hwm.append(h / 1024.0)
-            finally:
-                app.quit()
-                profile.cleanup()
-        target = "< 50" if low_memory else "< 150"
-        record("memory.%s.10_tabs.rss_mb" % label, rss, "MB", target,
-               "tabs: " + ", ".join(MEMORY_TITLES))
-        record("memory.%s.10_tabs.hwm_mb" % label, hwm, "MB", target, "peak RSS (VmHWM)")
+        for set_name, titles in MEMORY_SETS.items():
+            rss, hwm = [], []
+            for _ in range(args.n_memory):
+                profile = Profile("memory")
+                profile.write_config(mock.port, extra="low_memory = true\n" if low_memory else "")
+                app = App(profile)
+                try:
+                    app.wait_for(start_page_marker, what="start page")
+                    open_and_wait(app, titles[0])
+                    for title in titles[1:]:
+                        app.send(":")
+                        app.wait_for(lambda t: t.splitlines()[-1].lstrip().startswith(":"),
+                                     what="command line")
+                        app.send("tab new " + title + "\r")
+                        app.wait_for(showing(title), what="tab " + title, timeout=60)
+                    # Every tab once more, ending back on the last one.
+                    for title in titles:
+                        app.send("gt")
+                        app.wait_for(showing(title), what="revisit " + title, timeout=60)
+                    app.wait_quiet(2.0)
+                    r, h = app.rss_kb()
+                    rss.append(r / 1024.0)
+                    hwm.append(h / 1024.0)
+                finally:
+                    app.quit()
+                    profile.cleanup()
+            target = "< 50" if low_memory else "< 150"
+            key = "memory.%s.%s" % (label, set_name)
+            record(key + ".rss_mb", rss, "MB", target, "10 tabs: " + ", ".join(titles))
+            record(key + ".hwm_mb", hwm, "MB", target, "peak RSS (VmHWM)")
     finally:
         mock.stop()
 

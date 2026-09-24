@@ -3,9 +3,8 @@ name: CI
 # PRD SEC-6 ("cargo audit/cargo deny in CI; lockfile committed"), FR-PR-1
 # ("CI check asserts no analytics endpoints exist in the binary" — the
 # no_analytics_endpoints_in_the_real_source_tree test below), and §9
-# ("performance regression: criterion-style benches ... wired to CI
-# thresholds") all name CI machinery the repo didn't have before this
-# workflow. It runs the exact gate battery CONTRIBUTING.md asks contributors
+# ("performance regression: criterion benches ... wired to CI thresholds")
+# all name CI machinery the repo didn't have before this workflow. It runs the exact gate battery CONTRIBUTING.md asks contributors
 # to run locally before every commit, so a PR that passes locally passes
 # here too, and one that doesn't can't merge.
 on:
@@ -84,26 +83,40 @@ jobs:
         name: FR-PR-1 telemetry guardrail (named check)
         run: cargo test privacy::tests::no_analytics_endpoints_in_the_real_source_tree -- --exact
 
-  # §9 "performance regression" bench, scaled to something a shared CI
-  # runner can honor without flaking (see corpus_tests.rs's own doc comment
-  # on perf_smoke_parse_and_layout_the_pathological_corpus for why the PRD
-  # §6.8 wall-clock target itself is not asserted here — this job catches an
-  # algorithmic regression, e.g. an accidental O(n^2), not a millisecond
-  # budget). Non-blocking: a noisy neighbor on the runner can slow this down
-  # for reasons that have nothing to do with the code under test, so it must
-  # never be the thing that turns a PR red.
-  perf-smoke:
-    name: perf smoke (non-blocking)
+  # PRD §9 "Performance regression: criterion benches for parse/layout on
+  # the pathological corpus wired to CI thresholds (§6.8)". Blocking: the
+  # in-process §6.8 rows as release-mode tests (src/perf_budget.rs). Each
+  # asserts the PRD target itself only where the reference VM measured at
+  # least 3x headroom under it, and a documented regression bound otherwise
+  # (docs/PERFORMANCE.md has the numbers), so a slower shared runner doesn't
+  # flake it while a lost target or an algorithmic regression still fails.
+  # One test thread: the rows are timings, not to be run against each other.
+  # The first two steps check the instruments: the committed fixtures still
+  # match their generator, and the pty harness / mock perf-mode self-tests.
+  perf-budget:
+    name: perf budget (§6.8, release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: python3 tests/perf/fixtures/generate.py --check
+      - run: python3 -m unittest discover -s tests/perf -p 'test_*.py'
+      - run: cargo test --release perf_budget -- --nocapture --test-threads=1
+
+  # The criterion benches themselves (benches/perf.rs), for the record in
+  # every run's log. Non-blocking: a shared runner's absolute numbers aren't
+  # comparable run to run — the perf-budget job above is the gate; this is
+  # the detail behind it. Short measurement windows keep it to a few minutes.
+  bench:
+    name: criterion benches (non-blocking)
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: >
-          cargo test --release
-          corpus_tests::perf_smoke_parse_and_layout_the_pathological_corpus
-          -- --ignored --exact
+      - run: cargo bench --bench perf -- --warm-up-time 1 --measurement-time 3
 
   # SEC-6 supply-chain: advisories (vulnerabilities + unmaintained, minus the
   # specific documented exceptions in deny.toml), license compatibility

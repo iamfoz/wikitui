@@ -218,8 +218,8 @@ benchmark run outside CI; nobody has published one yet.
 Memory (§6.8: < 150 MB RSS with 10 tabs, `low_memory` < 50 MB) has been
 measured, on one machine only: a release build on Linux x86_64 (glibc),
 ten tabs of generated Parsoid-like articles from 150 KB to 1.5 MB of HTML
-(8.5 MB in total), cold cache, every tab visited — `tests/mock-server/
-measure_rss.sh` against `tests/mock-server/large_pages.py` reproduces it.
+(8.5 MB in total), cold cache, every tab visited — `python3
+tests/perf/harness.py memory --low-memory` reproduces the measurement.
 Default mode peaked at 56–60 MB RSS; low-memory mode settled at 28–34 MB
 and peaked at 37–38 MB. With ten 1.5 MB tabs: 74–80 MB default, 32–35 MB
 (peak 38–39 MB) low-memory. About 14 MB of any of these is the binary's

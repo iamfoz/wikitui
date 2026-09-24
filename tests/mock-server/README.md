@@ -479,40 +479,22 @@ redirect, rate-limiting, and parse-failure rows):
 
 ## Large pages for memory measurement (PRD §6.8)
 
-`server.py`'s fixtures are a few KB each, which says nothing about §6.8's
-"< 150 MB RSS with 10 tabs; `low_memory` mode < 50 MB". `large_pages.py` is
-a separate, standalone mock (default port 8944) that serves generated
-articles shaped like real Parsoid HTML — `data-mw-section-id` sections,
-`mw:WikiLink` anchors, `mw:Extension/ref` footnote markers, an infobox
-transclusion with a `data-mw` blob, thumbnail figures, wikitables, a
-references list of `cite` entries, a trailing navbox — with prose drawn from
-a ~3,000-word pseudo-vocabulary so the pages compress (~6x overall, ~3x for
-the text) roughly like real ones rather than like one sentence repeated.
-
-- `Large_<KB>` (e.g. `Large_150`, `Large_1500`) — an article of at least
-  that many KB of HTML (`Large_1500`: 1.5 MB, ~1,300 footnotes, ~65
-  sections). Deterministic: the same title always yields the same bytes and
-  revid.
-- any other title — a small ordinary page, so link prefetch and link
-  previews of a generated article's links stay cheap and don't distort a
-  measurement with more large pages.
-- `/page/{title}/bare` answers revalidation; `/w/api.php` answers every
-  Action API call with an empty-but-valid reply; everything else 404s.
-
-`measure_rss.sh` drives a real (release) binary in a detached tmux session
-against it — fresh throwaway XDG dirs, so every first open is a cold-cache
-network fetch — opens one tab per size (default: ten tabs, 150 KB to 1.5 MB,
-8.5 MB of HTML in total), visits each tab once more, and prints
-`VmRSS`/`VmHWM` plus a per-mapping RSS breakdown:
+§6.8's "< 150 MB RSS with 10 tabs; `low_memory` mode < 50 MB" needs pages far
+bigger than the fixtures above. Perf mode's corpus (see "Perf mode" above)
+serves them: `Perf_Pathological` and the `Perf_Corpus_<n>` set for a mixed
+ten-tab session, and `Perf_Large_0`…`Perf_Large_9` — ten distinct ~1.5 MB,
+520-reference Parsoid-shaped articles — for the worst case. The harness's
+`memory` scenario drives a release binary through both tab sets (open each
+in its own tab, visit every tab once more, read `VmRSS`/`VmHWM` from
+`/proc`), in default and `low_memory` mode:
 
 ```sh
-python3 tests/mock-server/large_pages.py &
 cargo build --release
-tests/mock-server/measure_rss.sh                  # default mode
-tests/mock-server/measure_rss.sh --low-memory     # low_memory mode
-SIZES="1501 1502 1503 1504 1505 1506 1507 1508 1509 1510" \
-  tests/mock-server/measure_rss.sh               # ten 1.5 MB tabs
+python3 tests/perf/harness.py memory --low-memory
 ```
+
+(This supersedes the standalone `large_pages.py` + `measure_rss.sh` pair an
+earlier change added for the same measurement, so there is one harness.)
 
 ## Extending it
 
