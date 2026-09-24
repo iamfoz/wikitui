@@ -185,6 +185,19 @@ problems, user theme files and their contrast-ratio lint results, and a
 terminal-capability report (color depth, detected graphics protocol, and
 so on) — useful before ever launching the TUI itself.
 
+**Low-memory mode** (`low_memory = true`, `--low-memory`, or
+`WIKITUI_LOW_MEMORY=1`) is for small machines and long-running sessions
+with many tabs: only the tab on screen (and the other pane of a split)
+keeps its parsed article and layout in memory. Every other tab — and each
+closed tab kept for `u` — holds just a compressed copy of the article's
+HTML and re-parses it when you return to it, landing exactly where you
+left it (scroll, folds, focused link, find, back/forward all unchanged).
+The cost is a pause on each tab switch while the article re-parses
+(noticeable only for very long articles), no in-memory layout cache
+between articles, and inline images defaulting to off (an explicit
+`images` setting still wins). `wikitui config doctor` shows whether it's
+on and which layer set it.
+
 ## Performance
 
 `PRD.md` §6.8 sets concrete wall-clock targets (e.g. parse+layout of a
@@ -201,6 +214,18 @@ PRD target) that only catches a catastrophic algorithmic regression (an
 accidental O(n²) in the parser or wrap loop) — see that test's own doc
 comment. Confirming the actual §6.8 targets needs a real-hardware
 benchmark run outside CI; nobody has published one yet.
+
+Memory (§6.8: < 150 MB RSS with 10 tabs, `low_memory` < 50 MB) has been
+measured, on one machine only: a release build on Linux x86_64 (glibc),
+ten tabs of generated Parsoid-like articles from 150 KB to 1.5 MB of HTML
+(8.5 MB in total), cold cache, every tab visited — `tests/mock-server/
+measure_rss.sh` against `tests/mock-server/large_pages.py` reproduces it.
+Default mode peaked at 56–60 MB RSS; low-memory mode settled at 28–34 MB
+and peaked at 37–38 MB. With ten 1.5 MB tabs: 74–80 MB default, 32–35 MB
+(peak 38–39 MB) low-memory. About 14 MB of any of these is the binary's
+own code pages and shared libraries, which no mode can shed. Treat these
+as indicative, not a guarantee on other platforms or allocators (musl,
+macOS and Windows return freed memory differently).
 
 The one §6.8 target you can check yourself is the steady-state cache-hit
 rate (> 60% of article opens): `:stats` / `wikitui stats` report it over

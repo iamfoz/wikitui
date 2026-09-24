@@ -144,6 +144,10 @@ pub struct CliOverrides {
     /// this one fetch, same as how the TITLE argument's own language prefix
     /// already overrides `--lang`/`lang` (`main`'s CLI-target handling).
     pub active_wiki: Option<String>,
+    /// PRD §6.8's `low_memory` mode via `--low-memory` (`Some(true)` when the
+    /// flag is given; the flag can only turn the mode on, never off — a
+    /// config/env `true` is turned off by editing it, not by a CLI flag).
+    pub low_memory: Option<bool>,
 }
 
 /// Environment-variable overrides. Kept as raw strings (mirroring how
@@ -177,6 +181,8 @@ pub struct EnvOverrides {
     /// — the mock-server/testing seam for the one endpoint this build
     /// addresses at `api.wikimedia.org` rather than a per-wiki host.
     pub liftwing_base_url: Option<String>,
+    /// PRD §6.8's `low_memory` mode via `WIKITUI_LOW_MEMORY`.
+    pub low_memory: Option<String>,
 }
 
 impl EnvOverrides {
@@ -200,6 +206,7 @@ impl EnvOverrides {
             animations: get("WIKITUI_ANIMATIONS"),
             color_depth: get("WIKITUI_COLOR_DEPTH"),
             liftwing_base_url: get("WIKITUI_LIFTWING_BASE_URL"),
+            low_memory: get("WIKITUI_LOW_MEMORY"),
         }
     }
 }
@@ -260,6 +267,12 @@ pub struct ResolvedConfig {
     /// PRD FR-HS-4's retention window: `history::History::retention_prune`
     /// runs with this at startup. `0` (the default) means "keep forever."
     pub history_retention_days: Valued<u64>,
+    /// PRD §6.8's `low_memory` mode (default `false`): only the tab(s) on
+    /// screen keep a parsed document and layout resident; every other tab
+    /// (and the close-undo stack) keeps a compressed copy of its source
+    /// HTML and re-parses it on focus — see `App::enforce_residency`. CLI
+    /// (`--low-memory`) > env (`WIKITUI_LOW_MEMORY`) > file > default.
+    pub low_memory: Valued<bool>,
     /// PRD FR-PF-3 / FR-PR-2: whether the local interest-learning model
     /// updates from reading signals. Default `true` — it is a differentiator,
     /// fully local + inspectable (`:interests`) + incognito-exempt (incognito
@@ -672,6 +685,14 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = "\
 # Inline images (FR-TH-7): follow the theme unless set here.
 # images = \"on\"
 
+# Low-memory mode (§6.8, target < 50 MB RSS): only the tab on screen (and
+# the other split pane) keeps its parsed article and layout in memory;
+# background tabs and closed-tab undo keep a compressed copy and re-parse
+# on focus (a short pause on each tab switch for a very long article).
+# Inline images default off, and the layout cache keeps only what's on
+# screen. Also `--low-memory` or WIKITUI_LOW_MEMORY=1.
+# low_memory = false
+
 # Prefetch (FR-PF-*): the kill switch and byte/request budgets.
 # [prefetch]
 # enabled = true
@@ -788,6 +809,7 @@ pub fn resolve(
         "active_wiki",
         "wiki",
         "readlater_auto_dequeue",
+        "low_memory",
         "history",
         "images",
         "include_nonfree",
@@ -894,6 +916,7 @@ pub fn resolve(
         resolve_wiki(cli, env, &table, &mut issues);
     let readlater_auto_dequeue = resolve_readlater_auto_dequeue(env, &table, &mut issues);
     let history_retention_days = resolve_history(&table, &mut issues);
+    let low_memory = resolve_low_memory(cli, env, &table, &mut issues);
     let interest_learning = resolve_interest_learning(&table, &mut issues);
     let interest_half_life_days = resolve_interest_half_life(&table, &mut issues);
     let images = resolve_images(env, &table, &mut issues);
@@ -954,6 +977,7 @@ pub fn resolve(
         wiki_registry,
         readlater_auto_dequeue,
         history_retention_days,
+        low_memory,
         interest_learning,
         interest_half_life_days,
         images,
@@ -1387,6 +1411,31 @@ fn resolve_readlater_auto_dequeue(
         },
         None => default,
     }
+}
+
+/// PRD §6.8's `low_memory` mode: `--low-memory` > `WIKITUI_LOW_MEMORY` >
+/// file `low_memory` > default `false`. The CLI flag is presence-only (it can
+/// switch the mode on for one run, e.g. on a small VPS, without editing the
+/// config); env and file follow `resolve_bool_field`'s warn-and-default rules.
+fn resolve_low_memory(
+    cli: &CliOverrides,
+    env: &EnvOverrides,
+    table: &toml::Table,
+    issues: &mut Vec<Issue>,
+) -> Valued<bool> {
+    if cli.low_memory == Some(true) {
+        return Valued {
+            value: true,
+            source: Source::Cli,
+        };
+    }
+    resolve_bool_field(
+        "low_memory",
+        env.low_memory.as_deref(),
+        table.get("low_memory"),
+        false,
+        issues,
+    )
 }
 
 /// PRD FR-TH-7's `images` override of the active theme's default: env
@@ -5292,5 +5341,63 @@ mod tests {
         assert_eq!(resolved.terminal.bidi.value, "auto");
         assert!(!resolved.terminal.rtl_reorder.value);
         cleanup(&path);
+    }
+
+    /// PRD §6.8's `low_memory`: default off; CLI > env > file.
+    #[test]
+    fn low_memory_defaults_false_and_follows_cli_env_file_precedence() {
+        let default = resolve(&CliOverrides::default(), &EnvOverrides::default(), None);
+        assert!(!default.low_memory.value);
+        assert_eq!(default.low_memory.source, Source::Default);
+
+        let path = temp_config("low_memory = true\n");
+        let from_file = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert!(from_file.low_memory.value);
+        assert_eq!(from_file.low_memory.source, Source::File);
+        assert!(
+            !from_file
+                .issues
+                .iter()
+                .any(|i| i.message.contains("unknown config key")),
+            "low_memory is a known key"
+        );
+
+        let env_off = EnvOverrides {
+            low_memory: Some("0".to_string()),
+            ..Default::default()
+        };
+        let from_env = resolve(&CliOverrides::default(), &env_off, Some(&path));
+        assert!(!from_env.low_memory.value, "env beats file");
+        assert_eq!(from_env.low_memory.source, Source::Env);
+
+        let cli_on = CliOverrides {
+            low_memory: Some(true),
+            ..Default::default()
+        };
+        let from_cli = resolve(&cli_on, &env_off, Some(&path));
+        assert!(from_cli.low_memory.value, "--low-memory beats env");
+        assert_eq!(from_cli.low_memory.source, Source::Cli);
+    }
+
+    #[test]
+    fn low_memory_rejects_a_non_boolean_with_a_warning() {
+        let path = temp_config("low_memory = \"sometimes\"\n");
+        let resolved = resolve(
+            &CliOverrides::default(),
+            &EnvOverrides::default(),
+            Some(&path),
+        );
+        assert!(!resolved.low_memory.value);
+        assert_eq!(resolved.low_memory.source, Source::Default);
+        assert!(
+            resolved
+                .issues
+                .iter()
+                .any(|i| i.message.contains("low_memory must be a boolean"))
+        );
     }
 }

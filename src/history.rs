@@ -196,6 +196,18 @@ impl History {
         Self { conn, visited }
     }
 
+    /// PRD §6.8 `low_memory`: caps SQLite's page cache for the history
+    /// connection at `kib` KiB (`PRAGMA cache_size = -kib`; SQLite's default
+    /// is 2000 KiB). Best-effort.
+    pub fn limit_page_cache(&self, kib: u32) {
+        if let Err(e) = self
+            .conn
+            .execute_batch(&format!("PRAGMA cache_size = -{kib};"))
+        {
+            log_write_failure("cache_size", &e);
+        }
+    }
+
     /// Records a visit to `(wiki, lang, title)`, returning the new row's id
     /// (for later `update_dwell`) or `None` if the write failed — a failure
     /// here is swallowed to a debug-log line (see the module doc comment),
@@ -1462,5 +1474,16 @@ mod tests {
         let now = now_unix();
         assert!(start <= now, "midnight must not be in the future");
         assert!(now - start < 86_400, "must be today's midnight, not older");
+    }
+
+    #[test]
+    fn limit_page_cache_sets_the_cache_size_pragma() {
+        let history = History::in_memory();
+        history.limit_page_cache(256);
+        let size: i64 = history
+            .conn
+            .query_row("PRAGMA cache_size", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(size, -256);
     }
 }

@@ -81,6 +81,70 @@ pub struct TabOverrides {
     pub hyphenate: Option<bool>,
 }
 
+/// PRD §6.8 `low_memory`: a zstd-compressed copy of the exact HTML a tab's
+/// installed document was parsed from. Kept (only in low-memory mode — see
+/// `App::remember_source`) so a tab that goes off screen can drop its parsed
+/// [`Document`], links, sections and layout and later re-parse *the same
+/// bytes* on focus: parsing is deterministic, so the rehydrated document —
+/// and therefore every block index that scroll, folds, the focused link and
+/// find results point into — is identical to the one dropped. Keeping the
+/// source in memory (rather than re-reading L2 on focus) is what makes that
+/// exact: L2 holds only the latest revision of a title and can evict or be
+/// overwritten by a background revalidation, and a saved/ZIM/`:noredirect`
+/// page may never have been in L2 at all. A long article compresses to
+/// roughly a tenth of its HTML, and far less than its parsed form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceHtml {
+    /// A boxed slice, not a `Vec`: `zstd::bulk::compress` returns a buffer
+    /// sized for the worst case (≈ the input length), so keeping the `Vec`
+    /// as-is would hold the uncompressed size in spare capacity and save
+    /// nothing. `into_boxed_slice` reallocates it down to the compressed
+    /// length.
+    compressed: Box<[u8]>,
+    len: usize,
+}
+
+impl SourceHtml {
+    /// zstd level 3 (a few ms for a 1.5 MB article). `None` only if the
+    /// compressor itself fails, in which case the tab simply stays resident.
+    pub fn compress(html: &str) -> Option<Self> {
+        let compressed = zstd::bulk::compress(html.as_bytes(), 3)
+            .ok()?
+            .into_boxed_slice();
+        Some(Self {
+            compressed,
+            len: html.len(),
+        })
+    }
+
+    pub fn decompress(&self) -> Option<String> {
+        let bytes = zstd::bulk::decompress(&self.compressed, self.len).ok()?;
+        String::from_utf8(bytes).ok()
+    }
+
+    /// Bytes held in memory for this copy.
+    #[cfg(test)]
+    pub fn compressed_len(&self) -> usize {
+        self.compressed.len()
+    }
+}
+
+/// What a dehydrated tab keeps in place of its parsed [`Document`] (PRD §6.8
+/// `low_memory`): only the facts other code reads *without* focusing it —
+/// the title (tab bar, pickers, session snapshot, `:save tabs`,
+/// reading-position save on close, revalidation and retry routing) and its
+/// word count (the FR-PF-3 dwell signal applied when a background tab
+/// closes). Everything else that is per-view — scroll,
+/// folds, focused link, selected section, table offset, find state,
+/// back/forward stacks, `disambig_pending`, `pending_open`, history/dwell
+/// tracking — stays on the [`Tab`] untouched, which is why rehydration
+/// restores the view exactly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dehydrated {
+    pub title: String,
+    pub word_count: u32,
+}
+
 /// One open reading context. Owns everything that is per-view; the app-global
 /// state (theme, mode, research store, command line…) stays on `App`.
 pub struct Tab {
@@ -200,6 +264,15 @@ pub struct Tab {
     /// `install_document` clears it (a fresh install is unarmed until its
     /// caller says it was an open); see `hitrate.rs` for what counts.
     pub pending_open: Option<crate::hitrate::OpenSource>,
+    /// PRD §6.8 `low_memory`: the compressed source of the installed
+    /// document (see [`SourceHtml`]); `None` outside low-memory mode, and for
+    /// an install whose caller had no HTML to hand over (such a tab simply
+    /// stays resident). Cleared by every fresh install.
+    pub source_html: Option<SourceHtml>,
+    /// PRD §6.8 `low_memory`: `Some` while this tab is off screen with its
+    /// parsed document dropped (`doc` is then `None`); see [`Tab::dehydrate`]
+    /// / [`Tab::rehydrate`] and `App::enforce_residency`.
+    pub dehydrated: Option<Dehydrated>,
 }
 
 impl Tab {
@@ -240,6 +313,8 @@ impl Tab {
             redirected_from: None,
             disambig_pending: false,
             pending_open: None,
+            source_html: None,
+            dehydrated: None,
         }
     }
 
@@ -247,8 +322,8 @@ impl Tab {
     /// once loaded, the pending target title while a background fetch is in
     /// flight, or a placeholder for a still-empty tab.
     pub fn display_title(&self) -> String {
-        if let Some(doc) = &self.doc {
-            doc.title.clone()
+        if let Some(title) = self.article_title() {
+            title.to_string()
         } else if let Some(t) = &self.pending_title {
             t.clone()
         } else {
@@ -261,6 +336,70 @@ impl Tab {
     /// of `App::set_document`, with none of the app-global side effects
     /// (citations, mode, layout invalidation) so it is safe to call on a
     /// *non-active* tab when a background fetch completes.
+    /// The installed article's title whether it is resident or dehydrated
+    /// (PRD §6.8 `low_memory`) — what every reader of a possibly-off-screen
+    /// tab's identity uses instead of `doc.title`.
+    pub fn article_title(&self) -> Option<&str> {
+        match (&self.doc, &self.dehydrated) {
+            (Some(doc), _) => Some(doc.title.as_str()),
+            (None, Some(d)) => Some(d.title.as_str()),
+            (None, None) => None,
+        }
+    }
+
+    /// PRD §6.8 `low_memory`: drop the parsed document and everything derived
+    /// from it (links, reference markers, section outline), keeping a
+    /// [`Dehydrated`] stand-in. Only possible when the tab holds both a
+    /// document and its [`SourceHtml`]; returns whether it dehydrated. The
+    /// view state (scroll, folds, focused link, …) is deliberately left in
+    /// place — see [`Dehydrated`].
+    pub fn dehydrate(&mut self) -> bool {
+        if self.dehydrated.is_some() || self.source_html.is_none() {
+            return false;
+        }
+        let Some(doc) = self.doc.take() else {
+            return false;
+        };
+        self.dehydrated = Some(Dehydrated {
+            title: doc.title.clone(),
+            word_count: crate::doc::word_count(&doc),
+        });
+        // Fresh (zero-capacity) vectors, not `clear()`, so the memory is
+        // actually released rather than kept as spare capacity.
+        self.links = Vec::new();
+        self.reference_markers = Vec::new();
+        self.sections = Vec::new();
+        true
+    }
+
+    /// PRD §6.8 `low_memory`: re-parse the kept [`SourceHtml`] and restore the
+    /// document, links, reference markers and section outline — the same
+    /// derivations `install_document` makes, but *without* its resets, so
+    /// scroll, folds, the focused link, find state and every tracking flag
+    /// survive untouched. Returns whether it rehydrated (`false` when the tab
+    /// wasn't dehydrated, or — never expected — the copy failed to
+    /// decompress, in which case the tab stays dehydrated rather than
+    /// showing a wrong document).
+    pub fn rehydrate(&mut self) -> bool {
+        let Some(d) = self.dehydrated.as_ref() else {
+            return false;
+        };
+        let Some(html) = self.source_html.as_ref().and_then(SourceHtml::decompress) else {
+            return false;
+        };
+        // `parse_article_html` prefers the page's own `<title>` and falls back
+        // to this argument, so passing the title it produced last time yields
+        // the same document either way.
+        let doc = crate::doc::parse_article_html(&d.title, &html);
+        drop(html);
+        self.links = collect_links(&doc);
+        self.reference_markers = collect_reference_markers(&doc);
+        self.sections = section_outline(&doc);
+        self.doc = Some(doc);
+        self.dehydrated = None;
+        true
+    }
+
     pub fn install_document(&mut self, doc: Document) {
         self.links = collect_links(&doc);
         self.reference_markers = collect_reference_markers(&doc);
@@ -274,6 +413,10 @@ impl Tab {
         // Unarmed until the installing caller says this was an open (PRD
         // §6.8 KPI) — a split duplicate or a rehydration never counts.
         self.pending_open = None;
+        // PRD §6.8 low_memory: a new document has a new source (the caller
+        // hands it over via `App::remember_source`) and is resident.
+        self.source_html = None;
+        self.dehydrated = None;
         self.doc = Some(doc);
         self.scroll = 0;
         self.table_col_offset = 0;
@@ -330,6 +473,8 @@ impl Tab {
         self.redirected_from = None;
         self.disambig_pending = false;
         self.pending_open = None;
+        self.source_html = None;
+        self.dehydrated = None;
         self.clear_find();
     }
 
@@ -346,10 +491,10 @@ impl Tab {
     /// open in this tab, or `None` if it is empty. Used to push the current
     /// article onto a stack before navigating away.
     pub fn current_entry(&self) -> Option<HistoryEntry> {
-        self.doc.as_ref().map(|d| HistoryEntry {
+        self.article_title().map(|title| HistoryEntry {
             wiki: self.wiki.clone(),
             lang: self.lang.clone(),
-            title: d.title.clone(),
+            title: title.to_string(),
             scroll: self.scroll,
         })
     }
@@ -411,5 +556,86 @@ mod tests {
             1,
             "forward stack is untouched by clear_to_blank itself"
         );
+    }
+
+    // ---- PRD §6.8 `low_memory`: SourceHtml / dehydrate / rehydrate ---------
+
+    const LM_HTML: &str = "<html><head><title>Alan Turing</title></head><body>\
+        <h2>Early life</h2><p>Born in <a href=\"./London\">London</a>.</p>\
+        <h2>Career</h2><p>Worked at <a href=\"./Bletchley_Park\">Bletchley</a>.</p>\
+        </body></html>";
+
+    #[test]
+    fn source_html_round_trips_and_holds_only_the_compressed_bytes() {
+        let big: String = (0..2000)
+            .map(|i| format!("<p id=\"mw{i:X}\">Paragraph {i} about computing.</p>"))
+            .collect();
+        let src = SourceHtml::compress(&big).unwrap();
+        assert_eq!(src.decompress().as_deref(), Some(big.as_str()));
+        assert!(
+            src.compressed_len() * 4 < big.len(),
+            "{} compressed vs {} raw",
+            src.compressed_len(),
+            big.len()
+        );
+        // A boxed slice: no worst-case-sized spare capacity kept around.
+        assert_eq!(src.compressed.len(), src.compressed_len());
+    }
+
+    #[test]
+    fn dehydrate_needs_a_source_and_rehydrate_restores_only_derived_data() {
+        let mut tab = Tab::new(1, "en".to_string());
+        tab.install_document(crate::doc::parse_article_html("Alan Turing", LM_HTML));
+        assert!(!tab.dehydrate(), "no kept source: stays resident");
+        assert!(tab.doc.is_some());
+
+        tab.source_html = SourceHtml::compress(LM_HTML);
+        tab.scroll = 3;
+        tab.focused_link = Some(1);
+        tab.pending_open = Some(crate::hitrate::OpenSource::Network);
+        tab.history_visit_id = Some(42);
+        let links_before = format!("{:?}", tab.links);
+        let doc_before = format!("{:?}", tab.doc);
+        assert!(tab.dehydrate());
+        assert!(!tab.dehydrate(), "already dehydrated");
+        assert!(tab.doc.is_none() && tab.links.is_empty() && tab.sections.is_empty());
+        assert_eq!(tab.display_title(), "Alan Turing");
+        assert_eq!(
+            tab.dehydrated.as_ref().map(|d| d.word_count),
+            Some(crate::doc::word_count(&crate::doc::parse_article_html(
+                "Alan Turing",
+                LM_HTML
+            )))
+        );
+
+        assert!(tab.rehydrate());
+        assert!(!tab.rehydrate(), "already resident");
+        assert_eq!(format!("{:?}", tab.doc), doc_before);
+        assert_eq!(format!("{:?}", tab.links), links_before);
+        assert_eq!(tab.sections.len(), 2);
+        // Unlike `install_document`, nothing per-view or per-visit resets.
+        assert_eq!(tab.scroll, 3);
+        assert_eq!(tab.focused_link, Some(1));
+        assert_eq!(tab.pending_open, Some(crate::hitrate::OpenSource::Network));
+        assert_eq!(tab.history_visit_id, Some(42));
+    }
+
+    #[test]
+    fn a_fresh_install_or_blank_drops_the_old_source_and_dehydrated_state() {
+        let mut tab = Tab::new(1, "en".to_string());
+        tab.install_document(crate::doc::parse_article_html("Alan Turing", LM_HTML));
+        tab.source_html = SourceHtml::compress(LM_HTML);
+        assert!(tab.dehydrate());
+        tab.install_document(doc("Enigma machine"));
+        assert!(
+            tab.source_html.is_none(),
+            "the old source is not this doc's"
+        );
+        assert!(tab.dehydrated.is_none());
+        assert_eq!(tab.display_title(), "Enigma machine");
+
+        tab.source_html = SourceHtml::compress(LM_HTML);
+        tab.clear_to_blank();
+        assert!(tab.source_html.is_none() && tab.dehydrated.is_none());
     }
 }

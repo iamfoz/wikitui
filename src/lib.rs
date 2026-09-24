@@ -42,6 +42,7 @@ mod interest;
 mod jsonl;
 mod layout;
 mod macros;
+mod memtrim;
 mod migrate;
 mod netqueue;
 mod offline_search;
@@ -674,9 +675,14 @@ pub async fn main() -> Result<()> {
         resolved.wiki_registry.clone(),
         resolved.tts_command.value.clone(),
         resolved.macros.clone(),
+        resolved.low_memory.value,
     )
     .await
 }
+
+/// PRD §6.8 `low_memory`: the SQLite page-cache cap (KiB) for the history
+/// database and the offline search index — see `run`.
+const LOW_MEMORY_SQLITE_CACHE_KIB: u32 = 256;
 
 /// Build the [`netqueue::SubstrateConfig`] from resolved `[prefetch]` config
 /// (PRD §5.8 / FR-PF-1/5). The jitter seed is time-derived in production so
@@ -717,6 +723,7 @@ fn cli_overrides_from(cli: &Cli) -> config::CliOverrides {
         // can't be known until then) — matching `lang`'s own split for the
         // exact same reason.
         active_wiki: None,
+        low_memory: cli.low_memory.then_some(true),
     }
 }
 
@@ -2088,7 +2095,7 @@ fn apply_revalidation_outcome(app: &mut App, cache: &PageCache, outcome: Revalid
             // on a different wiki (or lang) is a different page (PRD FR-ML-4).
             let still_open = tab.wiki == outcome.wiki
                 && tab.lang == outcome.lang
-                && tab.doc.as_ref().is_some_and(|d| d.title == outcome.title);
+                && tab.article_title() == Some(outcome.title.as_str());
             if still_open {
                 tab.pending_reload = Some(PendingReload {
                     lang: outcome.lang,
@@ -2174,9 +2181,9 @@ fn apply_tab_load_outcome_as(
                 let upgrades_same_request = kind == LoadKind::ForegroundRetry
                     && tab.wiki == outcome.wiki
                     && tab.lang == outcome.lang
-                    && tab.doc.as_ref().is_some_and(|d| {
-                        d.title == outcome.title || d.title == fetch.resolved_title
-                    });
+                    && tab
+                        .article_title()
+                        .is_some_and(|t| t == outcome.title || t == fetch.resolved_title);
                 (!upgrades_same_request, tab.pending_open)
             };
             {
@@ -2197,6 +2204,7 @@ fn apply_tab_load_outcome_as(
             if arm {
                 app.arm_open(index, hitrate::OpenSource::from_page_source(fetch.source));
             }
+            app.remember_source(index, &fetch.html);
             // PRD FR-TB-5: a session-restore fetch (`main::restore_session_tabs`)
             // stashed the scroll/fold-set to apply once `install_document`
             // (just above) finishes resetting both to the top — apply it
@@ -2251,6 +2259,11 @@ fn apply_tab_load_outcome_as(
             {
                 app.pending_revalidations += 1;
             }
+            // PRD §6.8 low_memory: a document that landed off screen keeps
+            // only its compressed source from here on (history, the session
+            // restore's scroll/folds and the open's KPI arming above all
+            // needed it resident first). A no-op outside low-memory mode.
+            app.enforce_residency();
             // PRD FR-TB-5: a background tab's document installing is a
             // "meaningful change" too — see `App::persist_session`'s doc
             // comment for the full trigger list.
@@ -2746,6 +2759,7 @@ fn open_saved(app: &mut App, wiki: &str, lang: &str, title: &str) {
                 tab.current_revid = content.revid;
             }
             app.open_document(document);
+            app.remember_source(app.active, &content.html);
             // `set_document` stamps the tab with the *active* wiki; a saved
             // page belongs to the wiki it was pinned on, so re-stamp it here
             // (PRD FR-ML-4) — reading a cross-wiki saved page from the `:saved`
@@ -2807,6 +2821,7 @@ fn try_open_from_zim(app: &mut App, title: &str) -> Result<String, String> {
                 tab.current_revid = 0;
             }
             app.open_document(document);
+            app.remember_source(app.active, &html);
             Ok(resolved_title)
         }
         Err(e) => Err(e.to_string()),
@@ -2881,6 +2896,7 @@ async fn run(
     wiki_registry: config::ResolvedWikiRegistry,
     tts_command: Option<String>,
     macros: std::collections::BTreeMap<String, Vec<String>>,
+    low_memory: bool,
 ) -> Result<()> {
     let mut app = App::new(lang, theme, no_color);
     app.keymap = keymap;
@@ -2973,6 +2989,13 @@ async fn run(
     // `App::graphics_protocol`.
     app.graphics_env = graphics::GraphicsEnv::from_process_env(std::io::stdout().is_terminal());
     app.images_override = images_config;
+    // PRD §6.8 `low_memory`: before anything opens, so the very first
+    // install already keeps its compressed source and the L1 layout cache is
+    // already at its on-screen size. Inline images default off in this mode
+    // (decoded thumbnails are pixel buffers held per article) unless the
+    // reader set `images` explicitly — config/env above, or `:set images=on`
+    // at runtime, both of which still win.
+    app.set_low_memory(low_memory);
     app.include_nonfree = include_nonfree;
     app.pro = pro;
     // PRD FR-DL-3 v2: the Lift Wing opt-in + its (config-overridable, §6.2
@@ -3000,6 +3023,14 @@ async fn run(
     // `history` does (see `App.search_index`'s doc comment); this is the one
     // place production opens the durable one.
     app.search_index = offline_search::OfflineIndex::open();
+    // PRD §6.8 `low_memory`: SQLite's default page cache is ~2 MB per
+    // connection; history and the offline index are both written once per
+    // open and read rarely, so a small cache costs little speed here.
+    if low_memory {
+        app.history.limit_page_cache(LOW_MEMORY_SQLITE_CACHE_KIB);
+        app.search_index
+            .limit_page_cache(LOW_MEMORY_SQLITE_CACHE_KIB);
+    }
     // PRD FR-BM-1/3/7, FR-OFF-4/6: the real, on-disk bookmark, read-later,
     // research-bibliography, saved-pages, and offline-fetch-queue stores —
     // `App::new` defaults every one of these to in-memory for the same
@@ -4207,6 +4238,7 @@ async fn open_noredirect(client: &WikiClient, app: &mut App) {
                 tab.current_revid = fetched.revid;
             }
             app.open_document(document);
+            app.remember_source(app.active, &fetched.html);
             app.notice = Some(format!("Showing the redirect page for \"{requested}\""));
         }
         Err(e) => {
@@ -4450,6 +4482,9 @@ async fn open_title(
                     tab.current_revid = outcome.revid;
                 }
                 app.open_document(document);
+                // PRD §6.8 low_memory: keep the exact source so this tab can
+                // be dehydrated once it leaves the screen (a no-op otherwise).
+                app.remember_source(app.active, &outcome.html);
                 // PRD §7 "Redirect": a notice for the reader, plus
                 // remembering the alias actually requested so `:noredirect`
                 // can re-fetch it without following (`Tab::install_document`
@@ -4598,6 +4633,7 @@ async fn open_title(
                     tab.current_revid = cached.revid;
                 }
                 app.open_document(document);
+                app.remember_source(app.active, &cached.html);
                 app.notice = Some(format!(
                     "\"{title}\" may have moved or been deleted — showing the last cached copy"
                 ));
@@ -4670,6 +4706,7 @@ async fn open_history_entry(
             // just below, so it must not also raise the resume toast.
             app.suppress_resume_once = true;
             app.set_document(document);
+            app.remember_source(app.active, &outcome.html);
             // `set_document` stamps the tab with the *active* wiki; this
             // navigation is to the entry's own wiki, so restore that (PRD
             // FR-ML-4) alongside the scroll below.
@@ -4756,6 +4793,7 @@ async fn open_trail_node(
                 tab.current_revid = outcome.revid;
             }
             app.open_document(document);
+            app.remember_source(app.active, &outcome.html);
             // `open_document`/`set_document` stamps the tab with the app's
             // *active* wiki scope; this reopen targets the trail node's own
             // wiki instead — restore it, the same correction
@@ -9504,7 +9542,10 @@ async fn execute_command(
                 let targets: Vec<(String, String)> = app
                     .tabs
                     .iter()
-                    .filter_map(|t| t.doc.as_ref().map(|d| (t.lang.clone(), d.title.clone())))
+                    .filter_map(|t| {
+                        t.article_title()
+                            .map(|title| (t.lang.clone(), title.to_string()))
+                    })
                     .collect();
                 let label = format!("{} open tabs", targets.len());
                 request_bulk_save(app, label, Tier::T0, targets);
@@ -10144,6 +10185,7 @@ fn open_offline_result(cache: &PageCache, app: &mut App, wiki: &str, lang: &str,
             tab.current_revid = page.revid;
         }
         app.open_document(document);
+        app.remember_source(app.active, &page.html);
         return;
     }
     app.notice = Some(format!(
@@ -13831,5 +13873,146 @@ mod tests {
             "back to Alan Turing: an L1 hit"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- PRD §6.8 `low_memory` through the real background-install paths ---
+
+    /// A background tab (`Ctrl-Enter`, `F`) or session-restore tab landing in
+    /// low-memory mode: installed, its visit recorded and its KPI open armed,
+    /// the session-restore scroll/folds applied — and then, since it is off
+    /// screen, dehydrated at once. Focusing it rehydrates it exactly.
+    #[test]
+    fn low_memory_background_and_restore_landings_dehydrate_then_rehydrate_on_focus() {
+        let client = test_client();
+        let (revalidate_tx, _rx) = mpsc::unbounded_channel::<RevalidationOutcome>();
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_low_memory(true);
+        app.layout_width = 80;
+        let id = app.open_background_tab("Enigma machine".to_string(), "en".to_string());
+        app.pending_session_restore.insert(
+            id,
+            app::PendingSessionRestore {
+                scroll: 3,
+                folded_blocks: [0usize].into_iter().collect(),
+            },
+        );
+        let mut fetch = kpi_fetch("Enigma machine", PageSource::Cached { age_secs: 2 }, 4);
+        fetch.html = "<html><head><title>Enigma machine</title></head><body>\
+                      <h2>Design</h2><p>Rotor <a href=\"./Rotor\">cipher</a> text.</p>\
+                      <h2>History</h2><p>More text.</p></body></html>"
+            .to_string();
+        apply_tab_load_outcome(
+            &client,
+            &mut app,
+            TabLoadOutcome {
+                tab_id: id,
+                wiki: String::new(),
+                lang: "en".to_string(),
+                title: "Enigma machine".to_string(),
+                result: Ok(fetch),
+            },
+            &revalidate_tx,
+        );
+        let idx = app.tab_index_by_id(id).unwrap();
+        {
+            let tab = &app.tabs[idx];
+            assert!(tab.doc.is_none() && tab.dehydrated.is_some(), "off screen");
+            assert!(!tab.loading);
+            assert_eq!(tab.display_title(), "Enigma machine");
+            assert_eq!(tab.scroll, 3, "restore scroll applied before dehydrating");
+            assert!(tab.folded_blocks.contains(&0));
+            assert_eq!(tab.pending_open, Some(hitrate::OpenSource::Disk));
+        }
+        assert_eq!(app.history.all_visits().len(), 1, "visit recorded");
+        let snap = app.session_snapshot();
+        assert_eq!(snap.tabs[idx].title.as_deref(), Some("Enigma machine"));
+
+        app.switch_to_tab(idx);
+        let tab = app.active_tab();
+        assert_eq!(
+            tab.doc.as_ref().map(|d| d.title.as_str()),
+            Some("Enigma machine")
+        );
+        assert_eq!(tab.links.len(), 1);
+        assert_eq!(tab.sections.len(), 2);
+        assert_eq!(tab.scroll, 3);
+        app.ensure_layout();
+        assert_eq!(app.open_log.window().disk, 1);
+    }
+
+    /// A revalidation result and a 429 retry both route to a tab by its
+    /// article title — which a dehydrated tab still answers to.
+    #[test]
+    fn low_memory_revalidation_and_retry_still_find_a_dehydrated_tab() {
+        let client = test_client();
+        let (revalidate_tx, _rx) = mpsc::unbounded_channel::<RevalidationOutcome>();
+        let dir = temp_state_path("lowmem-reval").with_extension("cachedir");
+        let cache = PageCache::at(dir.clone(), 10_000_000, 86_400, 604_800);
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_low_memory(true);
+        app.layout_width = 80;
+        let html = "<html><head><title>Busy Page</title></head><body><p>stale</p></body></html>";
+        {
+            let tab = app.active_tab_mut();
+            tab.page_source = PageSource::Offline { age_secs: 99 };
+            tab.current_revid = 1;
+        }
+        app.open_document(crate::doc::parse_article_html("Busy Page", html));
+        app.remember_source(app.active, html);
+        app.ensure_layout();
+        let busy_id = app.active_tab().id;
+        app.new_foreground_tab();
+        assert!(app.tabs[0].dehydrated.is_some());
+
+        apply_revalidation_outcome(
+            &mut app,
+            &cache,
+            RevalidationOutcome {
+                tab_id: busy_id,
+                wiki: String::new(),
+                lang: "en".to_string(),
+                title: "Busy Page".to_string(),
+                result: Some(RevalidationResult::Changed {
+                    html: html.replace("stale", "fresh"),
+                    revid: 2,
+                    etag: None,
+                }),
+            },
+        );
+        assert!(
+            app.tabs[0].pending_reload.is_some(),
+            "the r-to-reload notice is armed for the dehydrated tab"
+        );
+
+        apply_foreground_retry_outcome(
+            &client,
+            &mut app,
+            TabLoadOutcome {
+                tab_id: busy_id,
+                wiki: String::new(),
+                lang: "en".to_string(),
+                title: "Busy Page".to_string(),
+                result: Ok(kpi_fetch("Busy Page", PageSource::Live, 2)),
+            },
+            &revalidate_tx,
+        );
+        assert!(app.tabs[0].dehydrated.is_some(), "landed off screen");
+        assert_eq!(app.tabs[0].current_revid, 2);
+        assert!(
+            app.tabs[0].pending_open.is_none(),
+            "recognized as the same request: not a second open"
+        );
+        app.switch_to_tab(0);
+        app.ensure_layout();
+        assert_eq!(app.open_log.window().total(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_low_memory_flag_reaches_the_config_overrides() {
+        let cli = Cli::try_parse_from(["wikitui", "--low-memory"]).unwrap();
+        assert_eq!(cli_overrides_from(&cli).low_memory, Some(true));
+        let cli = Cli::try_parse_from(["wikitui"]).unwrap();
+        assert_eq!(cli_overrides_from(&cli).low_memory, None);
     }
 }

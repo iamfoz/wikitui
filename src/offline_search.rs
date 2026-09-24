@@ -220,6 +220,28 @@ impl OfflineIndex {
         }
     }
 
+    /// PRD §6.8 `low_memory`: caps SQLite's page cache for this connection
+    /// at `kib` KiB (`PRAGMA cache_size = -kib`; SQLite's own default is
+    /// 2000 KiB). Every clone shares the one connection, so this covers the
+    /// background indexer too. Best-effort, like every write here.
+    pub fn limit_page_cache(&self, kib: u32) {
+        if let Ok(conn) = self.conn.lock()
+            && let Err(e) = conn.execute_batch(&format!("PRAGMA cache_size = -{kib};"))
+        {
+            log_failure("cache_size", &e);
+        }
+    }
+
+    /// The connection's current `cache_size` pragma (tests only).
+    #[cfg(test)]
+    fn page_cache_pragma(&self) -> i64 {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA cache_size", [], |r| r.get(0))
+            .unwrap()
+    }
+
     /// Upserts `(wiki, lang, title)`'s plain text under `kind` (see the
     /// module doc's "Populate / remove"). Best-effort: a write failure (a
     /// full disk, a corrupted index file, a poisoned lock) is logged and
@@ -773,5 +795,14 @@ mod tests {
             "wikitui-test-offline-search-{}-{n}.sqlite",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn limit_page_cache_sets_the_cache_size_pragma() {
+        let index = OfflineIndex::in_memory();
+        index.limit_page_cache(256);
+        assert_eq!(index.page_cache_pragma(), -256);
+        // A clone shares the connection, so the limit covers it too.
+        assert_eq!(index.clone().page_cache_pragma(), -256);
     }
 }

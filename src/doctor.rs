@@ -151,6 +151,16 @@ fn print_resolved_config(resolved: &ResolvedConfig) {
         resolved.readlater_auto_dequeue.value, resolved.readlater_auto_dequeue.source
     );
     println!(
+        "  low_memory = {} ({}){}",
+        resolved.low_memory.value,
+        resolved.low_memory.source,
+        if resolved.low_memory.value {
+            " -- only on-screen tabs stay parsed; others re-parse on focus"
+        } else {
+            ""
+        }
+    );
+    println!(
         "  history.retention_days = {} ({}){}",
         resolved.history_retention_days.value,
         resolved.history_retention_days.source,

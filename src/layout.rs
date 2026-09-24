@@ -2623,8 +2623,22 @@ impl LayoutCache {
         }
     }
 
+    /// PRD §6.8 `low_memory`: shrink (or grow) the capacity, evicting
+    /// least-recently-used entries until the cache fits.
+    pub fn set_capacity(&mut self, capacity: usize) {
+        self.capacity = capacity.max(1);
+        while self.entries.len() > self.capacity {
+            self.entries.remove(0);
+        }
+    }
+
+    /// Drops every entry (PRD §6.8 `low_memory`: leaving a split).
+    pub fn clear(&mut self) {
+        self.entries = Vec::new();
+    }
+
     #[cfg(test)]
-    fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.entries.len()
     }
 }

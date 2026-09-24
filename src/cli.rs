@@ -97,6 +97,14 @@ pub struct Cli {
     /// the app runs exactly as if `--zim` had not been given.
     #[arg(long, value_name = "PATH")]
     pub zim: Option<PathBuf>,
+
+    /// PRD §6.8: low-memory mode for this run (target < 50 MB RSS) — only
+    /// the tab on screen (and the other split pane) keeps its parsed article
+    /// and layout resident; every other tab keeps a compressed copy of its
+    /// source and re-parses it when focused. Same as `low_memory = true` in
+    /// config.toml or `WIKITUI_LOW_MEMORY=1`.
+    #[arg(long)]
+    pub low_memory: bool,
 }
 
 #[derive(Subcommand, Debug)]

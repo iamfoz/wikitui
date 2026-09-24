@@ -34,6 +34,11 @@ use crate::tts::TtsRuntime;
 /// closes, not to the dawn of the session.
 pub const CLOSED_TABS_CAP: usize = 10;
 
+/// PRD §6.8 `low_memory`: the L1 layout cache holds at most what can be on
+/// screen at once — the two panes of a split (single-pane reading keeps its
+/// layout in `App::layout` alone). See `App::set_low_memory`.
+pub const LOW_MEMORY_L1_CAPACITY: usize = 2;
+
 /// PRD FR-SR-1's typeahead debounce window (spec calls for 150-250ms; 200ms
 /// splits the difference). Reset on every keystroke while the Search prompt
 /// has a query, so a burst of typing only fires one request, after it stops.
@@ -366,7 +371,14 @@ pub struct App {
     pub pending_ctrl_w: bool,
     /// Snapshots of closed tabs for `u` (reopen — PRD FR-TB-1), most-recent
     /// last. Capped at [`CLOSED_TABS_CAP`] so retained `Document`s drop.
+    /// In `low_memory` mode each snapshot is dehydrated on the way in
+    /// (`push_closed`), so the stack holds compressed sources, not parses.
     pub closed_tabs: Vec<Tab>,
+    /// PRD §6.8's `low_memory` mode (config `low_memory`, `--low-memory`):
+    /// only the tab(s) on screen keep a parsed document resident — see
+    /// [`App::enforce_residency`]. `false` in `App::new` (every existing
+    /// behavior unchanged); `main::run` sets it from the resolved config.
+    pub low_memory: bool,
     /// The next tab id to hand out (PRD FR-TB-3): stable across closes so a
     /// background completion routes to the right tab even after indices shift.
     pub next_tab_id: TabId,
@@ -1580,6 +1592,7 @@ impl App {
             split: None,
             pending_ctrl_w: false,
             closed_tabs: Vec::new(),
+            low_memory: false,
             next_tab_id: 1,
             selected_tab_pick: 0,
             selected_history: 0,
@@ -2132,6 +2145,110 @@ impl App {
         self.open_log
             .record(crate::hitrate::OpenSource::resolve(tier, l1_hit));
         self.persist_open_log();
+    }
+
+    // -- Low-memory residency (PRD §6.8 `low_memory`) -------------------------
+
+    /// Hands `tabs[index]` the exact HTML its just-installed document was
+    /// parsed from, compressed, so the tab can be dehydrated once it leaves
+    /// the screen (see `tab::SourceHtml`). Called by every install site right
+    /// after `set_document`/`open_document`/`install_document`. A no-op
+    /// outside low-memory mode — the default mode never pays for the copy
+    /// (or the trim that follows it).
+    pub(crate) fn remember_source(&mut self, index: usize, html: &str) {
+        if !self.low_memory {
+            return;
+        }
+        if let Some(tab) = self.tabs.get_mut(index) {
+            tab.source_html = crate::tab::SourceHtml::compress(html);
+        }
+        // Every caller has just parsed `html`: the parse's transient DOM is
+        // freed but still resident until trimmed (see `memtrim`).
+        crate::memtrim::release_free_memory();
+    }
+
+    /// Turns PRD §6.8's `low_memory` mode on or off: sets the flag, sizes the
+    /// L1 layout cache to what can be on screen at once (two split panes —
+    /// single-pane reading keeps its one layout in `self.layout`, see
+    /// `ensure_layout`) or back to the default, and applies the residency
+    /// rule to whatever is already open.
+    pub fn set_low_memory(&mut self, on: bool) {
+        self.low_memory = on;
+        self.layout_cache.set_capacity(if on {
+            LOW_MEMORY_L1_CAPACITY
+        } else {
+            layout::DEFAULT_L1_CAPACITY
+        });
+        if on {
+            // Decoded inline images are pixel buffers held per article; off
+            // by default in this mode unless the reader already chose
+            // (`images` in config/env — applied before this — or a later
+            // `:set images=on`, both of which win).
+            if self.images_override.is_none() {
+                self.images_override = Some(false);
+            }
+            self.enforce_residency();
+        } else {
+            for tab in &mut self.tabs {
+                tab.rehydrate();
+            }
+            for tab in &mut self.closed_tabs {
+                tab.rehydrate();
+            }
+        }
+    }
+
+    /// Whether `tabs[index]` is on screen: the active tab, or either pane of
+    /// a live split.
+    fn is_on_screen(&self, index: usize) -> bool {
+        if index == self.active {
+            return true;
+        }
+        let Some(tab) = self.tabs.get(index) else {
+            return false;
+        };
+        self.split
+            .as_ref()
+            .is_some_and(|s| s.panes.contains(&tab.id))
+    }
+
+    /// PRD §6.8 `low_memory`'s one rule, applied after every focus change
+    /// (`sync_active_tab` — tab switch/close/reopen/new/split close —
+    /// `begin_bilingual_split`) and every background landing
+    /// (`main::apply_tab_load_outcome`): **on-screen tabs are resident,
+    /// every other tab is dehydrated.** A dehydrated tab keeps its view state
+    /// and a compressed copy of its source, and re-parses on focus
+    /// (`Tab::rehydrate`), so it looks exactly as it did. A tab without a
+    /// kept source (an install path that had no HTML to hand over) just
+    /// stays resident. When anything was dropped or re-parsed, free heap is
+    /// handed back to the OS (`memtrim`), since the parse's transient DOM is
+    /// many times the size of the document it leaves behind. A no-op outside
+    /// low-memory mode.
+    pub(crate) fn enforce_residency(&mut self) {
+        if !self.low_memory {
+            return;
+        }
+        // Two passes, dehydrate first: the tab leaving the screen gives its
+        // parse back (and the heap is trimmed) *before* the tab arriving is
+        // re-parsed, so the two never peak together.
+        let mut dropped = false;
+        for i in 0..self.tabs.len() {
+            if !self.is_on_screen(i) {
+                dropped |= self.tabs[i].dehydrate();
+            }
+        }
+        if dropped {
+            crate::memtrim::release_free_memory();
+        }
+        let mut parsed = false;
+        for i in 0..self.tabs.len() {
+            if self.is_on_screen(i) {
+                parsed |= self.tabs[i].rehydrate();
+            }
+        }
+        if parsed {
+            crate::memtrim::release_free_memory();
+        }
     }
 
     /// Persist `open_log` to `open_log_path`, if one is set (a real run,
@@ -2995,8 +3112,20 @@ impl App {
     /// snapshotted, since it never actually closes.
     pub fn reset_to_single_blank_tab(&mut self) {
         self.split = None;
+        // PRD §6.8 low_memory: each `close_tab(0)` below would otherwise
+        // re-parse the tab sliding into slot 0 only to close it next — so
+        // residency is suspended for the teardown and the whole closed batch
+        // dehydrated once at the end.
+        let low_memory = std::mem::replace(&mut self.low_memory, false);
         while self.tabs.len() > 1 {
             self.close_tab(0);
+        }
+        self.low_memory = low_memory;
+        if low_memory {
+            for tab in &mut self.closed_tabs {
+                tab.dehydrate();
+            }
+            crate::memtrim::release_free_memory();
         }
         self.flush_tab_dwell(0);
         self.save_reading_position(0);
@@ -3005,7 +3134,12 @@ impl App {
         self.selected_tab_pick = 0;
     }
 
-    fn push_closed(&mut self, tab: Tab) {
+    fn push_closed(&mut self, mut tab: Tab) {
+        // PRD §6.8 low_memory: a closed tab is off screen by definition — keep
+        // only its compressed source until (if ever) `u` reopens it.
+        if self.low_memory && tab.dehydrate() {
+            crate::memtrim::release_free_memory();
+        }
         self.closed_tabs.push(tab);
         // §6.8 memory note: cap the undo stack so closed tabs' `Document`s
         // actually drop — dropping the oldest snapshot is the deliberate
@@ -3187,7 +3321,7 @@ impl App {
         }
         let active_idx = self.active;
         let focused_id = self.tabs[active_idx].id;
-        let (doc, revid, page_source, scroll, folded, lang) = {
+        let (doc, revid, page_source, scroll, folded, lang, source_html) = {
             let t = &self.tabs[active_idx];
             (
                 t.doc.clone(),
@@ -3196,6 +3330,7 @@ impl App {
                 t.scroll,
                 t.folded_blocks.clone(),
                 t.lang.clone(),
+                t.source_html.clone(),
             )
         };
         let dup_id = self.push_blank_tab(lang);
@@ -3207,6 +3342,9 @@ impl App {
             t.page_source = page_source;
             t.scroll = scroll;
             t.folded_blocks = folded;
+            // PRD §6.8 low_memory: the duplicate is the same document, so it
+            // can be dehydrated later exactly like the original.
+            t.source_html = source_html;
         }
         // Focus stays on the original (left) pane; `active` already points at
         // it and `push_blank_tab` appended without moving focus.
@@ -3226,6 +3364,10 @@ impl App {
         };
         self.split = Some(crate::split::Split::bilingual([original_id, other_id]));
         self.active = orig_idx;
+        // PRD §6.8 low_memory: the original pane went off screen (and was
+        // dehydrated) while the other edition loaded in its own tab; both
+        // panes are on screen again now.
+        self.enforce_residency();
         // Not a full `sync_active_tab` (which would reset mode/persist): a
         // lighter refocus onto the original pane.
         self.lang = self.active_tab().lang.clone();
@@ -3248,6 +3390,13 @@ impl App {
         let Some(split) = self.split.take() else {
             return false;
         };
+        // PRD §6.8 low_memory: the L1 layout cache only ever held the two
+        // panes' layouts (single-pane reading keeps its layout in
+        // `self.layout` alone — see `ensure_layout`), neither of which is on
+        // screen at pane width any more.
+        if self.low_memory {
+            self.layout_cache.clear();
+        }
         let focused_id = split.focused_id();
         let other_id = split.other_id();
         if !split.bilingual
@@ -3368,6 +3517,13 @@ impl App {
     /// reload" notice iff this tab has one pending, land in Reading mode, and
     /// refresh the status line.
     pub(crate) fn sync_active_tab(&mut self) {
+        // PRD §6.8 low_memory: the newly active tab must be resident before
+        // anything below reads its document, and whatever just left the
+        // screen gives its parse back. The outgoing tab's layout (rebuilt
+        // below for the new tab regardless) goes first, so it isn't still
+        // held while the incoming tab re-parses.
+        self.layout = None;
+        self.enforce_residency();
         self.lang = self.active_tab().lang.clone();
         self.rebuild_citations();
         self.layout = None;
@@ -3406,8 +3562,11 @@ impl App {
                 .tabs
                 .iter()
                 .map(|t| {
-                    let title = match &t.doc {
-                        Some(doc) => Some(doc.title.clone()),
+                    // `article_title` covers a low-memory dehydrated tab
+                    // (PRD §6.8), whose `doc` is `None` but which very much
+                    // still has an article open.
+                    let title = match t.article_title() {
+                        Some(title) => Some(title.to_string()),
                         None if t.loading => t.pending_title.clone(),
                         None => None,
                     };
@@ -3608,6 +3767,12 @@ impl App {
         // (lang/title/revid), which the shared `layout_cache` disambiguates
         // across tabs — so a single cache serves every tab and a tab switch
         // is an L1 hit, not a relayout (§6.8).
+        // PRD §6.8 low_memory safety net: whatever focus path got here, a
+        // dehydrated active tab is re-parsed before it is laid out, never
+        // shown blank. (`enforce_residency` normally did this already.)
+        if self.active_tab().dehydrated.is_some() && self.active_tab_mut().rehydrate() {
+            crate::memtrim::release_free_memory();
+        }
         let key = {
             let tab = self.active_tab();
             tab.doc.as_ref().map(|doc| layout::LayoutCacheKey {
@@ -3646,7 +3811,14 @@ impl App {
                 .expect("keyed above, so a document is present");
             layout::layout_document_with_images(doc, width, opts, &img_map, &folds)
         };
-        self.layout_cache.put(key, computed.clone());
+        // PRD §6.8 low_memory: "L1 holds only what's on screen" — and in
+        // single-pane reading, what's on screen already *is* `self.layout`,
+        // so an L1 copy would just be a second full layout of the same
+        // article. (Split panes still go through L1 — `layout_for_tab` —
+        // since their draw path re-reads it every frame.)
+        if !self.low_memory {
+            self.layout_cache.put(key, computed.clone());
+        }
         self.layout = Some(computed);
     }
 
@@ -3666,6 +3838,16 @@ impl App {
     /// never binds and the pane just uses its full width — exactly the
     /// documented behavior for splits.
     pub fn layout_for_tab(&mut self, tab_idx: usize, width: u16) -> Option<Layout> {
+        // PRD §6.8 low_memory safety net, as in `ensure_layout`: a pane is on
+        // screen, so it is resident before it is laid out.
+        if self
+            .tabs
+            .get(tab_idx)
+            .is_some_and(|t| t.dehydrated.is_some())
+            && self.tabs[tab_idx].rehydrate()
+        {
+            crate::memtrim::release_free_memory();
+        }
         let (opts, folds, key) = {
             let tab = self.tabs.get(tab_idx)?;
             let doc = tab.doc.as_ref()?;
@@ -4277,12 +4459,14 @@ impl App {
         if tab.interest_dwell_signaled {
             return;
         }
-        let Some(doc) = tab.doc.as_ref() else {
-            return;
+        // A low-memory dehydrated tab (PRD §6.8) kept its title and word
+        // count for exactly this: the dwell signal applied when it closes.
+        let (title, words) = match (&tab.doc, &tab.dehydrated) {
+            (Some(doc), _) => (doc.title.clone(), crate::doc::word_count(doc)),
+            (None, Some(d)) => (d.title.clone(), d.word_count),
+            (None, None) => return,
         };
-        let title = doc.title.clone();
         let wiki = tab.wiki.clone();
-        let words = crate::doc::word_count(doc);
         let expected = (words as f64 / self.reading_wpm.max(1) as f64) * 60.0;
         let amount = crate::interest::normalized_dwell(dwell_secs as i64, expected);
         if amount <= 0.0 {
@@ -4608,6 +4792,7 @@ impl App {
             // as the stale L2 serve it began as (`hitrate.rs`, "Not opens").
             self.not_an_open_once = true;
             self.set_document(document);
+            self.remember_source(self.active, &page.html);
         }
     }
 
@@ -5537,10 +5722,11 @@ impl App {
         let Some(tab) = self.tabs.get(index) else {
             return;
         };
-        let Some(doc) = tab.doc.as_ref() else {
+        // `article_title`: a low-memory dehydrated tab (PRD §6.8) closing
+        // still saves its position — scroll and folds never left the tab.
+        let Some(title) = tab.article_title().map(str::to_string) else {
             return;
         };
-        let title = doc.title.clone();
         let lang = tab.lang.clone();
         let wiki = tab.wiki.clone();
         let revid = tab.current_revid;
@@ -12679,5 +12865,364 @@ mod tests {
         app.switch_to_tab(idx);
         app.ensure_layout();
         assert_eq!(kpi_counts(&app).total(), 2, "and only then");
+    }
+
+    // ---- PRD §6.8 `low_memory`: residency round trips -----------------------
+
+    /// A Parsoid-shaped fixture with enough structure (sections, links, a
+    /// footnote marker, a table, a references list) that a wrong rehydration
+    /// — different block indices, links, or sections — would show.
+    fn lm_html(title: &str, sections: usize) -> String {
+        let mut h = format!(
+            "<html><head><title>{title}</title></head><body><p>Lead with \
+             <a href=\"./Lead_link\">a link</a>.<sup class=\"reference\">\
+             <a href=\"#cite_note-1\">[1]</a></sup></p>"
+        );
+        for i in 0..sections {
+            h.push_str(&format!(
+                "<h2>Section {i}</h2><p>Paragraph {i} of {title}, with \
+                 <a href=\"./Topic_{i}\">topic {i}</a> and \
+                 <a href=\"./Other_{i}\">other {i}</a> in running prose that \
+                 wraps over more than one line at eighty columns.</p>"
+            ));
+        }
+        h.push_str(
+            "<table class=\"wikitable\"><tr><th>A</th><th>B</th></tr>\
+             <tr><td>1</td><td>2</td></tr></table><h2>References</h2>\
+             <ol class=\"references\"><li id=\"cite_note-1\">\
+             <span class=\"reference-text\">Ref one.</span></li></ol></body></html>",
+        );
+        h
+    }
+
+    /// What every real install site does in low-memory mode: set the source
+    /// tier, install, and hand over the exact HTML (`remember_source`).
+    fn lm_open(app: &mut App, title: &str, html: &str, revid: u64) {
+        {
+            let t = app.active_tab_mut();
+            t.page_source = PageSource::Cached { age_secs: 1 };
+            t.current_revid = revid;
+        }
+        app.open_document(crate::doc::parse_article_html(title, html));
+        app.remember_source(app.active, html);
+    }
+
+    fn lm_app() -> App {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_low_memory(true);
+        app.layout_width = 80;
+        app
+    }
+
+    /// Everything a reader can see of a tab, as comparable data (`Document`
+    /// and friends aren't `PartialEq`; their `Debug` output is a full deep
+    /// rendering of every field).
+    fn lm_view(tab: &Tab) -> String {
+        let mut folds: Vec<usize> = tab.folded_blocks.iter().copied().collect();
+        folds.sort_unstable();
+        format!(
+            "{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{:?}|{}|{:?}|{:?}|{:?}|{}",
+            tab.doc,
+            tab.links,
+            tab.sections,
+            tab.reference_markers,
+            tab.focused_link,
+            tab.selected_section,
+            tab.scroll,
+            folds,
+            tab.table_col_offset,
+            tab.find_input,
+            tab.find_matches,
+            tab.back_stack,
+            tab.disambig_pending
+        )
+    }
+
+    #[test]
+    fn low_memory_an_off_screen_tab_dehydrates_and_comes_back_identical() {
+        let mut app = lm_app();
+        let html = lm_html("Alpha", 12);
+        lm_open(&mut app, "Alpha", &html, 11);
+        app.ensure_layout();
+        {
+            let t = app.active_tab_mut();
+            t.scroll = 7;
+            t.focused_link = Some(3);
+            t.selected_section = 2;
+            let fold = t.sections[4].block;
+            t.folded_blocks.insert(fold);
+            t.find_input = "topic".to_string();
+            t.find_matches = vec![2, 5];
+        }
+        app.layout = None;
+        app.ensure_layout();
+        let before = lm_view(app.active_tab());
+        let lines_before = app.layout.as_ref().unwrap().lines.clone();
+
+        app.new_foreground_tab();
+        lm_open(&mut app, "Beta", &lm_html("Beta", 3), 12);
+        app.ensure_layout();
+        {
+            let a = &app.tabs[0];
+            assert!(a.doc.is_none(), "off screen: the parse is gone");
+            assert!(a.links.is_empty() && a.sections.is_empty());
+            assert!(a.reference_markers.is_empty());
+            assert!(a.source_html.is_some(), "only the compressed source stays");
+            assert_eq!(a.display_title(), "Alpha", "tab bar still names it");
+            assert_eq!(a.article_title(), Some("Alpha"));
+            assert_eq!(a.scroll, 7, "view state never left the tab");
+        }
+
+        app.switch_to_tab(0);
+        assert!(app.tabs[1].doc.is_none(), "Beta went off screen in turn");
+        assert_eq!(lm_view(app.active_tab()), before, "identical on focus");
+        app.ensure_layout();
+        assert_eq!(
+            app.layout.as_ref().unwrap().lines,
+            lines_before,
+            "and it lays out to the very same lines"
+        );
+    }
+
+    #[test]
+    fn default_mode_never_dehydrates_or_keeps_a_source_copy() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.layout_width = 80;
+        lm_open(&mut app, "Alpha", &lm_html("Alpha", 3), 11);
+        app.new_foreground_tab();
+        lm_open(&mut app, "Beta", &lm_html("Beta", 3), 12);
+        assert!(app.tabs[0].doc.is_some());
+        assert!(app.tabs[0].source_html.is_none(), "no copy is paid for");
+        assert!(app.tabs[0].dehydrated.is_none());
+    }
+
+    #[test]
+    fn low_memory_a_tab_with_no_kept_source_simply_stays_resident() {
+        let mut app = lm_app();
+        // An install that never handed its HTML over.
+        app.open_document(crate::doc::parse_article_html(
+            "Alpha",
+            &lm_html("Alpha", 3),
+        ));
+        app.new_foreground_tab();
+        lm_open(&mut app, "Beta", &lm_html("Beta", 3), 12);
+        assert!(
+            app.tabs[0].doc.is_some(),
+            "can't dehydrate without a source"
+        );
+        assert!(app.tabs[0].dehydrated.is_none());
+    }
+
+    #[test]
+    fn low_memory_closed_tabs_are_dehydrated_and_u_reopens_them_intact() {
+        let mut app = lm_app();
+        lm_open(&mut app, "Alpha", &lm_html("Alpha", 3), 11);
+        app.new_foreground_tab();
+        lm_open(&mut app, "Beta", &lm_html("Beta", 6), 12);
+        app.active_tab_mut().scroll = 4;
+        let before = lm_view(app.active_tab());
+        assert!(!app.close_tab(1));
+        let snapshot = app.closed_tabs.last().unwrap();
+        assert!(snapshot.doc.is_none() && snapshot.dehydrated.is_some());
+        assert!(app.reopen_closed_tab());
+        assert_eq!(lm_view(app.active_tab()), before);
+    }
+
+    #[test]
+    fn low_memory_back_and_forward_work_inside_a_tab_that_was_dehydrated() {
+        let mut app = lm_app();
+        lm_open(&mut app, "Xray", &lm_html("Xray", 2), 10);
+        lm_open(&mut app, "Alpha", &lm_html("Alpha", 4), 11);
+        app.active_tab_mut().scroll = 5;
+        app.new_foreground_tab();
+        lm_open(&mut app, "Beta", &lm_html("Beta", 2), 12);
+        assert!(app.tabs[0].dehydrated.is_some());
+        assert_eq!(
+            app.tabs[0].current_entry().map(|e| e.title),
+            Some("Alpha".to_string()),
+            "a dehydrated tab still knows what it is showing"
+        );
+
+        app.switch_to_tab(0);
+        let back = app.navigate_back_target().expect("Xray is behind Alpha");
+        assert_eq!(back.title, "Xray");
+        let fwd = app.active_tab().forward_stack.last().unwrap().clone();
+        assert_eq!((fwd.title.as_str(), fwd.scroll), ("Alpha", 5));
+        // Install Xray as back/forward does (`set_document`: stacks
+        // untouched), then go forward again.
+        let xray = lm_html("Xray", 2);
+        app.set_document(crate::doc::parse_article_html("Xray", &xray));
+        app.remember_source(app.active, &xray);
+        let forward = app.navigate_forward_target().unwrap();
+        assert_eq!((forward.title.as_str(), forward.scroll), ("Alpha", 5));
+    }
+
+    #[test]
+    fn low_memory_session_snapshot_keeps_dehydrated_tabs_whole() {
+        let mut app = lm_app();
+        lm_open(&mut app, "Alpha", &lm_html("Alpha", 6), 11);
+        {
+            let t = app.active_tab_mut();
+            t.scroll = 9;
+            let fold = t.sections[1].block;
+            t.folded_blocks.insert(fold);
+        }
+        let fold = app.active_tab().sections[1].block;
+        app.new_foreground_tab();
+        lm_open(&mut app, "Beta", &lm_html("Beta", 2), 12);
+        assert!(app.tabs[0].dehydrated.is_some());
+        let snap = app.session_snapshot();
+        assert_eq!(snap.tabs[0].title.as_deref(), Some("Alpha"));
+        assert_eq!(snap.tabs[0].scroll, 9);
+        assert_eq!(snap.tabs[0].folded_blocks, vec![fold]);
+        assert_eq!(snap.tabs[0].current_revid, 11);
+    }
+
+    #[test]
+    fn low_memory_split_panes_stay_resident_and_l1_holds_only_them() {
+        let mut app = lm_app();
+        lm_open(&mut app, "Alpha", &lm_html("Alpha", 3), 11);
+        app.ensure_layout();
+        assert_eq!(
+            app.layout_cache.len(),
+            0,
+            "single pane: the on-screen layout lives in `app.layout` only"
+        );
+        app.new_foreground_tab();
+        lm_open(&mut app, "Beta", &lm_html("Beta", 3), 12);
+        app.open_split(120).unwrap();
+        let (l, r) = {
+            let sp = app.split.as_ref().unwrap();
+            (
+                app.tab_index_by_id(sp.panes[0]).unwrap(),
+                app.tab_index_by_id(sp.panes[1]).unwrap(),
+            )
+        };
+        assert!(app.tabs[0].dehydrated.is_some(), "Alpha is not on screen");
+        assert!(app.layout_for_tab(l, 59).is_some());
+        assert!(app.layout_for_tab(r, 59).is_some());
+        assert!(app.tabs[l].doc.is_some() && app.tabs[r].doc.is_some());
+        // A resize: new pane widths push the old ones out, never past two.
+        assert!(app.layout_for_tab(l, 49).is_some());
+        assert!(app.layout_for_tab(r, 49).is_some());
+        assert_eq!(app.layout_cache.len(), LOW_MEMORY_L1_CAPACITY);
+        assert!(app.close_split());
+        assert_eq!(app.layout_cache.len(), 0, "leaving the split empties L1");
+    }
+
+    #[test]
+    fn low_memory_bilingual_split_rehydrates_the_original_pane() {
+        let mut app = lm_app();
+        lm_open(&mut app, "Alpha", &lm_html("Alpha", 3), 11);
+        let original = app.active_tab().id;
+        // `:bilingual` opens the other edition in a fresh foreground tab —
+        // the original goes off screen (and is dehydrated) meanwhile.
+        app.new_foreground_tab();
+        app.lang = "de".to_string();
+        lm_open(&mut app, "Alpha (de)", &lm_html("Alpha (de)", 3), 21);
+        let other = app.active_tab().id;
+        assert!(app.tabs[0].dehydrated.is_some());
+        app.begin_bilingual_split(original, other);
+        assert!(app.tabs[0].doc.is_some(), "left pane back on screen");
+        assert!(app.tabs[1].doc.is_some(), "right pane on screen");
+        assert_eq!(app.citations.len(), 2, "rebuilt from the resident doc");
+    }
+
+    #[test]
+    fn low_memory_a_dehydrated_tab_closing_still_saves_its_reading_position() {
+        let mut app = lm_app();
+        lm_open(&mut app, "Alpha", &lm_html("Alpha", 6), 11);
+        app.active_tab_mut().scroll = 9;
+        app.new_foreground_tab();
+        lm_open(&mut app, "Beta", &lm_html("Beta", 2), 12);
+        assert!(app.tabs[0].dehydrated.is_some());
+        let wiki = app.tabs[0].wiki.clone();
+        assert!(!app.close_tab(0));
+        let pos = app.history.position(&wiki, "en", "Alpha").expect("saved");
+        assert_eq!((pos.scroll, pos.revid), (9, 11));
+    }
+
+    #[test]
+    fn low_memory_keeps_the_kpi_arming_and_disambig_flag_across_dehydration() {
+        let mut app = lm_app();
+        lm_open(&mut app, "Alpha", &lm_html("Alpha", 2), 11);
+        app.ensure_layout();
+        // A background tab that landed (armed, disambiguation pending) and
+        // was dehydrated before the reader ever looked at it.
+        let id = app.push_blank_tab("en".to_string());
+        let idx = app.tab_index_by_id(id).unwrap();
+        let html = "<html><head><link rel=\"mw:PageProp/disambiguation\"/></head><body>\
+                    <p><b>Mercury</b> may refer to:</p><ul>\
+                    <li><a href=\"./Mercury_(planet)\">Mercury</a>, a planet</li>\
+                    <li><a href=\"./Mercury_(element)\">Mercury</a>, an element</li></ul>\
+                    </body></html>";
+        app.tabs[idx].page_source = PageSource::Cached { age_secs: 1 };
+        app.tabs[idx].install_document(crate::doc::parse_article_html("Mercury", html));
+        app.arm_open(idx, Some(crate::hitrate::OpenSource::Disk));
+        app.remember_source(idx, html);
+        app.enforce_residency();
+        assert!(app.tabs[idx].dehydrated.is_some());
+        assert!(app.tabs[idx].disambig_pending);
+        assert_eq!(app.open_log.window().total(), 1);
+
+        app.switch_to_tab(idx);
+        assert_eq!(app.mode, Mode::Disambig, "chooser on first focus");
+        app.ensure_layout();
+        assert_eq!(app.open_log.window().disk, 2, "counted once, on view");
+        app.mode = Mode::Reading; // Esc: view as text
+        app.switch_to_tab(0);
+        assert!(app.tabs[idx].dehydrated.is_some());
+        app.switch_to_tab(idx);
+        assert_eq!(app.mode, Mode::Reading, "dismissed stays dismissed");
+        app.ensure_layout();
+        assert_eq!(app.open_log.window().total(), 2);
+    }
+
+    #[test]
+    fn low_memory_defaults_images_off_unless_the_reader_chose() {
+        let mut app = App::new("en".to_string(), Theme::terminal(), false);
+        app.set_low_memory(true);
+        assert_eq!(app.images_override, Some(false));
+        let mut chose = App::new("en".to_string(), Theme::terminal(), false);
+        chose.images_override = Some(true);
+        chose.set_low_memory(true);
+        assert_eq!(chose.images_override, Some(true), "explicit choice wins");
+    }
+
+    #[test]
+    fn turning_low_memory_off_rehydrates_every_tab() {
+        let mut app = lm_app();
+        lm_open(&mut app, "Alpha", &lm_html("Alpha", 2), 11);
+        app.new_foreground_tab();
+        lm_open(&mut app, "Beta", &lm_html("Beta", 2), 12);
+        assert!(app.tabs[0].dehydrated.is_some());
+        app.set_low_memory(false);
+        assert!(
+            app.tabs
+                .iter()
+                .all(|t| t.doc.is_some() && t.dehydrated.is_none())
+        );
+        assert_eq!(app.layout_cache.len(), 0);
+    }
+
+    #[test]
+    fn low_memory_session_reset_leaves_every_closed_tab_dehydrated() {
+        let mut app = lm_app();
+        for (i, t) in ["A", "B", "C"].iter().enumerate() {
+            if i > 0 {
+                app.new_foreground_tab();
+            }
+            lm_open(&mut app, t, &lm_html(t, 2), 10 + i as u64);
+        }
+        app.switch_to_tab(0);
+        app.reset_to_single_blank_tab();
+        assert!(app.low_memory, "the mode is restored after the teardown");
+        assert_eq!(app.closed_tabs.len(), 2);
+        assert!(
+            app.closed_tabs
+                .iter()
+                .all(|t| t.doc.is_none() && t.dehydrated.is_some())
+        );
+        assert!(app.tabs[0].doc.is_none() && app.tabs[0].dehydrated.is_none());
     }
 }
