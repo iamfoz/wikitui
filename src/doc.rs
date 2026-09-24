@@ -2152,6 +2152,69 @@ fn page_display_title(parsed: &Html) -> Option<String> {
     (!normalized.is_empty()).then_some(normalized)
 }
 
+/// The page's canonical title from Parsoid's `<link rel="dc:isVersionOf"
+/// href="//en.wikipedia.org/wiki/Alan_Turing">` — the title its own
+/// same-page links carry, which a redirect's requested title and a
+/// `DISPLAYTITLE`-styled `<title>` can both differ from.
+fn canonical_title(parsed: &Html) -> Option<String> {
+    let sel = Selector::parse(r#"head > link[rel="dc:isVersionOf"]"#).unwrap();
+    let href = parsed.select(&sel).next()?.value().attr("href")?;
+    let (_, path) = href.split_once("/wiki/")?;
+    Some(urlencoding::decode(path).ok()?.into_owned())
+}
+
+/// The form two titles are compared in to decide "same page": MediaWiki
+/// treats `_` and space alike and, on Wikipedia, ignores the case of the
+/// first letter.
+fn same_page_key(title: &str) -> String {
+    let spaced = title.replace('_', " ");
+    let mut chars = spaced.trim().chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// Byte offset of the `#` in `href` when it is an internal link
+/// (`./Title#frag` or `/wiki/Title#frag`) to one of `own_keys` (see
+/// [`same_page_key`]) — i.e. an anchor on the page being parsed.
+fn same_page_fragment(href: &str, own_keys: &[String]) -> Option<usize> {
+    let hash = href.find('#')?;
+    let path = &href[..hash];
+    let path = path
+        .strip_prefix("./")
+        .or_else(|| path.strip_prefix("/wiki/"))?;
+    if path.is_empty() {
+        return None;
+    }
+    let decoded = urlencoding::decode(path).ok()?;
+    own_keys.contains(&same_page_key(&decoded)).then_some(hash)
+}
+
+/// Rewrites every link to an anchor on this same page (see
+/// [`same_page_fragment`]) to its bare `#frag` form. Runs after
+/// `sanitize_document`, and only ever shortens an already-sanitized href to
+/// a suffix of itself.
+fn localize_same_page_links(doc: &mut Document, own_keys: &[String]) {
+    for block in &mut doc.blocks {
+        let spans = match block {
+            Block::Heading { spans, .. }
+            | Block::Paragraph(spans)
+            | Block::ListItem { spans, .. }
+            | Block::Blockquote(spans) => spans,
+            _ => continue,
+        };
+        for span in spans.iter_mut() {
+            let (SpanStyle::Link(href) | SpanStyle::RedLink(href)) = &mut span.style else {
+                continue;
+            };
+            if let Some(hash) = same_page_fragment(href, own_keys) {
+                href.drain(..hash);
+            }
+        }
+    }
+}
+
 /// PRD SEC-3: truncates `html` to at most `MAX_ARTICLE_HTML_BYTES` bytes (on
 /// a UTF-8 char boundary, never splitting a multi-byte character) before it
 /// ever reaches the parser. Returns `(slice, was_truncated)`. This is the
@@ -2360,6 +2423,7 @@ pub fn parse_article_html(title: &str, html: &str) -> Document {
     }
 
     let is_disambiguation = detect_disambiguation(&parsed);
+    let canonical = canonical_title(&parsed);
 
     let mut document = Document {
         title: display_title,
@@ -2374,6 +2438,27 @@ pub fn parse_article_html(title: &str, html: &str) -> Document {
     // `document` passes through before it's handed back to callers (the UI,
     // `--dump`, the clipboard yank, `cite.rs` exports) — see its doc comment.
     sanitize_document(&mut document);
+
+    // Real Parsoid writes a same-page anchor with the page's own title in
+    // front — a reference marker is `<a href="./Alan_Turing#cite_note-1">`,
+    // a section link `./Alan_Turing#Early_life` — where older and
+    // hand-written HTML has a bare `#cite_note-1`. Everything downstream
+    // (`collect_links`, `collect_reference_markers`, `layout::span_kind`)
+    // knows a same-page anchor by its leading `#`, so fold the titled form
+    // into it here. Otherwise every footnote marker is a Tab-followable
+    // "link" whose Enter reopens the article it sits in, and `K` finds no
+    // marker to peek.
+    let own_keys: Vec<String> = [
+        Some(title),
+        Some(document.title.as_str()),
+        canonical.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(same_page_key)
+    .filter(|k| !k.is_empty())
+    .collect();
+    localize_same_page_links(&mut document, &own_keys);
 
     if document.truncated {
         document.blocks.insert(
@@ -3507,6 +3592,69 @@ mod tests {
             links.is_empty(),
             "a document with only reference markers has no followable links: {links:?}"
         );
+    }
+
+    /// Real Parsoid output puts the page's own title in front of every
+    /// same-page anchor (`./Alan_Turing#cite_note-1`), not the bare
+    /// `#cite_note-1` older HTML has. Those markers must still be reference
+    /// markers, never Tab-followable links that reopen the article they're
+    /// in — whichever of the requested title, the `<title>` or the canonical
+    /// `dc:isVersionOf` title the href spells, underscores and
+    /// percent-escapes and all. A link to an anchor on another page stays a
+    /// link.
+    #[test]
+    fn titled_same_page_anchors_are_reference_markers_not_links() {
+        let html = r##"<html><head><title>Erdős number</title>
+            <link rel="dc:isVersionOf" href="//en.wikipedia.org/wiki/Erd%C5%91s_number"/></head>
+            <body><section data-mw-section-id="0"><p>Paul
+            <a rel="mw:WikiLink" href="./Paul_Erd%C5%91s" title="Paul Erdős">Erdős</a>
+            wrote papers.<sup about="#mwt1" class="mw-ref reference" id="cite_ref-1"
+            rel="dc:references" typeof="mw:Extension/ref"><a href="./Erd%C5%91s_number#cite_note-1"><span
+            class="mw-reflink-text">[1]</span></a></sup> Some
+            <a rel="mw:WikiLink" href="./Erdős_number#Variations">variations</a> and
+            <a rel="mw:WikiLink" href="/wiki/erd%C5%91s_number#cite_note-2">[2]</a> and a
+            <a rel="mw:WikiLink" href="./Paul_Erd%C5%91s#Life">life</a>.</p>
+            <ol class="mw-references references"><li about="#cite_note-1" id="cite_note-1"><span
+            class="mw-cite-backlink" rel="mw:referencedBy"><a href="./Erd%C5%91s_number#cite_ref-1">↑</a></span>
+            <span id="mw-reference-text-cite_note-1" class="mw-reference-text">A source.</span></li>
+            </ol></section></body></html>"##;
+        // Requested through a redirect: the hrefs only match the page's own
+        // `<title>` and canonical title.
+        let doc = parse_article_html("Erdos number", html);
+        let links: Vec<String> = collect_links(&doc).into_iter().map(|l| l.href).collect();
+        assert_eq!(links, ["./Paul_Erd%C5%91s", "./Paul_Erd%C5%91s#Life"]);
+        let markers: Vec<String> = collect_reference_markers(&doc)
+            .into_iter()
+            .map(|m| m.href)
+            .collect();
+        assert!(
+            markers.starts_with(&[
+                "#cite_note-1".to_string(),
+                "#Variations".to_string(),
+                "#cite_note-2".to_string(),
+            ]),
+            "{markers:?}"
+        );
+    }
+
+    #[test]
+    fn same_page_fragment_matches_only_this_pages_anchors() {
+        let own = [same_page_key("Alan_Turing")];
+        assert_eq!(same_page_key(" alan Turing "), own[0]);
+        assert_ne!(same_page_key("Alan turing"), own[0]);
+        assert_eq!(
+            same_page_fragment("./Alan_Turing#cite_note-1", &own),
+            Some(13)
+        );
+        assert_eq!(same_page_fragment("/wiki/Alan%20Turing#x", &own), Some(19));
+        assert_eq!(same_page_fragment("./Alan_Turing", &own), None);
+        assert_eq!(same_page_fragment("./Enigma#cite_note-1", &own), None);
+        assert_eq!(same_page_fragment("#cite_note-1", &own), None);
+        assert_eq!(
+            same_page_fragment("https://x.org/wiki/Alan_Turing#a", &own),
+            None
+        );
+        assert_eq!(same_page_key(""), "");
     }
 
     /// Approximates real MediaWiki Cite-extension output: a backlink caret,
