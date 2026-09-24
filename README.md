@@ -136,10 +136,10 @@ than what's actually there:
 - **Packaging breadth**: `cargo install wikitui` works today; Homebrew,
   AUR, nixpkgs packages, and static GitHub-release binaries are planned
   (see [Install](#install)) but not published yet.
-- **§6.8 performance targets**: the PRD's parse+layout targets (e.g. < 500 ms
-  for a 1.5 MB / 500+-reference article) are asserted in an `#[ignore]`d
-  test with a deliberately loose 10-second bound, not the real target — see
-  [Performance](#performance) below.
+- **§6.8 performance targets** have been measured on one machine only (a
+  4-vCPU cloud VM, not the PRD's 2020-era laptop). The cache-hit rate target
+  has only been simulated, and network opens don't paint the lead section
+  ahead of the rest of the article. See [Performance](#performance) below.
 
 ## Install
 
@@ -200,40 +200,53 @@ on and which layer set it.
 
 ## Performance
 
-`PRD.md` §6.8 sets concrete wall-clock targets (e.g. parse+layout of a
-1.5 MB / 500+-reference pathological article in under 500 ms on a
-2020-era laptop; an L1 cache-hit article open in under 50 ms). These
-targets are **not validated in CI** and should not be read as a proven
-claim: CI runners (and the sandboxed environment this project is
-developed in) are shared, throttled, and not representative real
-hardware, so a strict wall-clock assertion there would fail on noisy-
-neighbor load, not a real regression. What exists today is
-`corpus_tests::perf_smoke_parse_and_layout_the_pathological_corpus`, an
-`#[ignore]`d test with a deliberately generous 10-second bound (20x the
-PRD target) that only catches a catastrophic algorithmic regression (an
-accidental O(n²) in the parser or wrap loop) — see that test's own doc
-comment. Confirming the actual §6.8 targets needs a real-hardware
-benchmark run outside CI; nobody has published one yet.
+`PRD.md` §6.8 sets concrete targets. Each one has been measured end to end
+against a release build on one machine: a 4-vCPU cloud VM (Intel Xeon at
+2.1 GHz, Linux, glibc). [docs/PERFORMANCE.md](docs/PERFORMANCE.md) has
+every number (p50 / p95 / max), the method, what had to change to meet
+them, the caveats, and one command that reproduces all of it
+(`tests/perf/reproduce.sh`). On that machine, at p50 (worst case in
+brackets):
 
-Memory (§6.8: < 150 MB RSS with 10 tabs, `low_memory` < 50 MB) has been
-measured, on one machine only: a release build on Linux x86_64 (glibc),
-ten tabs of generated Parsoid-like articles from 150 KB to 1.5 MB of HTML
-(8.5 MB in total), cold cache, every tab visited — `python3
-tests/perf/harness.py memory --low-memory` reproduces the measurement.
-Default mode peaked at 56–60 MB RSS; low-memory mode settled at 28–34 MB
-and peaked at 37–38 MB. With ten 1.5 MB tabs: 74–80 MB default, 32–35 MB
-(peak 38–39 MB) low-memory. About 14 MB of any of these is the binary's
-own code pages and shared libraries, which no mode can shed. Treat these
-as indicative, not a guarantee on other platforms or allocators (musl,
-macOS and Windows return freed memory differently).
+| §6.8 target | Measured |
+|---|---|
+| Cold start → interactive < 100 ms | 16–24 ms (max 34 ms, even with every network response stalled 5 s) |
+| L1 cache-hit open < 50 ms | 8–11 ms (max 15 ms) |
+| L2 cache-hit open < 150 ms | 19 ms typical; 112 ms for a 1.55 MB article (p95 141 ms; one sample in 40 took 159 ms) |
+| Network open, broadband p50 < 800 ms | 70 ms for a mix of article sizes; 227 ms for a 1.55 MB article (emulated 40 ms / 25 Mbit/s) |
+| Parse + layout, 1.5 MB / 500+ references < 500 ms | 90 ms |
+| Search: debounce 150–250 ms, render < 100 ms after response | 214 ms; 20 ms |
+| Scroll at 60 Hz, ≤ 16 ms per frame, no dropped input | no dropped keys at 60 or 120 Hz; frames ≤ 3.6 ms |
+| < 150 MB RSS with 10 tabs; `low_memory` < 50 MB | 62–84 MB; 33–42 MB (peak 47 MB) |
 
-The one §6.8 target you can check yourself is the steady-state cache-hit
-rate (> 60% of article opens): `:stats` / `wikitui stats` report it over
-your last 500 article opens, broken down by source (L1 memory · disk ·
+What that doesn't establish:
+
+- **One machine.** It isn't the PRD's 2020-era laptop. The tightest rows
+  are opening a 1.55 MB article from the disk cache and switching to one
+  in low-memory mode, both at about 110 ms p50 against a 150 ms target.
+- **Emulated network.** Network opens were measured against a local mock
+  server with emulated broadband, not live Wikipedia. wikitui doesn't
+  paint the lead section before the rest of the article arrives; the
+  target is met without it.
+- **Memory** was measured on Linux with glibc only. About 14 MB of any
+  figure is the binary's own code and shared libraries. Other platforms
+  and allocators return freed memory differently.
+- **Cache-hit rate.** The steady-state cache-hit rate target (> 60% of
+  article opens) is a field KPI. It has only been simulated: 65–78% for a
+  simulated reader under three stated browsing assumptions.
+
+Your own cache-hit rate is in `:stats` / `wikitui stats`, over your last
+500 article opens and broken down by source (L1 memory · disk ·
 saved/offline · network). An "open" is an article you asked for appearing
-on screen — tab switches, the stale-while-revalidate `r` reload, prefetch,
-and link previews don't count — and anything but a live network fetch the
-open waited on is a hit (see `src/hitrate.rs` for the exact rules).
+on screen. Tab switches, the stale-while-revalidate `r` reload, prefetch
+and link previews don't count. Anything but a live network fetch the open
+waited on is a hit (see `src/hitrate.rs` for the exact rules).
+
+CI blocks on the in-process rows (`cargo test --release perf_budget`)
+and also runs the criterion benches (`cargo bench --bench perf`), without
+blocking on them. Setting `WIKITUI_PERF_LOG=<path>` makes wikitui append
+frame and startup timings as JSON lines to that local file. It is off by
+default and never sent anywhere.
 
 ## Privacy
 

@@ -836,7 +836,8 @@ def scenario_open_network(args):
             by_class.setdefault(label, []).append(t)
             mix.append(t)
         record("open.network.mix_ms", mix, "ms", "p50 < 800",
-               "first paint of the lead section; corpus size mix, %d ms RTT, %d kbit/s, gzip"
+               "first paint of the article's top rows (the whole article is fetched and laid "
+               "out first; no lead-first paint); corpus size mix, %d ms RTT, %d kbit/s, gzip"
                % (BROADBAND_RTT_MS, BROADBAND_KBIT))
         for label in ("short", "typical", "long", "very-long"):
             if label in by_class:

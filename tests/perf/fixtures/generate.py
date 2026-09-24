@@ -189,8 +189,8 @@ def corpus_title(n):
 
 def lead_marker(title):
     """The unique token each generated article carries in its first lead
-    sentence — what the pty harness waits for to call the lead section
-    painted. Derived from the title alone so the harness can recompute it."""
+    sentence, for finding the lead in a screen dump. Derived from the title
+    alone so the harness can recompute it."""
     h = 0
     for ch in title.encode("utf-8"):
         h = (h * 131 + ch) % 0xFFFFF

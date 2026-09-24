@@ -13,6 +13,7 @@ instruments.
 | `../../src/perf_budget.rs` | The same rows as release-mode CI gates (`cargo test --release perf_budget`) |
 | `harness.py` | End-to-end pty harness driving the release binary against the mock |
 | `test_harness.py` | Self-tests for the generator, the harness's screen model, and the mock's perf mode |
+| `reproduce.sh` | Runs everything above the way `docs/PERFORMANCE.md`'s numbers were taken |
 
 Run the self-tests with `python3 -m unittest discover -s tests/perf -p 'test_*.py'`.
 

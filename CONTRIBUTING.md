@@ -56,6 +56,9 @@ python3 tests/perf/harness.py                 # every scenario
 python3 tests/perf/harness.py scroll --n 30   # or a subset
 ```
 
+`tests/perf/reproduce.sh` runs all of it (benches, budget rows, every
+harness scenario) the way the reference numbers were taken.
+
 ### The mock MediaWiki server
 
 Live Wikipedia is not something the test suite or a dev loop should hit
